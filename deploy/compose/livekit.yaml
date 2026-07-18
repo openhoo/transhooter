@@ -1,0 +1,21 @@
+port: 7880
+log_level: info
+rtc:
+  tcp_port: 7881
+  port_range_start: __RTC_UDP_PORT_START__
+  port_range_end: __RTC_UDP_PORT_END__
+  use_external_ip: false
+  node_ip: __RTC_HOST__
+redis:
+  address: redis:6379
+  password: __REDIS_PASSWORD__
+keys:
+  __LIVEKIT_API_KEY__: __LIVEKIT_API_SECRET__
+webhook:
+  api_key: __LIVEKIT_API_KEY__
+  urls:
+    - http://web:3000/api/webhooks/livekit
+room:
+  auto_create: false
+  empty_timeout: 300
+  departure_timeout: 20

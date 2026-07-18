@@ -1,0 +1,326 @@
+.room {
+  background: var(--ink);
+  color: var(--cloud);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
+.chrome {
+  min-height: 3.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--cloud-line);
+}
+
+.recording {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.8125rem;
+  min-inline-size: 0;
+}
+
+.recording::before {
+  content: "";
+  width: var(--space-2);
+  height: var(--space-2);
+  flex: 0 0 var(--space-2);
+  border-radius: 50%;
+  background: var(--mint);
+}
+
+.recordingWarning::before {
+  background: var(--amber);
+}
+
+.videoRegion {
+  min-inline-size: 0;
+}
+
+.videos {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--cloud-line);
+  min-inline-size: 0;
+}
+
+.pane {
+  position: relative;
+  min-width: 0;
+  aspect-ratio: 16 / 9;
+  background: var(--ink-panel);
+  overflow: hidden;
+}
+
+.pane video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.person {
+  position: absolute;
+  inset-inline-start: var(--space-3);
+  inset-block-end: var(--space-3);
+  padding: var(--space-1) var(--space-2);
+  background: var(--ink-overlay);
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  max-inline-size: calc(100% - var(--space-6));
+  overflow-wrap: anywhere;
+  unicode-bidi: isolate;
+}
+
+.ribbon {
+  block-size: 10rem;
+  min-height: 10rem;
+  display: grid;
+  grid-template-columns: 10rem minmax(0, 1fr);
+  background: var(--cloud);
+  color: var(--ink);
+  border-top: 0.25rem solid var(--cobalt);
+  overflow: hidden;
+}
+
+.speaker {
+  padding: var(--space-4);
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  border-inline-end: 1px solid var(--line);
+  color: var(--ink-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.caption {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  align-content: safe center;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-6);
+}
+
+.translation {
+  margin: 0;
+  font:
+    600 clamp(1.25rem, 2.5vw, 2rem) / 1.25 "Noto Sans",
+    "Noto Sans Arabic",
+    "Noto Sans SC",
+    sans-serif;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
+
+.source {
+  min-block-size: 2.6rem;
+  margin: 0;
+  color: var(--ink-muted);
+  font-family: "Noto Sans", "Noto Sans Arabic", "Noto Sans SC", sans-serif;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  unicode-bidi: plaintext;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-4);
+  background: var(--cloud);
+  color: var(--ink);
+  border-top: 1px solid var(--line);
+}
+
+.audioModeGroup {
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.controlLabel {
+  margin-bottom: var(--space-2);
+  color: var(--ink-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.modes {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.mode {
+  min-height: 2.5rem;
+  border: 0;
+  border-right: 1px solid var(--line);
+  padding: 0 var(--space-3);
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  position: relative;
+  flex: 1 1 auto;
+}
+
+.mode:last-child {
+  border-right: 0;
+}
+
+.mode:focus-visible {
+  z-index: 1;
+  box-shadow: inset 0 0 0 var(--space-1) var(--cobalt);
+}
+
+.selected {
+  background: var(--cobalt);
+  color: var(--cloud);
+}
+
+.selected:focus-visible {
+  box-shadow: inset 0 0 0 var(--space-1) var(--cloud);
+}
+
+.recovery {
+  display: block;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--amber-room-line);
+  background: var(--amber-room-tint);
+  color: var(--cloud);
+  animation: recover 150ms ease-out both;
+}
+
+.join {
+  min-height: 32rem;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  padding: var(--space-8);
+  text-align: center;
+  background: var(--ink);
+  color: var(--cloud);
+  border-radius: var(--radius-lg);
+}
+
+.join .error,
+.room > .error {
+  width: 100%;
+  margin: 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  text-align: start;
+}
+
+.hiddenMedia {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+@keyframes recover {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 48rem) {
+  .chrome {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .videos {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pane {
+    aspect-ratio: 4 / 3;
+  }
+
+  .person {
+    inset-inline: var(--space-2);
+    inset-block-end: var(--space-2);
+    max-inline-size: calc(100% - var(--space-4));
+  }
+
+  .ribbon {
+    grid-template-columns: 1fr;
+    min-height: 10rem;
+    block-size: auto;
+  }
+
+  .speaker {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding-block: var(--space-2);
+  }
+
+  .caption {
+    min-height: calc(var(--space-12) * 2);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .translation {
+    font-size: 1.25rem;
+  }
+
+  .controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .audioModeGroup,
+  .modes {
+    width: 100%;
+  }
+
+  .modes {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recovery {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .selected {
+    border: 2px solid ButtonText;
+    outline: 2px solid Highlight;
+    outline-offset: -4px;
+  }
+}

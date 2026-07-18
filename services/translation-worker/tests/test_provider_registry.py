@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import pytest
+
+from transhooter_worker.domain.models import RawRef
+from transhooter_worker.runtime.provider_registry import (
+    AlternateProfile,
+    ProviderRegistry,
+    resolve_profile_config,
+)
+
+APPEND_REF = RawRef(
+    UUID(int=1),
+    1,
+    "0" * 64,
+    0,
+    "application/octet-stream",
+)
+TERMINAL_REF = RawRef(
+    UUID(int=2),
+    2,
+    "1" * 64,
+    0,
+    "application/json",
+)
+
+
+class DeterministicJournal:
+    def append(self, **kwargs: Any) -> RawRef:
+        return RawRef(
+            APPEND_REF.object_id,
+            APPEND_REF.ordinal,
+            APPEND_REF.sha256,
+            len(kwargs.get("payload", b"")),
+            str(kwargs.get("media_type", APPEND_REF.media_type)),
+        )
+
+    def terminal(self, attempt_id: UUID, payload: bytes) -> RawRef:
+        return RawRef(
+            TERMINAL_REF.object_id,
+            TERMINAL_REF.ordinal,
+            TERMINAL_REF.sha256,
+            len(payload),
+            TERMINAL_REF.media_type,
+        )
+
+
+def alternate_profile(tmp_path: Path) -> AlternateProfile:
+    deepgram_key_file = tmp_path / "deepgram"
+    deepl_key_file = tmp_path / "deepl"
+    deepgram_key_file.write_text("dg")
+    deepl_key_file.write_text("dl")
+    return AlternateProfile(
+        kind="deepgram-deepl-eu",
+        deepgram_key_file=deepgram_key_file,
+        deepl_key_file=deepl_key_file,
+        deepgram_api_key="dg",
+        deepl_api_key="dl",
+        language="en-US",
+        languages=("en-US", "de-DE"),
+        voice="aura-2-test",
+        approved_voices=("aura-2-test",),
+        deepgram_credential_fingerprint="dg-v1",
+        deepl_credential_fingerprint="dl-v1",
+        deepgram_streams=2,
+        deepgram_audio_seconds_minute=120,
+        deepl_requests_minute=100,
+        deepl_characters_minute=100000,
+    )
+
+
+def test_alternate_profile_equality_ignores_secret_bytes_but_compares_fingerprints(
+    tmp_path: Path,
+) -> None:
+    original = alternate_profile(tmp_path)
+    different_secrets = original.model_copy(
+        update={"deepgram_api_key": "other-dg", "deepl_api_key": "other-dl"}
+    )
+    different_fingerprint = original.model_copy(update={"deepgram_credential_fingerprint": "dg-v2"})
+
+    assert original == different_secrets
+    assert original != different_fingerprint
+    assert "deepgram_api_key" not in original.model_dump()
+    assert "other-dg" not in repr(different_secrets)
+
+
+def test_environment_resolver_preserves_alternate_profile_fingerprints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    deepgram_key_file = tmp_path / "deepgram"
+    deepl_key_file = tmp_path / "deepl"
+    deepgram_key_file.write_text("dg")
+    deepl_key_file.write_text("dl")
+    environment = {
+        "DEEPGRAM_API_KEY_FILE": str(deepgram_key_file),
+        "DEEPL_API_KEY_FILE": str(deepl_key_file),
+        "DEEPGRAM_VOICE": "aura-2-test",
+        "DEEPGRAM_APPROVED_VOICES": "aura-2-test",
+        "DEEPGRAM_STREAMS": "2",
+        "DEEPGRAM_AUDIO_SECONDS_MINUTE": "120",
+        "DEEPL_REQUESTS_MINUTE": "100",
+        "DEEPL_CHARACTERS_MINUTE": "100000",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    profile = resolve_profile_config(
+        "deepgram-deepl-eu",
+        ("en-US", "de-DE", "en-US"),
+    )
+
+    assert isinstance(profile, AlternateProfile)
+    assert profile.languages == ("en-US", "de-DE")
+    assert profile.deepgram_credential_fingerprint == hashlib.sha256(b"dg").hexdigest()
+    assert profile.deepl_credential_fingerprint == hashlib.sha256(b"dl").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_alternate_capabilities_cover_bilingual_directions(
+    tmp_path: Path,
+) -> None:
+    profile = alternate_profile(tmp_path)
+    providers = ProviderRegistry.construct(
+        profile,
+        UUID(int=3),
+        DeterministicJournal(),
+    )
+    stt = await providers.stt.capabilities()
+    tts = await providers.tts.capabilities()
+
+    assert stt.languages == ("en-US", "de-DE")
+    assert tts.languages == ("en-US", "de-DE")
+
+
+def test_alternate_credentials_are_read_once_and_bound_to_fingerprints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    deepgram_key_file = tmp_path / "deepgram-once"
+    deepl_key_file = tmp_path / "deepl-once"
+    deepgram_key_file.write_text("dg-original")
+    deepl_key_file.write_text("dl-original")
+    environment = {
+        "DEEPGRAM_API_KEY_FILE": str(deepgram_key_file),
+        "DEEPL_API_KEY_FILE": str(deepl_key_file),
+        "DEEPGRAM_VOICE": "aura-2-thalia-en",
+        "DEEPGRAM_APPROVED_VOICES": "aura-2-thalia-en",
+        "DEEPGRAM_STREAMS": "2",
+        "DEEPGRAM_AUDIO_SECONDS_MINUTE": "120",
+        "DEEPL_REQUESTS_MINUTE": "100",
+        "DEEPL_CHARACTERS_MINUTE": "100000",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    reads: dict[Path, int] = {}
+    original_read_bytes = Path.read_bytes
+
+    def counted_read_bytes(path: Path) -> bytes:
+        reads[path] = reads.get(path, 0) + 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    profile = resolve_profile_config("deepgram-deepl-eu", ("en-US", "de-DE"))
+    assert isinstance(profile, AlternateProfile)
+    deepgram_key_file.write_text("dg-rotated")
+    deepl_key_file.write_text("dl-rotated")
+
+    providers = ProviderRegistry.construct(profile, UUID(int=4), DeterministicJournal())
+
+    assert reads == {deepgram_key_file: 1, deepl_key_file: 1}
+    assert providers.stt._config.api_key == "dg-original"
+    assert providers.translation._config.api_key == "dl-original"
+    assert profile.deepgram_credential_fingerprint == hashlib.sha256(b"dg-original").hexdigest()
+    assert profile.deepl_credential_fingerprint == hashlib.sha256(b"dl-original").hexdigest()

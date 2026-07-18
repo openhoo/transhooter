@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+. "$(dirname -- "$0")/../deploy/scripts/compose-lib.sh"
+
+profile=google-eu
+if [ "${1:-}" = "--provider-profile" ]; then
+  test "$#" -eq 2 || { echo "usage: ./scripts/dev-up [--provider-profile google-eu|deepgram-deepl-eu|fixture]" >&2; exit 2; }
+  profile=$2
+elif [ "$#" -ne 0 ]; then
+  echo "usage: ./scripts/dev-up [--provider-profile google-eu|deepgram-deepl-eu|fixture]" >&2
+  exit 2
+fi
+
+mkdir -p "$ROOT/.secrets"
+
+resolve_profile "$profile"
+case "$profile" in
+  google-eu)
+    test -s "$ROOT/.secrets/google-adc.json" || { echo "Missing .secrets/google-adc.json" >&2; exit 1; }
+    ;;
+  deepgram-deepl-eu)
+    test -s "$ROOT/.secrets/deepgram-api-key" || { echo "Missing .secrets/deepgram-api-key" >&2; exit 1; }
+    test -s "$ROOT/.secrets/deepl-api-key" || { echo "Missing .secrets/deepl-api-key" >&2; exit 1; }
+    ;;
+esac
+
+announce_phase "Validating ${profile} Compose configuration"
+compose config --quiet
+announce_phase "Building the current secret initializer"
+compose build secrets-init
+announce_phase "Initializing missing runtime secrets"
+compose run --rm --no-deps secrets-init
+announce_phase "Building current sources and waiting for semantic readiness"
+compose up --build --wait --remove-orphans web
+write_compose_state
+printf 'Transhooter is ready with profile %s.\n' "$profile"

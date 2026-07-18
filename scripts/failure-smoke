@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/deploy/scripts/compose-lib.sh"
+
+PROJECT_NAME=${COMPOSE_PROJECT_NAME:-transhooter-test}
+export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+OVERLAY_FILE="$ROOT/deploy/compose/compose.test.yml"
+export APP_ENV=test
+export PROVIDER_PROFILE=fixture
+export BOOTSTRAP_ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:-admin@example.test}"
+export BOOTSTRAP_ADMIN_NAME="${BOOTSTRAP_ADMIN_NAME:-Test Administrator}"
+export RTC_SUBNET="${TEST_RTC_SUBNET:-10.254.232.0/24}"
+export RTC_NODE_IP="${TEST_RTC_NODE_IP:-10.254.232.250}"
+
+cleanup() {
+  status=$?
+  trap - 0 HUP INT TERM
+  if [ "$status" -ne 0 ]; then
+    announce_phase "Capturing failure-smoke diagnostics"
+    compose ps || true
+    compose logs --no-color --tail=80 translation-worker spool-drainer control-worker-1 control-worker-2 || true
+  fi
+  announce_phase "Cleaning failure-smoke stack"
+  if ! compose down --volumes --remove-orphans; then
+    if [ "$status" -eq 0 ]; then
+      status=1
+    fi
+    printf 'Failure-smoke stack cleanup failed.\n' >&2
+  fi
+  exit "$status"
+}
+
+trap cleanup 0
+trap 'exit 130' HUP INT TERM
+announce_phase "Removing stale failure-smoke containers and volumes"
+compose down --volumes --remove-orphans
+announce_phase "Initializing failure-smoke runtime secrets"
+compose run --rm --no-deps secrets-init
+announce_phase "Building failure-smoke application and harness images from the current source tree"
+build_runtime_and_harness_images failure-smoke
+announce_phase "Running failure injection scenarios"
+compose run --rm failure-smoke bun run test -- "$@"

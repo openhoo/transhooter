@@ -1,0 +1,56 @@
+{{- if .Values.egress.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "transhooter.fullname" . }}-egress
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.egress.replicas }}
+  selector:
+    matchLabels:
+      {{- include "transhooter.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: egress
+  template:
+    metadata:
+      labels:
+        {{- include "transhooter.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: egress
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: Localhost
+          localhostProfile: {{ .Values.egress.seccompLocalhostProfile | quote }}
+      terminationGracePeriodSeconds: 3600
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      nodeSelector:
+        {{- toYaml .Values.egress.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.egress.tolerations | nindent 8 }}
+      affinity:
+        {{- toYaml .Values.egress.affinity | nindent 8 }}
+      containers:
+        - name: egress
+          image: {{ include "transhooter.image" .Values.images.egress | quote }}
+          imagePullPolicy: {{ .Values.images.egress.pullPolicy }}
+          env: [{name: EGRESS_CONFIG_FILE, value: /etc/egress/config.yaml}]
+          ports: [{name: health, containerPort: 8080}, {name: metrics, containerPort: 9090}]
+          readinessProbe: {httpGet: {path: /, port: health}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {httpGet: {path: /, port: health}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            {{- toYaml .Values.egress.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/egress, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ .Values.egressConfigSecret }}
+            items: [{key: config.yaml, path: config.yaml}]
+        - {name: tmp, emptyDir: {sizeLimit: 4Gi}}
+{{- end }}

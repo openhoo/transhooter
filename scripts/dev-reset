@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+. "$(dirname -- "$0")/../deploy/scripts/compose-lib.sh"
+load_state
+export PROVIDER_PROFILE=$profile
+
+if [ "${1:-}" = "--yes" ]; then
+  test "$#" -eq 1 || { echo "usage: ./scripts/dev-reset [--yes]" >&2; exit 2; }
+else
+  test "$#" -eq 0 || { echo "usage: ./scripts/dev-reset [--yes]" >&2; exit 2; }
+  printf '%s\n' 'WARNING: this permanently removes Transhooter PostgreSQL, Redis, MinIO, spool, and rendered-config volumes.' >&2
+  printf '%s' 'Type RESET to continue: ' >&2
+  IFS= read -r answer
+  test "$answer" = RESET || { echo "Reset cancelled." >&2; exit 1; }
+fi
+compose down --volumes --remove-orphans
+rm -f "$STATE_FILE"
+printf '%s\n' 'Persistent volumes removed. Versioned files in .secrets were preserved.'

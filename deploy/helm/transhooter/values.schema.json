@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["images", "existingSecret", "providerSecretName", "spool", "config"],
+  "oneOf": [
+    {
+      "required": ["config", "providerSecretKeys"],
+      "properties": {
+        "config": {
+          "type": "object",
+          "required": ["providerProfile", "providers"],
+          "properties": {
+            "providerProfile": { "const": "google-eu" },
+            "providers": {
+              "type": "object",
+              "required": ["googleEu"]
+            }
+          }
+        },
+        "providerSecretKeys": {
+          "type": "array",
+          "items": { "const": "google-adc.json" },
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    {
+      "required": ["config", "providerSecretKeys"],
+      "properties": {
+        "config": {
+          "type": "object",
+          "required": ["providerProfile", "providers"],
+          "properties": {
+            "providerProfile": { "const": "deepgram-deepl-eu" },
+            "providers": {
+              "type": "object",
+              "required": ["deepgramDeeplEu"]
+            }
+          }
+        },
+        "providerSecretKeys": {
+          "type": "array",
+          "items": { "enum": ["deepgram-api-key", "deepl-api-key"] },
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true
+        }
+      }
+    }
+  ],
+  "properties": {
+    "existingSecret": { "type": "string", "minLength": 1 },
+    "providerSecretName": { "type": "string", "minLength": 1 },
+    "providerSecretKeys": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "egressConfigSecret": { "type": "string", "minLength": 1 },
+    "images": {
+      "propertyNames": {
+        "enum": ["web", "controlWorker", "translationWorker", "egress"]
+      },
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["repository", "tag", "pullPolicy"],
+        "properties": {
+          "repository": { "type": "string", "minLength": 1 },
+          "tag": { "type": "string", "minLength": 1, "not": { "const": "latest" } },
+          "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+        }
+      }
+    },
+    "replicas": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 } },
+    "spool": {
+      "type": "object",
+      "required": ["existingClaim"],
+      "properties": { "existingClaim": { "type": "string", "minLength": 1 } }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "appEnv",
+        "providerProfile",
+        "livekitUrl",
+        "s3Endpoint",
+        "s3Region",
+        "s3Bucket",
+        "s3KmsKeyId",
+        "archiveRequireKms",
+        "publicUrl",
+        "publicLivekitUrl",
+        "internalIssuer",
+        "internalAudience",
+        "kubernetesApiAudience",
+        "providers"
+      ],
+      "properties": {
+        "appEnv": { "const": "production" },
+        "providerProfile": { "enum": ["google-eu", "deepgram-deepl-eu"] },
+        "archiveRequireKms": { "const": true },
+        "livekitUrl": { "type": "string", "pattern": "^wss://" },
+        "publicUrl": { "type": "string", "pattern": "^https://" },
+        "publicLivekitUrl": { "type": "string", "pattern": "^wss://" },
+        "s3Endpoint": { "type": "string", "pattern": "^https://" },
+        "s3KmsKeyId": { "type": "string", "pattern": ".*\\S.*" },
+        "s3Region": { "type": "string", "minLength": 1 },
+        "s3Bucket": { "type": "string", "minLength": 1 },
+        "kubernetesApiAudience": { "type": "string", "pattern": "^https://" },
+        "internalIssuer": { "type": "string", "pattern": "^https://" },
+        "internalAudience": { "type": "string", "minLength": 1 },
+        "bootstrapAdminName": { "type": "string", "minLength": 1 },
+        "providers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "googleEu": {
+              "type": "object",
+              "required": [
+                "cloudProject",
+                "quotaProject",
+                "speechEndpoint",
+                "speechRecognizer",
+                "speechModel",
+                "translationEndpoint",
+                "translationParent",
+                "translationModel",
+                "ttsEndpoint",
+                "ttsModel",
+                "ttsVoice",
+                "sttStreams",
+                "sttMessagesMinute",
+                "translationRequestsMinute",
+                "translationCharactersMinute",
+                "ttsSessions",
+                "ttsStartsMinute"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "cloudProject": { "type": "string", "minLength": 1 },
+                "quotaProject": { "type": "string", "minLength": 1 },
+                "speechEndpoint": { "const": "eu-speech.googleapis.com" },
+                "speechRecognizer": {
+                  "type": "string",
+                  "pattern": "^projects/[^/]+/locations/eu/recognizers/_$"
+                },
+                "speechModel": { "type": "string", "minLength": 1 },
+                "translationEndpoint": { "const": "translate-eu.googleapis.com" },
+                "translationParent": {
+                  "type": "string",
+                  "pattern": "^projects/[^/]+/locations/eu$"
+                },
+                "translationModel": {
+                  "type": "string",
+                  "pattern": "^projects/[^/]+/locations/eu/models/general/nmt$"
+                },
+                "ttsEndpoint": { "const": "eu-texttospeech.googleapis.com" },
+                "ttsModel": { "type": "string", "minLength": 1 },
+                "ttsVoice": { "type": "string", "minLength": 1 },
+                "sttStreams": { "type": "integer", "minimum": 1 },
+                "sttMessagesMinute": { "type": "integer", "minimum": 1 },
+                "translationRequestsMinute": { "type": "integer", "minimum": 1 },
+                "translationCharactersMinute": { "type": "integer", "minimum": 1 },
+                "ttsSessions": { "type": "integer", "minimum": 1 },
+                "ttsStartsMinute": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "deepgramDeeplEu": {
+              "type": "object",
+              "required": [
+                "deepgramListenEndpoint",
+                "deepgramSpeakEndpoint",
+                "deepgramSttModel",
+                "deepgramTtsModel",
+                "deepgramVoice",
+                "deepgramApprovedVoices",
+                "deeplEndpoint",
+                "deeplModelType",
+                "deepgramStreams",
+                "deepgramAudioSecondsMinute",
+                "deeplRequestsMinute",
+                "deeplCharactersMinute"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "deepgramListenEndpoint": { "const": "wss://api.eu.deepgram.com/v1/listen" },
+                "deepgramSpeakEndpoint": { "const": "wss://api.eu.deepgram.com/v1/speak" },
+                "deepgramSttModel": { "const": "nova-3" },
+                "deepgramTtsModel": { "const": "aura-2" },
+                "deepgramVoice": { "type": "string", "minLength": 1 },
+                "deepgramApprovedVoices": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "minItems": 1,
+                  "uniqueItems": true
+                },
+                "deeplEndpoint": { "const": "https://api.deepl.com" },
+                "deeplModelType": { "enum": ["latency_optimized", "quality_optimized"] },
+                "deepgramStreams": { "type": "integer", "minimum": 1 },
+                "deepgramAudioSecondsMinute": { "type": "integer", "minimum": 1 },
+                "deeplRequestsMinute": { "type": "integer", "minimum": 1 },
+                "deeplCharactersMinute": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "egress": {
+      "type": "object",
+      "required": ["enabled", "replicas", "seccompLocalhostProfile", "resources"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "seccompLocalhostProfile": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

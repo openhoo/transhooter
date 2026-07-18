@@ -1,0 +1,1163 @@
+import { createHash, randomUUID } from "node:crypto";
+import { lookup } from "node:dns";
+import { access } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { chromium } from "playwright";
+
+function option(name, fallback) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : fallback;
+}
+function requireValue(value, name) {
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+async function poll(label, operation, timeoutMs = 120_000, intervalMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      const value = await operation();
+      if (value) return value;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`Timed out waiting for ${label}${lastError ? `: ${lastError}` : ""}`);
+}
+
+const baseUrl = option("--base-url", process.env.BASE_URL ?? "http://web:3000");
+const mailpitUrl = option("--mailpit-url", process.env.MAILPIT_URL ?? "http://mailpit:8025");
+const expectedProfile = option("--expected-profile", process.env.EXPECTED_PROFILE ?? "fixture");
+const expectedLiveKitUrl = option("--livekit-url", process.env.LIVEKIT_URL ?? "ws://livekit:7880");
+const fixtureMinimumCompleteObjectCount = 5;
+const archivePageCeiling = 10_000;
+const archiveObjectCeiling = 1_000_000;
+const objectDownloadTimeoutMs = 30_000;
+const captureBarrierTimeoutMs = Number.parseInt(
+  option("--capture-barrier-timeout-ms", "90000"),
+  10,
+);
+if (!Number.isSafeInteger(captureBarrierTimeoutMs) || captureBarrierTimeoutMs <= 0) {
+  throw new Error("--capture-barrier-timeout-ms must be a positive integer");
+}
+const expectedProfileRevisionText = option("--expected-profile-revision", null);
+const expectedProfileRevision =
+  expectedProfileRevisionText === null ? null : Number(expectedProfileRevisionText);
+if (
+  expectedProfileRevision !== null &&
+  (!Number.isSafeInteger(expectedProfileRevision) || expectedProfileRevision < 1)
+) {
+  throw new Error("--expected-profile-revision must be a positive integer");
+}
+const allowedProvidersByProfile = {
+  fixture: new Set(["fixture"]),
+  "google-eu": new Set(["google"]),
+  "deepgram-deepl-eu": new Set(["deepgram", "deepl"]),
+};
+const emitProof =
+  process.argv.includes("--emit-proof-json") || process.env.EMIT_PROOF_JSON === "true";
+const failureHarnessReleaseFile = option("--failure-harness-release-file", null);
+const failureHarnessReleaseTimeoutMs = Number.parseInt(
+  option("--failure-harness-release-timeout-ms", "120000"),
+  10,
+);
+if (
+  failureHarnessReleaseFile &&
+  (!Number.isSafeInteger(failureHarnessReleaseTimeoutMs) || failureHarnessReleaseTimeoutMs <= 0)
+) {
+  throw new Error("--failure-harness-release-timeout-ms must be a positive integer");
+}
+const employeeEmail = requireValue(
+  process.env.E2E_EMPLOYEE_EMAIL ?? process.env.BOOTSTRAP_ADMIN_EMAIL,
+  "E2E_EMPLOYEE_EMAIL",
+);
+const configuredRunId = process.env.E2E_RUN_ID;
+const runId = configuredRunId === undefined ? randomUUID() : configuredRunId;
+if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(runId)) {
+  throw new Error("E2E_RUN_ID must be a non-empty UUID");
+}
+const customerEmail = `customer-${runId}@example.test`;
+const startedAt = Date.now();
+
+async function latestLink(recipient) {
+  const response = await fetch(`${mailpitUrl}/api/v1/messages?limit=100`);
+  if (!response.ok) throw new Error(`Mailpit list failed: ${response.status}`);
+  const payload = await response.json();
+  const messages = payload.messages ?? payload.Messages ?? [];
+  const candidate = messages.find((message) => {
+    const recipients = message.To ?? message.to ?? [];
+    return (
+      recipients.some((entry) => (entry.Address ?? entry.address) === recipient) &&
+      Date.parse(message.Created ?? message.created ?? 0) >= startedAt - 1_000
+    );
+  });
+  if (!candidate) return null;
+  const id = candidate.ID ?? candidate.Id ?? candidate.id;
+  const detailResponse = await fetch(`${mailpitUrl}/api/v1/message/${encodeURIComponent(id)}`);
+  if (!detailResponse.ok) throw new Error(`Mailpit message failed: ${detailResponse.status}`);
+  const detail = await detailResponse.json();
+  const content = `${detail.HTML ?? detail.Html ?? ""}\n${detail.Text ?? detail.text ?? ""}`;
+  const match = content.match(/https?:\/\/[^\s"'<>]+\/auth\/exchange\?[^\s"'<>]+/);
+  return match?.[0]?.replaceAll("&amp;", "&") ?? null;
+}
+function internalizeLink(link) {
+  const parsed = new URL(link);
+  const base = new URL(baseUrl);
+  parsed.protocol = base.protocol;
+  parsed.host = base.host;
+  return parsed.toString();
+}
+async function authenticate(context, email, existingLink = null) {
+  const page = await context.newPage();
+  if (!existingLink) {
+    await page.goto(`${baseUrl}/sign-in`);
+    await page.getByLabel("Email address").fill(email);
+    await page.getByRole("button", { name: "Email me a sign-in link" }).click();
+    await page.getByRole("status").filter({ hasText: "If this address can sign in" }).waitFor();
+  }
+  const link = existingLink ?? (await poll(`magic link for ${email}`, () => latestLink(email)));
+  await page.goto(internalizeLink(link), { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Continue securely" }).click();
+  await page.waitForURL(/\/consultations(?:\?|$)/);
+  const cookies = await context.cookies();
+  for (const required of ["session", "csrf"]) {
+    if (!cookies.some((cookie) => cookie.name === required && cookie.value))
+      throw new Error(`${required} cookie was not issued`);
+  }
+  return page;
+}
+async function savePreferences(page, displayName, language) {
+  await page.getByRole("button", { name: "Preview camera and microphone" }).click();
+  await Promise.all([
+    page.getByLabel("Microphone").locator("option").first().waitFor({ state: "attached" }),
+    page.getByLabel("Camera").locator("option").first().waitFor({ state: "attached" }),
+  ]);
+  await page.getByLabel("Display name").fill(displayName);
+  await page.getByLabel("Your spoken language").selectOption(language);
+  const microphones = await page.getByLabel("Microphone").locator("option").count();
+  const cameras = await page.getByLabel("Camera").locator("option").count();
+  if (microphones < 1 || cameras < 1) throw new Error("fake media devices were not enumerated");
+  const responsePromise = page.waitForResponse(
+    (response) => response.url().includes("/preferences") && response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Save and continue" }).click();
+  const response = await responsePromise;
+  if (!response.ok()) {
+    throw new Error(`preference save failed: ${response.status()} ${await response.text()}`);
+  }
+}
+async function consentAndJoin(page) {
+  const consentCheckbox = page.getByRole("checkbox", { name: /I have read and agree/ });
+  await consentCheckbox.waitFor({ timeout: 60_000 });
+  const consentText = await page.locator("main").innerText();
+  if (!consentText.toLowerCase().includes(expectedProfile.toLowerCase())) {
+    throw new Error(
+      `consent did not freeze expected profile ${expectedProfile}: ${JSON.stringify(consentText)}`,
+    );
+  }
+  if (!/region|eu/i.test(consentText)) throw new Error("consent did not disclose provider region");
+  await consentCheckbox.check();
+  await page.getByRole("button", { name: "Agree and join" }).click();
+  await page.waitForURL(/\/consultations\/[0-9a-f-]+\/room/, { timeout: 90_000 });
+}
+async function enterRoom(page) {
+  await page.getByRole("button", { name: "Enter room" }).click();
+  await page.getByLabel("Live consultation").waitFor({ timeout: 60_000 });
+  await page
+    .getByText("Media enabled", { exact: true })
+    .waitFor({ timeout: captureBarrierTimeoutMs });
+  await page.getByText("Recording and secure storage active", { exact: true }).waitFor();
+}
+async function assertModes(page) {
+  await page
+    .getByRole("status", { name: /Interpretation reconnecting/ })
+    .waitFor({ state: "hidden", timeout: 60_000 })
+    .catch(() => {});
+  for (const mode of ["Interpreted", "Overlay", "Original"]) {
+    const button = page.getByRole("button", { name: mode });
+    await button.click();
+    if ((await button.getAttribute("aria-pressed")) !== "true")
+      throw new Error(`${mode} mode did not become selected`);
+  }
+  const media = await page.locator("audio").evaluateAll((elements) =>
+    elements.map((element) => ({
+      volume: element.volume,
+      paused: element.paused,
+      attached:
+        element.srcObject instanceof MediaStream &&
+        element.srcObject.getAudioTracks().some((track) => track.readyState === "live"),
+    })),
+  );
+  if (media.length !== 2 || media.some((element) => !element.attached))
+    throw new Error("original and interpretation audio were not attached");
+}
+async function assertAudibleInterpretation(page) {
+  return await page.evaluate(async () => {
+    const element = document.querySelectorAll("audio")[1];
+    if (!(element instanceof HTMLAudioElement))
+      throw new Error("interpretation audio element is absent");
+    const deadline = Date.now() + 90_000;
+    while (!(element.srcObject instanceof MediaStream) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!(element.srcObject instanceof MediaStream))
+      throw new Error("interpretation MediaStream was never attached");
+    if (element.paused || element.muted || element.volume <= 0) {
+      throw new Error("interpretation track is present but not routed audibly");
+    }
+    const context = new AudioContext();
+    const source = context.createMediaStreamSource(element.srcObject);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    const samples = new Uint8Array(analyser.fftSize);
+    try {
+      while (Date.now() < deadline) {
+        analyser.getByteTimeDomainData(samples);
+        if (samples.some((sample) => Math.abs(sample - 128) > 3)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      throw new Error("interpretation track remained silent");
+    } finally {
+      source.disconnect();
+      await context.close();
+    }
+  });
+}
+async function apiJson(page, path) {
+  return await page.evaluate(
+    async ({ path }) => {
+      const response = await fetch(path, { credentials: "same-origin", cache: "no-store" });
+      const text = await response.text();
+      return { status: response.status, body: text ? JSON.parse(text) : null };
+    },
+    { path },
+  );
+}
+
+async function assertFrozenProfile(page, consultationId) {
+  const result = await poll("frozen provider profile", async () => {
+    const response = await apiJson(page, `/api/consultations/${consultationId}`);
+    return response.status === 200 && response.body?.directions?.length === 2
+      ? response.body
+      : null;
+  });
+  if (result.profileName !== expectedProfile) {
+    throw new Error(
+      `consultation froze profile ${String(result.profileName)} instead of ${expectedProfile}`,
+    );
+  }
+  if (!Number.isInteger(result.profileRevision) || result.profileRevision < 1) {
+    throw new Error(`frozen profile revision is invalid: ${String(result.profileRevision)}`);
+  }
+  if (expectedProfileRevision !== null && result.profileRevision !== expectedProfileRevision) {
+    throw new Error(
+      `frozen profile revision ${String(result.profileRevision)} did not match leased revision ` +
+        String(expectedProfileRevision),
+    );
+  }
+  const directionalKeys = new Set();
+  for (const direction of result.directions) {
+    for (const field of [
+      "sourceLabel",
+      "destinationLabel",
+      "speech",
+      "translation",
+      "voice",
+      "region",
+    ]) {
+      if (typeof direction[field] !== "string" || !direction[field].trim()) {
+        throw new Error(`frozen direction omitted ${field}: ${JSON.stringify(direction)}`);
+      }
+    }
+    if (!direction.speech.includes(" · ") || !direction.translation.includes(" · ")) {
+      throw new Error(
+        `frozen direction omitted provider/model evidence: ${JSON.stringify(direction)}`,
+      );
+    }
+    if (direction.voice === "Original audio") {
+      throw new Error(`translated language pair unexpectedly froze a TTS bypass`);
+    }
+    directionalKeys.add(`${direction.sourceLabel}->${direction.destinationLabel}`);
+  }
+  if (directionalKeys.size !== 2) {
+    throw new Error(`frozen profile did not expose two inverse directions`);
+  }
+  return result;
+}
+
+async function installCaptionProbe(context) {
+  await context.addInitScript(() => {
+    const originalParse = JSON.parse;
+    Object.defineProperty(globalThis, "__transhooterCaptionPackets", {
+      configurable: false,
+      value: [],
+      writable: false,
+    });
+    JSON.parse = function parseWithCaptionProbe(...arguments_) {
+      const value = Reflect.apply(originalParse, this, arguments_);
+      if (
+        value &&
+        typeof value === "object" &&
+        value.schemaVersion === 1 &&
+        (value.finality === "provisional" || value.finality === "final") &&
+        typeof value.consultationId === "string" &&
+        typeof value.destinationParticipantId === "string"
+      ) {
+        globalThis.__transhooterCaptionPackets.push(structuredClone(value));
+      }
+      return value;
+    };
+  });
+}
+
+function canonicalLiveKitUrl(value) {
+  const url = new URL(value);
+  if (url.hostname === "rtc.localhost") url.hostname = "livekit";
+  return url.toString().replace(/\/$/u, "");
+}
+
+async function assertFinalTargetedCaption(page, consultationId) {
+  const room = await poll("room participant contract", async () => {
+    const result = await apiJson(page, `/api/consultations/${consultationId}/room`);
+    return result.status === 200 ? result.body : null;
+  });
+  if (canonicalLiveKitUrl(room.liveKitUrl) !== canonicalLiveKitUrl(expectedLiveKitUrl)) {
+    throw new Error(
+      `room advertised ${String(room.liveKitUrl)}, which does not route to ${expectedLiveKitUrl}`,
+    );
+  }
+  const packet = await poll(
+    "nonempty final targeted caption",
+    () =>
+      page.evaluate(
+        ({ expectedConsultationId, destinationParticipantId, sourceParticipantId }) => {
+          const packets = globalThis.__transhooterCaptionPackets ?? [];
+          return (
+            packets.find(
+              (candidate) =>
+                candidate.finality === "final" &&
+                candidate.consultationId === expectedConsultationId &&
+                candidate.destinationParticipantId === destinationParticipantId &&
+                candidate.sourceParticipantId === sourceParticipantId &&
+                typeof candidate.sourceText === "string" &&
+                candidate.sourceText.trim().length > 0 &&
+                typeof candidate.translatedText === "string" &&
+                candidate.translatedText.trim().length > 0,
+            ) ?? null
+          );
+        },
+        {
+          expectedConsultationId: consultationId,
+          destinationParticipantId: room.participantId,
+          sourceParticipantId: room.otherParticipantId,
+        },
+      ),
+    90_000,
+    250,
+  );
+  if (
+    !Number.isInteger(packet.revision) ||
+    packet.revision < 1 ||
+    !Number.isInteger(packet.sourceSampleStart) ||
+    !Number.isInteger(packet.sourceSampleEnd) ||
+    packet.sourceSampleEnd <= packet.sourceSampleStart
+  ) {
+    throw new Error(
+      `final caption lacks monotonic revision/sample evidence: ${JSON.stringify(packet)}`,
+    );
+  }
+  return packet;
+}
+
+function archiveObjectGroup(objectClass) {
+  if (objectClass.includes("composite")) return "composite";
+  if (objectClass.includes("participant") || objectClass.includes("original")) return "original";
+  if (objectClass.includes("interpret") || objectClass.includes("tts")) return "interpretation";
+  if (objectClass.includes("caption") || objectClass.includes("vtt")) return "captions";
+  if (objectClass.includes("inventory") || objectClass.includes("checkpoint")) return "inventory";
+  return "pipeline";
+}
+
+async function allArchiveObjects(page, archiveId) {
+  const objects = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  let pageCount = 0;
+  do {
+    if (pageCount >= archivePageCeiling) {
+      throw new Error(`archive pagination exceeded ${archivePageCeiling} pages`);
+    }
+    pageCount += 1;
+    const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+    const result = await apiJson(page, `/api/archives/${archiveId}/objects${suffix}`);
+    if (result.status !== 200 || !Array.isArray(result.body?.objects)) {
+      throw new Error(`archive object listing failed: ${result.status}`);
+    }
+    if (objects.length + result.body.objects.length > archiveObjectCeiling) {
+      throw new Error(`archive object listing exceeded ${archiveObjectCeiling} objects`);
+    }
+    for (const object of result.body.objects) {
+      const objectClass = object.objectClass ?? object.object_class;
+      objects.push({
+        id: object.id,
+        key: object.key,
+        group: archiveObjectGroup(objectClass),
+        label: objectClass,
+        contentType: object.contentType ?? object.content_type,
+        size: Number(object.size),
+        sha256: object.sha256,
+        s3Checksum: object.s3Checksum ?? object.s3_checksum,
+        versionId: object.versionId ?? object.version_id,
+      });
+    }
+    cursor = result.body.cursor;
+    if (cursor !== null && cursor !== undefined) {
+      if (typeof cursor !== "string" || cursor.length === 0) {
+        throw new Error("archive pagination returned an invalid cursor");
+      }
+      if (seenCursors.has(cursor)) {
+        throw new Error(`archive pagination repeated cursor ${cursor}`);
+      }
+      seenCursors.add(cursor);
+    }
+  } while (cursor);
+  if (new Set(objects.map(({ id }) => id)).size !== objects.length) {
+    throw new Error("archive object pagination returned duplicate object IDs");
+  }
+  return objects;
+}
+
+async function presignedObjectUrl(page, archiveId, objectId) {
+  return await page.evaluate(
+    async ({ id, archiveObjectId }) => {
+      const csrf = document.cookie
+        .split("; ")
+        .find((part) => part.startsWith("csrf="))
+        ?.slice(5);
+      if (!csrf) throw new Error("CSRF cookie is unavailable for archive verification");
+      const response = await fetch(`/api/archives/${id}/download`, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          "content-type": "application/json",
+          "x-csrf-token": decodeURIComponent(csrf),
+        },
+        body: JSON.stringify({ archiveId: id, objectId: archiveObjectId }),
+      });
+      const body = await response.json();
+      if (!response.ok || typeof body.url !== "string") {
+        throw new Error(`archive download authorization failed (${response.status})`);
+      }
+      return body.url;
+    },
+    { id: archiveId, archiveObjectId: objectId },
+  );
+}
+
+const crc64NvmeTable = Object.freeze(
+  Array.from({ length: 256 }, (_, index) => {
+    let value = BigInt(index);
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1n) === 1n ? (value >> 1n) ^ 0x9a6c9329ac4bc9b5n : value >> 1n;
+    }
+    return value;
+  }),
+);
+
+function updateCrc64Nvme(crc, chunk) {
+  let current = crc;
+  for (const byte of chunk) {
+    current = (current >> 8n) ^ crc64NvmeTable[Number((current ^ BigInt(byte)) & 0xffn)];
+  }
+  return current;
+}
+
+function encodeCrc64Nvme(crc) {
+  let value = crc ^ 0xffffffffffffffffn;
+  const bytes = Buffer.allocUnsafe(8);
+  for (let index = 7; index >= 0; index -= 1) {
+    bytes[index] = Number(value & 0xffn);
+    value >>= 8n;
+  }
+  return bytes.toString("base64");
+}
+
+function crc32Table(polynomial) {
+  return Object.freeze(
+    Array.from({ length: 256 }, (_, index) => {
+      let value = index;
+      for (let bit = 0; bit < 8; bit += 1) {
+        value = (value & 1) === 1 ? (value >>> 1) ^ polynomial : value >>> 1;
+      }
+      return value >>> 0;
+    }),
+  );
+}
+
+const crc32IeeeTable = crc32Table(0xedb88320);
+const crc32cTable = crc32Table(0x82f63b78);
+
+function updateCrc32(crc, chunk, table) {
+  let current = crc;
+  for (const byte of chunk) {
+    current = (table[(current ^ byte) & 0xff] ^ (current >>> 8)) >>> 0;
+  }
+  return current;
+}
+
+function encodeCrc32(crc) {
+  const bytes = Buffer.allocUnsafe(4);
+  bytes.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
+  return bytes.toString("base64");
+}
+
+function headerValue(headers, name) {
+  const value = headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+function canonicalBase64(value, byteLength) {
+  try {
+    const decoded = Buffer.from(value, "base64");
+    return decoded.length === byteLength && decoded.toString("base64") === value;
+  } catch {
+    return false;
+  }
+}
+
+function validS3Checksum(value) {
+  if (canonicalBase64(value, 8)) return true;
+  const separator = value.indexOf(":");
+  if (separator < 1 || separator !== value.lastIndexOf(":")) return false;
+  const algorithm = value.slice(0, separator);
+  const encoded = value.slice(separator + 1);
+  const byteLength = {
+    CRC32: 4,
+    CRC32C: 4,
+    SHA256: 32,
+  }[algorithm];
+  return byteLength !== undefined && canonicalBase64(encoded, byteLength);
+}
+
+function checksumEvidence(declared, downloaded) {
+  if (!declared.includes(":")) {
+    return {
+      computed: downloaded.checksums.crc64nvme,
+      response: headerValue(downloaded.headers, "x-amz-checksum-crc64nvme"),
+    };
+  }
+  const separator = declared.indexOf(":");
+  const algorithm = declared.slice(0, separator);
+  const headers = {
+    CRC32: "x-amz-checksum-crc32",
+    CRC32C: "x-amz-checksum-crc32c",
+    SHA256: "x-amz-checksum-sha256",
+  };
+  const computed = {
+    CRC32: downloaded.checksums.crc32,
+    CRC32C: downloaded.checksums.crc32c,
+    SHA256: downloaded.checksums.sha256,
+  };
+  const header = headers[algorithm];
+  const digest = computed[algorithm];
+  if (header === undefined || digest === undefined) {
+    throw new Error(`unsupported S3 checksum algorithm: ${algorithm}`);
+  }
+  const responseDigest = headerValue(downloaded.headers, header);
+  return {
+    computed: `${algorithm}:${digest}`,
+    response: responseDigest === undefined ? undefined : `${algorithm}:${responseDigest}`,
+  };
+}
+
+function download(url, declaredSize, mapLocalhostToMinio = false, captureBody = false) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const request = parsed.protocol === "https:" ? httpsRequest : httpRequest;
+    const options = {
+      headers: { "x-amz-checksum-mode": "ENABLED" },
+      ...(mapLocalhostToMinio
+        ? {
+            lookup(hostname, lookupOptions, callback) {
+              lookup(hostname === "localhost" ? "minio" : hostname, lookupOptions, callback);
+            },
+          }
+        : {}),
+    };
+    let settled = false;
+    let outgoing;
+    const absoluteTimer = setTimeout(() => {
+      outgoing?.destroy(
+        new Error(`presigned object GET exceeded absolute ${objectDownloadTimeoutMs}ms deadline`),
+      );
+    }, objectDownloadTimeoutMs);
+    const finish = (operation, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(absoluteTimer);
+      operation(value);
+    };
+    outgoing = request(parsed, options, (response) => {
+      let size = 0;
+      const sha256 = createHash("sha256");
+      let crc64Nvme = 0xffffffffffffffffn;
+      let crc32 = 0xffffffff;
+      let crc32c = 0xffffffff;
+      const body = captureBody ? [] : null;
+      response.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > declaredSize) {
+          outgoing.destroy(
+            new Error(`presigned object GET exceeded declared size ${String(declaredSize)}`),
+          );
+          return;
+        }
+        sha256.update(chunk);
+        crc64Nvme = updateCrc64Nvme(crc64Nvme, chunk);
+        crc32 = updateCrc32(crc32, chunk, crc32IeeeTable);
+        crc32c = updateCrc32(crc32c, chunk, crc32cTable);
+        body?.push(chunk);
+      });
+      response.on("aborted", () =>
+        finish(reject, new Error("presigned object GET response was aborted")),
+      );
+      response.on("error", (error) => finish(reject, error));
+      response.on("end", () => {
+        if (response.statusCode !== 200) {
+          finish(reject, new Error(`presigned object GET failed (${String(response.statusCode)})`));
+          return;
+        }
+        const sha256Hex = sha256.digest("hex");
+        finish(resolve, {
+          size,
+          sha256: sha256Hex,
+          checksums: {
+            crc64nvme: encodeCrc64Nvme(crc64Nvme),
+            crc32: encodeCrc32(crc32),
+            crc32c: encodeCrc32(crc32c),
+            sha256: Buffer.from(sha256Hex, "hex").toString("base64"),
+          },
+          headers: response.headers,
+          body: body === null ? null : Buffer.concat(body, size),
+        });
+      });
+    });
+    outgoing.setTimeout(objectDownloadTimeoutMs, () => {
+      outgoing.destroy(
+        new Error(`presigned object GET timed out after ${objectDownloadTimeoutMs}ms`),
+      );
+    });
+    outgoing.on("error", (error) => finish(reject, error));
+    outgoing.end();
+  });
+}
+
+async function independentlyVerifyObject(page, archiveId, object, captureBody = false) {
+  const url = await presignedObjectUrl(page, archiveId, object.id);
+  let downloaded;
+  try {
+    downloaded = await download(url, object.size, false, captureBody);
+  } catch (error) {
+    if (new URL(url).hostname !== "localhost") throw error;
+    downloaded = await download(url, object.size, true, captureBody);
+  }
+  const checksum = checksumEvidence(object.s3Checksum, downloaded);
+  const metadataHash = headerValue(downloaded.headers, "x-amz-meta-sha256");
+  const responseVersion = headerValue(downloaded.headers, "x-amz-version-id");
+  const responseChecksum = checksum.response;
+  const contentLength = headerValue(downloaded.headers, "content-length");
+  const contentType = headerValue(downloaded.headers, "content-type");
+  if (
+    downloaded.size !== object.size ||
+    Number(contentLength) !== object.size ||
+    downloaded.sha256 !== object.sha256 ||
+    checksum.computed !== object.s3Checksum ||
+    responseChecksum !== object.s3Checksum ||
+    (metadataHash !== undefined && metadataHash !== object.sha256) ||
+    contentType !== object.contentType ||
+    responseVersion !== object.versionId
+  ) {
+    throw new Error(
+      `independent object verification failed for ${object.id}: ` +
+        JSON.stringify({
+          expectedSize: object.size,
+          downloadedSize: downloaded.size,
+          contentLength,
+          expectedContentType: object.contentType,
+          responseContentType: contentType,
+          expectedHash: object.sha256,
+          actualHash: downloaded.sha256,
+          metadataHash,
+          expectedChecksum: object.s3Checksum,
+          actualChecksum: checksum.computed,
+          responseChecksum,
+          expectedVersion: object.versionId,
+          responseVersion,
+        }),
+    );
+  }
+  return downloaded;
+}
+
+async function independentlyVerifyObjects(page, archiveId, objects, concurrency = 4) {
+  const failures = new Array(objects.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, objects.length) }, async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= objects.length) return;
+      const object = objects[index];
+      try {
+        await independentlyVerifyObject(page, archiveId, object);
+      } catch (error) {
+        failures[index] = new Error(`${object.id}: ${error?.message ?? String(error)}`, {
+          cause: error,
+        });
+      }
+    }
+  });
+  await Promise.all(workers);
+  const objectFailures = failures.filter(Boolean);
+  if (objectFailures.length > 0) {
+    throw new AggregateError(
+      objectFailures,
+      `independent archive verification failed for object IDs: ${objectFailures
+        .map((failure) => failure.message.split(":", 1)[0])
+        .join(", ")}`,
+    );
+  }
+  return objects.length;
+}
+
+function archiveObjectProof(object) {
+  return {
+    id: object.id ?? object.objectId,
+    key: object.key,
+    label: object.label ?? object.objectClass ?? object.class,
+    versionId: object.versionId,
+    size: Number(object.size),
+    sha256: object.sha256,
+    s3Checksum: object.s3Checksum ?? object.checksum,
+    contentType: object.contentType,
+  };
+}
+
+function assertFinalInventoryBinding(
+  archive,
+  consultationId,
+  listedObjects,
+  finalObject,
+  inventory,
+) {
+  if (
+    inventory?.status !== "complete" ||
+    !Array.isArray(inventory.objects) ||
+    !Array.isArray(inventory.missing) ||
+    !Array.isArray(inventory.errors)
+  ) {
+    throw new Error("downloaded final inventory has an invalid terminal shape");
+  }
+  if (inventory.missing.length !== 0 || inventory.errors.length !== 0) {
+    throw new Error(
+      `complete final inventory contains missing/errors: ${JSON.stringify({
+        missing: inventory.missing,
+        errors: inventory.errors,
+      })}`,
+    );
+  }
+  if ((archive.gaps ?? []).length !== inventory.missing.length) {
+    throw new Error("archive detail gaps diverge from downloaded final inventory");
+  }
+  if (inventory.consultationId !== undefined && inventory.consultationId !== consultationId) {
+    throw new Error("downloaded final inventory belongs to another consultation");
+  }
+  const listedMembers = listedObjects.filter((object) => object.id !== finalObject.id);
+  const listedById = new Map(
+    listedMembers.map((object) => {
+      const proof = archiveObjectProof(object);
+      return [proof.id, proof];
+    }),
+  );
+  const inventoryProofs = inventory.objects.map(archiveObjectProof);
+  if (
+    listedById.size !== listedMembers.length ||
+    new Set(inventoryProofs.map((object) => object.id)).size !== inventoryProofs.length ||
+    inventoryProofs.length !== listedMembers.length
+  ) {
+    throw new Error(
+      "final inventory and downloaded listing do not have the same unique object IDs",
+    );
+  }
+  for (const proof of inventoryProofs) {
+    const listed = listedById.get(proof.id);
+    if (!listed || JSON.stringify(listed) !== JSON.stringify(proof)) {
+      throw new Error(
+        `final inventory object does not exactly bind listing object ${String(proof.id)}: ` +
+          JSON.stringify({ inventory: proof, listed }),
+      );
+    }
+  }
+  return inventoryProofs;
+}
+
+function assertAttemptArchiveEvidence(providerAttemptGroups, inventoryObjects, consultationId) {
+  const meetingPrefix = `v1/meetings/${consultationId}/`;
+  for (const group of providerAttemptGroups) {
+    for (const attemptId of group.attemptIds ?? []) {
+      const terminalPath = `/pipeline/terminal/raw/${attemptId}/`;
+      const exchangePath = `/pipeline/${group.stage}/raw/${attemptId}/`;
+      const terminal = inventoryObjects.find(
+        (object) => object.key.startsWith(meetingPrefix) && object.key.includes(terminalPath),
+      );
+      const exchange = inventoryObjects.find(
+        (object) => object.key.startsWith(meetingPrefix) && object.key.includes(exchangePath),
+      );
+      if (!terminal || !exchange || terminal.id === exchange.id) {
+        throw new Error(
+          `attempt ${attemptId} lacks distinct archived terminal/raw ${group.stage} evidence`,
+        );
+      }
+    }
+  }
+}
+let currentPhase = "browser-startup";
+function beginPhase(name) {
+  currentPhase = name;
+  console.error(`[consultation-smoke] phase: ${name}`);
+}
+
+beginPhase(currentPhase);
+const mediaArgs = [
+  "--use-fake-ui-for-media-stream",
+  "--use-fake-device-for-media-stream",
+  "--host-resolver-rules=MAP app.localhost web, MAP rtc.localhost livekit",
+  "--use-file-for-fake-audio-capture=/workspace/tests/fixtures/en-good-morning.wav",
+  "--use-file-for-fake-video-capture=/workspace/tests/fixtures/consultation.y4m",
+];
+const browser = await chromium.launch({ headless: true, args: mediaArgs });
+const employeeContext = await browser.newContext({ permissions: ["camera", "microphone"] });
+const customerContext = await browser.newContext({ permissions: ["camera", "microphone"] });
+const thirdContext = await browser.newContext();
+await Promise.all([installCaptionProbe(employeeContext), installCaptionProbe(customerContext)]);
+try {
+  beginPhase("employee-authentication-and-consultation-creation");
+  const employee = await authenticate(employeeContext, employeeEmail);
+  await employee.goto(`${baseUrl}/consultations/new`);
+  await employee.getByLabel("Customer name").fill(`Customer ${runId.slice(0, 8)}`);
+  await employee.getByLabel("Customer email").fill(customerEmail);
+  const profileValue = await employee
+    .getByLabel("Translation provider profile")
+    .locator("option")
+    .filter({ hasText: expectedProfile })
+    .getAttribute("value");
+  if (!profileValue) throw new Error(`provider profile ${expectedProfile} is unavailable`);
+  await employee.getByLabel("Translation provider profile").selectOption(profileValue);
+  const creationResponsePromise = employee.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/consultations") && response.request().method() === "POST",
+  );
+  await employee.getByRole("button", { name: "Create and send invitation" }).click();
+  const creationResponse = await creationResponsePromise;
+  if (!creationResponse.ok())
+    throw new Error(`consultation creation failed: ${creationResponse.status()}`);
+  const created = await creationResponse.json();
+  const consultationId = requireValue(created.id, "created consultation id");
+  beginPhase("failure-injection-release");
+  if (failureHarnessReleaseFile) {
+    console.log(
+      JSON.stringify({
+        phase: "consultation-created",
+        runId,
+        consultationId,
+      }),
+    );
+    await poll(
+      "failure harness release",
+      async () => {
+        try {
+          await access(failureHarnessReleaseFile);
+          return true;
+        } catch {
+          return null;
+        }
+      },
+      failureHarnessReleaseTimeoutMs,
+      100,
+    );
+  }
+  beginPhase("customer-invitation-and-authentication");
+  const invite = await poll("customer invitation", () => latestLink(customerEmail));
+  const customer = await authenticate(customerContext, customerEmail, invite);
+
+  beginPhase("preferences-and-frozen-provider-consent");
+  await Promise.all([
+    employee.goto(`${baseUrl}/consultations/${consultationId}/lobby`),
+    customer.goto(`${baseUrl}/consultations/${consultationId}/lobby`),
+  ]);
+  await savePreferences(employee, `Employee ${runId.slice(0, 8)}`, "en-US");
+  await savePreferences(customer, `Customer ${runId.slice(0, 8)}`, "de-DE");
+  const [employeeProfile, customerProfile] = await Promise.all([
+    assertFrozenProfile(employee, consultationId),
+    assertFrozenProfile(customer, consultationId),
+  ]);
+  if (
+    employeeProfile.profileRevision !== customerProfile.profileRevision ||
+    JSON.stringify(employeeProfile.directions) !== JSON.stringify(customerProfile.directions)
+  ) {
+    throw new Error("participants did not receive the same frozen provider profile");
+  }
+  beginPhase("room-admission-and-capture-barrier");
+  await Promise.all([consentAndJoin(employee), consentAndJoin(customer)]);
+  await Promise.all([enterRoom(employee), enterRoom(customer)]);
+
+  beginPhase("third-participant-rejection");
+  const third = await thirdContext.newPage();
+  await third.goto(`${baseUrl}/consultations/${consultationId}/room`);
+  await third.waitForURL(/\/sign-in$/);
+  const unauthorizedRoom = await apiJson(third, `/api/consultations/${consultationId}/room`);
+  if (
+    unauthorizedRoom.status !== 401 ||
+    (await third.getByLabel("Live consultation").count()) !== 0
+  ) {
+    throw new Error(
+      `unauthorized third human was not rejected: status=${String(unauthorizedRoom.status)}`,
+    );
+  }
+
+  beginPhase("captions-interpretation-and-audio-modes");
+  const [employeeFinalCaption, customerFinalCaption] = await Promise.all([
+    assertFinalTargetedCaption(employee, consultationId),
+    assertFinalTargetedCaption(customer, consultationId),
+    assertAudibleInterpretation(employee),
+    assertAudibleInterpretation(customer),
+  ]);
+  await Promise.all([assertModes(employee), assertModes(customer)]);
+
+  beginPhase("consultation-finalization");
+  await employee.getByRole("button", { name: "End consultation" }).click();
+  await Promise.all([
+    employee
+      .getByRole("timer")
+      .filter({ hasText: /Consultation ending in [1-5] seconds?/ })
+      .waitFor(),
+    customer
+      .getByRole("timer")
+      .filter({ hasText: /Consultation ending in [1-5] seconds?/ })
+      .waitFor(),
+  ]);
+  await employee.waitForURL(/\/archives\/[0-9a-f-]+/, { timeout: 120_000 });
+  const archiveId = employee.url().match(/\/archives\/([0-9a-f-]+)/)?.[1];
+  requireValue(archiveId, "archive id");
+  beginPhase("complete-archive-reconciliation");
+  await poll(
+    "complete archive inventory",
+    async () => {
+      const result = await apiJson(employee, `/api/archives/${archiveId}`);
+      return result.status === 200 && result.body?.status === "complete" ? result.body : null;
+    },
+    180_000,
+    2_000,
+  );
+  const archive = (await apiJson(employee, `/api/archives/${archiveId}`)).body;
+  if ((archive.gaps ?? []).length) {
+    throw new Error(`archive unexpectedly has gaps: ${JSON.stringify(archive.gaps)}`);
+  }
+  beginPhase("archive-object-pagination-and-shape");
+  const objects = await allArchiveObjects(employee, archiveId);
+  const requiredGroups = [
+    "composite",
+    "original",
+    "interpretation",
+    "captions",
+    "pipeline",
+    "inventory",
+  ];
+  for (const group of requiredGroups) {
+    if (!objects.some((object) => object.group === group))
+      throw new Error(`archive missing ${group} evidence`);
+  }
+  for (const [pathClass, objectClass] of [
+    ["tts-output", "tts_output_pcm"],
+    ["livekit-output", "livekit_output_pcm"],
+  ]) {
+    if (
+      !objects.some(
+        (object) => object.label === objectClass && object.key.includes(`/audio/${pathClass}/`),
+      )
+    ) {
+      throw new Error(`archive missing preserved ${pathClass} interpretation audio`);
+    }
+  }
+  if (!objects.some((object) => object.label.includes("checkpoint"))) {
+    throw new Error("archive omitted the terminal worker checkpoint");
+  }
+  if (expectedProfile === "fixture" && objects.length < fixtureMinimumCompleteObjectCount) {
+    throw new Error(
+      `fixture archive has ${objects.length} objects; expected at least ` +
+        `${fixtureMinimumCompleteObjectCount}`,
+    );
+  }
+  for (const object of objects) {
+    if (
+      typeof object.id !== "string" ||
+      typeof object.key !== "string" ||
+      object.key.length === 0 ||
+      typeof object.label !== "string" ||
+      object.label.length === 0 ||
+      typeof object.versionId !== "string" ||
+      object.versionId.length === 0 ||
+      typeof object.contentType !== "string" ||
+      object.contentType.length === 0 ||
+      !/^[0-9a-f]{64}$/u.test(object.sha256) ||
+      typeof object.s3Checksum !== "string" ||
+      !validS3Checksum(object.s3Checksum) ||
+      !Number.isSafeInteger(object.size) ||
+      object.size < 0
+    ) {
+      throw new Error(`archive object lacks integrity evidence: ${String(object.id)}`);
+    }
+  }
+  beginPhase("archive-object-download-and-checksum-verification");
+  const checkedObjectCount = await independentlyVerifyObjects(employee, archiveId, objects);
+  if (checkedObjectCount !== objects.length) {
+    throw new Error(
+      `archive verification count mismatch: checked ${checkedObjectCount} of ${objects.length}`,
+    );
+  }
+  const finalObjects = objects.filter(
+    (object) => object.key === `v1/meetings/${consultationId}/inventory/final.json`,
+  );
+  if (finalObjects.length !== 1) {
+    throw new Error(
+      `archive must contain exactly one final inventory object, got ${finalObjects.length}`,
+    );
+  }
+  const finalObject = finalObjects[0];
+  if (
+    finalObject.versionId !== archive.inventoryVersion ||
+    finalObject.sha256 !== archive.inventorySha256
+  ) {
+    throw new Error("archive detail inventory version/hash diverges from the final object listing");
+  }
+  beginPhase("final-inventory-binding");
+  const finalDownload = await independentlyVerifyObject(employee, archiveId, finalObject, true);
+  let finalInventory;
+  try {
+    finalInventory = JSON.parse(finalDownload.body.toString("utf8"));
+  } catch (error) {
+    throw new Error("downloaded inventory/final.json is not valid JSON", { cause: error });
+  }
+  const inventoryObjects = assertFinalInventoryBinding(
+    archive,
+    consultationId,
+    objects,
+    finalObject,
+    finalInventory,
+  );
+  beginPhase("provider-attempt-and-egress-evidence");
+  const allowedProviders = allowedProvidersByProfile[expectedProfile];
+  if (!allowedProviders) {
+    throw new Error(`smoke has no provider evidence policy for ${expectedProfile}`);
+  }
+  const providerAttemptIds = archive.providerAttemptIds ?? [];
+  const providerAttemptGroups = archive.providerAttemptGroups ?? [];
+  if (providerAttemptIds.length === 0 || providerAttemptGroups.length === 0) {
+    throw new Error("complete archive omitted provider-attempt evidence");
+  }
+  const groupedAttemptIdList = providerAttemptGroups.flatMap((group) => group.attemptIds ?? []);
+  const groupedAttemptIds = new Set(groupedAttemptIdList);
+  const directions = new Map();
+  for (const group of providerAttemptGroups) {
+    if (!allowedProviders.has(group.provider)) {
+      throw new Error(
+        `foreign provider attempt ${group.provider} found for profile ${expectedProfile}`,
+      );
+    }
+    if (
+      typeof group.direction !== "string" ||
+      !["stt", "translation", "tts"].includes(group.stage) ||
+      !group.attemptIds?.length
+    ) {
+      throw new Error(`provider attempt group is incomplete: ${JSON.stringify(group)}`);
+    }
+    const stages = directions.get(group.direction) ?? new Set();
+    if (stages.has(group.stage)) {
+      throw new Error(`provider attempt partition repeated ${group.direction}/${group.stage}`);
+    }
+    stages.add(group.stage);
+    directions.set(group.direction, stages);
+  }
+  if (
+    directions.size !== 2 ||
+    [...directions.values()].some(
+      (stages) =>
+        stages.size !== 3 || !["stt", "translation", "tts"].every((stage) => stages.has(stage)),
+    )
+  ) {
+    throw new Error("provider attempts do not cover STT/Translation/TTS in both directions");
+  }
+  if (
+    new Set(providerAttemptIds).size !== providerAttemptIds.length ||
+    groupedAttemptIds.size !== groupedAttemptIdList.length ||
+    groupedAttemptIds.size !== providerAttemptIds.length ||
+    providerAttemptIds.some((id) => !groupedAttemptIds.has(id))
+  ) {
+    throw new Error("provider attempt groups are not an exact unique attempt partition");
+  }
+  assertAttemptArchiveEvidence(providerAttemptGroups, inventoryObjects, consultationId);
+  const egressIds = archive.egressIds ?? [];
+  if (!egressIds.length || new Set(egressIds).size !== egressIds.length) {
+    throw new Error("complete archive omitted unique terminal Egress IDs");
+  }
+  const inventoryEgressIds = (finalInventory.egressResults ?? []).map(
+    (result) => result.egressId ?? result.egress_id ?? result.id,
+  );
+  if (
+    new Set(inventoryEgressIds).size !== inventoryEgressIds.length ||
+    inventoryEgressIds.length !== egressIds.length ||
+    egressIds.some((id) => !inventoryEgressIds.includes(id))
+  ) {
+    throw new Error("archive Egress IDs diverge from downloaded final inventory");
+  }
+  beginPhase("proof-emission");
+  const proof = {
+    runId,
+    consultationId,
+    archiveId,
+    providerProfile: expectedProfile,
+    profileRevision: employeeProfile.profileRevision,
+    directions: employeeProfile.directions,
+    objectCount: objects.length,
+    checkedObjectCount,
+    inventoryBoundObjectCount: inventoryObjects.length,
+    inventoryVersion: archive.inventoryVersion ?? null,
+    inventorySha256: archive.inventorySha256 ?? null,
+    egressIds,
+    providerAttemptIds,
+    finalCaptionRevisions: [employeeFinalCaption.revision, customerFinalCaption.revision],
+    targetedCaptions: 2,
+    audioModes: 3,
+    thirdHumanRejected: true,
+  };
+  if (!proof.inventoryVersion || !/^[0-9a-f]{64}$/u.test(proof.inventorySha256 ?? "")) {
+    throw new Error("archive proof omitted inventory version/hash");
+  }
+  if (emitProof) console.log(JSON.stringify(proof));
+} catch (error) {
+  throw new Error(
+    `[consultation-smoke] phase ${currentPhase} failed: ${error?.message ?? String(error)}`,
+    { cause: error },
+  );
+} finally {
+  await Promise.allSettled([
+    employeeContext.close(),
+    customerContext.close(),
+    thirdContext.close(),
+  ]);
+  await browser.close();
+}

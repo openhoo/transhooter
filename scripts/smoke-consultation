@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/deploy/scripts/compose-lib.sh"
+
+load_state
+export PROVIDER_PROFILE="$profile"
+export COMPOSE_PROFILES=e2e
+
+cleanup() {
+  status=$?
+  trap - 0 HUP INT TERM
+  announce_phase "Removing consultation-smoke one-off containers"
+  if ! compose --profile e2e rm --force --stop e2e >/dev/null; then
+    if [ "$status" -eq 0 ]; then
+      status=1
+    fi
+    printf 'Consultation-smoke cleanup failed.\n' >&2
+  fi
+  exit "$status"
+}
+
+trap cleanup 0
+trap 'exit 130' HUP INT TERM
+announce_phase "Removing stale consultation-smoke one-off containers"
+compose --profile e2e rm --force --stop e2e >/dev/null
+announce_phase "Building consultation application and smoke images from the current source tree"
+build_runtime_and_harness_images e2e
+announce_phase "Running consultation smoke for ${profile}"
+compose --profile e2e run --rm e2e bun run smoke:consultation -- "$@"

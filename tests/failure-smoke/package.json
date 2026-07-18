@@ -1,0 +1,13 @@
+{
+  "name": "@transhooter/failure-smoke",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun failure-smoke.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.55.0",
+    "postgres": "3.4.7"
+  }
+}

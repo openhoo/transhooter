@@ -1,0 +1,9 @@
+apiVersion: v2
+name: transhooter
+description: Portable self-hosted Transhooter application workloads
+version: 0.1.0
+appVersion: "0.1.0"
+type: application
+kubeVersion: ">=1.30.0-0"
+annotations:
+  transhooter.io/livekit-egress-version: "1.12.0"

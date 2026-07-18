@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "fixtures": [
+    {
+      "id": "en-good-morning",
+      "audio": "en-good-morning.wav",
+      "sourceLanguage": "en-US",
+      "targetLanguages": ["de-DE"],
+      "referenceText": "Good morning. This is a deterministic consultation audio fixture."
+    }
+  ]
+}

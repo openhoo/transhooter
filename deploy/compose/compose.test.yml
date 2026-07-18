@@ -1,0 +1,225 @@
+x-provider-disabled-env: &provider-disabled-env
+  GOOGLE_APPLICATION_CREDENTIALS: ""
+  GOOGLE_CLOUD_PROJECT: ""
+  GOOGLE_QUOTA_PROJECT: ""
+  GOOGLE_SPEECH_ENDPOINT: ""
+  GOOGLE_SPEECH_RECOGNIZER: ""
+  GOOGLE_TRANSLATION_ENDPOINT: ""
+  GOOGLE_TRANSLATION_PARENT: ""
+  GOOGLE_TRANSLATION_MODEL: ""
+  GOOGLE_TTS_ENDPOINT: ""
+  GOOGLE_TTS_MODEL: ""
+  GOOGLE_TTS_VOICE: ""
+  DEEPGRAM_API_KEY_FILE: ""
+  DEEPGRAM_LISTEN_ENDPOINT: ""
+  DEEPGRAM_SPEAK_ENDPOINT: ""
+  DEEPGRAM_STT_MODEL: ""
+  DEEPGRAM_TTS_MODEL: ""
+  DEEPGRAM_TTS_VOICE: ""
+  DEEPGRAM_STREAMS: ""
+  DEEPGRAM_AUDIO_SECONDS_MINUTE: ""
+  DEEPL_API_KEY_FILE: ""
+  DEEPL_ENDPOINT: ""
+  DEEPL_MODEL_TYPE: ""
+  DEEPL_REQUESTS_MINUTE: ""
+  DEEPL_CHARACTERS_MINUTE: ""
+
+x-fixture-runtime-env: &fixture-runtime-env
+  APP_ENV: test
+  PROVIDER_PROFILE: fixture
+  PROVIDER_NETWORK_DISABLED: "true"
+
+services:
+  minio:
+    ports: !override []
+
+  mailpit:
+    ports: !override []
+
+  livekit:
+    ports: !override []
+
+  profile-preflight:
+    environment:
+      <<: *provider-disabled-env
+      APP_ENV: test
+      SPOOL_KEYRING_FILE: ""
+      PROVIDER_PROFILE: fixture
+    command: [python, -m, transhooter_worker.providers, preflight, --profile, fixture]
+    volumes: !override []
+
+  capability-publisher:
+    environment:
+      <<: *fixture-runtime-env
+
+  language-refresh:
+    environment:
+      <<: *provider-disabled-env
+      APP_ENV: test
+      PROVIDER_PROFILE: fixture
+      DATABASE_URL_FILE: /run/secrets/database-url
+    command: [python, -m, transhooter_worker.providers, sync, --profile, fixture]
+    volumes: !override
+      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
+      - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
+
+  translation-worker:
+    environment:
+      <<: [*provider-disabled-env, *fixture-runtime-env]
+      FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+    volumes: !override
+      - spool-data:/var/lib/transhooter/spool
+      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - ../../.secrets/redis-url:/run/secrets/redis-url:ro
+      - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
+      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+      - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
+      - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
+      - fault-control:/shared:ro
+
+  spool-drainer:
+    environment:
+      <<: [*provider-disabled-env, *fixture-runtime-env]
+      FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+    volumes:
+      - fault-control:/shared:ro
+
+  migrate:
+    environment:
+      APP_ENV: test
+
+  bootstrap-admin:
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      language-refresh: {condition: service_completed_successfully}
+    environment:
+      APP_ENV: test
+      DATABASE_URL_FILE: /run/secrets/database-url
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Test Administrator}
+    command: [bun, run, admin:create-staff, --email, "${BOOTSTRAP_ADMIN_EMAIL}", --name, "${BOOTSTRAP_ADMIN_NAME:-Test Administrator}", --role, admin]
+
+  fault-control-init:
+    image: alpine:3.22.1
+    user: "0:0"
+    restart: "no"
+    networks: [backend]
+    volumes: [fault-control:/shared]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /shared/releases /shared/failure-smoke-owners
+        chmod 0777 /shared/releases /shared/failure-smoke-owners
+        if [ ! -e /shared/faults.json ] || ! grep -q '"consultations"' /shared/faults.json; then
+          printf '{"consultations":{}}\n' > /shared/faults.json.tmp
+          chmod 0666 /shared/faults.json.tmp
+          mv /shared/faults.json.tmp /shared/faults.json
+        fi
+        if [ ! -e /shared/worker-scenarios.json ] || ! grep -q '"consultations"' /shared/worker-scenarios.json || grep -q '"\*"' /shared/worker-scenarios.json; then
+          printf '{"consultations":{}}\n' > /shared/worker-scenarios.json.tmp
+          chmod 0666 /shared/worker-scenarios.json.tmp
+          mv /shared/worker-scenarios.json.tmp /shared/worker-scenarios.json
+        fi
+
+  control-worker-1:
+    depends_on:
+      bootstrap-admin: {condition: service_completed_successfully}
+      fault-control-init: {condition: service_completed_successfully}
+    environment:
+      <<: *fixture-runtime-env
+      TEST_FAULT_CONTROL_FILE: /shared/faults.json
+    volumes:
+      - fault-control:/shared:ro
+
+  control-worker-2:
+    depends_on:
+      bootstrap-admin: {condition: service_completed_successfully}
+      fault-control-init: {condition: service_completed_successfully}
+    environment:
+      <<: *fixture-runtime-env
+      TEST_FAULT_CONTROL_FILE: /shared/faults.json
+    volumes:
+      - fault-control:/shared:ro
+
+  web:
+    ports: !override []
+    depends_on: !override
+      bootstrap-admin: {condition: service_completed_successfully}
+      mailpit: {condition: service_healthy}
+      livekit: {condition: service_healthy}
+      language-refresh: {condition: service_completed_successfully}
+      egress-ready: {condition: service_completed_successfully}
+      translation-worker: {condition: service_healthy}
+      spool-drainer: {condition: service_healthy}
+      control-worker-1: {condition: service_healthy}
+      control-worker-2: {condition: service_healthy}
+    environment:
+      <<: *fixture-runtime-env
+      PUBLIC_BASE_URL: http://app.localhost:3000
+      PUBLIC_LIVEKIT_URL: ws://rtc.localhost:7880
+
+  test:
+    depends_on:
+      bootstrap-admin: {condition: service_completed_successfully}
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio-bootstrap: {condition: service_completed_successfully}
+      livekit: {condition: service_healthy}
+      mailpit: {condition: service_healthy}
+    environment:
+      <<: *fixture-runtime-env
+      DATABASE_URL_FILE: /run/secrets/database-url
+      REDIS_URL_FILE: /run/secrets/redis-url
+    volumes:
+      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - ../../.secrets/redis-url:/run/secrets/redis-url:ro
+      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+      - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
+    tmpfs:
+      - /tmp:size=536870912,mode=1777,uid=10001,gid=10001
+
+  provider-benchmark:
+    environment:
+      <<: [*provider-disabled-env, *fixture-runtime-env]
+    volumes: !override
+      - ../../tests/fixtures:/workspace/tests/fixtures:ro
+      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+
+  e2e:
+    environment:
+      <<: *fixture-runtime-env
+      EXPECTED_PROFILE: fixture
+
+  failure-smoke:
+    user: "0:0"
+    cap_add: [FOWNER]
+    depends_on:
+      bootstrap-admin: {condition: service_completed_successfully}
+      language-refresh: {condition: service_completed_successfully}
+      web: {condition: service_healthy}
+    environment:
+      <<: *fixture-runtime-env
+      TARGET_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-transhooter}
+      DATABASE_URL_FILE: /run/secrets/database-url
+      BASE_URL: http://app.localhost:3000
+      LIVEKIT_URL: ws://rtc.localhost:7880
+      MAILPIT_URL: http://mailpit:8025
+      E2E_EMPLOYEE_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL}
+      EXPECTED_PROFILE: fixture
+      FAULT_CONTROL_FILE: /shared/faults.json
+      WORKER_SCENARIO_FILE: /shared/worker-scenarios.json
+      FAILURE_RELEASE_DIR: /shared/releases
+    volumes:
+      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - fault-control:/shared
+      - spool-data:/var/lib/transhooter/spool
+      - /var/run/docker.sock:/var/run/docker.sock
+
+networks:
+  backend:
+    internal: true
+
+volumes:
+  fault-control:

@@ -1,0 +1,1 @@
+ALTER TABLE "egress_jobs" ADD CONSTRAINT "egress_jobs_state_check" CHECK (state = ANY (ARRAY['requested'::text, 'EGRESS_STARTING'::text, 'EGRESS_ACTIVE'::text, 'EGRESS_ENDING'::text, 'EGRESS_COMPLETE'::text, 'EGRESS_FAILED'::text, 'EGRESS_ABORTED'::text, 'EGRESS_LIMIT_REACHED'::text]));

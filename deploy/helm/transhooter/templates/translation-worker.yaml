@@ -1,0 +1,79 @@
+{{- $root := . -}}
+{{- range $component, $replicas := dict "translation-worker" .Values.replicas.translationWorker "spool-drainer" .Values.replicas.spoolDrainer }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "transhooter.fullname" $root }}-{{ $component }}
+  labels:
+    {{- include "transhooter.labels" $root | nindent 4 }}
+spec:
+  replicas: {{ $replicas }}
+  selector:
+    matchLabels:
+      {{- include "transhooter.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $component }}
+  template:
+    metadata:
+      annotations:
+        {{- toYaml $root.Values.podAnnotations | nindent 8 }}
+      labels:
+        {{- include "transhooter.selectorLabels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: {{ $component }}
+      imagePullSecrets:
+        {{- toYaml $root.Values.imagePullSecrets | nindent 8 }}
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: {{ $component }}
+          image: {{ include "transhooter.image" $root.Values.images.translationWorker | quote }}
+          imagePullPolicy: {{ $root.Values.images.translationWorker.pullPolicy }}
+          {{- if eq $component "spool-drainer" }}
+          command: [python, -m, transhooter_worker.runtime.spool_drainer]
+          {{- else }}
+          command: [python, -m, transhooter_worker.runtime]
+          {{- end }}
+          envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" $root }}}}]
+          env:
+            - {name: INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
+            - {name: SPOOL_PATH, value: /var/lib/transhooter/spool}
+            - {name: WORKER_INTERNAL_BEARER_FILE, value: /var/run/secrets/transhooter/token}
+          ports: [{name: health, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /health/ready, port: health}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {httpGet: {path: /health/live, port: health}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources:
+            {{- toYaml $root.Values.resources.translationWorker | nindent 12 }}
+          volumeMounts:
+            - {name: runtime-secrets, mountPath: /run/secrets, readOnly: true}
+            - {name: internal-token, mountPath: /var/run/secrets/transhooter, readOnly: true}
+            - {name: spool, mountPath: /var/lib/transhooter/spool}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: runtime-secrets
+          projected:
+            sources:
+              - secret:
+                  name: {{ $root.Values.existingSecret }}
+                  items:
+                    - {key: database-url, path: database-url}
+                    - {key: redis-url, path: redis-url}
+                    - {key: livekit-credentials, path: livekit-credentials}
+                    - {key: s3-credentials, path: s3-credentials}
+                    - {key: spool-keyring, path: spool-keyring}
+              - secret:
+                  name: {{ $root.Values.providerSecretName }}
+                  items:
+                    {{- range $root.Values.providerSecretKeys }}
+                    - {key: {{ . | quote }}, path: {{ . | quote }}}
+                    {{- end }}
+        - name: internal-token
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, audience: {{ $root.Values.config.internalAudience | quote }}, expirationSeconds: 600}
+        - name: spool
+          persistentVolumeClaim: {claimName: {{ $root.Values.spool.existingClaim }}}
+        - {name: tmp, emptyDir: {}}
+---
+{{- end }}

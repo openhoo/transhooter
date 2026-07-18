@@ -1,0 +1,97 @@
+{{- range $component := list "web" "control-worker" "translation-worker" "spool-drainer" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $component }}
+  labels:
+    {{- include "transhooter.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+automountServiceAccountToken: false
+---
+{{- end }}
+{{- range $component := list "language-refresh" "capability-publisher" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $component }}
+  labels:
+    {{- include "transhooter.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-40"
+    helm.sh/hook-delete-policy: before-hook-creation
+automountServiceAccountToken: false
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "transhooter.fullname" . }}-language-refresh-cleanup
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-40"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ printf "%s-capability-publisher" (include "transhooter.fullname" .) | quote }}]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: [{{ printf "%s-capability-publisher" (include "transhooter.fullname" .) | quote }}]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "transhooter.fullname" . }}-language-refresh-cleanup
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-40"
+    helm.sh/hook-delete-policy: before-hook-creation
+subjects:
+  - kind: ServiceAccount
+    name: language-refresh
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "transhooter.fullname" . }}-language-refresh-cleanup
+---
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "transhooter.fullname" . }}
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.ingress.annotations | nindent 4 }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ include "transhooter.fullname" $ }}-web
+                port: {number: {{ $.Values.service.port }}}
+          {{- end }}
+    {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

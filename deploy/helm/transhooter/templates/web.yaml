@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "transhooter.fullname" . }}-web
+  labels: {{- include "transhooter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas.web }}
+  selector:
+    matchLabels:
+      {{- include "transhooter.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      annotations: {{- toYaml .Values.podAnnotations | nindent 8 }}
+      labels:
+        {{- include "transhooter.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: web
+      imagePullSecrets: {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: web
+          image: {{ include "transhooter.image" .Values.images.web | quote }}
+          imagePullPolicy: {{ .Values.images.web.pullPolicy }}
+          command: [bun, run, --filter, "@transhooter/web", start]
+          envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" . }}}}]
+          env:
+            - {name: INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
+            - {name: SESSION_SECRET_FILE, value: /run/secrets/session-secret}
+            - {name: CSRF_SECRET_FILE, value: /run/secrets/csrf-secret}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: EGRESS_LAYOUT_SIGNING_KEY_FILE, value: /run/secrets/egress-layout-signing-key}
+          ports: [{name: http, containerPort: 3000}]
+          readinessProbe: {httpGet: {path: /api/health/ready, port: http}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {httpGet: {path: /api/health/live, port: http}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {{- toYaml .Values.resources.web | nindent 12 }}
+          volumeMounts:
+            - {name: runtime-secrets, mountPath: /run/secrets, readOnly: true}
+            - {name: internal-token, mountPath: /var/run/secrets/transhooter, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: runtime-secrets
+          secret:
+            secretName: {{ .Values.existingSecret }}
+            items:
+              - {key: database-url, path: database-url}
+              - {key: redis-url, path: redis-url}
+              - {key: livekit-credentials, path: livekit-credentials}
+              - {key: s3-credentials, path: s3-credentials}
+              - {key: smtp-url, path: smtp-url}
+              - {key: session-secret, path: session-secret}
+              - {key: csrf-secret, path: csrf-secret}
+              - {key: egress-layout-signing-key, path: egress-layout-signing-key}
+        - name: internal-token
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, audience: {{ .Values.config.internalAudience | quote }}, expirationSeconds: 600}
+        - {name: tmp, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "transhooter.fullname" . }}-web
+  labels: {{- include "transhooter.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "transhooter.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+  ports: [{name: http, port: {{ .Values.service.port }}, targetPort: http}]

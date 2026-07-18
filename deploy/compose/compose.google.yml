@@ -1,0 +1,38 @@
+x-google-env: &google-env
+  APP_ENV: development
+  PROVIDER_PROFILE: google-eu
+  GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/google-adc.json
+  GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:?set GOOGLE_CLOUD_PROJECT}
+  GOOGLE_QUOTA_PROJECT: ${GOOGLE_QUOTA_PROJECT:?set GOOGLE_QUOTA_PROJECT}
+  GOOGLE_SPEECH_ENDPOINT: eu-speech.googleapis.com
+  GOOGLE_SPEECH_RECOGNIZER: projects/${GOOGLE_CLOUD_PROJECT}/locations/eu/recognizers/_
+  GOOGLE_TRANSLATION_ENDPOINT: translate-eu.googleapis.com
+  GOOGLE_TRANSLATION_PARENT: projects/${GOOGLE_CLOUD_PROJECT}/locations/eu
+  GOOGLE_TRANSLATION_MODEL: projects/${GOOGLE_CLOUD_PROJECT}/locations/eu/models/general/nmt
+  GOOGLE_TTS_ENDPOINT: eu-texttospeech.googleapis.com
+  GOOGLE_TTS_VOICE: en-US-Chirp3-HD-Achernar
+
+x-google-secret-volumes: &google-secret-volumes
+  - ../../.secrets/google-adc.json:/run/secrets/google-adc.json:ro
+
+services:
+  profile-preflight:
+    environment:
+      <<: *google-env
+    volumes: *google-secret-volumes
+
+  language-refresh:
+    environment:
+      <<: *google-env
+    volumes: *google-secret-volumes
+
+  translation-worker:
+    environment:
+      <<: *google-env
+    volumes: *google-secret-volumes
+
+  provider-benchmark:
+    environment:
+      <<: *google-env
+      APP_ENV: benchmark
+    volumes: *google-secret-volumes

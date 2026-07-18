@@ -1,0 +1,11 @@
+log_level: info
+api_key: __LIVEKIT_API_KEY__
+api_secret: __LIVEKIT_API_SECRET__
+ws_url: ws://livekit:7880
+redis:
+  address: redis:6379
+  password: __REDIS_PASSWORD__
+health_port: 8080
+prometheus_port: 9090
+template_base: http://web:3000/api/internal/egress-layout
+enable_chrome_sandbox: true
