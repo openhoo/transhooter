@@ -1,5 +1,9 @@
 import { describe, expect, it, mock } from "bun:test";
-import { DrizzleApplicationOperations } from "../src/application-operations";
+import { PgDialect } from "drizzle-orm/pg-core";
+import {
+  checkpointPersistenceValues,
+  DrizzleApplicationOperations,
+} from "../src/application-operations";
 
 const ADMIN = {
   userId: "00000000-0000-4000-8000-000000000001",
@@ -190,7 +194,7 @@ function createOperations(rows: unknown[]) {
 function createSequentialOperations(
   results: Array<{ rows: Record<string, unknown>[]; rowCount?: number }>,
 ) {
-  const execute = mock(async () => results.shift() ?? { rows: [], rowCount: 0 });
+  const execute = mock(async (_statement: unknown) => results.shift() ?? { rows: [], rowCount: 0 });
   const operations = new DrizzleApplicationOperations({ execute } as never, {} as never, {
     now: () => new Date(),
   });
@@ -256,6 +260,34 @@ describe("ApplicationOperations typed views", () => {
       "PROVIDER_ATTEMPT_CONFLICT",
     );
   });
+  it("retries a provider terminal after a PostgreSQL deadlock", async () => {
+    let calls = 0;
+    const execute = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return { rows: [PROVIDER_CONTEXT_ROW], rowCount: 1 };
+      }
+      if (calls === 2) {
+        throw new Error("provider attempt deadlocked", { cause: { code: "40P01" } });
+      }
+      return { rows: [{ id: PROVIDER_REPORT.attemptId }], rowCount: 1 };
+    });
+    const operations = new DrizzleApplicationOperations({ execute } as never, {} as never, {
+      now: () => new Date(),
+    });
+
+    await expect(
+      operations.providerAttempt({
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        workerId: "00000000-0000-4000-8000-000000000022",
+        epoch: 2,
+        eventId: "00000000-0000-4000-8000-000000000023",
+        report: PROVIDER_REPORT,
+      }),
+    ).resolves.toBe(true);
+    expect(execute).toHaveBeenCalledTimes(3);
+  });
 
   it("rejects provider evidence from a fenced worker or an unselected stage", async () => {
     const fenced = createSequentialOperations([{ rows: [], rowCount: 0 }]);
@@ -285,5 +317,204 @@ describe("ApplicationOperations typed views", () => {
         },
       }),
     ).rejects.toThrow("PROVIDER_STAGE_MISMATCH");
+  });
+  it("persists checkpoint sample watermark and direction independently of wall time", () => {
+    const persisted = checkpointPersistenceValues({
+      checkpointId: "00000000-0000-4000-8000-000000000031",
+      workerEpoch: 2,
+      sourceParticipantId: "00000000-0000-4000-8000-000000000011",
+      destinationParticipantId: "00000000-0000-4000-8000-000000000012",
+      acceptedInputSequence: 8,
+      acceptedInput: 32_000,
+      receivedOutput: 24_000,
+      emittedOutput: 20_000,
+      previousCheckpointSha256: null,
+      highWatermarkSha256: "d".repeat(64),
+      expectedObjectIds: [],
+      observedObjectIds: [],
+      gaps: [],
+      terminal: false,
+      occurredAtMs: 1_700_000_000_000,
+    });
+
+    expect(persisted).toEqual({
+      acceptedInputSequence: 8,
+      acceptedInput: 32_000,
+      receivedOutput: 24_000,
+      emittedOutput: 20_000,
+      sourceParticipantId: "00000000-0000-4000-8000-000000000011",
+      destinationParticipantId: "00000000-0000-4000-8000-000000000012",
+      createdAt: new Date(1_700_000_000_000),
+    });
+  });
+
+  it("accepts terminal checkpoints in either direction and settles only after both exist", async () => {
+    const terminalCheckpoint = {
+      checkpointId: "00000000-0000-4000-8000-000000000031",
+      workerEpoch: 2,
+      sourceParticipantId: "00000000-0000-4000-8000-000000000011",
+      destinationParticipantId: "00000000-0000-4000-8000-000000000012",
+      acceptedInputSequence: 8,
+      acceptedInput: 32_000,
+      receivedOutput: 24_000,
+      emittedOutput: 20_000,
+      previousCheckpointSha256: null,
+      highWatermarkSha256: "d".repeat(64),
+      expectedObjectIds: [],
+      observedObjectIds: [],
+      gaps: [],
+      terminal: true,
+      occurredAtMs: 1_700_000_000_000,
+    };
+    const input = {
+      workerId: "00000000-0000-4000-8000-000000000022",
+      consultationId: "00000000-0000-4000-8000-000000000021",
+      generation: 3,
+      writeEpoch: 1,
+      objectKey: "v1/checkpoint.json",
+      checkpoint: terminalCheckpoint,
+    };
+
+    const firstDirection = createSequentialOperations([
+      { rows: [{ id: terminalCheckpoint.checkpointId }], rowCount: 1 },
+      { rows: [], rowCount: 0 },
+    ]);
+    await expect(firstDirection.operations.checkpoint(input)).resolves.toBe(true);
+    expect(firstDirection.execute).toHaveBeenCalledTimes(2);
+
+    const reverseDirection = createSequentialOperations([
+      { rows: [{ id: "00000000-0000-4000-8000-000000000032" }], rowCount: 1 },
+      { rows: [{ worker_id: input.workerId }], rowCount: 1 },
+    ]);
+    await expect(
+      reverseDirection.operations.checkpoint({
+        ...input,
+        checkpoint: {
+          ...terminalCheckpoint,
+          checkpointId: "00000000-0000-4000-8000-000000000032",
+          sourceParticipantId: terminalCheckpoint.destinationParticipantId,
+          destinationParticipantId: terminalCheckpoint.sourceParticipantId,
+          highWatermarkSha256: "e".repeat(64),
+        },
+      }),
+    ).resolves.toBe(true);
+    expect(reverseDirection.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts an exact terminal replay after clean two-direction settlement", async () => {
+    const replayed = createSequentialOperations([
+      { rows: [], rowCount: 0 },
+      { rows: [{ "?column?": 1 }], rowCount: 1 },
+      { rows: [], rowCount: 0 },
+    ]);
+
+    await expect(
+      replayed.operations.checkpoint({
+        workerId: "00000000-0000-4000-8000-000000000022",
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        writeEpoch: 1,
+        objectKey: "v1/checkpoint.json",
+        checkpoint: {
+          checkpointId: "00000000-0000-4000-8000-000000000032",
+          workerEpoch: 2,
+          sourceParticipantId: "00000000-0000-4000-8000-000000000012",
+          destinationParticipantId: "00000000-0000-4000-8000-000000000011",
+          acceptedInputSequence: 8,
+          acceptedInput: 32_000,
+          receivedOutput: 24_000,
+          emittedOutput: 20_000,
+          previousCheckpointSha256: null,
+          highWatermarkSha256: "e".repeat(64),
+          expectedObjectIds: [],
+          observedObjectIds: [],
+          gaps: [],
+          terminal: true,
+          occurredAtMs: 1_700_000_000_000,
+        },
+      }),
+    ).resolves.toBe(true);
+    expect(replayed.execute).toHaveBeenCalledTimes(3);
+
+    const replayStatement = replayed.execute.mock.calls[1]?.[0];
+    const replaySql = new PgDialect().sqlToQuery(replayStatement as never).sql;
+    expect(replaySql).toContain("job.terminal_outcome='clean'");
+    expect(replaySql).toContain("consultation.generation=checkpoint.generation");
+    expect(replaySql).toContain("reservation.fenced_at IS NULL");
+  });
+  it("rejects an old-generation or inactive-job checkpoint replay", async () => {
+    const operations = createSequentialOperations([
+      { rows: [], rowCount: 0 },
+      { rows: [], rowCount: 0 },
+    ]);
+
+    await expect(
+      operations.operations.checkpoint({
+        workerId: "00000000-0000-4000-8000-000000000022",
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 2,
+        writeEpoch: 1,
+        objectKey: "v1/stale-checkpoint.json",
+        checkpoint: {
+          checkpointId: "00000000-0000-4000-8000-000000000033",
+          workerEpoch: 2,
+          sourceParticipantId: "00000000-0000-4000-8000-000000000011",
+          destinationParticipantId: "00000000-0000-4000-8000-000000000012",
+          acceptedInputSequence: 1,
+          acceptedInput: 4_000,
+          receivedOutput: 0,
+          emittedOutput: 0,
+          previousCheckpointSha256: null,
+          highWatermarkSha256: "f".repeat(64),
+          expectedObjectIds: [],
+          observedObjectIds: [],
+          gaps: [],
+          terminal: false,
+          occurredAtMs: 1_700_000_000_000,
+        },
+      }),
+    ).rejects.toThrow("CHECKPOINT_CONFLICT");
+  });
+
+  it("leaves explicit worker failure eligible for supervisor checkpoint settlement", async () => {
+    const transactionResults = [
+      { rows: [], rowCount: 0 },
+      { rows: [{ generation: 4 }], rowCount: 1 },
+      { rows: [], rowCount: 1 },
+      { rows: [], rowCount: 1 },
+      { rows: [], rowCount: 1 },
+    ];
+    const execute = mock(
+      async (_statement: unknown) => transactionResults.shift() ?? { rows: [], rowCount: 0 },
+    );
+    const database = {
+      execute,
+      transaction: async <T>(callback: (transaction: { execute: typeof execute }) => Promise<T>) =>
+        callback({ execute }),
+    };
+    const operations = new DrizzleApplicationOperations(database as never, {} as never, {
+      now: () => new Date("2026-01-01T00:00:00Z"),
+    });
+
+    await expect(
+      operations.workerFailure({
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        workerId: "00000000-0000-4000-8000-000000000022",
+        epoch: 2,
+        eventId: "00000000-0000-4000-8000-000000000023",
+        kindName: "spool_unwritable",
+        message: "fsync failed",
+        lastCheckpointHashes: {},
+      }),
+    ).resolves.toBe(true);
+
+    const admissionStatement = execute.mock.calls[1]?.[0];
+    const admissionSql = new PgDialect().sqlToQuery(admissionStatement as never).sql;
+    expect(admissionSql).toContain("lease_expires_at=");
+    expect(admissionSql).toContain("accepting_load=false");
+    expect(admissionSql).not.toContain("released_at=");
+    expect(admissionSql).not.toContain("archive_state");
+    expect(admissionSql).not.toContain("terminal_at=");
   });
 });

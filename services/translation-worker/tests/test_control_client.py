@@ -12,7 +12,11 @@ import pytest
 from transhooter_worker.adapters.spool import EncryptedSpool, deterministic_roomy_capacity
 from transhooter_worker.domain.models import SampleRange
 from transhooter_worker.ports.archive import ObjectRecord
-from transhooter_worker.runtime.control_client import ControlClient
+from transhooter_worker.runtime.control_client import (
+    ControlClient,
+    PermanentControlRequestError,
+    RetryableControlRequestError,
+)
 from transhooter_worker.runtime.job import (
     CheckpointChainState,
     _persist_checkpoint,
@@ -43,6 +47,7 @@ def make_client(
         1,
         spool,  # type: ignore[arg-type]
         httpx.AsyncClient(transport=transport),
+        retry_delays=(0, 0),
     )
 
 
@@ -81,6 +86,48 @@ async def test_provider_attempt_posts_shared_envelope_and_body(tmp_path: Path) -
         }
     ]
     assert spool.records[0]["stage"] == "control-provider-attempt"
+
+
+@pytest.mark.asyncio
+async def test_archive_object_registration_does_not_recursively_journal_itself(
+    tmp_path: Path,
+) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("secret", "utf-8")
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(204, request=request)
+
+    spool = RecordingSpool()
+    client = make_client(bearer_file, httpx.MockTransport(handler), spool)
+    await client.record_object({"objectId": str(uuid4())})
+
+    assert paths == ["/api/internal/archive-object"]
+    assert spool.records == []
+
+
+@pytest.mark.asyncio
+async def test_control_client_reloads_projected_bearer_for_each_request(tmp_path: Path) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("first", "utf-8")
+    authorizations: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        authorizations.append(request.headers.get("authorization"))
+        return httpx.Response(204, request=request)
+
+    client = make_client(
+        bearer_file,
+        httpx.MockTransport(handler),
+        RecordingSpool(),
+    )
+    await client.heartbeat({})
+    bearer_file.write_text("second", "utf-8")
+    await client.heartbeat({})
+
+    assert authorizations == ["Bearer first", "Bearer second"]
 
 
 @pytest.mark.asyncio
@@ -124,6 +171,70 @@ async def test_control_post_retries_server_failure_with_stable_event_id(tmp_path
     assert bodies[0] == bodies[1]
     assert bodies[0]["eventId"]
     assert [record["direction"] for record in spool.records] == ["out", "in", "out", "in"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error_type", "expected_requests"),
+    [
+        (409, PermanentControlRequestError, 1),
+        (429, RetryableControlRequestError, 3),
+        (503, RetryableControlRequestError, 3),
+    ],
+)
+async def test_control_post_exposes_permanent_and_retryable_rejections(
+    tmp_path: Path,
+    status: int,
+    error_type: type[RuntimeError],
+    expected_requests: int,
+) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("secret", "utf-8")
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(status, request=request)
+
+    client = make_client(
+        bearer_file,
+        httpx.MockTransport(handler),
+        RecordingSpool(),
+    )
+
+    with pytest.raises(error_type, match=f"HTTP {status}") as caught:
+        await client.record_object({"objectId": str(uuid4())})
+
+    assert type(caught.value) is error_type
+    assert requests == expected_requests
+
+
+@pytest.mark.asyncio
+async def test_control_post_survives_extended_transient_server_failure(tmp_path: Path) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("secret", "utf-8")
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(503 if requests < 6 else 204, request=request)
+
+    client = ControlClient(
+        "http://control.test",
+        bearer_file,
+        UUID(int=1),
+        1,
+        UUID(int=2),
+        1,
+        RecordingSpool(),  # type: ignore[arg-type]
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        retry_delays=(0, 0, 0, 0, 0),
+    )
+    await client.checkpoint({"terminal": True})
+
+    assert requests == 6
 
 
 @pytest.mark.asyncio
@@ -322,6 +433,7 @@ async def test_restart_replays_exact_checkpoint_before_advancing_chain(
         3,
         first_spool,
         httpx.AsyncClient(transport=httpx.MockTransport(lose_checkpoint_acks)),
+        retry_delays=(0, 0),
     )
     first_state = CheckpointChainState.empty()
     with pytest.raises(httpx.ReadError, match="ack lost"):
@@ -385,6 +497,23 @@ async def test_restart_replays_exact_checkpoint_before_advancing_chain(
     assert acknowledged.acknowledged
     assert restarted_state.hashes[source_id] == acknowledged.checkpoint_hash
     assert restarted_state.watermarks[source_id] == (7, 28_000, 24_000, 19_200, False)
+    await _persist_checkpoint(
+        checkpoint_metadata(meeting_id),
+        restarted_spool,
+        archive,  # type: ignore[arg-type]
+        restarted_client,
+        restarted_state,
+        source_id,
+        destination_id,
+        28_000,
+        19_200,
+        False,
+        input_sequence=7,
+        provider_output_sample=24_000,
+    )
+    assert len(restarted_spool.list_checkpoint_deliveries(meeting_id, 3)) == 1
+    assert replayed_checkpoint_requests == [committed_checkpoint_requests[0]]
+
     with pytest.raises(RuntimeError, match="cannot regress"):
         await _persist_checkpoint(
             checkpoint_metadata(meeting_id),

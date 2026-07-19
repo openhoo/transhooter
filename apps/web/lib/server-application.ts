@@ -48,6 +48,25 @@ const ProviderAttemptEnvelopeSchema = z
     report: ProviderAttemptReportSchema,
   })
   .strict();
+const WorkerFailureEnvelopeSchema = z
+  .object({
+    consultationId: UuidSchema,
+    generation: z.number().int().nonnegative(),
+    workerId: UuidSchema,
+    epoch: z.number().int().nonnegative(),
+    eventId: UuidSchema,
+    kind: z.string().min(1).max(120),
+    message: z.string().min(1).max(2_000),
+    phase: z.string().min(1).max(120).optional(),
+    snapshotHash: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/u)
+      .optional(),
+    lastCheckpointHashes: z.record(UuidSchema, z.string().regex(/^[0-9a-f]{64}$/u)),
+  })
+  .strict();
+const JSON_BODY_LIMIT_BYTES = 1_048_576;
+const WEBHOOK_BODY_LIMIT_BYTES = 1_048_576;
 const AuthResultSchema = z.object({
   session: z.object({
     id: UuidSchema,
@@ -112,6 +131,7 @@ type RequestContext = {
   params: Record<string, string>;
   query: Record<string, string>;
   body: unknown;
+  rawBody: Uint8Array | null;
   sessionToken: string | null;
   csrfToken: string | null;
   exchangeNonce: string | null;
@@ -184,6 +204,19 @@ export function providerAttemptCommand(
   return {
     kind: "internal.providerAttempt",
     ...envelope,
+  };
+}
+
+export function workerFailureCommand(
+  body: unknown,
+): Extract<WebCommand, { kind: "internal.failure" }> {
+  const { kind, phase, snapshotHash, ...envelope } = WorkerFailureEnvelopeSchema.parse(body);
+  return {
+    kind: "internal.failure",
+    kindName: kind,
+    ...envelope,
+    ...(phase === undefined ? {} : { phase }),
+    ...(snapshotHash === undefined ? {} : { snapshotHash }),
   };
 }
 
@@ -360,14 +393,24 @@ function commandFor(operation: string, context: RequestContext): WebCommand {
       };
     case "internal.providerAttempt":
       return providerAttemptCommand(body);
-    case "internal.archiveObject":
+    case "internal.failure":
+      return workerFailureCommand(body);
+    case "internal.archiveObject": {
+      const generation = z.number().int().nonnegative().optional().parse(body.generation);
+      const workerId = UuidSchema.optional().parse(body.workerId);
+      const workerEpoch = z.number().int().nonnegative().optional().parse(body.epoch);
+      const writerEpoch = z.number().int().nonnegative().optional().parse(body.writerEpoch);
       return {
         kind: "internal.archiveObject",
         consultationId: requiredUuid(z.string().parse(body.consultationId), "consultationId"),
-        writerEpoch: z.number().int().nonnegative().parse(body.writerEpoch),
+        ...(generation === undefined ? {} : { generation }),
+        ...(workerId === undefined ? {} : { workerId }),
+        ...(workerEpoch === undefined ? {} : { workerEpoch }),
+        ...(writerEpoch === undefined ? {} : { writerEpoch }),
         causalKey: z.string().min(1).parse(body.causalKey),
         object: ArchiveObjectRecordSchema.parse(body.object),
       };
+    }
     case "internal.archive.finalize":
       return {
         kind: "internal.finalize",
@@ -525,6 +568,7 @@ async function presentConsultationLobby(
   );
   const redirectTo = durableConsultationDestination(consultation);
   return {
+    state: consultation.state,
     phase: consultationPhase(consultation, own, redirectTo),
     snapshotHash: consultation.snapshotHash,
     profileName: displayString(
@@ -692,6 +736,23 @@ function presentLanguages(result: unknown) {
   };
 }
 
+export function presentConsultationEnd(result: unknown): {
+  generation: number;
+  shutdownAtMs: number;
+} {
+  const ended = z
+    .object({
+      consultation: ConsultationSchema,
+      generation: z.number().int().nonnegative(),
+      shutdownAtMs: z.number().int().nonnegative(),
+    })
+    .parse(result);
+  return {
+    generation: ended.generation,
+    shutdownAtMs: ended.shutdownAtMs,
+  };
+}
+
 async function present(
   operation: string,
   result: unknown,
@@ -743,7 +804,6 @@ async function present(
       participantId: room.participant_id,
       participantIdentity: room.participant_identity,
       otherParticipantId: room.other_participant_id,
-      workerIdentity: room.worker_identity,
       otherIdentity: room.other_identity,
       generation: room.generation,
       liveKitUrl: webConfig().liveKitBrowserUrl,
@@ -757,11 +817,7 @@ async function present(
     return presentArchive(result, context);
   }
   if (operation === "consultations.end") {
-    const consultation = ConsultationSchema.parse(result);
-    return {
-      generation: consultation.generation,
-      shutdownAtMs: Date.now() + 5_000,
-    };
+    return presentConsultationEnd(result);
   }
   if (operation === "archives.object.download") {
     return { url: z.url().parse(result) };
@@ -800,8 +856,12 @@ async function present(
   return result;
 }
 
-function statusFor(error: DomainError): number {
-  if (error.code === "UNAUTHENTICATED" || error.code === "UNAUTHENTICATED_INTERNAL") {
+export function statusFor(error: DomainError): number {
+  if (
+    error.code === "UNAUTHENTICATED" ||
+    error.code === "UNAUTHENTICATED_INTERNAL" ||
+    error.code === "UNAUTHORIZED_INTERNAL"
+  ) {
     return 401;
   }
   if (
@@ -831,14 +891,19 @@ function statusFor(error: DomainError): number {
   ) {
     return 409;
   }
+  if (error.code === "PAYLOAD_TOO_LARGE") {
+    return 413;
+  }
   return 400;
 }
 
 async function dispatch(operation: string, context: RequestContext): Promise<unknown> {
   if (operation === "webhooks.livekit.receive") {
-    const rawBody = new Uint8Array(await context.request.arrayBuffer());
+    if (context.rawBody === null) {
+      throw new DomainError("INVALID_WEBHOOK");
+    }
     return configuredApplication().roomService.acceptWebhook(
-      rawBody,
+      context.rawBody,
       Object.fromEntries(context.request.headers.entries()),
     );
   }
@@ -850,17 +915,72 @@ async function dispatch(operation: string, context: RequestContext): Promise<unk
   });
 }
 
-async function parseRequestBody(operation: string, request: Request): Promise<unknown> {
+async function readLimitedBody(request: Request, limit: number): Promise<Uint8Array> {
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength !== null) {
+    const parsedLength = Number(declaredLength);
+    if (Number.isFinite(parsedLength) && parsedLength > limit) {
+      throw new DomainError("PAYLOAD_TOO_LARGE");
+    }
+  }
+  const reader = request.body?.getReader();
+  if (!reader) {
+    return new Uint8Array();
+  }
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    length += value.byteLength;
+    if (length > limit) {
+      await reader.cancel();
+      throw new DomainError("PAYLOAD_TOO_LARGE");
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+export async function parseRequestPayload(
+  operation: string,
+  request: Request,
+): Promise<{ body: unknown; rawBody: Uint8Array | null }> {
   const hasBody =
-    operation !== "webhooks.livekit.receive" &&
     request.method !== "GET" &&
     request.method !== "HEAD" &&
     request.headers.get("content-length") !== "0";
   if (!hasBody) {
-    return undefined;
+    return { body: undefined, rawBody: null };
   }
-  const text = await request.text();
-  return text ? (JSON.parse(text) as unknown) : undefined;
+  const rawBody = await readLimitedBody(
+    request,
+    operation === "webhooks.livekit.receive" ? WEBHOOK_BODY_LIMIT_BYTES : JSON_BODY_LIMIT_BYTES,
+  );
+  if (operation === "webhooks.livekit.receive") {
+    return { body: undefined, rawBody };
+  }
+  if (rawBody.byteLength === 0) {
+    return { body: undefined, rawBody: null };
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(rawBody);
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new SyntaxError("Request body is not valid UTF-8", { cause: error });
+    }
+    throw error;
+  }
+  return { body: JSON.parse(text) as unknown, rawBody: null };
 }
 
 function applicationResponse(payload: unknown): Response {
@@ -912,17 +1032,19 @@ export async function execute(
     );
   }
 
-  const url = new URL(request.url);
-  const context: RequestContext = {
-    request,
-    params,
-    query: Object.fromEntries(url.searchParams.entries()),
-    body: await parseRequestBody(operation, request),
-    sessionToken: cookieStore.get("session")?.value ?? null,
-    csrfToken: csrfToken ?? null,
-    exchangeNonce: cookieStore.get("exchange")?.value ?? null,
-  };
   try {
+    const url = new URL(request.url);
+    const payload = await parseRequestPayload(operation, request);
+    const context: RequestContext = {
+      request,
+      params,
+      query: Object.fromEntries(url.searchParams.entries()),
+      body: payload.body,
+      rawBody: payload.rawBody,
+      sessionToken: cookieStore.get("session")?.value ?? null,
+      csrfToken: csrfToken ?? null,
+      exchangeNonce: cookieStore.get("exchange")?.value ?? null,
+    };
     const result = await dispatch(operation, context);
     if (
       operation === "auth.magicLink.request" ||
@@ -1031,9 +1153,10 @@ export async function requirePageData<T>(
     params,
     query,
     body: {},
+    rawBody: null,
     sessionToken: cookieStore.get("session")?.value ?? null,
     csrfToken: cookieStore.get("csrf")?.value ?? null,
-    exchangeNonce: null,
+    exchangeNonce: cookieStore.get("exchange")?.value ?? null,
   };
   try {
     const result = await dispatch(operation, context);

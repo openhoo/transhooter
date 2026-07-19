@@ -67,12 +67,21 @@ export const ArchiveGapSchema = z
     reason: z.string().min(1),
   })
   .strict()
-  .refine(
-    (gap) => gap.sampleRange !== null || (gap.segmentStart !== null && gap.segmentEnd !== null),
-    {
-      message: "gap requires a sample or segment range",
-    },
-  );
+  .superRefine((gap, context) => {
+    if (gap.sampleRange === null && (gap.segmentStart === null || gap.segmentEnd === null)) {
+      context.addIssue({
+        code: "custom",
+        message: "gap requires a sample or segment range",
+      });
+    }
+    if (gap.segmentStart !== null && gap.segmentEnd !== null && gap.segmentEnd < gap.segmentStart) {
+      context.addIssue({
+        code: "custom",
+        message: "segmentEnd must not precede segmentStart",
+        path: ["segmentEnd"],
+      });
+    }
+  });
 export type ArchiveGap = z.infer<typeof ArchiveGapSchema>;
 
 export const WorkerCheckpointSchema = z
@@ -93,7 +102,11 @@ export const WorkerCheckpointSchema = z
     terminal: z.boolean(),
     occurredAtMs: NonNegativeIntegerSchema,
   })
-  .strict();
+  .strict()
+  .refine((checkpoint) => checkpoint.sourceParticipantId !== checkpoint.destinationParticipantId, {
+    message: "checkpoint source and destination must differ",
+    path: ["destinationParticipantId"],
+  });
 export type WorkerCheckpoint = z.infer<typeof WorkerCheckpointSchema>;
 
 export const RoomCloseRecordSchema = z
@@ -154,12 +167,20 @@ export const FinalInventorySchema = z
   .strict()
   .superRefine((inventory, context) => {
     const isComplete = inventory.status === "complete";
-    const hasGaps = inventory.missing.length > 0;
-    const hasErrors = inventory.errors.length > 0;
-    if (isComplete && (hasGaps || hasErrors)) {
+    const hasIncompleteWorker = inventory.workerTerminal.outcome !== "clean";
+    const hasIncompleteEgress = inventory.egressResults.some(
+      (result) => result.outcome !== "complete" || result.gaps.length > 0,
+    );
+    if (
+      isComplete &&
+      (inventory.missing.length > 0 ||
+        inventory.errors.length > 0 ||
+        hasIncompleteWorker ||
+        hasIncompleteEgress)
+    ) {
       context.addIssue({
         code: "custom",
-        message: "complete inventory cannot contain gaps or errors",
+        message: "complete inventory requires clean, gap-free worker and Egress results",
         path: ["status"],
       });
     }

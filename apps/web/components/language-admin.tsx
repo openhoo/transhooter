@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { api } from "@/lib/browser-api";
+import { createExclusiveActionGate } from "./interface-state";
 
 type Direction = {
   id: string;
@@ -28,8 +29,12 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
   const [items, setItems] = useState(directions);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [actionGate] = useState(createExclusiveActionGate);
 
   async function toggle(item: Direction) {
+    if (!actionGate.tryEnter()) {
+      return;
+    }
     setBusy(item.id);
     setError("");
 
@@ -51,11 +56,12 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
       setError(cause instanceof Error ? cause.message : "Language direction could not be updated");
     } finally {
       setBusy(null);
+      actionGate.leave();
     }
   }
 
   return (
-    <div className="stack">
+    <div className="stack" aria-busy={busy !== null}>
       <div className="tableWrap">
         <table>
           <thead>
@@ -88,8 +94,9 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
                 </td>
                 <td>
                   <button
+                    aria-label={`${item.enabled ? "Disable" : "Enable"} ${item.source} to ${item.target} for ${item.profile}`}
                     className={`button ${item.enabled ? "secondary" : ""}`}
-                    disabled={busy === item.id}
+                    disabled={busy !== null}
                     type="button"
                     onClick={() => {
                       void toggle(item);
@@ -107,7 +114,16 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
       {items.length === 0 && (
         <section className="empty flat">
           <h2>No complete provider directions</h2>
-          <p>Refresh provider capabilities before enabling a language.</p>
+          <p>Refresh provider capabilities, then reload this catalog before enabling a language.</p>
+          <button
+            className="button secondary"
+            type="button"
+            onClick={() => {
+              window.location.reload();
+            }}
+          >
+            Reload language catalog
+          </button>
         </section>
       )}
 

@@ -12,6 +12,7 @@ RUN --mount=type=cache,id=bun-control-worker,target=/root/.bun/install/cache \
 COPY packages/contracts packages/contracts
 COPY packages/server-core packages/server-core
 COPY apps/control-worker apps/control-worker
+COPY deploy/scripts/migrate.mjs deploy/scripts/migrate.mjs
 RUN bun run --filter @transhooter/contracts build \
     && bun run --filter @transhooter/server-core build \
     && bun run --filter @transhooter/control-worker build

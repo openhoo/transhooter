@@ -18,6 +18,7 @@ const staticOperations: Readonly<Record<string, string>> = {
   "POST internal/checkpoint": "internal.archive.checkpoint",
   "POST internal/provider-attempt": "internal.providerAttempt",
   "POST internal/archive-object": "internal.archiveObject",
+  "POST internal/failure": "internal.failure",
   "POST internal/finalize": "internal.archive.finalize",
   "POST internal/archive-recording": "internal.archiveRecording",
   "POST internal/delete-drain": "internal.deleteDrain",
@@ -62,6 +63,29 @@ function match(method: string, path: string): Match | null {
   return null;
 }
 
+function safeErrorSummary(error: unknown): {
+  name: string;
+  code?: string;
+  status?: number;
+} {
+  const summary: { name: string; code?: string; status?: number } = {
+    name: error instanceof Error ? error.name : typeof error,
+  };
+  let current = error;
+  for (let depth = 0; depth < 4 && current !== null && typeof current === "object"; depth += 1) {
+    const record = current as Record<string, unknown>;
+    if (summary.code === undefined && ["string", "number"].includes(typeof record.code)) {
+      summary.code = String(record.code);
+    }
+    const status = record.statusCode ?? record.status;
+    if (summary.status === undefined && typeof status === "number") {
+      summary.status = status;
+    }
+    current = record.cause;
+  }
+  return summary;
+}
+
 async function route(
   request: Request,
   context: { params: Promise<{ path: string[] }> },
@@ -74,11 +98,12 @@ async function route(
   try {
     return await execute(selected.operation, request, selected.params);
   } catch (error) {
-    const isInvalidJson = error instanceof Error && error.message.includes("JSON");
+    console.error("Unhandled API request failure", safeErrorSummary(error));
+    const isInvalidJson = error instanceof SyntaxError;
     const message = isInvalidJson
       ? "Request body is not valid JSON"
       : "The request could not be completed";
-    const status = error instanceof SyntaxError ? 400 : 503;
+    const status = isInvalidJson ? 400 : 503;
 
     return Response.json(
       { code: "REQUEST_FAILED", message },

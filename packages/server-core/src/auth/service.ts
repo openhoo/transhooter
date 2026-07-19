@@ -179,11 +179,16 @@ export class AuthService {
   ): Promise<VerifiedExchange> {
     const nonce = decodeBase64url(exchangeNonce);
     const verificationCsrf = decodeBase64url(context.csrfToken);
+    let sameOrigin = false;
+    try {
+      sameOrigin =
+        new URL(context.origin).origin === new URL(context.publicBaseUrl).origin &&
+        context.origin.length > 0;
+    } catch {
+      sameOrigin = false;
+    }
     const invalidContext =
-      nonce.length !== 32 ||
-      verificationCsrf.length !== 32 ||
-      !context.requestIp ||
-      new URL(context.origin).origin !== new URL(context.publicBaseUrl).origin;
+      nonce.length !== 32 || verificationCsrf.length !== 32 || !context.requestIp || !sameOrigin;
     if (invalidContext) {
       throw new DomainError("INVALID_EXCHANGE_CONTEXT");
     }

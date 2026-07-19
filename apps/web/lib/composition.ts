@@ -1,4 +1,5 @@
 import "server-only";
+import { isIP } from "node:net";
 import {
   type BearerRegistration,
   ComposeBearerVerifier,
@@ -56,6 +57,7 @@ const servicePermissions = Object.freeze({
       "heartbeat:write",
       "checkpoint:write",
       "archive:finalize",
+      "failure:write",
     ]),
   }),
   spoolDrainer: Object.freeze({
@@ -92,6 +94,21 @@ function composeBearerRegistrations(
     }
   }
   return registrations;
+}
+
+export type ClientIpBoundary =
+  | Readonly<{ mode: "direct-local" }>
+  | Readonly<{ mode: "trusted-header"; headerName: string }>;
+
+export function trustedClientIp(request: Request, boundary: ClientIpBoundary): string {
+  if (boundary.mode === "direct-local") {
+    return "direct-local";
+  }
+  const address = request.headers.get(boundary.headerName)?.trim();
+  if (!address || address.includes(",") || isIP(address) === 0) {
+    return "unknown";
+  }
+  return address.toLowerCase();
 }
 
 function kubernetesPrincipalVerifier(
@@ -206,9 +223,12 @@ export function configuredApplication(): ConfiguredWebApplication {
     authSecrets: { rateLimitKey: config.sessionSecret },
     publicBaseUrl: config.publicUrl,
     clientIp: (request) =>
-      request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-      request.headers.get("x-real-ip") ||
-      "unknown",
+      trustedClientIp(
+        request,
+        config.trustedClientIpHeader
+          ? { mode: "trusted-header", headerName: config.trustedClientIpHeader }
+          : { mode: "direct-local" },
+      ),
     readiness: async () => {
       const databaseResult = await pool.query<{ value: number }>("SELECT 1 AS value");
       if (databaseResult.rows[0]?.value !== 1) {

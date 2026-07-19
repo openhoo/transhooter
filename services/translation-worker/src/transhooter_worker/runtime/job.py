@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from transhooter_worker.adapters.scoped_journal import ScopedExchangeJournal
 from transhooter_worker.adapters.spool import (
     EncryptedSpool,
     SpoolCheckpointDelivery,
+    SpoolUnavailable,
     deterministic_roomy_capacity,
     statvfs_capacity,
 )
@@ -39,6 +41,7 @@ from transhooter_worker.domain.models import (
     SessionTerminal,
     StageCapabilities,
 )
+from transhooter_worker.ports.archive import ObjectRecord
 from transhooter_worker.runtime.control_client import ControlClient
 from transhooter_worker.runtime.provider_registry import (
     ProviderRegistry,
@@ -49,7 +52,10 @@ from transhooter_worker.runtime.publisher import (
     publish_private_interpretation_tracks,
 )
 from transhooter_worker.runtime.redis_quota import RedisQuotaGate
-from transhooter_worker.runtime.spool_drainer import build_archive, upload_committed_objects
+from transhooter_worker.runtime.spool_drainer import (
+    build_archive,
+    upload_committed_objects_async,
+)
 
 
 @dataclass(slots=True)
@@ -332,6 +338,14 @@ def _expected_credential_version(profile_id: str, capability: StageCapabilities)
     return "fixture"
 
 
+def _expected_credential_reference(profile_id: str, stage: str) -> str:
+    if profile_id == "google-eu":
+        return "google-adc"
+    if profile_id == "deepgram-deepl-eu":
+        return "deepl-api-key" if stage == "translation" else "deepgram-api-key"
+    return "fixture"
+
+
 def _validate_frozen_stage(
     selected: FrozenStage | None,
     capability: StageCapabilities,
@@ -346,8 +360,18 @@ def _validate_frozen_stage(
         or selected.model not in capability.models
     ):
         raise RuntimeError("frozen provider stage does not match admitted capability")
+    if selected.adapter_build != "transhooter-worker@0.1.0":
+        raise RuntimeError("frozen provider adapter build differs from runtime")
+    if selected.policy != "provider-profile-v1":
+        raise RuntimeError("frozen provider policy differs from runtime")
+    if selected.credential.reference != _expected_credential_reference(
+        profile_id, capability.stage
+    ):
+        raise RuntimeError("frozen provider credential reference differs from admitted profile")
     if isinstance(selected, SttStage) and selected.locale not in capability.languages:
         raise RuntimeError("frozen STT locale is not capability-approved")
+    if isinstance(selected, SttStage) and selected.encoding != "linear16":
+        raise RuntimeError("frozen STT encoding is not runtime-approved")
     if isinstance(selected, TranslationStage) and (
         selected.source_code not in capability.languages
         or selected.target_code not in capability.languages
@@ -359,8 +383,10 @@ def _validate_frozen_stage(
         or selected.sample_rate != dict(capability.limits).get("sample_rate")
     ):
         raise RuntimeError("frozen TTS format is not capability-approved")
+    if isinstance(selected, TtsStage) and selected.encoding != "linear16":
+        raise RuntimeError("frozen TTS encoding is not runtime-approved")
     required_limits = dict(capability.limits)
-    if any(selected.limits.get(name) != value for name, value in required_limits.items()):
+    if selected.limits != required_limits:
         raise RuntimeError("frozen provider limits differ from admitted capability")
     if selected.credential.version != _expected_credential_version(profile_id, capability):
         raise RuntimeError("frozen provider credential version differs from admitted profile")
@@ -467,7 +493,9 @@ async def _report_runtime_failure(
             {
                 "kind": type(error).__name__,
                 "message": str(error),
-                "lastCheckpointHashes": checkpoint_hashes,
+                "lastCheckpointHashes": {
+                    str(source_id): digest for source_id, digest in checkpoint_hashes.items()
+                },
             }
         )
     except Exception:
@@ -688,6 +716,8 @@ async def _persist_checkpoint(
                 return
 
         predecessor = state.watermarks.get(source_id)
+        if requested == predecessor:
+            return
         if predecessor is not None:
             (
                 previous_sequence,
@@ -969,8 +999,7 @@ async def _record_terminal_pcm(
             meeting_id,
             16_000 if stage == "stt-input" else 48_000,
         )
-        closed_objects = await asyncio.to_thread(
-            compactor.compact,
+        closed_objects = compactor.compact(
             stage,
             direction,
             drain=True,
@@ -989,6 +1018,36 @@ async def _record_terminal_pcm(
                 closed_object,
                 str(terminal_checkpoint),
             )
+
+
+async def _register_uploaded_evidence(
+    metadata: JobMetadata,
+    control: ControlClient,
+    _meeting_id: UUID,
+    spool_object_id: UUID,
+    object_class: str,
+    record: ObjectRecord,
+) -> None:
+    await control.record_object(
+        {
+            "writerEpoch": metadata.write_epoch,
+            "causalKey": str(spool_object_id),
+            "object": {
+                "objectId": str(spool_object_id),
+                "class": object_class,
+                "key": record.key,
+                "versionId": record.version_id,
+                "size": record.size,
+                "sha256": record.sha256,
+                "s3Checksum": record.s3_checksum,
+                "contentType": record.content_type,
+                "sampleRange": None,
+                "attempt": None,
+                "sequence": None,
+            },
+        },
+        event_id=spool_object_id,
+    )
 
 
 async def _deliver_checkpoint(
@@ -1017,8 +1076,7 @@ async def _deliver_checkpoint(
         control_event_id=pending.control_event_id,
         body=pending.body,
     )
-    archived = await asyncio.to_thread(
-        archive.put_create_once,
+    archived = archive.put_create_once(
         object_key,
         pending.body,
         "application/json",
@@ -1045,10 +1103,17 @@ async def _deliver_checkpoint(
         event_id=pending.checkpoint_id,
     )
     if pending.terminal:
-        await asyncio.to_thread(
-            upload_committed_objects,
+        await upload_committed_objects_async(
             spool,
             archive,
+            lambda meeting_id, object_id, object_class, record: _register_uploaded_evidence(
+                metadata,
+                control,
+                meeting_id,
+                object_id,
+                object_class,
+                record,
+            ),
             metadata.consultation_id,
         )
         await _record_terminal_pcm(metadata, spool, archive, control)
@@ -1530,7 +1595,7 @@ def _install_room_handlers(
     return subscribe_if_allowed
 
 
-async def consultation_entrypoint(ctx: agents.JobContext) -> None:
+async def _run_consultation(ctx: agents.JobContext) -> None:
     metadata = _validated_job_metadata(ctx.job.metadata)
     spool = _spool()
     archive = build_archive(Path(os.environ.get("SPOOL_PATH") or os.environ["SPOOL_DIR"]))
@@ -1781,6 +1846,18 @@ async def consultation_entrypoint(ctx: agents.JobContext) -> None:
     )
 
 
+
+
+async def consultation_entrypoint(ctx: agents.JobContext) -> None:
+    try:
+        await _run_consultation(ctx)
+    except SpoolUnavailable:
+        supervisor_pid = os.environ.get("TRANSHOOTER_WORKER_SUPERVISOR_PID")
+        if supervisor_pid is not None:
+            os.kill(int(supervisor_pid), signal.SIGTERM)
+        raise
+
+
 def run_worker() -> None:
     credentials_file = os.environ.get("LIVEKIT_CREDENTIALS_FILE")
     if not credentials_file:
@@ -1795,6 +1872,7 @@ def run_worker() -> None:
         or not api_secret
     ):
         raise RuntimeError("LiveKit credential file is invalid")
+    os.environ["TRANSHOOTER_WORKER_SUPERVISOR_PID"] = str(os.getpid())
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=consultation_entrypoint,

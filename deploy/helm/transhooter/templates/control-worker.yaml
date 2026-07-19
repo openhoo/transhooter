@@ -13,7 +13,11 @@ spec:
   template:
     metadata:
       annotations:
-        {{- toYaml .Values.podAnnotations | nindent 8 }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        transhooter.io/runtime-secret-revision: {{ .Values.rollout.runtimeSecretRevision | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
         {{- include "transhooter.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: control-worker

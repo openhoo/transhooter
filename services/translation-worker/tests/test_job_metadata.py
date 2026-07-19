@@ -1,15 +1,21 @@
 import hashlib
 import json
+import signal
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 from jsonschema.exceptions import ValidationError
 
+from transhooter_worker.adapters.spool import SpoolUnavailable
+from transhooter_worker.domain.models import StageCapabilities
 from transhooter_worker.runtime.job import (
     SourceTrackTimeline,
+    SttStage,
     _reported_preflight,
+    _validate_frozen_stage,
     _validated_job_metadata,
+    consultation_entrypoint,
 )
 
 
@@ -155,3 +161,69 @@ async def test_provider_preflight_failure_is_reported_before_propagation() -> No
         "lastCheckpointHashes": {},
     }
     assert reports == [expected_report]
+
+
+@pytest.mark.asyncio
+async def test_spool_failure_requests_graceful_supervisor_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[tuple[int, int]] = []
+
+    async def fail_consultation(_ctx: object) -> None:
+        raise SpoolUnavailable("spool unavailable")
+
+    monkeypatch.setenv("TRANSHOOTER_WORKER_SUPERVISOR_PID", "1234")
+    monkeypatch.setattr("transhooter_worker.runtime.job._run_consultation", fail_consultation)
+    monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
+
+    with pytest.raises(SpoolUnavailable, match="spool unavailable"):
+        await consultation_entrypoint(object())  # type: ignore[arg-type]
+
+    assert killed == [(1234, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("adapterBuild", "stale-build", "adapter build"),
+        ("policy", "unfrozen-policy", "policy"),
+        ("encoding", "opus", "encoding"),
+        (
+            "credential",
+            {"reference": "caller-secret", "version": "fixture"},
+            "credential reference",
+        ),
+        ("limits", {"message_bytes": 8_000, "extra": 1}, "limits"),
+    ],
+)
+def test_frozen_stage_preflight_rejects_every_non_capability_field_mismatch(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    selected = {
+        "provider": "fixture",
+        "endpoint": "fixture://stt",
+        "region": "test",
+        "model": "deterministic",
+        "adapterBuild": "transhooter-worker@0.1.0",
+        "policy": "provider-profile-v1",
+        "credential": {"reference": "fixture", "version": "fixture"},
+        "limits": {"message_bytes": 8_000},
+        "locale": "en-US",
+        "encoding": "linear16",
+    }
+    selected[field] = value
+    capability = StageCapabilities(
+        provider="fixture",
+        stage="stt",
+        endpoint="fixture://stt",
+        regions=("test",),
+        languages=("en-US",),
+        models=("deterministic",),
+        limits=(("message_bytes", 8_000),),
+        evidence=None,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        _validate_frozen_stage(SttStage.model_validate(selected), capability, "fixture")

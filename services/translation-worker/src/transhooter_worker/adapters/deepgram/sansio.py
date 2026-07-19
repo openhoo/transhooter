@@ -15,6 +15,8 @@ JournalFrame = Callable[[str, str, bytes, tuple[tuple[str, str], ...]], None]
 class SansIoWebSocket:
     """Adapter-owned TLS transport exposing every HTTP and WebSocket protocol boundary."""
 
+    _INBOUND_QUEUE_SIZE = 64
+
     def __init__(
         self,
         reader: asyncio.StreamReader,
@@ -26,7 +28,10 @@ class SansIoWebSocket:
         self._writer = writer
         self._protocol = protocol
         self._journal = journal
-        self._queue: asyncio.Queue[str | bytes | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[str | bytes | None] = asyncio.Queue(
+            maxsize=self._INBOUND_QUEUE_SIZE + 1
+        )
+        self._message_slots = asyncio.Semaphore(self._INBOUND_QUEUE_SIZE)
         self._fragments = bytearray()
         self._fragment_opcode: Opcode | None = None
         self._reader_task = asyncio.create_task(self._read())
@@ -42,10 +47,15 @@ class SansIoWebSocket:
     ) -> SansIoWebSocket:
         uri = parse_uri(url)
         reader, writer = await cls._open_tls_stream(uri.host, uri.port)
-        protocol = ClientProtocol(uri, max_size=2**24)
-        await cls._send_upgrade_request(protocol, writer, authorization, journal)
-        await cls._receive_upgrade_response(protocol, reader, journal)
-        return cls(reader, writer, protocol, journal)
+        try:
+            protocol = ClientProtocol(uri, max_size=2**24)
+            await cls._send_upgrade_request(protocol, writer, authorization, journal)
+            await cls._receive_upgrade_response(protocol, reader, journal)
+            return cls(reader, writer, protocol, journal)
+        except BaseException:
+            writer.close()
+            await writer.wait_closed()
+            raise
 
     @staticmethod
     async def _open_tls_stream(
@@ -139,6 +149,7 @@ class SansIoWebSocket:
                 value = await self._queue.get()
                 if value is None:
                     return
+                self._message_slots.release()
                 yield value
 
         return iterator()
@@ -154,6 +165,7 @@ class SansIoWebSocket:
 
                 for event in self._protocol.events_received():
                     if isinstance(event, Frame) and await self._handle_frame(event):
+                        await self._flush()
                         return
 
                 await self._flush()
@@ -208,7 +220,12 @@ class SansIoWebSocket:
             message = payload.decode()
         else:
             message = payload
-        await self._queue.put(message)
+        await self._message_slots.acquire()
+        try:
+            self._queue.put_nowait(message)
+        except BaseException:
+            self._message_slots.release()
+            raise
         self._fragment_opcode = None
         self._fragments.clear()
 

@@ -30,8 +30,8 @@ const finalCaption = CaptionPacketSchema.parse({
   occurredAtMs: 10,
 });
 
-void test("caption trust binding and revisions fail closed", () => {
-  assert.equal(acceptsCaption(finalCaption, undefined, expectedCaption), true);
+void test("caption route binding and revisions fail closed", () => {
+  assert.equal(acceptsCaption(finalCaption, undefined, expectedCaption, true), true);
   assert.equal(
     acceptsCaption(
       {
@@ -40,11 +40,12 @@ void test("caption trust binding and revisions fail closed", () => {
       },
       undefined,
       expectedCaption,
+      true,
     ),
     false,
   );
   assert.equal(
-    acceptsCaption({ ...finalCaption, revision: 1 }, finalCaption, expectedCaption),
+    acceptsCaption({ ...finalCaption, revision: 1 }, finalCaption, expectedCaption, true),
     false,
   );
   assert.equal(
@@ -52,9 +53,14 @@ void test("caption trust binding and revisions fail closed", () => {
       { ...finalCaption, revision: 3, finality: "provisional" },
       finalCaption,
       expectedCaption,
+      true,
     ),
     false,
   );
+});
+
+void test("caption trust binding requires a LiveKit agent sender", () => {
+  assert.equal(acceptsCaption(finalCaption, undefined, expectedCaption, false), false);
 });
 
 void test("status accepts only absent server sender in the current generation", () => {

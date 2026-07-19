@@ -13,6 +13,11 @@ spec:
       app.kubernetes.io/component: egress
   template:
     metadata:
+      annotations:
+        transhooter.io/egress-config-secret-revision: {{ .Values.rollout.egressConfigSecretRevision | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
         {{- include "transhooter.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: egress
@@ -20,8 +25,10 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         seccompProfile:
-          type: Localhost
-          localhostProfile: {{ .Values.egress.seccompLocalhostProfile | quote }}
+          type: {{ .Values.egress.seccomp.type }}
+          {{- if eq .Values.egress.seccomp.type "Localhost" }}
+          localhostProfile: {{ .Values.egress.seccomp.localhostProfile | quote }}
+          {{- end }}
       terminationGracePeriodSeconds: 3600
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}

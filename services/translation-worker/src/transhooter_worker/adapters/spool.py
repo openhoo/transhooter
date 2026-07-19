@@ -107,8 +107,13 @@ def _locked[**P, R](
 ) -> Callable[Concatenate[EncryptedSpool, P], R]:
     @wraps(method)
     def wrapper(self: EncryptedSpool, *args: P.args, **kwargs: P.kwargs) -> R:
-        with self._exclusive():
-            return method(self, *args, **kwargs)
+        try:
+            with self._exclusive():
+                return method(self, *args, **kwargs)
+        except SpoolUnavailable:
+            raise
+        except (InvalidTag, OSError, sqlite3.Error) as exc:
+            raise SpoolUnavailable("encrypted spool operation failed") from exc
 
     return cast(Callable[Concatenate["EncryptedSpool", P], R], wrapper)
 
@@ -206,9 +211,6 @@ class EncryptedSpool:
         key_id = self._active_key_id
         nonce = os.urandom(12)
         plaintext_hash = hashlib.sha256(payload).hexdigest()
-        aad = self._envelope_aad(meeting_id, attempt_id, object_id, stage, metadata, version=2)
-        encrypted = AESGCM(self._keys[key_id]).encrypt(nonce, payload, aad)
-        ciphertext_hash = hashlib.sha256(encrypted).hexdigest()
         header = self._build_header(
             object_id=object_id,
             attempt_id=attempt_id,
@@ -220,11 +222,14 @@ class EncryptedSpool:
             key_id=key_id,
             nonce=nonce,
             plaintext_hash=plaintext_hash,
-            ciphertext_hash=ciphertext_hash,
+            ciphertext_hash="",
             payload_size=len(payload),
             sample_range=sample_range,
             metadata=metadata,
         )
+        encrypted = AESGCM(self._keys[key_id]).encrypt(nonce, payload, self._header_aad(header))
+        ciphertext_hash = hashlib.sha256(encrypted).hexdigest()
+        header["ciphertext_sha256"] = ciphertext_hash
         final_path = self._root / f"{object_id}.wal"
         temp_path = self._root / f".{object_id}.tmp"
         ordinal = self._commit_envelope(
@@ -362,7 +367,7 @@ class EncryptedSpool:
         metadata: tuple[tuple[str, str], ...],
     ) -> dict[str, Any]:
         return {
-            "aad_version": 2,
+            "aad_version": 3,
             "object_id": str(object_id),
             "attempt_id": str(attempt_id),
             "meeting_id": str(meeting_id),
@@ -395,6 +400,17 @@ class EncryptedSpool:
         if version < 2:
             return base
         return base + b":" + json.dumps(metadata, separators=(",", ":")).encode()
+
+    @staticmethod
+    def _header_aad(header: dict[str, Any]) -> bytes:
+        if int(header.get("aad_version", 0)) != 3:
+            raise ValueError("unsupported full-header AAD version")
+        authenticated = {key: value for key, value in header.items() if key != "ciphertext_sha256"}
+        return json.dumps(
+            authenticated,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
 
     def _commit_envelope(
         self,
@@ -840,15 +856,19 @@ class EncryptedSpool:
         ):
             raise SpoolUnavailable("ciphertext authentication hash mismatch")
         try:
-            metadata = tuple(tuple(str(value) for value in item) for item in header["metadata"])
-            aad = self._envelope_aad(
-                UUID(row[0]),
-                UUID(row[1]),
-                object_id,
-                str(row[2]),
-                metadata,
-                version=int(header.get("aad_version", 1)),
-            )
+            version = int(header.get("aad_version", 1))
+            if version >= 3:
+                aad = self._header_aad(header)
+            else:
+                metadata = tuple(tuple(str(value) for value in item) for item in header["metadata"])
+                aad = self._envelope_aad(
+                    UUID(row[0]),
+                    UUID(row[1]),
+                    object_id,
+                    str(row[2]),
+                    metadata,
+                    version=version,
+                )
         except (KeyError, TypeError, ValueError) as exc:
             raise SpoolUnavailable("invalid authenticated spool header") from exc
         try:
@@ -1011,6 +1031,10 @@ class EncryptedSpool:
                 (version_id, checksum, str(object_id)),
             )
 
+    def quarantine(self, object_id: UUID) -> None:
+        with self._exclusive():
+            self._quarantine(object_id)
+
     def recover(self) -> None:
         with self._exclusive():
             self._recover_unlocked()
@@ -1100,15 +1124,12 @@ class EncryptedSpool:
         if final.stem != str(object_id) or hashlib.sha256(encrypted).hexdigest() != ciphertext_hash:
             raise ValueError("orphan ciphertext hash mismatch")
         try:
-            metadata = tuple(tuple(str(value) for value in item) for item in header["metadata"])
-            aad = self._envelope_aad(
-                meeting_id,
-                attempt_id,
-                object_id,
-                str(header["stage"]),
-                metadata,
-                version=int(header.get("aad_version", 1)),
-            )
+            version = int(header.get("aad_version", 1))
+            if version < 3:
+                raise ValueError(
+                    "legacy spool envelope cannot be imported without authenticated recovery metadata"
+                )
+            aad = self._header_aad(header)
             plain = AESGCM(self._keys[key_id]).decrypt(nonce, encrypted, aad)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("orphan authenticated header is invalid") from exc

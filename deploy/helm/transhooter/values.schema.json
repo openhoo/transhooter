@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["images", "existingSecret", "providerSecretName", "spool", "config"],
+  "required": ["images", "existingSecret", "providerSecretName", "spool", "config", "rollout"],
   "oneOf": [
     {
       "required": ["config", "providerSecretKeys"],
@@ -59,6 +59,16 @@
       "uniqueItems": true
     },
     "egressConfigSecret": { "type": "string", "minLength": 1 },
+    "rollout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeSecretRevision", "providerSecretRevision", "egressConfigSecretRevision"],
+      "properties": {
+        "runtimeSecretRevision": { "type": "string", "pattern": ".*\\S.*" },
+        "providerSecretRevision": { "type": "string", "pattern": ".*\\S.*" },
+        "egressConfigSecretRevision": { "type": "string", "pattern": ".*\\S.*" }
+      }
+    },
     "images": {
       "propertyNames": {
         "enum": ["web", "controlWorker", "translationWorker", "egress"]
@@ -94,6 +104,7 @@
         "archiveRequireKms",
         "publicUrl",
         "publicLivekitUrl",
+        "trustedClientIpHeader",
         "internalIssuer",
         "internalAudience",
         "kubernetesApiAudience",
@@ -106,6 +117,11 @@
         "livekitUrl": { "type": "string", "pattern": "^wss://" },
         "publicUrl": { "type": "string", "pattern": "^https://" },
         "publicLivekitUrl": { "type": "string", "pattern": "^wss://" },
+        "trustedClientIpHeader": {
+          "type": "string",
+          "pattern": "^x-[a-z0-9-]+$",
+          "not": { "enum": ["x-forwarded-for", "x-real-ip"] }
+        },
         "s3Endpoint": { "type": "string", "pattern": "^https://" },
         "s3KmsKeyId": { "type": "string", "pattern": ".*\\S.*" },
         "s3Region": { "type": "string", "minLength": 1 },
@@ -212,11 +228,28 @@
     },
     "egress": {
       "type": "object",
-      "required": ["enabled", "replicas", "seccompLocalhostProfile", "resources"],
+      "required": ["enabled", "replicas", "seccomp", "resources"],
       "properties": {
         "enabled": { "type": "boolean" },
         "replicas": { "type": "integer", "minimum": 1 },
-        "seccompLocalhostProfile": { "type": "string", "minLength": 1 }
+        "seccomp": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "enum": ["RuntimeDefault", "Localhost"] },
+            "localhostProfile": { "type": "string" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "type": { "const": "Localhost" } } },
+              "then": {
+                "required": ["localhostProfile"],
+                "properties": { "localhostProfile": { "type": "string", "minLength": 1 } }
+              }
+            }
+          ]
+        }
       }
     }
   }

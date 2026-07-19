@@ -205,7 +205,7 @@ export const HttpRawReferenceSchema = z
   .object({
     transport: z.literal("http"),
     method: z.string().min(1),
-    url: z.url(),
+    url: z.url({ protocol: /^https?$/u }),
     status: z.number().int().min(100).max(599).nullable(),
     requestHeaders: z.array(OrderedHeaderSchema),
     requestBody: RawArtifactSchema,
@@ -229,7 +229,7 @@ export type WebSocketFrameReference = z.infer<typeof WebSocketFrameReferenceSche
 export const WebSocketRawReferenceSchema = z
   .object({
     transport: z.literal("websocket"),
-    url: z.url(),
+    url: z.url({ protocol: /^wss?$/u }),
     upgradeRequestHeaders: z.array(OrderedHeaderSchema),
     upgradeResponseHeaders: z.array(OrderedHeaderSchema),
     frames: z.array(WebSocketFrameReferenceSchema),
@@ -340,52 +340,88 @@ const ProviderAttemptTerminalCommonShape = {
   occurredAtMs: NonNegativeIntegerSchema,
 };
 
+const ProviderAttemptTerminalCommonSchema = z.object(ProviderAttemptTerminalCommonShape);
+type ProviderAttemptTerminalCommon = z.infer<typeof ProviderAttemptTerminalCommonSchema>;
+
+function validateProviderAttemptTerminal(
+  terminal: ProviderAttemptTerminalCommon,
+  context: z.RefinementCtx,
+): void {
+  const didFail = terminal.outcome === "failed";
+  const hasError = terminal.error !== null;
+  if (didFail !== hasError) {
+    context.addIssue({
+      code: "custom",
+      message: "only failed terminals carry an error",
+      path: ["error"],
+    });
+  }
+  if (terminal.error !== null && terminal.error.attemptId !== terminal.attemptId) {
+    context.addIssue({
+      code: "custom",
+      message: "error attemptId must match the terminal attempt",
+      path: ["error", "attemptId"],
+    });
+  }
+  if (
+    terminal.retryDecision.previousAttemptId !== null &&
+    terminal.retryDecision.previousAttemptId !== terminal.attemptId
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "retry decision must link to the terminal attempt",
+      path: ["retryDecision", "previousAttemptId"],
+    });
+  }
+  if (
+    terminal.retryDecision.action === "retry" &&
+    terminal.retryDecision.previousAttemptId !== terminal.attemptId
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "retry decisions require the terminal attempt link",
+      path: ["retryDecision", "previousAttemptId"],
+    });
+  }
+  if (terminal.retryOfAttemptId === terminal.attemptId) {
+    context.addIssue({
+      code: "custom",
+      message: "an attempt cannot retry itself",
+      path: ["retryOfAttemptId"],
+    });
+  }
+}
+
 export const HttpProviderAttemptTerminalSchema = z
   .object({
     ...ProviderAttemptTerminalCommonShape,
     transport: z.literal("http"),
     rawReference: HttpRawReferenceSchema,
   })
-  .strict();
+  .strict()
+  .superRefine(validateProviderAttemptTerminal);
 export const WebSocketProviderAttemptTerminalSchema = z
   .object({
     ...ProviderAttemptTerminalCommonShape,
     transport: z.literal("websocket"),
     rawReference: WebSocketRawReferenceSchema,
   })
-  .strict();
+  .strict()
+  .superRefine(validateProviderAttemptTerminal);
 export const GrpcProviderAttemptTerminalSchema = z
   .object({
     ...ProviderAttemptTerminalCommonShape,
     transport: z.literal("grpc"),
     rawReference: GrpcRawReferenceSchema,
   })
-  .strict();
+  .strict()
+  .superRefine(validateProviderAttemptTerminal);
 
-export const ProviderAttemptTerminalSchema = z
-  .discriminatedUnion("transport", [
-    HttpProviderAttemptTerminalSchema,
-    WebSocketProviderAttemptTerminalSchema,
-    GrpcProviderAttemptTerminalSchema,
-  ])
-  .superRefine((terminal, context) => {
-    const didFail = terminal.outcome === "failed";
-    const hasError = terminal.error !== null;
-    if (didFail !== hasError) {
-      context.addIssue({
-        code: "custom",
-        message: "only failed terminals carry an error",
-        path: ["error"],
-      });
-    }
-    if (terminal.retryDecision.previousAttemptId !== terminal.retryOfAttemptId) {
-      context.addIssue({
-        code: "custom",
-        message: "retry links must agree",
-        path: ["retryOfAttemptId"],
-      });
-    }
-  });
+export const ProviderAttemptTerminalSchema = z.discriminatedUnion("transport", [
+  HttpProviderAttemptTerminalSchema,
+  WebSocketProviderAttemptTerminalSchema,
+  GrpcProviderAttemptTerminalSchema,
+]);
 export type ProviderAttemptTerminal = z.infer<typeof ProviderAttemptTerminalSchema>;
 
 export const ProviderAttemptRawReferenceSchema = z
@@ -434,6 +470,33 @@ export const ProviderAttemptReportSchema = z
         code: "custom",
         message: "error attemptId must match the reported attempt",
         path: ["error", "attemptId"],
+      });
+    }
+    if (
+      report.retryDecision.previousAttemptId !== null &&
+      report.retryDecision.previousAttemptId !== report.attemptId
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "retry decision must link to the reported attempt",
+        path: ["retryDecision", "previousAttemptId"],
+      });
+    }
+    if (
+      report.retryDecision.action === "retry" &&
+      report.retryDecision.previousAttemptId !== report.attemptId
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "retry decisions require the reported attempt link",
+        path: ["retryDecision", "previousAttemptId"],
+      });
+    }
+    if (report.retryOfAttemptId === report.attemptId) {
+      context.addIssue({
+        code: "custom",
+        message: "an attempt cannot retry itself",
+        path: ["retryOfAttemptId"],
       });
     }
     if (report.occurredAtMs < report.startedAtMs) {

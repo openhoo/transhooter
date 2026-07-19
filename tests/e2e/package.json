@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "smoke:consultation": "bun smoke-consultation.mjs"
+    "smoke:consultation": "bun smoke-consultation.mjs",
+    "test": "bun test harness-contracts.test.mjs"
   },
   "dependencies": {
     "playwright": "1.55.0"

@@ -35,6 +35,13 @@ function hasInternalAuthentication(value: {
   return hasBearerFiles || hasJwtConfiguration;
 }
 
+function hasTrustedClientIpBoundary(value: {
+  APP_ENV: "development" | "test" | "production";
+  TRUSTED_CLIENT_IP_HEADER?: string | undefined;
+}): boolean {
+  return value.APP_ENV !== "production" || value.TRUSTED_CLIENT_IP_HEADER !== undefined;
+}
+
 const EnvironmentSchema = z
   .object({
     APP_ENV: z.enum(["development", "test", "production"]),
@@ -64,12 +71,23 @@ const EnvironmentSchema = z
     INTERNAL_JWT_AUDIENCE: z.string().min(1).optional(),
     INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE: z.string().min(1).optional(),
     POD_NAMESPACE: z.string().min(1).optional(),
+    TRUSTED_CLIENT_IP_HEADER: z
+      .string()
+      .regex(/^x-[a-z0-9-]+$/iu)
+      .transform((header) => header.toLowerCase())
+      .refine((header) => header !== "x-forwarded-for" && header !== "x-real-ip", {
+        message: "TRUSTED_CLIENT_IP_HEADER must be a dedicated boundary header",
+      })
+      .optional(),
   })
   .refine(hasSmtpSource, {
     message: "SMTP_URL or SMTP_URL_FILE is required",
   })
   .refine(hasRequiredKmsKey, {
     message: "S3_KMS_KEY_ID is required when ARCHIVE_REQUIRE_KMS=true",
+  })
+  .refine(hasTrustedClientIpBoundary, {
+    message: "TRUSTED_CLIENT_IP_HEADER is required in production",
   })
   .refine(hasInternalAuthentication, {
     message:
@@ -105,6 +123,7 @@ export type WebConfig = {
   internalJwtAudience: string | null;
   internalServiceAccountToken: string | null;
   podNamespace: string | null;
+  trustedClientIpHeader: string | null;
 };
 
 let cached: WebConfig | undefined;
@@ -121,12 +140,16 @@ function readOptionalSecret(path: string | undefined): string | null {
   return path ? readSecret(path) : null;
 }
 
+export function parseWebEnvironment(environment: NodeJS.ProcessEnv) {
+  return EnvironmentSchema.parse(environment);
+}
+
 export function webConfig(): WebConfig {
   if (cached) {
     return cached;
   }
 
-  const environment = EnvironmentSchema.parse(process.env);
+  const environment = parseWebEnvironment(process.env);
   const smtpUrl = environment.SMTP_URL_FILE
     ? readSecret(environment.SMTP_URL_FILE)
     : environment.SMTP_URL;
@@ -167,6 +190,7 @@ export function webConfig(): WebConfig {
       environment.INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE,
     ),
     podNamespace: environment.POD_NAMESPACE ?? null,
+    trustedClientIpHeader: environment.TRUSTED_CLIENT_IP_HEADER ?? null,
   };
   return cached;
 }

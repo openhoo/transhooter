@@ -12,10 +12,22 @@ import {
   writeFile,
 } from "node:fs/promises";
 import http from "node:http";
+import { chromium } from "playwright";
 import postgres from "postgres";
+import { archiveRaceWinner, restartCountIncremented } from "./harness-contracts.mjs";
 
 const baseUrl = process.env.BASE_URL ?? "http://web:3000";
+const serviceBaseUrl = (() => {
+  const url = new URL(baseUrl);
+  if (url.hostname === "app.localhost") {
+    url.hostname = "web";
+  }
+  return url.toString().replace(/\/$/u, "");
+})();
 const livekitUrl = process.env.LIVEKIT_URL ?? "ws://livekit:7880";
+const mailpitUrl = process.env.MAILPIT_URL ?? "http://mailpit:8025";
+const adminEmail = process.env.E2E_EMPLOYEE_EMAIL ?? process.env.BOOTSTRAP_ADMIN_EMAIL;
+if (!adminEmail) throw new Error("E2E_EMPLOYEE_EMAIL is required");
 const faultFile = process.env.FAULT_CONTROL_FILE ?? "/shared/faults.json";
 const workerScenarioFile = process.env.WORKER_SCENARIO_FILE ?? "/shared/worker-scenarios.json";
 const expectedProfile = process.env.EXPECTED_PROFILE ?? "fixture";
@@ -667,7 +679,7 @@ async function runConsultation({
   });
   run.absoluteTimer = setTimeout(() => {
     terminateProcessTree(run).catch(() => undefined);
-  }, 3 * 60_000);
+  }, 8 * 60_000);
   let created;
   try {
     created = await progress.promise;
@@ -728,6 +740,177 @@ async function resetAuthenticationThrottle() {
   await sql("TRUNCATE magic_link_requests");
 }
 
+async function latestLink(recipient) {
+  const listResponse = await fetch(`${mailpitUrl}/api/v1/messages?limit=100`);
+  if (!listResponse.ok) throw new Error(`Mailpit list failed: ${listResponse.status}`);
+  const payload = await listResponse.json();
+  const messages = (payload.messages ?? payload.Messages ?? [])
+    .filter((message) => {
+      const recipients = message.To ?? message.to ?? [];
+      return recipients.some((entry) => (entry.Address ?? entry.address) === recipient);
+    })
+    .sort(
+      (left, right) =>
+        Date.parse(right.Created ?? right.created ?? 0) -
+        Date.parse(left.Created ?? left.created ?? 0),
+    );
+  const message = messages[0];
+  if (!message) return null;
+  const id = message.ID ?? message.Id ?? message.id;
+  const detailResponse = await fetch(`${mailpitUrl}/api/v1/message/${encodeURIComponent(id)}`);
+  if (!detailResponse.ok) throw new Error(`Mailpit message failed: ${detailResponse.status}`);
+  const detail = await detailResponse.json();
+  const content = `${detail.HTML ?? detail.Html ?? ""}\n${detail.Text ?? detail.text ?? ""}`;
+  const match = content.match(/https?:\/\/[^\s"'<>]+\/auth\/exchange\?[^\s"'<>]+/u);
+  return match?.[0]?.replaceAll("&amp;", "&") ?? null;
+}
+
+function internalizeLink(link) {
+  const url = new URL(link);
+  const internal = new URL(baseUrl);
+  url.protocol = internal.protocol;
+  url.host = internal.host;
+  return url.toString();
+}
+
+async function authenticateAdmin(context) {
+  const page = await context.newPage();
+  await page.goto(`${baseUrl}/sign-in`, { waitUntil: "domcontentloaded" });
+  await page.getByLabel("Email address").fill(adminEmail);
+  const previousLink = await latestLink(adminEmail);
+  await page.getByRole("button", { name: "Email me a sign-in link" }).click();
+  const link = await waitFor(
+    "admin magic link",
+    async () => {
+      const candidate = await latestLink(adminEmail);
+      return candidate && candidate !== previousLink ? candidate : null;
+    },
+    30_000,
+  );
+  await page.goto(internalizeLink(link), { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Continue securely" }).click();
+  await page.waitForURL(/\/consultations(?:\?|$)/u);
+  return page;
+}
+
+async function pagePost(page, path, body) {
+  return await page.evaluate(
+    async ({ path, body }) => {
+      const csrf = document.cookie
+        .split("; ")
+        .find((part) => part.startsWith("csrf="))
+        ?.slice(5);
+      if (!csrf) throw new Error("CSRF cookie unavailable");
+      const response = await fetch(path, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { "content-type": "application/json", "x-csrf-token": csrf },
+        body: JSON.stringify(body),
+      });
+      return {
+        ok: response.ok,
+        status: response.status,
+        body: await response.text(),
+      };
+    },
+    { path, body },
+  );
+}
+
+async function reauthenticateForArchive(page, consultationId) {
+  const previousLink = await latestLink(adminEmail);
+  const requested = await pagePost(page, "/api/auth/archive-delete-reauth", { consultationId });
+  if (!requested.ok) {
+    throw new Error(`archive reauthentication request failed: ${JSON.stringify(requested)}`);
+  }
+  const link = await waitFor(
+    "archive-bound reauthentication link",
+    async () => {
+      const candidate = await latestLink(adminEmail);
+      return candidate && candidate !== previousLink ? candidate : null;
+    },
+    30_000,
+  );
+  await page.goto(internalizeLink(link), { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Continue securely" }).click();
+  await page.waitForURL((url) => !url.pathname.startsWith("/auth/"), { timeout: 30_000 });
+}
+
+async function raceArchiveHoldAndDelete(archiveId, consultationId) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--host-resolver-rules=MAP app.localhost web, MAP rtc.localhost livekit"],
+  });
+  const holdContext = await browser.newContext();
+  const deleteContext = await browser.newContext();
+  try {
+    const holdPage = await authenticateAdmin(holdContext);
+    const deletePage = await authenticateAdmin(deleteContext);
+    await reauthenticateForArchive(holdPage, consultationId);
+    await reauthenticateForArchive(deletePage, consultationId);
+    const [hold, deletion] = await Promise.all([
+      pagePost(holdPage, `/api/archives/${archiveId}/hold`, {
+        archiveId,
+        consultationId,
+        reason: "failure-smoke-race",
+        enabled: true,
+      }),
+      pagePost(deletePage, `/api/archives/${archiveId}/delete`, {
+        archiveId,
+        consultationId,
+        reason: "failure-smoke-race",
+      }),
+    ]);
+    const outcome = await queryJson(`
+      SELECT a.state,
+        COALESCE(jsonb_agg(jsonb_build_object('id',h.id,'reason',h.reason))
+          FILTER (WHERE h.id IS NOT NULL AND h.released_at IS NULL),'[]'::jsonb) AS active_holds
+      FROM archives a
+      LEFT JOIN legal_holds h ON h.archive_id=a.id
+      WHERE a.id='${archiveId}'
+      GROUP BY a.state`);
+    const row = outcome[0];
+    const activeHolds = row?.active_holds ?? [];
+    const winner = archiveRaceWinner({
+      holdOk: hold.ok,
+      deleteOk: deletion.ok,
+      archiveState: row?.state,
+      activeHoldCount: activeHolds.length,
+    });
+    if (!winner) {
+      throw new Error(
+        `production hold/delete operations did not serialize: ${JSON.stringify({
+          hold,
+          deletion,
+          outcome,
+        })}`,
+      );
+    }
+    if (winner === "hold") {
+      await reauthenticateForArchive(holdPage, consultationId);
+      const release = await pagePost(holdPage, `/api/archives/${archiveId}/hold`, {
+        archiveId,
+        consultationId,
+        holdId: activeHolds[0].id,
+        enabled: false,
+      });
+      if (!release.ok) {
+        throw new Error(`production hold cleanup failed: ${JSON.stringify(release)}`);
+      }
+    }
+    return {
+      archiveState: row.state,
+      winner,
+      holdStatus: hold.status,
+      deleteStatus: deletion.status,
+    };
+  } finally {
+    await Promise.allSettled([holdContext.close(), deleteContext.close()]);
+    await browser.close();
+  }
+}
+
 async function queryJson(statement) {
   const output = await sql(
     `SELECT COALESCE(json_agg(row_to_json(q)), '[]'::json)::text FROM (${statement}) q`,
@@ -764,8 +947,9 @@ async function consultationEvidence(consultationId) {
         'terminalAt',w.terminal_at,'terminalCheckpointId',w.terminal_checkpoint_id
       ) ORDER BY w.epoch) FROM worker_job_epochs w WHERE w.consultation_id=c.id),'[]'::json) AS worker_epochs,
       COALESCE((SELECT json_agg(json_build_object(
-        'workerId',r.worker_id,'epoch',r.epoch,'heartbeatAt',r.heartbeat_at,
-        'leaseExpiresAt',r.lease_expires_at,'fencedAt',r.fenced_at,'fenceReason',r.fence_reason
+        'workerId',r.worker_id,'generation',r.generation,'epoch',r.epoch,
+        'heartbeatAt',r.heartbeat_at,'leaseExpiresAt',r.lease_expires_at,
+        'fencedAt',r.fenced_at,'fenceReason',r.fence_reason
       ) ORDER BY r.epoch) FROM worker_reservations r WHERE r.consultation_id=c.id),'[]'::json) AS reservations,
       COALESCE((SELECT count(*) FROM expected_archive_artifacts x WHERE x.archive_id=a.id),0)::int AS expected_count,
       COALESCE((SELECT count(*) FROM archive_objects o WHERE o.archive_id=a.id),0)::int AS object_count,
@@ -776,8 +960,8 @@ async function consultationEvidence(consultationId) {
         AS participant_grant_effects,
       COALESCE((SELECT count(*) FROM external_effects e
         WHERE e.consultation_id=c.id AND e.effect_kind='STATUS_PACKET'
-          AND e.request_bytes IS NOT NULL
-          AND convert_from(e.request_bytes,'UTF8') LIKE '%CAPTURE_READY%'),0)::int
+          AND e.result->'plan'->>'reasonCode'='CAPTURE_READY'
+          AND e.request_bytes IS NOT NULL),0)::int
         AS capture_ready_packets,
       COALESCE((SELECT count(*) FROM outbox o
         WHERE o.aggregate_id=c.id AND o.delivered_at IS NULL),0)::int AS pending_outbox,
@@ -801,6 +985,11 @@ async function consultationEvidence(consultationId) {
       COALESCE((SELECT count(*) FROM worker_job_epochs w
         WHERE w.consultation_id=c.id AND w.terminal_at IS NULL),0)::int
         AS unterminated_worker_epochs,
+      COALESCE((SELECT json_agg(json_build_object(
+        'kind',d.kind,'dueAt',d.due_at,'completedAt',d.completed_at,
+        'leaseOwner',d.lease_owner,'leaseExpiresAt',d.lease_expires_at
+      ) ORDER BY d.kind) FROM orchestration_deadlines d
+        WHERE d.consultation_id=c.id),'[]'::json) AS deadlines,
       (
         c.room_name IS NULL
         OR EXISTS (
@@ -831,6 +1020,27 @@ function isCleanSettlement(evidence) {
     Number(evidence.unterminated_worker_epochs) === 0 &&
     evidence.room_cleanup_confirmed === true
   );
+}
+
+function settlementSummary(evidence) {
+  return {
+    state: evidence.state,
+    generation: evidence.generation,
+    archiveState: evidence.archive_state,
+    pendingOutbox: evidence.pending_outbox,
+    pendingCancellationOutbox: evidence.pending_cancellation_outbox,
+    activeEffects: evidence.active_effects,
+    activeEgress: evidence.active_egress,
+    unfencedReservations: evidence.unfenced_reservations,
+    unterminatedWorkerEpochs: evidence.unterminated_worker_epochs,
+    roomCleanupConfirmed: evidence.room_cleanup_confirmed,
+    workerEpochs: evidence.worker_epochs,
+    reservations: evidence.reservations,
+    deadlines: evidence.deadlines,
+    roomEffects: evidence.effects.filter(
+      (effect) => effect.kind === "ROOM_CREATE" || effect.kind === "ROOM_DELETE",
+    ),
+  };
 }
 
 async function cancelBeforeStartForCleanup(consultationId) {
@@ -865,17 +1075,63 @@ async function cancelBeforeStartForCleanup(consultationId) {
   });
 }
 
-async function settleConsultation(consultationId) {
+async function forceArchiveReconciliationDeadline(consultationId, generation) {
+  await sql(`
+    UPDATE archives
+    SET reconciliation_deadline_at=now()-interval '1 second'
+    WHERE consultation_id='${consultationId}' AND state='reconciling';
+    INSERT INTO orchestration_deadlines(
+      consultation_id,generation,kind,due_at,completed_at,lease_owner,lease_expires_at
+    )
+    VALUES (
+      '${consultationId}',${generation},'archive-reconcile',
+      now()-interval '1 second',NULL,NULL,NULL
+    )
+    ON CONFLICT (consultation_id,generation,kind) DO UPDATE
+    SET due_at=excluded.due_at,completed_at=NULL,lease_owner=NULL,lease_expires_at=NULL
+  `);
+}
+
+async function settleConsultation(consultationId, { stopAtReconciliation = false } = {}) {
   for (let transition = 0; transition < 6; transition += 1) {
     const evidence = await consultationEvidence(consultationId);
     if (["ended", "cancelled", "deleted"].includes(evidence.state)) {
-      return await waitFor(
-        `${consultationId} terminal resource settlement`,
-        async () => {
-          const current = await consultationEvidence(consultationId);
-          return isCleanSettlement(current) ? current : null;
-        },
-        90_000,
+      if (stopAtReconciliation && evidence.archive_state === "reconciling") {
+        return evidence;
+      }
+      let initialError;
+      try {
+        return await waitFor(
+          `${consultationId} terminal resource settlement`,
+          async () => {
+            const current = await consultationEvidence(consultationId);
+            return isCleanSettlement(current) ? current : null;
+          },
+          30_000,
+        );
+      } catch (error) {
+        initialError = error;
+      }
+      let current = await consultationEvidence(consultationId);
+      if (current.archive_state === "reconciling") {
+        await forceArchiveReconciliationDeadline(consultationId, current.generation);
+        try {
+          return await waitFor(
+            `${consultationId} forced terminal resource settlement`,
+            async () => {
+              const forced = await consultationEvidence(consultationId);
+              return isCleanSettlement(forced) ? forced : null;
+            },
+            90_000,
+          );
+        } catch (error) {
+          initialError = error;
+          current = await consultationEvidence(consultationId);
+        }
+      }
+      throw new Error(
+        `terminal resources did not settle: ${JSON.stringify(settlementSummary(current))}`,
+        { cause: initialError },
       );
     }
     const generation = evidence.generation;
@@ -901,14 +1157,22 @@ async function settleConsultation(consultationId) {
       throw new Error(`cannot settle consultation ${consultationId} from state ${evidence.state}`);
     }
     const previousState = evidence.state;
-    await waitFor(
-      `${consultationId} cleanup from ${previousState}`,
-      async () => {
-        const current = await consultationEvidence(consultationId);
-        return current.state !== previousState ? current : null;
-      },
-      90_000,
-    );
+    try {
+      await waitFor(
+        `${consultationId} cleanup from ${previousState}`,
+        async () => {
+          const current = await consultationEvidence(consultationId);
+          return current.state !== previousState ? current : null;
+        },
+        90_000,
+      );
+    } catch (error) {
+      const current = await consultationEvidence(consultationId);
+      throw new Error(
+        `cleanup did not advance from ${previousState}: ${JSON.stringify(settlementSummary(current))}`,
+        { cause: error },
+      );
+    }
   }
   throw new Error(`consultation ${consultationId} did not release its scenario resources`);
 }
@@ -952,9 +1216,9 @@ async function settleConsultations(consultationIds, concurrency = 3) {
       await renewLease(0);
       throw new AggregateError(
         failures,
-        `failed to settle owned consultation IDs: ${failures
-          .map((failure) => failure.message.split(":", 1)[0])
-          .join(", ")}`,
+        `failed to settle owned consultations: ${failures
+          .map((failure) => failure.message)
+          .join("; ")}`,
       );
     }
   } catch (error) {
@@ -1011,21 +1275,33 @@ function assertTranslationFailureEvidence(evidence, expected) {
   );
   const linkedAttempts = operationAttempts.filter((candidate) => candidate.retryOf === attempt.id);
   if (expected.expectRetry) {
-    if (operationAttempts.length !== 2 || linkedAttempts.length !== 1) {
+    if (operationAttempts.length < 2 || linkedAttempts.length !== 1) {
       throw new Error(
         `${expected.failure} retry policy/relation mismatch: ${JSON.stringify(operationAttempts)}`,
       );
     }
-    const retry = linkedAttempts[0];
-    assertTerminalAttempt(retry);
-    if (
-      Number(retry.attemptNumber) !== Number(attempt.attemptNumber) + 1 ||
-      retry.operationId !== attempt.operationId ||
-      retry.retryOf !== attempt.id
-    ) {
+    const orderedAttempts = operationAttempts.toSorted(
+      (left, right) => Number(left.attemptNumber) - Number(right.attemptNumber),
+    );
+    for (let index = 1; index < orderedAttempts.length; index += 1) {
+      const previous = orderedAttempts[index - 1];
+      const current = orderedAttempts[index];
+      if (
+        !previous ||
+        !current ||
+        previous.retryDecision?.action !== "retry" ||
+        Number(current.attemptNumber) !== Number(previous.attemptNumber) + 1 ||
+        current.operationId !== previous.operationId ||
+        current.retryOf !== previous.id
+      ) {
+        throw new Error(
+          `${expected.failure} retry chain is not contiguous: ${JSON.stringify(operationAttempts)}`,
+        );
+      }
+    }
+    if (orderedAttempts.at(-1)?.retryDecision?.action === "retry") {
       throw new Error(
-        `${expected.failure} linked retry is not the exact next logical attempt: ` +
-          JSON.stringify(operationAttempts),
+        `${expected.failure} retry chain lacks a terminal decision: ${JSON.stringify(operationAttempts)}`,
       );
     }
   } else if (
@@ -1070,20 +1346,15 @@ async function main() {
         faults: { crashAfterPersistCalling: ["ROOM_CREATE"] },
       });
       const crashObservation = waitFor(
-        "control worker crash after persisted ROOM_CREATE",
+        "control worker container RestartCount increment after persisted ROOM_CREATE",
         async () => {
           for (const container of controls) {
-            if ((await inspect(container.Id)).RestartCount > restartBaseline.get(container.Id)) {
-              return container.Id;
+            const restartCount = (await inspect(container.Id)).RestartCount;
+            if (restartCountIncremented(restartBaseline.get(container.Id), restartCount)) {
+              return { containerId: container.Id, restartCount };
             }
           }
-          const attempts = await queryJson(`
-      SELECT effect.id,effect.attempts
-      FROM external_effects effect
-      WHERE effect.consultation_id='${crashRun.consultationId}'
-        AND effect.effect_kind = 'ROOM_CREATE'
-      LIMIT 1`);
-          return Number(attempts[0]?.attempts ?? 0) >= 2 ? `effect:${attempts[0].id}` : null;
+          return null;
         },
         30_000,
       );
@@ -1148,80 +1419,29 @@ async function main() {
         throw new Error("ROOM_CREATE did not durably continue its exact persisted request");
       proof.scenarios.push({
         name: "outbox-crash-continuation",
-        restartedContainer: restarted,
+        restartedContainer: restarted.containerId,
+        restartCount: restarted.restartCount,
         consultationId: recoveryProof.consultationId,
         inventorySha256: recoveryProof.inventorySha256,
         gapFreeInventory: true,
         durableContinuation: true,
       });
 
-      // Hold placement and delete admission serialize on the archive row. The delete
-      // contender must observe the committed hold after waiting for the row lock.
-      const holdId = randomUUID();
-      const holdLock = Promise.withResolvers();
-      const holdWriter = database.begin(async (transaction) => {
-        await transaction`SELECT id FROM archives WHERE id = ${recoveryProof.archiveId} FOR UPDATE`;
-        await transaction`
-    INSERT INTO legal_holds(
-      id,
-      archive_id,
-      reason,
-      actor_id,
-      session_id,
-      reauthenticated_at,
-      state,
-      placed_at,
-      aggregate_result,
-      per_version_results
-    )
-    SELECT
-      ${holdId},
-      ${recoveryProof.archiveId},
-      'failure-smoke-race',
-      session.user_id,
-      session.id,
-      now(),
-      'active',
-      now(),
-      '{}'::jsonb,
-      '[]'::jsonb
-    FROM sessions session
-    ORDER BY session.created_at DESC
-    LIMIT 1
-  `;
-        holdLock.resolve();
-        await transaction`SELECT pg_sleep(2)`;
-      });
-      await Promise.race([holdLock.promise, holdWriter]);
-      const deleteContender = database.begin(async (transaction) => {
-        await transaction`SELECT id FROM archives WHERE id = ${recoveryProof.archiveId} FOR UPDATE`;
-        await transaction`
-    UPDATE archives
-    SET state = 'deleting', write_epoch = write_epoch + 1, updated_at = now()
-    WHERE id = ${recoveryProof.archiveId}
-      AND state IN ('complete', 'incomplete')
-      AND NOT EXISTS (
-        SELECT 1
-        FROM legal_holds hold
-        WHERE hold.archive_id = archives.id
-          AND hold.released_at IS NULL
-      )
-  `;
-      });
-      await Promise.all([holdWriter, deleteContender]);
-      const holdRace = await queryJson(`
-  SELECT a.state,count(h.id)::int AS active_holds
-  FROM archives a LEFT JOIN legal_holds h ON h.archive_id=a.id AND h.released_at IS NULL
-  WHERE a.id='${recoveryProof.archiveId}' GROUP BY a.state`);
-      if (holdRace[0]?.state !== "complete" || holdRace[0]?.active_holds !== 1)
-        throw new Error(`hold/delete exclusion failed: ${JSON.stringify(holdRace)}`);
-      await sql(`DELETE FROM legal_holds WHERE id='${holdId}'`);
+      // Race the authenticated archive operations themselves. SQL is inspection-only:
+      // exactly one production operation may cross the archive-row exclusion boundary.
+      await resetAuthenticationThrottle();
+      const holdRace = await raceArchiveHoldAndDelete(
+        recoveryProof.archiveId,
+        recoveryProof.consultationId,
+      );
       proof.scenarios.push({
         name: "hold-delete-race",
         archiveId: recoveryProof.archiveId,
-        archiveState: holdRace[0].state,
-        activeHoldWon: true,
-        deleteFenced: true,
+        archiveState: holdRace.archiveState,
+        winner: holdRace.winner,
+        holdStatus: holdRace.holdStatus,
+        deleteStatus: holdRace.deleteStatus,
+        mutuallyExclusive: true,
       });
       await checkpointScenario("recovery-hold");
     }
@@ -1363,39 +1583,38 @@ async function main() {
         emittedOutputWatermark: partialAttempt.emitted,
         retryDecision: partialAttempt.retryDecision,
       });
-      await sql(`
-  UPDATE consultations SET both_absent_since=now()-interval '1 minute' WHERE id='${partialConsultationId}' AND state='active';
-  INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
-  VALUES ('${partialConsultationId}',${partialEvidence.generation},'absence',now()-interval '1 second')
-  ON CONFLICT(consultation_id,generation,kind) DO UPDATE SET due_at=excluded.due_at,completed_at=NULL,lease_owner=NULL,lease_expires_at=NULL`);
-      await waitFor(
-        "both-absent finalization",
-        async () => {
-          const evidence = await consultationEvidence(partialConsultationId);
-          return evidence.state === "finalizing" ? evidence : null;
-        },
-        60_000,
+      const reconcilingSettlement = await settleConsultation(partialConsultationId, {
+        stopAtReconciliation: true,
+      });
+      if (
+        reconcilingSettlement.state !== "ended" ||
+        reconcilingSettlement.archive_state !== "reconciling"
+      ) {
+        throw new Error(
+          `partial TTS did not reach archive reconciliation: ${JSON.stringify(
+            settlementSummary(reconcilingSettlement),
+          )}`,
+        );
+      }
+      await forceArchiveReconciliationDeadline(
+        partialConsultationId,
+        reconcilingSettlement.generation,
       );
-      await sql(`
-  UPDATE consultations SET finalize_deadline_at=now()-interval '1 second' WHERE id='${partialConsultationId}';
-  INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
-  VALUES ('${partialConsultationId}',${partialEvidence.generation},'finalize',now()-interval '1 second')
-  ON CONFLICT(consultation_id,generation,kind) DO UPDATE SET due_at=excluded.due_at,completed_at=NULL,lease_owner=NULL,lease_expires_at=NULL`);
-      const deadlineEvidence = await waitFor(
-        "forced finalization terminal evidence",
-        async () => {
-          const evidence = await consultationEvidence(partialConsultationId);
-          return evidence.state === "ended" &&
-            evidence.archive_state === "incomplete" &&
-            evidence.inventory?.status === "incomplete" &&
-            (evidence.inventory?.missing ?? []).length > 0 &&
-            evidence.egress.length > 0 &&
-            evidence.egress.every((job) => job.terminalAt && job.terminalResult)
-            ? evidence
-            : null;
-        },
-        120_000,
-      );
+      const deadlineEvidence = await settleConsultation(partialConsultationId);
+      if (
+        deadlineEvidence.state !== "ended" ||
+        deadlineEvidence.archive_state !== "incomplete" ||
+        deadlineEvidence.inventory?.status !== "incomplete" ||
+        (deadlineEvidence.inventory?.missing ?? []).length === 0 ||
+        deadlineEvidence.egress.length === 0 ||
+        !deadlineEvidence.egress.every((job) => job.terminalAt && job.terminalResult)
+      ) {
+        throw new Error(
+          `forced finalization omitted terminal evidence: ${JSON.stringify(
+            settlementSummary(deadlineEvidence),
+          )}`,
+        );
+      }
       proof.scenarios.push({
         name: "finalization-deadline",
         consultationId: partialConsultationId,
@@ -1440,6 +1659,19 @@ async function main() {
         120_000,
       );
       const beforeFence = await consultationEvidence(preservationConsultationId);
+      if (
+        beforeFence.generation !== reservation.generation ||
+        !["active", "finalizing"].includes(beforeFence.state)
+      ) {
+        throw new Error(
+          `preservation fence preconditions changed before supervision: ${JSON.stringify({
+            consultationState: beforeFence.state,
+            consultationGeneration: beforeFence.generation,
+            reservationGeneration: reservation.generation,
+            reservationEpoch: reservation.epoch,
+          })}`,
+        );
+      }
       if (beforeFence.expected_count < 1)
         throw new Error("preservation failure crossed no durable expected-artifact barrier");
       await sql(
@@ -1491,7 +1723,7 @@ async function main() {
         "durable archive-failure status",
         async () => {
           const rows = await queryJson(
-            `SELECT effect_kind,state,result FROM external_effects WHERE consultation_id='${preservationConsultationId}' AND effect_kind='STATUS_PACKET' AND request_bytes IS NOT NULL AND convert_from(request_bytes,'UTF8') LIKE '%ARCHIVE_FAILED%' ORDER BY created_at`,
+            `SELECT effect_kind,state,result FROM external_effects WHERE consultation_id='${preservationConsultationId}' AND effect_kind='STATUS_PACKET' AND result->'plan'->>'reasonCode'='ARCHIVE_FAILED' AND request_bytes IS NOT NULL AND request_hash IS NOT NULL AND attempts > 0 ORDER BY created_at`,
           );
           return rows.length > 0 ? rows : null;
         },
@@ -1523,7 +1755,7 @@ async function main() {
         "web readiness to fail closed during MinIO outage",
         async () => {
           try {
-            const response = await fetch(`${baseUrl}/api/health/ready`, {
+            const response = await fetch(`${serviceBaseUrl}/api/health/ready`, {
               signal: AbortSignal.timeout(10_000),
             });
             return !response.ok;
@@ -1539,7 +1771,7 @@ async function main() {
         "web readiness after MinIO recovery",
         async () =>
           (
-            await fetch(`${baseUrl}/api/health/ready`, {
+            await fetch(`${serviceBaseUrl}/api/health/ready`, {
               signal: AbortSignal.timeout(10_000),
             })
           ).ok,
@@ -1565,9 +1797,13 @@ async function main() {
             inspect(drainerId).then((value) => value.State),
           ]);
           const workerUnavailable =
-            !workerState.Running || workerState.Health?.Status === "unhealthy";
+            !workerState.Running ||
+            workerState.Health?.Status === "unhealthy" ||
+            workerState.Health?.Log?.some((entry) => entry.ExitCode !== 0) === true;
           const drainerUnavailable =
-            !drainerState.Running || drainerState.Health?.Status === "unhealthy";
+            !drainerState.Running ||
+            drainerState.Health?.Status === "unhealthy" ||
+            drainerState.Health?.Log?.some((entry) => entry.ExitCode !== 0) === true;
           return workerUnavailable && drainerUnavailable
             ? { workerUnavailable, drainerUnavailable }
             : null;

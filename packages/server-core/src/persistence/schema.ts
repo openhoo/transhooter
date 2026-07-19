@@ -141,6 +141,7 @@ export const consultationParticipants = pgTable("consultation_participants", {
 			foreignColumns: [languageCapabilities.id],
 			name: "consultation_participants_capability_row_id_fkey"
 		}),
+	unique("consultation_participants_consultation_id_id_key").on(table.consultationId, table.id),
 	unique("consultation_participants_consultation_id_role_key").on(table.consultationId, table.role),
 	unique("consultation_participants_consultation_id_user_id_key").on(table.consultationId, table.userId),
 	unique("consultation_participants_livekit_identity_key").on(table.livekitIdentity),
@@ -302,8 +303,15 @@ export const workerCheckpoints = pgTable("worker_checkpoints", {
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	workerEpoch: bigint("worker_epoch", { mode: "number" }).notNull(),
 	writeEpoch: integer("write_epoch").notNull(),
+	sourceParticipantId: uuid("source_participant_id").notNull(),
+	destinationParticipantId: uuid("destination_participant_id").notNull(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
-	highWatermark: bigint("high_watermark", { mode: "number" }).notNull(),
+	acceptedInputSequence: bigint("accepted_input_sequence", { mode: "number" }).notNull(),
+	acceptedInput: bigint("high_watermark", { mode: "number" }).notNull(),
+	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
+	receivedOutput: bigint("received_output", { mode: "number" }).notNull(),
+	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
+	emittedOutput: bigint("emitted_output", { mode: "number" }).notNull(),
 	previousHash: text("previous_hash"),
 	checkpointHash: text("checkpoint_hash").notNull(),
 	expectedIds: jsonb("expected_ids").notNull(),
@@ -324,9 +332,22 @@ export const workerCheckpoints = pgTable("worker_checkpoints", {
 			foreignColumns: [workerReservations.consultationId, workerReservations.generation, workerReservations.workerId, workerReservations.epoch],
 			name: "worker_checkpoints_consultation_id_generation_worker_id_wo_fkey"
 		}),
-	unique("worker_checkpoints_consultation_id_worker_epoch_high_waterm_key").on(table.consultationId, table.workerEpoch, table.highWatermark),
+	foreignKey({
+			columns: [table.consultationId, table.sourceParticipantId],
+			foreignColumns: [consultationParticipants.consultationId, consultationParticipants.id],
+			name: "worker_checkpoints_source_participant_fkey"
+		}),
+	foreignKey({
+			columns: [table.consultationId, table.destinationParticipantId],
+			foreignColumns: [consultationParticipants.consultationId, consultationParticipants.id],
+			name: "worker_checkpoints_destination_participant_fkey"
+		}),
+	unique("worker_checkpoints_direction_watermarks_key").on(table.consultationId, table.workerEpoch, table.sourceParticipantId, table.destinationParticipantId, table.acceptedInputSequence, table.acceptedInput, table.receivedOutput, table.emittedOutput),
 	unique("worker_checkpoints_checkpoint_hash_key").on(table.checkpointHash),
-	check("worker_checkpoints_high_watermark_check", sql`high_watermark >= 0`),
+	check("worker_checkpoints_accepted_input_sequence_check", sql`accepted_input_sequence >= 0`),
+	check("worker_checkpoints_accepted_input_check", sql`high_watermark >= 0`),
+	check("worker_checkpoints_received_output_check", sql`received_output >= 0`),
+	check("worker_checkpoints_emitted_output_check", sql`emitted_output >= 0`),
 ]);
 
 export const externalEffects = pgTable("external_effects", {
@@ -446,6 +467,7 @@ export const archives = pgTable("archives", {
 			name: "archives_consultation_id_fkey"
 		}),
 	unique("archives_consultation_id_key").on(table.consultationId),
+	unique("archives_id_consultation_id_key").on(table.id, table.consultationId),
 	check("archives_write_epoch_check", sql`write_epoch >= 0`),
 	check("archives_hold_operation_kind_check", sql`hold_operation_kind = ANY (ARRAY['add'::text, 'release'::text])`),
 	check("archives_check", sql`((hold_operation_id IS NULL) = (hold_operation_owner IS NULL)) AND ((hold_operation_id IS NULL) = (hold_operation_kind IS NULL)) AND ((hold_operation_id IS NULL) = (hold_operation_started_at IS NULL)) AND ((hold_operation_id IS NULL) = (hold_operation_lease_expires_at IS NULL))`),
@@ -590,14 +612,9 @@ export const providerAttempts = pgTable("provider_attempts", {
 	terminalAt: timestamp("terminal_at", { withTimezone: true, mode: 'date' }),
 }, (table) => [
 	foreignKey({
-			columns: [table.archiveId],
-			foreignColumns: [archives.id],
-			name: "provider_attempts_archive_id_fkey"
-		}),
-	foreignKey({
-			columns: [table.consultationId],
-			foreignColumns: [consultations.id],
-			name: "provider_attempts_consultation_id_fkey"
+			columns: [table.archiveId, table.consultationId],
+			foreignColumns: [archives.id, archives.consultationId],
+			name: "provider_attempts_archive_consultation_fkey"
 		}),
 	foreignKey({
 			columns: [table.retryOf],

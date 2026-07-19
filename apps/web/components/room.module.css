@@ -1,6 +1,6 @@
 .room {
   background: var(--ink);
-  color: var(--cloud);
+  color: var(--room-foreground);
   border-radius: var(--radius-lg);
   overflow: hidden;
   box-shadow: var(--shadow);
@@ -17,6 +17,10 @@
   gap: var(--space-4);
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--cloud-line);
+}
+
+.chrome :global(.meta) {
+  color: var(--room-foreground-muted);
 }
 
 .recording {
@@ -209,7 +213,7 @@
   padding: var(--space-3) var(--space-4);
   border-top: 1px solid var(--amber-room-line);
   background: var(--amber-room-tint);
-  color: var(--cloud);
+  color: var(--room-foreground);
   animation: recover 150ms ease-out both;
 }
 
@@ -221,8 +225,21 @@
   padding: var(--space-8);
   text-align: center;
   background: var(--ink);
-  color: var(--cloud);
+  color: var(--room-foreground);
   border-radius: var(--radius-lg);
+}
+
+.join p {
+  color: var(--room-foreground-muted);
+}
+
+.join :global(.eyebrow) {
+  color: var(--room-foreground-muted);
+}
+
+.join :global(.button.secondary) {
+  border-color: var(--cloud-line);
+  color: var(--room-foreground);
 }
 
 .join .error,

@@ -184,9 +184,25 @@ type InternalCommand =
       report: ProviderAttemptReport;
     }
   | {
+      kind: "internal.failure";
+      consultationId: UUID;
+      generation: number;
+      workerId: UUID;
+      epoch: number;
+      eventId: UUID;
+      kindName: string;
+      message: string;
+      phase?: string;
+      snapshotHash?: string;
+      lastCheckpointHashes: Readonly<Record<UUID, string>>;
+    }
+  | {
       kind: "internal.archiveObject";
       consultationId: UUID;
-      writerEpoch: number;
+      generation?: number;
+      workerId?: UUID;
+      workerEpoch?: number;
+      writerEpoch?: number;
       causalKey: string;
       object: ArchiveObjectRecord;
     }
@@ -606,11 +622,34 @@ async function executeInternal(
     case "internal.providerAttempt":
       authorizeInternal(principal, "checkpoint:write", ["translation-worker"]);
       return config.operations.providerAttempt(command);
+    case "internal.failure":
+      authorizeInternal(principal, "failure:write", ["translation-worker"]);
+      return config.operations.workerFailure(command);
     case "internal.archiveObject":
       authorizeInternal(principal, "checkpoint:write", ["translation-worker", "spool-drainer"]);
-      return config.archives.recordObject(
+      if (principal.service === "translation-worker") {
+        if (
+          command.generation === undefined ||
+          command.workerId === undefined ||
+          command.workerEpoch === undefined ||
+          command.writerEpoch === undefined
+        ) {
+          throw new DomainError("INVALID_WORKER_ARCHIVE_OBJECT");
+        }
+        return config.archives.recordWorkerObject(
+          command.consultationId,
+          {
+            generation: command.generation,
+            workerId: command.workerId,
+            workerEpoch: command.workerEpoch,
+          },
+          command.writerEpoch,
+          command.causalKey,
+          command.object,
+        );
+      }
+      return config.archives.recordDrainerObject(
         command.consultationId,
-        command.writerEpoch,
         command.causalKey,
         command.object,
       );

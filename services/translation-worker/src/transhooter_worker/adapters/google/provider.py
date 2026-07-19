@@ -440,6 +440,8 @@ class GoogleSttProvider:
 
 class GoogleSttSession:
     _ROTATE = object()
+    _INPUT_QUEUE_SIZE = 32
+    _EVENT_QUEUE_SIZE = 64
 
     def __init__(
         self,
@@ -456,10 +458,15 @@ class GoogleSttSession:
         self._channel = channel
         self._id = sid
         self._language = language
-        self._input: asyncio.Queue[AudioChunk | object | None] = asyncio.Queue()
-        self._events: asyncio.Queue[SttEvent] = asyncio.Queue()
+        self._input: asyncio.Queue[AudioChunk | object | None] = asyncio.Queue(
+            maxsize=self._INPUT_QUEUE_SIZE
+        )
+        self._events: asyncio.Queue[SttEvent] = asyncio.Queue(maxsize=self._EVENT_QUEUE_SIZE + 1)
+        self._event_slots = asyncio.Semaphore(self._EVENT_QUEUE_SIZE)
         self._terminal: SessionTerminal | None = None
         self._lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._input_closed = asyncio.Event()
         self._refs: list[RawRef] = []
         self._accepted = 0
         self._received = 0
@@ -475,25 +482,51 @@ class GoogleSttSession:
     async def send_audio(self, chunk: AudioChunk) -> None:
         if len(chunk.pcm) > 8000:
             raise ValueError("Google Speech chunks must be <=8,000 bytes")
-        async with self._lock:
-            if self._terminal or self._finishing:
-                raise RuntimeError("session terminal")
-            if self._accepted == 0 and chunk.samples.start:
-                self._stream_bases[0] = chunk.samples.start
+        async with self._send_lock:
+            async with self._lock:
+                if self._terminal or self._finishing:
+                    raise RuntimeError("session terminal")
+                if self._accepted == 0 and chunk.samples.start:
+                    self._stream_bases[0] = chunk.samples.start
             if chunk.samples.end >= self._next_rotation:
                 await self._enqueue_rollover(chunk)
-            await self._input.put(chunk)
-            self._accepted = max(self._accepted, chunk.samples.end)
-            self._remember_recent_chunk(chunk)
+            await self._put_input(chunk)
+            async with self._lock:
+                if self._terminal or self._finishing:
+                    raise RuntimeError("session terminal")
+                self._accepted = max(self._accepted, chunk.samples.end)
+                self._remember_recent_chunk(chunk)
+
+    async def _put_input(self, item: AudioChunk | object | None) -> None:
+        try:
+            self._input.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+        put = asyncio.create_task(self._input.put(item))
+        closed = asyncio.create_task(self._input_closed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {put, closed},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if closed in done and self._input_closed.is_set():
+                raise RuntimeError("session terminal")
+            await put
+        finally:
+            for task in (put, closed):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(put, closed, return_exceptions=True)
 
     async def _enqueue_rollover(self, chunk: AudioChunk) -> None:
         overlap_start = chunk.samples.start - 32000
         overlap = [item for item in self._recent if item.samples.end > overlap_start]
         stream_base = overlap[0].samples.start if overlap else chunk.samples.start
         self._stream_bases.append(stream_base)
-        await self._input.put(self._ROTATE)
+        await self._put_input(self._ROTATE)
         for item in overlap:
-            await self._input.put(item)
+            await self._put_input(item)
         self._next_rotation += 270 * 16000
 
     def _remember_recent_chunk(self, chunk: AudioChunk) -> None:
@@ -505,6 +538,8 @@ class GoogleSttSession:
         async def stream() -> AsyncIterator[SttEvent]:
             while True:
                 event = await self._events.get()
+                if not isinstance(event, SessionTerminalEvent):
+                    self._event_slots.release()
                 yield event
                 if isinstance(event, SessionTerminalEvent):
                     return
@@ -519,11 +554,12 @@ class GoogleSttSession:
             return BoundaryReceipt(True, boundary_id)
 
     async def finish(self) -> SessionTerminal:
-        async with self._lock:
-            if self._terminal:
-                return self._terminal
-            self._finishing = True
-            await self._input.put(None)
+        async with self._send_lock:
+            async with self._lock:
+                if self._terminal:
+                    return self._terminal
+                self._finishing = True
+            await self._put_input(None)
         await self._task
         assert self._terminal
         return self._terminal
@@ -533,6 +569,7 @@ class GoogleSttSession:
             if self._terminal:
                 return self._terminal
             self._finishing = True
+            self._input_closed.set()
             self._task.cancel()
         return await self._terminalize(
             Outcome.CANCELLED,
@@ -599,7 +636,7 @@ class GoogleSttSession:
                     break
                 raise RuntimeError("Google Speech stream ended before rollover or finish")
             while self._boundaries:
-                await self._events.put(
+                await self._emit_event(
                     BoundaryEvent(self._boundaries.pop(0), self._last_result_end, self._refs[-1])
                 )
             await self._terminalize(Outcome.SUCCEEDED, None)
@@ -662,7 +699,7 @@ class GoogleSttSession:
             start = words[0].samples.start if words else max(base_sample, self._last_result_end)
             end = max(start + 1, reported_end)
             self._last_result_end = max(self._last_result_end, end)
-            await self._events.put(
+            await self._emit_event(
                 TranscriptEvent(
                     samples=SampleRange(start=start, end=end),
                     revision=self._received,
@@ -675,7 +712,7 @@ class GoogleSttSession:
             )
             if result.is_final and self._boundaries:
                 self._commit_watermark = end
-                await self._events.put(
+                await self._emit_event(
                     BoundaryEvent(
                         boundary_id=self._boundaries.pop(0),
                         committed_through=end,
@@ -748,6 +785,14 @@ class GoogleSttSession:
             cloud_speech.StreamingRecognizeResponse.deserialize(raw),
         )
 
+    async def _emit_event(self, event: SttEvent) -> None:
+        await self._event_slots.acquire()
+        try:
+            self._events.put_nowait(event)
+        except BaseException:
+            self._event_slots.release()
+            raise
+
     async def _terminalize(self, outcome: Outcome, error: ProviderError | None) -> SessionTerminal:
         if self._terminal:
             return self._terminal
@@ -763,6 +808,7 @@ class GoogleSttSession:
                     payload=b'{"code":"CANCELLED"}',
                 )
             )
+        self._input_closed.set()
         self._terminal = SessionTerminal(
             terminal_id=uuid4(),
             session_id=self._id,
@@ -852,32 +898,71 @@ class GoogleTranslationAttempt:
         self._request = r
         self._task: asyncio.Task[TranslationOutcome] | None = None
         self._terminal: OperationTerminal | None = None
+        self._lock = asyncio.Lock()
+        self._cancel_lock = asyncio.Lock()
+        self._cancel_task: asyncio.Task[OperationTerminal] | None = None
+        self._cancelling = False
+        self._cancelled_terminal_ready = asyncio.Event()
 
     async def result(self) -> TranslationOutcome:
-        if self._task is not None and not self._task.cancelled():
-            return await self._task
-        if self._terminal is not None:
+        async with self._lock:
+            if self._terminal is not None:
+                if self._task is not None and self._task.done() and not self._task.cancelled():
+                    return self._task.result()
+                return TranslationOutcome(None, self._terminal)
+            if self._task is not None:
+                task = self._task
+            elif self._cancelling:
+                task = None
+            else:
+                self._task = asyncio.create_task(self._run())
+                task = self._task
+        if task is None:
+            await self._cancelled_terminal_ready.wait()
+            assert self._terminal is not None
             return TranslationOutcome(None, self._terminal)
-        self._task = asyncio.create_task(self._run())
-        return await self._task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            async with self._lock:
+                terminal = self._terminal
+                cancelling = self._cancelling
+            if terminal is not None:
+                return TranslationOutcome(None, terminal)
+            if cancelling:
+                await self._cancelled_terminal_ready.wait()
+                assert self._terminal is not None
+                return TranslationOutcome(None, self._terminal)
+            raise
 
     async def cancel(self) -> OperationTerminal:
-        if self._terminal:
-            return self._terminal
-        if self._task:
-            self._task.cancel()
-        error = ProviderError(
-            ErrorKind.CANCELLED,
-            "operation",
-            RetryAdvice.NEVER,
-            "cancelled",
-            None,
-            None,
-            self._request.attempt_id,
-            (),
-            "cancelled",
-        )
-        return self._make_terminal(Outcome.CANCELLED, (), error)
+        async with self._cancel_lock:
+            async with self._lock:
+                if self._terminal is not None:
+                    return self._terminal
+                if self._cancel_task is None:
+                    self._cancelling = True
+                    task = self._task
+                    if task is not None:
+                        task.cancel()
+                    self._cancel_task = asyncio.create_task(self._finish_cancellation(task))
+                cancellation = self._cancel_task
+        assert cancellation is not None
+        return await asyncio.shield(cancellation)
+
+    async def _finish_cancellation(
+        self, task: asyncio.Task[TranslationOutcome] | None
+    ) -> OperationTerminal:
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        async with self._lock:
+            if self._terminal is not None:
+                terminal = self._terminal
+            else:
+                refs, error = self._cancellation_details()
+                terminal = self._make_terminal(Outcome.CANCELLED, refs, error)
+        self._cancelled_terminal_ready.set()
+        return terminal
 
     async def _run(self) -> TranslationOutcome:
         request = self._build_request()
@@ -1013,23 +1098,40 @@ class GoogleTranslationAttempt:
             sample_range=self._request.source_range,
         )
 
+    def _cancellation_details(self) -> tuple[tuple[RawRef, ...], ProviderError]:
+        ref = self._journal.append(
+            meeting_id=self._config.meeting_id,
+            attempt_id=self._request.attempt_id,
+            stage="translation",
+            transport="grpc",
+            direction="status-in",
+            media_type="application/json",
+            payload=b'{"code":"CANCELLED"}',
+            sample_range=self._request.source_range,
+        )
+        refs = (ref,)
+        return refs, ProviderError(
+            ErrorKind.CANCELLED,
+            "operation",
+            RetryAdvice.NEVER,
+            "cancelled",
+            None,
+            None,
+            self._request.attempt_id,
+            refs,
+            "cancelled",
+        )
+
     def _make_terminal(
         self, outcome: Outcome, refs: tuple[RawRef, ...], error: ProviderError | None
     ) -> OperationTerminal:
         if self._terminal:
             return self._terminal
-        if not refs:
-            ref = self._journal.append(
-                meeting_id=self._config.meeting_id,
-                attempt_id=self._request.attempt_id,
-                stage="translation",
-                transport="grpc",
-                direction="status-in",
-                media_type="application/json",
-                payload=b'{"code":"CANCELLED"}',
-                sample_range=self._request.source_range,
-            )
-            refs = (ref,)
+        if self._cancelling and outcome is not Outcome.CANCELLED:
+            refs, error = self._cancellation_details()
+            outcome = Outcome.CANCELLED
+        elif not refs:
+            refs, error = self._cancellation_details()
         self._terminal = OperationTerminal(
             terminal_id=uuid4(),
             operation_id=self._request.operation_id,

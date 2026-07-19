@@ -14,6 +14,14 @@ export BOOTSTRAP_ADMIN_NAME="${BOOTSTRAP_ADMIN_NAME:-Test Administrator}"
 export RTC_SUBNET="${TEST_RTC_SUBNET:-10.254.232.0/24}"
 export RTC_NODE_IP="${TEST_RTC_NODE_IP:-10.254.232.250}"
 
+LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
+LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
+exec 9>"$LOCK_FILE"
+if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
+  printf 'Timed out after %s seconds waiting for the compose harness lock.\n' "$LOCK_WAIT_SECONDS" >&2
+  exit 1
+fi
+
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
@@ -24,6 +32,7 @@ cleanup() {
     fi
     printf 'Hermetic test stack cleanup failed.\n' >&2
   fi
+  flock -u 9
   exit "$status"
 }
 

@@ -79,15 +79,22 @@ export class S3ArchiveVersionDeleter implements ArchiveVersionDeleter {
     size: number;
     checksum: string;
   }): Promise<boolean> {
-    const head = await this.client.send(
-      new HeadObjectCommand({
-        Bucket: this.bucket,
-        Key: input.key,
-        VersionId: input.versionId,
-        ChecksumMode: "ENABLED",
-      }),
-    );
-    return head.ContentLength === input.size && objectChecksum(head) === input.checksum;
+    try {
+      const head = await this.client.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: input.key,
+          VersionId: input.versionId,
+          ChecksumMode: "ENABLED",
+        }),
+      );
+      return head.ContentLength === input.size && objectChecksum(head) === input.checksum;
+    } catch (error) {
+      if (isMissingObjectVersion(error)) {
+        return false;
+      }
+      throw error;
+    }
   }
 
   async readObject(input: { key: string; versionId: string }): Promise<Uint8Array> {
@@ -356,6 +363,16 @@ function objectChecksum(
     return `SHA256:${head.ChecksumSHA256}`;
   }
   throw new Error("S3 object does not expose a checksum");
+}
+
+function isMissingObjectVersion(error: unknown): boolean {
+  if (httpStatusCode(error) === 404) {
+    return true;
+  }
+  if (typeof error !== "object" || error === null || !("name" in error)) {
+    return false;
+  }
+  return error.name === "NoSuchKey" || error.name === "NoSuchVersion" || error.name === "NotFound";
 }
 
 function httpStatusCode(error: unknown): number | undefined {

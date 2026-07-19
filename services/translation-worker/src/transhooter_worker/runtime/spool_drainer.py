@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from uuid import UUID
 
 import boto3  # type: ignore[import-untyped]
+import httpx
 
 from transhooter_worker.adapters.s3_archive import S3Archive
 from transhooter_worker.adapters.spool import EncryptedSpool
 from transhooter_worker.application.compactor import PcmCompactor
+from transhooter_worker.ports.archive import ArchiveStore, ObjectRecord
+from transhooter_worker.runtime.control_client import PermanentControlRequestError
+
+logger = logging.getLogger(__name__)
 
 
 def _secret(name: str) -> str:
@@ -64,6 +71,88 @@ def build_archive(root: Path) -> S3Archive:
     )
 
 
+class RetryableRegistrationError(RuntimeError):
+    pass
+
+
+class PermanentRegistrationError(RuntimeError):
+    pass
+
+
+class ArchiveObjectRegistrationClient:
+    def __init__(
+        self,
+        base_url: str,
+        bearer_file: Path,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._url = f"{base_url.rstrip('/')}/api/internal/archive-object"
+        self._bearer_file = bearer_file
+        self._client = client or httpx.Client(timeout=10, follow_redirects=False)
+
+    def register(
+        self,
+        meeting_id: UUID,
+        spool_object_id: UUID,
+        object_class: str,
+        record: ObjectRecord,
+    ) -> None:
+        bearer = self._bearer_file.read_text("utf-8").strip()
+        if not bearer:
+            raise RuntimeError("spool drainer internal bearer is empty")
+        response = self._client.post(
+            self._url,
+            headers={
+                "Authorization": f"Bearer {bearer}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "consultationId": str(meeting_id),
+                "causalKey": str(spool_object_id),
+                "object": {
+                    "objectId": str(spool_object_id),
+                    "class": object_class,
+                    "key": record.key,
+                    "versionId": record.version_id,
+                    "size": record.size,
+                    "sha256": record.sha256,
+                    "s3Checksum": record.s3_checksum,
+                    "contentType": record.content_type,
+                    "sampleRange": None,
+                    "attempt": None,
+                    "sequence": None,
+                },
+            },
+        )
+        if response.status_code // 100 != 2:
+            error_type = (
+                RetryableRegistrationError
+                if response.status_code in {408, 425, 429} or response.status_code >= 500
+                else PermanentRegistrationError
+            )
+            response_code = "unknown"
+            try:
+                response_body = response.json()
+                if isinstance(response_body, dict) and isinstance(response_body.get("code"), str):
+                    response_code = response_body["code"]
+            except ValueError:
+                pass
+            raise error_type(
+                "archive object registration rejected with "
+                f"HTTP {response.status_code} ({response_code})"
+            )
+
+
+def _object_class(stage: str) -> str:
+    if stage == "terminal" or stage.endswith("-terminal"):
+        return "provider_terminal"
+    if stage == "checkpoint":
+        return "checkpoint"
+    if stage == "caption":
+        return "caption_ledger"
+    return "pipeline_exchange"
+
+
 def _compact_pcm_scopes(spool: EncryptedSpool, archive: S3Archive) -> None:
     for meeting, stage, direction in spool.pcm_scopes():
         sample_rate = 16_000 if stage == "stt-input" else 48_000
@@ -90,13 +179,18 @@ def _compact_pcm_scopes(spool: EncryptedSpool, archive: S3Archive) -> None:
 
 def upload_committed_objects(
     spool: EncryptedSpool,
-    archive: S3Archive,
+    archive: ArchiveStore,
+    register: Callable[[UUID, UUID, str, ObjectRecord], None],
     meeting_id: UUID | None = None,
 ) -> None:
     pcm_stages = {"stt-input", "tts-output", "livekit-output"}
     for spool_ref, _ in spool.committed():
         meeting, attempt, stage, ordinal, media_type = spool.context(spool_ref.object_id)
-        if (meeting_id is not None and meeting != meeting_id) or stage in pcm_stages:
+        if (
+            (meeting_id is not None and meeting != meeting_id)
+            or stage in pcm_stages
+            or stage == "checkpoint"
+        ):
             continue
         suffix = "json" if "json" in media_type else "bin"
         key = f"v1/meetings/{meeting}/pipeline/{stage}/raw/{attempt}/{ordinal:020d}.{suffix}"
@@ -107,6 +201,21 @@ def upload_committed_objects(
             media_type,
             hashlib.sha256(body).hexdigest(),
         )
+        try:
+            register(
+                meeting,
+                spool_ref.object_id,
+                _object_class(stage),
+                archive_record,
+            )
+        except PermanentRegistrationError as error:
+            logger.error(
+                "quarantining permanently rejected spool object %s: %s",
+                spool_ref.object_id,
+                error,
+            )
+            spool.quarantine(spool_ref.object_id)
+            continue
         spool.mark_uploaded(
             spool_ref.object_id,
             archive_record.version_id,
@@ -114,20 +223,83 @@ def upload_committed_objects(
         )
 
 
-def _drain_once(spool: EncryptedSpool, archive: S3Archive) -> None:
+async def upload_committed_objects_async(
+    spool: EncryptedSpool,
+    archive: ArchiveStore,
+    register: Callable[[UUID, UUID, str, ObjectRecord], Awaitable[None]],
+    meeting_id: UUID,
+) -> None:
+    pcm_stages = {"stt-input", "tts-output", "livekit-output"}
+    for spool_ref, _ in spool.committed():
+        meeting, attempt, stage, ordinal, media_type = spool.context(spool_ref.object_id)
+        if meeting != meeting_id or stage in pcm_stages or stage == "checkpoint":
+            continue
+        suffix = "json" if "json" in media_type else "bin"
+        key = f"v1/meetings/{meeting}/pipeline/{stage}/raw/{attempt}/{ordinal:020d}.{suffix}"
+        body = spool.read(spool_ref.object_id)
+        archive_record = archive.put_create_once(
+            key,
+            body,
+            media_type,
+            hashlib.sha256(body).hexdigest(),
+        )
+        try:
+            await register(
+                meeting,
+                spool_ref.object_id,
+                _object_class(stage),
+                archive_record,
+            )
+        except PermanentControlRequestError as error:
+            logger.error(
+                "quarantining permanently rejected spool object %s: %s",
+                spool_ref.object_id,
+                error,
+            )
+            spool.quarantine(spool_ref.object_id)
+            continue
+        spool.mark_uploaded(
+            spool_ref.object_id,
+            archive_record.version_id,
+            archive_record.s3_checksum,
+        )
+
+
+def _drain_once(
+    spool: EncryptedSpool,
+    archive: S3Archive,
+    register: Callable[[UUID, UUID, str, ObjectRecord], None],
+) -> None:
     _compact_pcm_scopes(spool, archive)
-    upload_committed_objects(spool, archive)
+    upload_committed_objects(spool, archive, register)
 
 
 def main() -> None:
+    token_file = (
+        os.environ.get("INTERNAL_TOKEN_FILE")
+        or os.environ.get("WORKER_INTERNAL_BEARER_FILE")
+        or os.environ.get("INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE")
+    )
+    if not token_file:
+        raise RuntimeError("spool drainer internal bearer file is required")
     root = Path(os.environ.get("SPOOL_PATH", os.environ.get("SPOOL_DIR", "")))
     spool = _build_spool(root)
     archive = build_archive(root)
+    registration = ArchiveObjectRegistrationClient(
+        os.environ["CONTROL_INTERNAL_URL"],
+        Path(token_file),
+    )
     drain_once = os.environ.get("DRAIN_ONCE", "false").lower() == "true"
     while True:
-        _drain_once(spool, archive)
-        if drain_once:
-            return
+        try:
+            _drain_once(spool, archive, registration.register)
+        except (httpx.TransportError, RetryableRegistrationError) as error:
+            if drain_once:
+                raise
+            logger.warning("spool drain deferred: %s", error)
+        else:
+            if drain_once:
+                return
         time.sleep(1)
 
 

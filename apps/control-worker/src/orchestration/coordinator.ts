@@ -74,6 +74,7 @@ const captureRequestSchema = z.object({
 const archiveFailureSchema = z.object({
   reasonCode: z.literal("ARCHIVE_FAILED"),
   egressId: z.string().min(1),
+  resourceGeneration: z.number().int().nonnegative(),
 });
 const sameLanguageBypassSchema = z.object({
   consultationId: uuid,
@@ -103,6 +104,7 @@ interface CapacityCoordination {
     ttlMs: number,
     reservationId: string,
   ): Promise<boolean>;
+  renew(key: string, ttlMs: number, reservationId: string): Promise<boolean>;
   release(key: string, reservationId: string): Promise<void>;
 }
 
@@ -216,8 +218,18 @@ export class Coordinator {
 
   private async handleHeartbeat(item: OutboxItem): Promise<void> {
     const heartbeat = heartbeatSchema.parse(item.payload);
+    const ttlMs = heartbeat.leaseSeconds * 1_000;
     const now = this.clock.now();
-    const leaseExpiresAt = new Date(now.getTime() + heartbeat.leaseSeconds * 1_000);
+    const leaseExpiresAt = new Date(now.getTime() + ttlMs);
+    const reservations = await this.capacityReservations(item.aggregateId);
+    const renewed = await Promise.all(
+      reservations.map(async ({ key, reservationId }) =>
+        this.capacity.renew(key, ttlMs, reservationId),
+      ),
+    );
+    if (renewed.some((acceptedReservation) => !acceptedReservation)) {
+      throw new Error("worker heartbeat capacity reservation expired");
+    }
     const accepted = await this.store.heartbeat(
       heartbeat.workerId,
       heartbeat.epoch,
@@ -288,21 +300,25 @@ export class Coordinator {
       acquired.push(reservation);
     }
 
-    await this.store.reserveWorker(lifecycle.consultationId, lifecycle.generation);
-    await this.plan(
-      lifecycle.consultationId,
-      lifecycle.generation,
-      "ROOM_CREATE",
-      lifecycle.subjectId,
-      {
-        emptyTimeout: 300,
-        metadata: {
-          consultationId: lifecycle.consultationId,
-          generation: lifecycle.generation,
+    try {
+      await this.store.reserveWorker(lifecycle.consultationId, lifecycle.generation);
+      await this.plan(
+        lifecycle.consultationId,
+        lifecycle.generation,
+        "ROOM_CREATE",
+        lifecycle.subjectId,
+        {
+          emptyTimeout: 300,
+          metadata: {
+            consultationId: lifecycle.consultationId,
+            generation: lifecycle.generation,
+          },
         },
-      },
-    );
-    await this.store.seedDeadlines(lifecycle.consultationId, lifecycle.generation);
+      );
+      await this.store.seedDeadlines(lifecycle.consultationId, lifecycle.generation);
+    } catch (error) {
+      await this.rollbackCapacity(acquired, error);
+    }
   }
 
   private async handleFinalizationRequested(item: OutboxItem): Promise<void> {
@@ -416,6 +432,31 @@ export class Coordinator {
       }),
     );
   }
+  private async rollbackCapacity(
+    reservations: readonly CapacityReservation[],
+    primaryError: unknown,
+  ): Promise<never> {
+    const rollback = await Promise.allSettled(
+      reservations.map(async ({ key, reservationId }) => {
+        await this.capacity.release(key, reservationId);
+      }),
+    );
+    const failures = rollback.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (failures.length === 0) {
+      throw primaryError;
+    }
+    const primaryMessage =
+      primaryError instanceof Error ? primaryError.message : String(primaryError);
+    const rollbackMessage = failures
+      .map((failure) => (failure instanceof Error ? failure.message : String(failure)))
+      .join("; ");
+    throw new AggregateError(
+      [primaryError, ...failures],
+      `${primaryMessage}; capacity rollback failed: ${rollbackMessage}`,
+    );
+  }
 
   private async planParticipantGrant(lifecycle: z.infer<typeof lifecycleSchema>): Promise<void> {
     await this.requirePublishableState(
@@ -505,6 +546,9 @@ export class Coordinator {
   private async handleArchiveFailed(item: OutboxItem): Promise<void> {
     const failure = archiveFailureSchema.parse(item.payload);
     const generation = await this.requireGeneration(item.aggregateId, item);
+    if (failure.resourceGeneration >= generation) {
+      throw new Error("archive failure resource generation must precede cleanup generation");
+    }
     const identities = await this.store.humanIdentities(item.aggregateId);
     const state = await this.store.consultationState(item.aggregateId);
     const failureState = requireFailureState(
@@ -514,6 +558,7 @@ export class Coordinator {
     const effects = await this.failureEffects(
       item.aggregateId,
       generation,
+      failure.resourceGeneration,
       item.aggregateId,
       failureState,
       identities,
@@ -554,6 +599,7 @@ export class Coordinator {
     );
     const effects = await this.failureEffects(
       failure.consultationId,
+      failure.generation,
       failure.generation,
       failure.subjectId,
       state,
@@ -678,6 +724,7 @@ export class Coordinator {
     const effects = await this.failureEffects(
       event.consultationId,
       generation,
+      generation,
       subjectId,
       failureState,
       humanIdentities,
@@ -693,7 +740,7 @@ export class Coordinator {
       await this.store.completeDeadline(deadline, this.options.owner);
       return;
     }
-
+    let complete = true;
     if (deadline.kind === "archive-reconcile") {
       await this.plan(
         deadline.consultationId,
@@ -703,17 +750,19 @@ export class Coordinator {
         { forceIncomplete: true },
       );
     } else {
-      await this.handleRoomDeadline(deadline);
+      complete = await this.handleRoomDeadline(deadline);
     }
-    await this.store.completeDeadline(deadline, this.options.owner);
+    if (complete) {
+      await this.store.completeDeadline(deadline, this.options.owner);
+    }
   }
 
-  private async handleRoomDeadline(deadline: Deadline): Promise<void> {
+  private async handleRoomDeadline(deadline: Deadline): Promise<boolean> {
     if (deadline.kind === "absence") {
       const roomName = deterministicRoomName(deadline.consultationId, deadline.generation);
       const identities = await this.store.humanIdentities(deadline.consultationId);
       if (!(await this.remote.areHumansAbsent(roomName, identities))) {
-        return;
+        return false;
       }
     }
 
@@ -726,6 +775,13 @@ export class Coordinator {
             this.clock.now(),
           )
         : await this.store.consultationState(deadline.consultationId);
+    if (
+      (deadline.kind === "ready" && state !== "ready") ||
+      (deadline.kind === "finalize" && state !== "finalizing") ||
+      (deadline.kind === "absence" && state !== "finalizing")
+    ) {
+      return true;
+    }
     const nowMs = this.clock.now().getTime();
     const notBeforeMs = state === "finalizing" ? nowMs + 5_000 : nowMs;
     let statusId: Uuid | null = null;
@@ -756,6 +812,7 @@ export class Coordinator {
       statusId,
       notBeforeMs,
     );
+    return true;
   }
 
   private async requireGeneration(consultationId: Uuid, item: OutboxItem): Promise<number> {
@@ -778,21 +835,26 @@ export class Coordinator {
   }
 
   private async recoverWorker(reservation: WorkerReservation): Promise<void> {
-    const [humanIdentities, state] = await Promise.all([
+    const [humanIdentities, state, cleanupGeneration] = await Promise.all([
       this.store.humanIdentities(reservation.consultationId),
       this.store.consultationState(reservation.consultationId),
+      this.store.currentGeneration(reservation.consultationId),
     ]);
-    if (state !== "active" && state !== "finalizing") {
+    if ((state !== "active" && state !== "finalizing") || cleanupGeneration === null) {
       return;
     }
-    const effects = await this.failureEffects(
-      reservation.consultationId,
-      reservation.generation,
-      reservation.workerId,
-      state,
-      humanIdentities,
-      `worker-epoch:${String(reservation.epoch)}`,
-    );
+    const effects =
+      cleanupGeneration === reservation.generation
+        ? await this.failureEffects(
+            reservation.consultationId,
+            cleanupGeneration,
+            reservation.generation,
+            reservation.workerId,
+            state,
+            humanIdentities,
+            `worker-epoch:${String(reservation.epoch)}`,
+          )
+        : [];
     await this.store.fenceWorkerAndPlanFailure(
       reservation,
       this.options.owner,
@@ -803,7 +865,8 @@ export class Coordinator {
 
   private async failureEffects(
     consultationId: Uuid,
-    generation: number,
+    cleanupGeneration: number,
+    resourceGeneration: number,
     subjectId: Uuid,
     state: "active" | "finalizing",
     destinationIdentities: readonly Uuid[],
@@ -812,7 +875,7 @@ export class Coordinator {
     const shutdownAtMs = this.clock.now().getTime() + 10_000;
     const status = this.effectInput(
       consultationId,
-      generation,
+      cleanupGeneration,
       "STATUS_PACKET",
       subjectId,
       {
@@ -820,14 +883,15 @@ export class Coordinator {
         reasonCode: "ARCHIVE_FAILED",
         state,
         shutdownAtMs,
+        resourceGeneration,
         destinationIdentities,
       },
       occurrenceIdentity,
     );
     const drain = await this.drainEffects(
       consultationId,
-      generation,
-      generation,
+      cleanupGeneration,
+      resourceGeneration,
       subjectId,
       status.id,
       shutdownAtMs,

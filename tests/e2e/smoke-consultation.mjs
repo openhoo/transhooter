@@ -4,6 +4,7 @@ import { access } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { chromium } from "playwright";
+import { acceptedCaptionMatchesRender, MODE_GAIN_PAIRS } from "./harness-contracts.mjs";
 
 function option(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -171,28 +172,58 @@ async function enterRoom(page) {
     .waitFor({ timeout: captureBarrierTimeoutMs });
   await page.getByText("Recording and secure storage active", { exact: true }).waitFor();
 }
-async function assertModes(page) {
-  await page
-    .getByRole("status", { name: /Interpretation reconnecting/ })
-    .waitFor({ state: "hidden", timeout: 60_000 })
-    .catch(() => {});
-  for (const mode of ["Interpreted", "Overlay", "Original"]) {
-    const button = page.getByRole("button", { name: mode });
-    await button.click();
-    if ((await button.getAttribute("aria-pressed")) !== "true")
-      throw new Error(`${mode} mode did not become selected`);
-  }
-  const media = await page.locator("audio").evaluateAll((elements) =>
+async function audioGains(page) {
+  return await page.locator("audio").evaluateAll((elements) =>
     elements.map((element) => ({
       volume: element.volume,
-      paused: element.paused,
       attached:
         element.srcObject instanceof MediaStream &&
         element.srcObject.getAudioTracks().some((track) => track.readyState === "live"),
     })),
   );
-  if (media.length !== 2 || media.some((element) => !element.attached))
+}
+
+async function assertGainPair(page, label, expectedOriginal, expectedInterpretation) {
+  await poll(
+    `${label} audio gains`,
+    async () => {
+      const media = await audioGains(page);
+      if (media.length !== 2) return null;
+      const [original, interpretation] = media;
+      return Math.abs(original.volume - expectedOriginal) < 0.001 &&
+        Math.abs(interpretation.volume - expectedInterpretation) < 0.001
+        ? media
+        : null;
+    },
+    5_000,
+    50,
+  );
+}
+
+async function assertModes(page) {
+  await page
+    .getByText("Interpretation reconnecting — original audio remains available.", { exact: true })
+    .waitFor({ state: "hidden", timeout: 60_000 });
+  for (const [mode, originalGain, interpretationGain] of MODE_GAIN_PAIRS) {
+    const button = page.getByRole("button", { name: mode });
+    await button.click();
+    if ((await button.getAttribute("aria-pressed")) !== "true") {
+      throw new Error(`${mode} mode did not become selected`);
+    }
+    await assertGainPair(page, mode, originalGain, interpretationGain);
+  }
+  const media = await audioGains(page);
+  if (media.some((element) => !element.attached)) {
     throw new Error("original and interpretation audio were not attached");
+  }
+
+  await page.getByRole("button", { name: "Interpreted" }).click();
+  await assertGainPair(page, "interpreted before fallback", 0, 1);
+  await page.locator("audio").nth(1).dispatchEvent("stalled");
+  await page
+    .getByText("Interpretation reconnecting — original audio remains available.", { exact: true })
+    .waitFor({ state: "visible" });
+  await assertGainPair(page, "interpretation fallback", 1, 0);
 }
 async function assertAudibleInterpretation(page) {
   return await page.evaluate(async () => {
@@ -235,6 +266,66 @@ async function apiJson(page, path) {
       return { status: response.status, body: text ? JSON.parse(text) : null };
     },
     { path },
+  );
+}
+
+async function postApi(page, path, body = {}) {
+  return await page.evaluate(
+    async ({ path, body }) => {
+      const csrf = document.cookie
+        .split("; ")
+        .find((part) => part.startsWith("csrf="))
+        ?.slice(5);
+      if (!csrf) throw new Error("cleanup CSRF cookie is unavailable");
+      const response = await fetch(path, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          "content-type": "application/json",
+          "x-csrf-token": csrf,
+        },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, text: await response.text() };
+    },
+    { path, body },
+  );
+}
+
+async function settleCreatedConsultation(page, consultationId) {
+  await page.goto(`${baseUrl}/consultations`, { waitUntil: "domcontentloaded" });
+  await poll(
+    `cleanup settlement for ${consultationId}`,
+    async () => {
+      const current = await apiJson(page, `/api/consultations/${consultationId}`);
+      if (current.status === 404) return true;
+      if (current.status !== 200) {
+        throw new Error(`cleanup consultation lookup returned ${current.status}`);
+      }
+      const state = current.body?.state;
+      if (["ended", "cancelled", "deleted"].includes(state)) return true;
+      if (state === "invited" || state === "ready") {
+        const response = await postApi(page, `/api/consultations/${consultationId}/cancel`, {
+          consultationId,
+        });
+        if (![200, 202, 204, 409].includes(response.status)) {
+          throw new Error(`cleanup cancel returned ${response.status}: ${response.text}`);
+        }
+      } else if (state === "active") {
+        const response = await postApi(page, `/api/consultations/${consultationId}/end`, {
+          consultationId,
+        });
+        if (![200, 202, 204, 409].includes(response.status)) {
+          throw new Error(`cleanup end returned ${response.status}: ${response.text}`);
+        }
+      } else if (state !== "finalizing") {
+        throw new Error(`cleanup cannot settle consultation in unexpected state ${String(state)}`);
+      }
+      return null;
+    },
+    120_000,
+    1_000,
   );
 }
 
@@ -320,7 +411,12 @@ function canonicalLiveKitUrl(value) {
   return url.toString().replace(/\/$/u, "");
 }
 
-async function assertFinalTargetedCaption(page, consultationId) {
+async function assertFinalTargetedCaption(
+  page,
+  consultationId,
+  expectedSourceLanguage,
+  expectedTargetLanguage,
+) {
   const room = await poll("room participant contract", async () => {
     const result = await apiJson(page, `/api/consultations/${consultationId}/room`);
     return result.status === 200 ? result.body : null;
@@ -331,22 +427,19 @@ async function assertFinalTargetedCaption(page, consultationId) {
     );
   }
   const packet = await poll(
-    "nonempty final targeted caption",
-    () =>
-      page.evaluate(
+    "rendered final targeted caption",
+    async () => {
+      const candidate = await page.evaluate(
         ({ expectedConsultationId, destinationParticipantId, sourceParticipantId }) => {
           const packets = globalThis.__transhooterCaptionPackets ?? [];
           return (
-            packets.find(
-              (candidate) =>
-                candidate.finality === "final" &&
-                candidate.consultationId === expectedConsultationId &&
-                candidate.destinationParticipantId === destinationParticipantId &&
-                candidate.sourceParticipantId === sourceParticipantId &&
-                typeof candidate.sourceText === "string" &&
-                candidate.sourceText.trim().length > 0 &&
-                typeof candidate.translatedText === "string" &&
-                candidate.translatedText.trim().length > 0,
+            packets.findLast(
+              (value) =>
+                value.schemaVersion === 1 &&
+                value.finality === "final" &&
+                value.consultationId === expectedConsultationId &&
+                value.destinationParticipantId === destinationParticipantId &&
+                value.sourceParticipantId === sourceParticipantId,
             ) ?? null
           );
         },
@@ -355,7 +448,29 @@ async function assertFinalTargetedCaption(page, consultationId) {
           destinationParticipantId: room.participantId,
           sourceParticipantId: room.otherParticipantId,
         },
-      ),
+      );
+      const ribbon = page.getByLabel("Current translated and source caption");
+      const lines = await ribbon.locator("p").allTextContents();
+      const expectedAnnouncement = `Final translation from ${room.otherDisplayName}, ${expectedSourceLanguage} to ${expectedTargetLanguage}: ${candidate?.translatedText}`;
+      const finalAnnouncement = await page
+        .getByText(expectedAnnouncement, { exact: true })
+        .textContent()
+        .catch(() => null);
+      return acceptedCaptionMatchesRender({
+        candidate,
+        consultationId,
+        destinationParticipantId: room.participantId,
+        sourceParticipantId: room.otherParticipantId,
+        sourceLanguage: expectedSourceLanguage,
+        targetLanguage: expectedTargetLanguage,
+        renderedTranslation: lines[0],
+        renderedSource: lines[1],
+        finalAnnouncement,
+        otherDisplayName: room.otherDisplayName,
+      })
+        ? candidate
+        : null;
+    },
     90_000,
     250,
   );
@@ -367,7 +482,7 @@ async function assertFinalTargetedCaption(page, consultationId) {
     packet.sourceSampleEnd <= packet.sourceSampleStart
   ) {
     throw new Error(
-      `final caption lacks monotonic revision/sample evidence: ${JSON.stringify(packet)}`,
+      `rendered final caption lacks monotonic revision/sample evidence: ${JSON.stringify(packet)}`,
     );
   }
   return packet;
@@ -832,21 +947,40 @@ function beginPhase(name) {
 }
 
 beginPhase(currentPhase);
-const mediaArgs = [
+const commonMediaArgs = [
   "--use-fake-ui-for-media-stream",
   "--use-fake-device-for-media-stream",
   "--host-resolver-rules=MAP app.localhost web, MAP rtc.localhost livekit",
-  "--use-file-for-fake-audio-capture=/workspace/tests/fixtures/en-good-morning.wav",
   "--use-file-for-fake-video-capture=/workspace/tests/fixtures/consultation.y4m",
 ];
-const browser = await chromium.launch({ headless: true, args: mediaArgs });
-const employeeContext = await browser.newContext({ permissions: ["camera", "microphone"] });
-const customerContext = await browser.newContext({ permissions: ["camera", "microphone"] });
-const thirdContext = await browser.newContext();
+const employeeBrowser = await chromium.launch({
+  headless: true,
+  args: [
+    ...commonMediaArgs,
+    "--use-file-for-fake-audio-capture=/workspace/tests/fixtures/en-good-morning.wav",
+  ],
+});
+const customerBrowser = await chromium.launch({
+  headless: true,
+  args: [
+    ...commonMediaArgs,
+    "--use-file-for-fake-audio-capture=/workspace/tests/fixtures/de-guten-morgen.wav",
+  ],
+});
+const employeeContext = await employeeBrowser.newContext({
+  permissions: ["camera", "microphone"],
+});
+const customerContext = await customerBrowser.newContext({
+  permissions: ["camera", "microphone"],
+});
+const thirdContext = await employeeBrowser.newContext();
 await Promise.all([installCaptionProbe(employeeContext), installCaptionProbe(customerContext)]);
+let employee;
+let consultationId = null;
+let completed = false;
 try {
   beginPhase("employee-authentication-and-consultation-creation");
-  const employee = await authenticate(employeeContext, employeeEmail);
+  employee = await authenticate(employeeContext, employeeEmail);
   await employee.goto(`${baseUrl}/consultations/new`);
   await employee.getByLabel("Customer name").fill(`Customer ${runId.slice(0, 8)}`);
   await employee.getByLabel("Customer email").fill(customerEmail);
@@ -866,7 +1000,7 @@ try {
   if (!creationResponse.ok())
     throw new Error(`consultation creation failed: ${creationResponse.status()}`);
   const created = await creationResponse.json();
-  const consultationId = requireValue(created.id, "created consultation id");
+  consultationId = requireValue(created.id, "created consultation id");
   beginPhase("failure-injection-release");
   if (failureHarnessReleaseFile) {
     console.log(
@@ -931,8 +1065,8 @@ try {
 
   beginPhase("captions-interpretation-and-audio-modes");
   const [employeeFinalCaption, customerFinalCaption] = await Promise.all([
-    assertFinalTargetedCaption(employee, consultationId),
-    assertFinalTargetedCaption(customer, consultationId),
+    assertFinalTargetedCaption(employee, consultationId, "de-DE", "en-US"),
+    assertFinalTargetedCaption(customer, consultationId, "en-US", "de-DE"),
     assertAudibleInterpretation(employee),
     assertAudibleInterpretation(customer),
   ]);
@@ -958,7 +1092,12 @@ try {
     "complete archive inventory",
     async () => {
       const result = await apiJson(employee, `/api/archives/${archiveId}`);
-      return result.status === 200 && result.body?.status === "complete" ? result.body : null;
+      if (result.status === 200 && result.body?.status === "complete") {
+        return result.body;
+      }
+      throw new Error(
+        `archive not complete: HTTP ${String(result.status)} ${JSON.stringify(result.body)}`,
+      );
     },
     180_000,
     2_000,
@@ -1148,16 +1287,26 @@ try {
     throw new Error("archive proof omitted inventory version/hash");
   }
   if (emitProof) console.log(JSON.stringify(proof));
+  completed = true;
 } catch (error) {
   throw new Error(
     `[consultation-smoke] phase ${currentPhase} failed: ${error?.message ?? String(error)}`,
     { cause: error },
   );
 } finally {
+  if (!completed && employee && consultationId && failureHarnessReleaseFile === null) {
+    await settleCreatedConsultation(employee, consultationId).catch((cleanupError) => {
+      console.error(
+        `[consultation-smoke] cleanup could not settle ${consultationId}: ${
+          cleanupError?.message ?? String(cleanupError)
+        }`,
+      );
+    });
+  }
   await Promise.allSettled([
     employeeContext.close(),
     customerContext.close(),
     thirdContext.close(),
   ]);
-  await browser.close();
+  await Promise.allSettled([employeeBrowser.close(), customerBrowser.close()]);
 }

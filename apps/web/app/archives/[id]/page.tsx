@@ -1,6 +1,10 @@
 import type { Metadata } from "next";
-import Link from "next/link";
-import { ArchiveAdminActions, DownloadButton } from "@/components/archive-actions";
+import {
+  ArchiveAdminActions,
+  ArchivePagination,
+  DownloadButton,
+  RefreshArchiveStatus,
+} from "@/components/archive-actions";
 import { requirePageData } from "@/lib/server-application";
 
 export const metadata: Metadata = { title: "Consultation archive" };
@@ -59,7 +63,7 @@ type ArchiveView = {
 
 type ArchivePageProps = {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ cursor?: string }>;
+  searchParams: Promise<{ cursor?: string; previous?: string | string[] }>;
 };
 
 type GroupedArchiveObjects = Record<ArchiveObjectGroup, ArchiveObject[]>;
@@ -119,12 +123,13 @@ function ArchiveFinalizingNotice({ status }: { status: string }) {
   }
 
   return (
-    <div className="notice warning" role="status">
+    <div className="notice warning">
       <strong>Finalizing the archive</strong>
       <p>
         Original recordings and provider evidence are still being reconciled. This page will show
         verified versions and checksums when available.
       </p>
+      <RefreshArchiveStatus />
     </div>
   );
 }
@@ -300,34 +305,10 @@ function ArchiveObjectGroups({
   ));
 }
 
-function ArchivePagination({
-  archiveId,
-  nextCursor,
-}: {
-  archiveId: string;
-  nextCursor: string | null;
-}) {
-  if (!nextCursor) {
-    return null;
-  }
-
-  return (
-    <nav className="archivePagination" aria-label="Archive object pages">
-      <p className="meta">Each page replaces the objects shown above.</p>
-      <Link
-        className="button secondary"
-        href={`/archives/${archiveId}?cursor=${encodeURIComponent(nextCursor)}`}
-        rel="next"
-      >
-        View next objects page
-      </Link>
-    </nav>
-  );
-}
-
 export default async function ArchivePage({ params, searchParams }: ArchivePageProps) {
   const { id } = await params;
-  const { cursor } = await searchParams;
+  const { cursor, previous } = await searchParams;
+  const previousCursor = Array.isArray(previous) ? previous.at(-1) : previous;
   const query = cursor ? { cursor } : {};
   const archive = await requirePageData<ArchiveView>("archives.get", { id }, query);
   const groupedObjects = groupArchiveObjects(archive.objects);
@@ -340,7 +321,12 @@ export default async function ArchivePage({ params, searchParams }: ArchivePageP
       <ArchiveProof archive={archive} />
       <InventoryGaps gaps={archive.gaps} />
       <ArchiveObjectGroups archiveId={archive.id} groupedObjects={groupedObjects} />
-      <ArchivePagination archiveId={id} nextCursor={archive.nextCursor} />
+      <ArchivePagination
+        archiveId={id}
+        currentCursor={cursor}
+        nextCursor={archive.nextCursor}
+        previousCursor={previousCursor}
+      />
       {archive.canAdminister && (
         <ArchiveAdminActions
           archiveId={archive.id}

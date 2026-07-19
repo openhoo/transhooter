@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { WorkerJobMetadataSchema } from "@transhooter/contracts";
 import { deterministicRoomName } from "@transhooter/server-core/rooms";
 import { Coordinator } from "../src/orchestration/coordinator";
-import type { DurableStore, Effect, OutboxItem } from "../src/orchestration/model";
+import type { Deadline, DurableStore, Effect, OutboxItem } from "../src/orchestration/model";
 
 const consultationId = "20000000-0000-4000-8000-000000000001";
 const participantId = "20000000-0000-4000-8000-000000000002";
@@ -164,6 +164,7 @@ async function run(
   };
   const coordination = {
     reserve: async () => true,
+    renew: async () => true,
     release: async () => undefined,
   };
   const coordinator = new Coordinator(store, clock, options, remote, coordination);
@@ -172,6 +173,44 @@ async function run(
 
   return planned;
 }
+
+test("absence deadline remains claimable while humans are still present", async () => {
+  const deadline: Deadline = {
+    consultationId,
+    generation: 7,
+    kind: "absence",
+    dueAt: new Date(4_000),
+  };
+  let completions = 0;
+  const store = {
+    claimOutbox: async () => [],
+    claimDeadlines: async () => [deadline],
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+    currentGeneration: async () => 7,
+    humanIdentities: async () => [participantId, secondParticipantId],
+    completeDeadline: async () => {
+      completions += 1;
+    },
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    {
+      areHumansAbsent: async () => false,
+      notifyArchiveRecording: async () => undefined,
+    },
+    {
+      reserve: async () => true,
+      renew: async () => true,
+      release: async () => undefined,
+    },
+  );
+
+  assert.equal(await coordinator.tick(), 1);
+  assert.equal(completions, 0);
+});
 
 test("an active participant egress plans publication grant, not capture-ready", async () => {
   const planned = await run({
@@ -522,6 +561,31 @@ test("failed Egress terminal schedules archive-failure status", async () => {
   assert.equal(archiveFailureStatus.plan.reasonCode, "ARCHIVE_FAILED");
 });
 
+test("archive failure drains the fenced resource generation", async () => {
+  const planned = await run({
+    id: "20000000-0000-4000-8000-000000000019",
+    aggregateId: consultationId,
+    generation: 7,
+    type: "archive.failed",
+    attempts: 0,
+    payload: {
+      reasonCode: "ARCHIVE_FAILED",
+      egressId: "EG_FAILED",
+      resourceGeneration: 6,
+    },
+  });
+  const status = planned.find(({ kind }) => kind === "STATUS_PACKET");
+  const roomDelete = planned.find(({ kind }) => kind === "ROOM_DELETE");
+  assert.ok(status);
+  assert.ok(roomDelete);
+  assert.equal(status.generation, 7);
+  assert.equal(status.plan.resourceGeneration, 6);
+  assert.equal(status.plan.roomName, deterministicRoomName(consultationId, 6));
+  assert.equal(roomDelete.generation, 7);
+  assert.equal(roomDelete.plan.resourceGeneration, 6);
+  assert.equal(roomDelete.plan.workerTerminalGeneration, 6);
+});
+
 test("Room Composite ACTIVE dispatches the full canonical worker metadata verbatim", async () => {
   const planned = await run({
     id: "20000000-0000-4000-8000-000000000016",
@@ -593,6 +657,7 @@ test("capacity rollback releases only reservations acquired before exhaustion", 
         reservationAttempt += 1;
         return reservationAttempt !== 2;
       },
+      renew: async () => true,
       release: async (key, reservationId) => {
         released.push([key, reservationId]);
       },
@@ -652,6 +717,7 @@ test("capacity rollback includes an ambiguously failed reservation", async () =>
         }
         return true;
       },
+      renew: async () => true,
       release: async (key, reservationId) => {
         released.push([key, reservationId]);
       },
@@ -666,4 +732,168 @@ test("capacity rollback includes an ambiguously failed reservation", async () =>
     ["second", `${consultationId}:1`],
   ]);
   assert.equal(retryMessage, "capacity reserve failed");
+});
+
+test("capacity rolls back when worker reservation fails after acquisition", async () => {
+  const released: Array<readonly [string, string]> = [];
+  let retryMessage = "";
+  const provisioning: OutboxItem = {
+    id: "20000000-0000-4000-8000-000000000021",
+    aggregateId: consultationId,
+    type: "consultation.provisioning.requested",
+    generation: 7,
+    attempts: 0,
+    payload: {
+      consultationId,
+      generation: 7,
+      subjectId: consultationId,
+    },
+  };
+  const store = {
+    claimOutbox: async () => [provisioning],
+    claimDeadlines: async () => [],
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+    completeOutbox: async () => undefined,
+    retryOutbox: async (_id: string, _owner: string, error: string) => {
+      retryMessage = error;
+    },
+    capacityDimensions: async () => [
+      { key: "stt", capacity: 4, units: 1 },
+      { key: "tts", capacity: 4, units: 1 },
+    ],
+    reserveWorker: async () => {
+      throw new Error("worker reservation failed");
+    },
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    {
+      areHumansAbsent: async () => true,
+      notifyArchiveRecording: async () => undefined,
+    },
+    {
+      reserve: async () => true,
+      renew: async () => true,
+      release: async (key, reservationId) => {
+        released.push([key, reservationId]);
+      },
+    },
+  );
+
+  await coordinator.tick();
+
+  assert.deepEqual(released, [
+    ["stt", `${consultationId}:0`],
+    ["tts", `${consultationId}:1`],
+  ]);
+  assert.equal(retryMessage, "worker reservation failed");
+});
+
+test("accepted worker heartbeats renew every active capacity reservation", async () => {
+  const renewed: Array<readonly [string, number, string]> = [];
+  const heartbeat: OutboxItem = {
+    id: "20000000-0000-4000-8000-000000000022",
+    aggregateId: consultationId,
+    type: "worker.heartbeat",
+    generation: 7,
+    attempts: 0,
+    payload: {
+      workerId: "20000000-0000-4000-8000-000000000023",
+      epoch: 7,
+      leaseSeconds: 30,
+    },
+  };
+  const store = {
+    claimOutbox: async () => [heartbeat],
+    claimDeadlines: async () => [],
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+    heartbeat: async () => true,
+    capacityDimensions: async () => [
+      { key: "stt", capacity: 4, units: 1 },
+      { key: "tts", capacity: 4, units: 1 },
+    ],
+    completeOutbox: async () => undefined,
+    retryOutbox: async () => undefined,
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    {
+      areHumansAbsent: async () => true,
+      notifyArchiveRecording: async () => undefined,
+    },
+    {
+      reserve: async () => true,
+      renew: async (key, ttlMs, reservationId) => {
+        renewed.push([key, ttlMs, reservationId]);
+        return true;
+      },
+      release: async () => undefined,
+    },
+  );
+
+  await coordinator.tick();
+
+  assert.deepEqual(renewed, [
+    ["stt", 30_000, `${consultationId}:0`],
+    ["tts", 30_000, `${consultationId}:1`],
+  ]);
+});
+
+test("expired capacity reservations prevent durable worker heartbeat persistence", async () => {
+  const calls: string[] = [];
+  const heartbeat: OutboxItem = {
+    id: "20000000-0000-4000-8000-000000000024",
+    aggregateId: consultationId,
+    type: "worker.heartbeat",
+    generation: 7,
+    attempts: 0,
+    payload: {
+      workerId: "20000000-0000-4000-8000-000000000025",
+      epoch: 6,
+      leaseSeconds: 30,
+    },
+  };
+  const store = {
+    claimOutbox: async () => [heartbeat],
+    claimDeadlines: async () => [],
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+    heartbeat: async () => {
+      calls.push("heartbeat");
+      return true;
+    },
+    capacityDimensions: async () => {
+      calls.push("capacity");
+      return [{ key: "stt", capacity: 4, units: 1 }];
+    },
+    completeOutbox: async () => undefined,
+    retryOutbox: async () => undefined,
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    {
+      areHumansAbsent: async () => true,
+      notifyArchiveRecording: async () => undefined,
+    },
+    {
+      reserve: async () => true,
+      renew: async () => {
+        calls.push("renew");
+        return false;
+      },
+      release: async () => undefined,
+    },
+  );
+
+  await coordinator.tick();
+
+  assert.deepEqual(calls, ["capacity", "renew"]);
 });

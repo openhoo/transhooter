@@ -20,6 +20,14 @@ const failureDateFormatter = new Intl.DateTimeFormat("en", {
   timeStyle: "short",
 });
 
+function formatEvidence(summary: string): string {
+  try {
+    return JSON.stringify(JSON.parse(summary), null, 2);
+  } catch {
+    return summary;
+  }
+}
+
 export default async function FailuresPage() {
   const data = await requirePageData<{ failures: Failure[] }>("admin.failures.list");
 
@@ -41,42 +49,41 @@ export default async function FailuresPage() {
           </p>
         </section>
       ) : (
-        <div className="tableWrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Consultation</th>
-                <th>Stage</th>
-                <th>Evidence</th>
-              </tr>
-            </thead>
-            <tbody>
-              {data.failures.map((failure) => (
-                <tr key={failure.id}>
-                  <td>{failureDateFormatter.format(new Date(failure.occurredAt))}</td>
-                  <td>
-                    <code>{failure.consultationId}</code>
-                  </td>
-                  <td>
-                    {failure.stage}
-                    <br />
-                    <span className="error">{failure.code}</span>
-                  </td>
-                  <td>
-                    {failure.summary}
-                    {failure.archiveId && (
-                      <>
-                        <br />
-                        <Link href={`/archives/${failure.archiveId}`}>Open archive evidence</Link>
-                      </>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <section className="failureList" aria-label="Unresolved preservation failures">
+          {data.failures.map((failure) => (
+            <article className="failureItem" key={failure.id}>
+              <div className="failureIdentity">
+                <div className="failureHeading">
+                  <time className="meta" dateTime={failure.occurredAt}>
+                    {failureDateFormatter.format(new Date(failure.occurredAt))}
+                  </time>
+                  <span className="status danger">{failure.stage}</span>
+                </div>
+                <h2>{failure.code}</h2>
+                <dl className="failureMetadata">
+                  <div>
+                    <dt>Consultation</dt>
+                    <dd>
+                      <code>{failure.consultationId}</code>
+                    </dd>
+                  </div>
+                </dl>
+                {failure.archiveId && (
+                  <Link
+                    className="button secondary failureLink"
+                    href={`/archives/${failure.archiveId}`}
+                  >
+                    Open archive evidence
+                  </Link>
+                )}
+              </div>
+              <div className="failureEvidence">
+                <p className="failureEvidenceLabel">Persisted evidence</p>
+                <pre>{formatEvidence(failure.summary)}</pre>
+              </div>
+            </article>
+          ))}
+        </section>
       )}
     </div>
   );

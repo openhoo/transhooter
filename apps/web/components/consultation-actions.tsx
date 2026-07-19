@@ -1,8 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { FormEvent, ReactNode } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/browser-api";
 
 type ProviderProfileOption = {
@@ -19,6 +20,7 @@ type ConsultationActionProps = {
   id: string;
   action: "cancel" | "resend";
   children: ReactNode;
+  contextLabel: string;
   danger?: boolean;
 };
 
@@ -27,6 +29,19 @@ export function NewConsultationForm({ profiles }: NewConsultationFormProps) {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
+  if (profiles.length === 0) {
+    return (
+      <section className="stack panel" aria-labelledby="no-provider-profiles">
+        <h2 id="no-provider-profiles">No provider profiles are available</h2>
+        <p className="muted">
+          Review the language catalog and refresh provider capabilities before inviting a customer.
+        </p>
+        <Link className="button secondary" href="/admin/languages">
+          Review provider languages
+        </Link>
+      </section>
+    );
+  }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
@@ -95,40 +110,118 @@ export function ConsultationAction({
   id,
   action,
   children,
+  contextLabel,
   danger = false,
 }: ConsultationActionProps) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const cancelConfirmationRef = useRef<HTMLButtonElement>(null);
+  const cancelTriggerRef = useRef<HTMLButtonElement>(null);
+  const restoreCancelTrigger = useRef(false);
 
+  useEffect(() => {
+    if (confirming) {
+      cancelConfirmationRef.current?.focus();
+      return;
+    }
+
+    if (restoreCancelTrigger.current) {
+      restoreCancelTrigger.current = false;
+      cancelTriggerRef.current?.focus();
+    }
+  }, [confirming]);
   async function run() {
     setBusy(true);
     setError("");
+    setSuccess("");
 
     try {
       await api(`/api/consultations/${id}/${action}`, {
         method: "POST",
         body: "{}",
       });
+      setConfirming(false);
+      setSuccess(
+        action === "resend"
+          ? `Invitation resent for ${contextLabel}.`
+          : `Consultation with ${contextLabel} cancelled.`,
+      );
       router.refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Action failed");
+    } finally {
       setBusy(false);
     }
+  }
+
+  if (confirming) {
+    return (
+      <div className="inlineConfirmation">
+        <p id={`cancel-confirmation-${id}`}>
+          Cancel the consultation with {contextLabel}? Its invitation will stop working.
+        </p>
+        <div className="actions">
+          <button
+            ref={cancelConfirmationRef}
+            className="button secondary"
+            disabled={busy}
+            type="button"
+            onClick={() => {
+              restoreCancelTrigger.current = true;
+              setConfirming(false);
+            }}
+          >
+            Keep consultation
+          </button>
+          <button
+            aria-describedby={`cancel-confirmation-${id}`}
+            className="button danger"
+            disabled={busy}
+            type="button"
+            onClick={() => {
+              void run();
+            }}
+          >
+            {busy ? "Cancelling…" : `Confirm cancellation for ${contextLabel}`}
+          </button>
+        </div>
+        {error && (
+          <p className="error" role="alert">
+            {error}
+          </p>
+        )}
+      </div>
+    );
   }
 
   return (
     <div>
       <button
+        ref={cancelTriggerRef}
+        aria-label={`${action === "cancel" ? "Cancel" : "Resend invitation for"} ${contextLabel}`}
         className={`button ${danger ? "danger" : "secondary"}`}
         disabled={busy}
         type="button"
         onClick={() => {
-          void run();
+          if (action === "cancel") {
+            setConfirming(true);
+            setError("");
+            setSuccess("");
+          } else {
+            void run();
+          }
         }}
       >
         {busy ? "Working…" : children}
       </button>
+      {success && (
+        <p className="notice" role="status">
+          {success}
+        </p>
+      )}
       {error && (
         <p className="error" role="alert">
           {error}

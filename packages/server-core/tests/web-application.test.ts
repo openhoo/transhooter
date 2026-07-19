@@ -76,6 +76,7 @@ function fixture(principal: InternalPrincipal = CONTROL_PRINCIPAL) {
   const beginDelete = mock(async () => undefined);
   const requestMagicLink = mock(async () => undefined);
   const providerAttempt = mock(async () => true);
+  const workerFailure = mock(async () => true);
   const verify = mock(async () => principal);
   const app = createWebApplication({
     auth: {
@@ -89,14 +90,14 @@ function fixture(principal: InternalPrincipal = CONTROL_PRINCIPAL) {
       drainDeletion: async () => true,
     } as never,
     languages: {} as never,
-    operations: { providerAttempt } as never,
+    operations: { providerAttempt, workerFailure } as never,
     internalPrincipalVerifier: { verify } as InternalPrincipalVerifier,
     publicBaseUrl: PUBLIC_BASE_URL,
     clientIp: () => "127.0.0.1",
     ready: async () => true,
   });
 
-  return { app, beginDelete, providerAttempt, requestMagicLink, verify };
+  return { app, beginDelete, providerAttempt, requestMagicLink, verify, workerFailure };
 }
 
 describe("WebApplication authentication boundary", () => {
@@ -168,6 +169,33 @@ describe("WebApplication authentication boundary", () => {
         internalHeaders: { authorization: "Bearer translation" },
       }),
     ).rejects.toThrow("FORBIDDEN_INTERNAL");
+  });
+
+  it("dispatches authenticated worker failure reports to durable fencing", async () => {
+    const translationWorker: InternalPrincipal = {
+      service: "translation-worker",
+      subject: "translation",
+      permissions: ["failure:write"],
+    };
+    const configured = fixture(translationWorker);
+    const command = {
+      kind: "internal.failure" as const,
+      consultationId: CONSULTATION,
+      generation: 3,
+      workerId: PROVIDER_COMMAND.workerId,
+      epoch: 2,
+      eventId: PROVIDER_COMMAND.eventId,
+      kindName: "SpoolUnavailable",
+      message: "fsync failed",
+      lastCheckpointHashes: {},
+    };
+
+    await expect(
+      configured.app.execute(command, {
+        internalHeaders: { authorization: "Bearer translation" },
+      }),
+    ).resolves.toBe(true);
+    expect(configured.workerFailure).toHaveBeenCalledWith(command);
   });
 
   it("derives public magic-link purpose, origin and client IP from trusted request context", async () => {

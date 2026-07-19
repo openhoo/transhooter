@@ -1,4 +1,4 @@
-import { test } from "bun:test";
+import { test, vi } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -55,6 +55,7 @@ function harness(
         attempt: 1,
       };
     },
+    renewEffectLease: async () => true,
     markApplied: async () => {
       calls.push("applied");
     },
@@ -133,6 +134,77 @@ test("adopts a matching deterministic remote without recreating it", async () =>
   });
   await runner.tick();
   assert.deepEqual(calls.slice(1), ["adopt", "applied", "done"]);
+});
+
+test("renews the effect lease until markApplied commits for execution and adoption", async () => {
+  vi.useFakeTimers();
+  try {
+    for (const adoption of [
+      null,
+      { remoteId: "existing", matchesRequest: true, terminal: false },
+    ] as const) {
+      const applied = Promise.withResolvers<void>();
+      const commit = Promise.withResolvers<void>();
+      let applying = false;
+      let renewalsWhileApplying = 0;
+      const calling = { ...effect, state: "calling" as const, attempt: 1 };
+      const store = {
+        claimEffects: async () => [effect],
+        currentGeneration: async () => effect.generation,
+        persistCalling: async () => calling,
+        renewEffectLease: async () => {
+          if (applying) {
+            renewalsWhileApplying += 1;
+          }
+          return true;
+        },
+        markApplied: async () => {
+          applying = true;
+          applied.resolve();
+          await commit.promise;
+          applying = false;
+        },
+        markDone: async () => undefined,
+        markFailed: async () => undefined,
+        markCompensating: async () => undefined,
+      } as unknown as DurableStore;
+      const remote = {
+        adopt: async () => adoption,
+        execute: async () => ({ remoteId: "created", result: {} }),
+        compensate: async () => undefined,
+      } as unknown as RemoteEffects;
+      const runner = new EffectRunner(
+        store,
+        remote,
+        { now: () => new Date(1_000) },
+        {
+          owner: "10000000-0000-4000-8000-000000000009",
+          leaseMs: 300,
+          batchSize: 1,
+        },
+      );
+
+      const tick = runner.tick();
+      await applied.promise;
+      vi.advanceTimersByTime(100);
+      commit.resolve();
+      await tick;
+
+      assert.ok(renewalsWhileApplying > 0);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("does not compensate a mismatched deterministic remote", async () => {
+  const { calls, runner } = harness(4, {
+    remoteId: "foreign-room",
+    matchesRequest: false,
+    terminal: false,
+  });
+  await runner.tick();
+  assert.deepEqual(calls.slice(1), ["adopt", "failed"]);
 });
 
 test("fenced generation compensates without a new remote call", async () => {
@@ -234,4 +306,89 @@ test("rejects global, non-UUID, and unknown-effect fault configurations", async 
       await assert.rejects(() => faults.shouldFail("ROOM_CREATE", effect.consultationId));
     });
   }
+});
+
+test("generation fenced after a remote create compensates instead of completing", async () => {
+  const calls: string[] = [];
+  let generationRead = 0;
+  const store = {
+    claimEffects: async () => [effect],
+    currentGeneration: async () => {
+      generationRead += 1;
+      return generationRead < 3 ? effect.generation : effect.generation + 1;
+    },
+    persistCalling: async () => ({ ...effect, state: "calling" as const, attempt: 1 }),
+    renewEffectLease: async () => true,
+    markApplied: async () => {
+      calls.push("applied");
+    },
+    markDone: async () => {
+      calls.push("done");
+    },
+    markCompensating: async () => {
+      calls.push("compensating");
+    },
+    markFailed: async () => {
+      calls.push("failed");
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    adopt: async () => null,
+    execute: async () => ({
+      remoteId: "RM_created",
+      result: {},
+    }),
+    compensate: async (stale: Effect) => {
+      calls.push(`compensate:${stale.remoteId}`);
+    },
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "10000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["compensating", "compensate:RM_created", "done"]);
+});
+
+test("lost compensation lease stops settlement", async () => {
+  const calls: string[] = [];
+  let renewal = 0;
+  const store = {
+    claimEffects: async () => [{ ...effect, state: "compensating" as const }],
+    currentGeneration: async () => effect.generation + 1,
+    renewEffectLease: async () => {
+      renewal += 1;
+      return renewal === 1;
+    },
+    markDone: async () => {
+      calls.push("done");
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    compensate: async () => {
+      calls.push("compensate");
+    },
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "10000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["compensate"]);
 });

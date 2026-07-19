@@ -46,13 +46,14 @@ export function acceptsCaption(
   candidate: CaptionPacket,
   current: CaptionPacket | undefined,
   expected: ExpectedCaptionRoute,
+  senderIsAgent: boolean,
 ): boolean {
   const consultationMatches = candidate.consultationId === expected.consultationId;
   const destinationMatches =
     candidate.destinationParticipantId === expected.destinationParticipantId;
   const sourceMatches = candidate.sourceParticipantId === expected.sourceParticipantId;
 
-  if (!consultationMatches || !destinationMatches || !sourceMatches) {
+  if (!senderIsAgent || !consultationMatches || !destinationMatches || !sourceMatches) {
     return false;
   }
 

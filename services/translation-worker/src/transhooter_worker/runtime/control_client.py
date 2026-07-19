@@ -10,6 +10,20 @@ import httpx
 
 from transhooter_worker.adapters.spool import EncryptedSpool
 
+_DEFAULT_RETRY_DELAYS = (0.25, 0.5, 1.0, 2.0, 2.0)
+
+
+class ControlRequestError(RuntimeError):
+    pass
+
+
+class RetryableControlRequestError(ControlRequestError):
+    pass
+
+
+class PermanentControlRequestError(ControlRequestError):
+    pass
+
 
 class ControlClient:
     def __init__(
@@ -22,18 +36,20 @@ class ControlClient:
         worker_epoch: int,
         spool: EncryptedSpool,
         client: httpx.AsyncClient | None = None,
+        *,
+        retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
     ) -> None:
-        bearer = bearer_file.read_text("utf-8").strip()
-        if not bearer:
+        self._bearer_file = bearer_file
+        if not self._read_bearer():
             raise RuntimeError("worker internal bearer is empty")
         self._base = base_url.rstrip("/")
-        self._bearer = bearer
         self._meeting = meeting_id
         self._generation = generation
         self._worker_id = worker_id
         self._epoch = worker_epoch
         self._spool = spool
         self._client = client or httpx.AsyncClient(timeout=10, follow_redirects=False)
+        self._retry_delays = retry_delays
 
     async def heartbeat(self, health: dict[str, Any], *, event_id: UUID | None = None) -> None:
         await self._post("heartbeat", health, event_id=event_id)
@@ -57,6 +73,15 @@ class ControlClient:
     ) -> None:
         await self._post("provider-attempt", {"report": payload}, event_id=event_id)
 
+    def _read_bearer(self) -> str:
+        try:
+            bearer = self._bearer_file.read_text("utf-8").strip()
+        except OSError as error:
+            raise RuntimeError("worker internal bearer is unavailable") from error
+        if not bearer:
+            raise RuntimeError("worker internal bearer is empty")
+        return bearer
+
     async def _post(
         self, kind: str, payload: dict[str, Any], *, event_id: UUID | None = None
     ) -> None:
@@ -74,13 +99,13 @@ class ControlClient:
             sort_keys=True,
         ).encode()
         url = f"{self._base}/api/internal/{kind}"
-        for attempt in range(3):
+        for attempt in range(len(self._retry_delays) + 1):
             prepared = self._client.build_request(
                 "POST",
                 url,
                 content=body,
                 headers={
-                    "Authorization": f"Bearer {self._bearer}",
+                    "Authorization": f"Bearer {self._read_bearer()}",
                     "Content-Type": "application/json",
                 },
             )
@@ -93,39 +118,43 @@ class ControlClient:
                 )
                 for name, value in prepared.headers.multi_items()
             )
-            self._spool.append(
-                meeting_id=self._meeting,
-                attempt_id=event_id,
-                stage=f"control-{kind}",
-                transport="http",
-                direction="out",
-                media_type="application/json",
-                payload=prepared.content,
-                metadata=((":method", prepared.method), (":url", str(prepared.url)), *headers),
-            )
+            if kind != "archive-object":
+                self._spool.append(
+                    meeting_id=self._meeting,
+                    attempt_id=event_id,
+                    stage=f"control-{kind}",
+                    transport="http",
+                    direction="out",
+                    media_type="application/json",
+                    payload=prepared.content,
+                    metadata=((":method", prepared.method), (":url", str(prepared.url)), *headers),
+                )
             try:
                 response = await self._client.send(prepared)
             except httpx.TransportError:
-                if attempt == 2:
+                if attempt == len(self._retry_delays):
                     raise
-                await asyncio.sleep(0.1 * (2**attempt))
+                await asyncio.sleep(self._retry_delays[attempt])
                 continue
-            self._spool.append(
-                meeting_id=self._meeting,
-                attempt_id=event_id,
-                stage=f"control-{kind}",
-                transport="http",
-                direction="in",
-                media_type="application/json",
-                payload=response.content,
-                metadata=(
-                    (":status", str(response.status_code)),
-                    *tuple(response.headers.multi_items()),
-                ),
-            )
+            if kind != "archive-object":
+                self._spool.append(
+                    meeting_id=self._meeting,
+                    attempt_id=event_id,
+                    stage=f"control-{kind}",
+                    transport="http",
+                    direction="in",
+                    media_type="application/json",
+                    payload=response.content,
+                    metadata=(
+                        (":status", str(response.status_code)),
+                        *tuple(response.headers.multi_items()),
+                    ),
+                )
             if response.status_code // 100 == 2:
                 return
-            if response.status_code // 100 == 5 and attempt < 2:
-                await asyncio.sleep(0.1 * (2**attempt))
+            retryable = response.status_code in {408, 425, 429} or response.status_code >= 500
+            if retryable and attempt < len(self._retry_delays):
+                await asyncio.sleep(self._retry_delays[attempt])
                 continue
-            raise RuntimeError(f"internal {kind} rejected with HTTP {response.status_code}")
+            error_type = RetryableControlRequestError if retryable else PermanentControlRequestError
+            raise error_type(f"internal {kind} rejected with HTTP {response.status_code}")

@@ -397,6 +397,16 @@ export interface ArchiveRepository extends TransactionManager {
     tx: Transaction,
   ): Promise<UUID>;
   recordObject(object: ArchiveObject, tx: Transaction): Promise<void>;
+  lockActiveWorkerWriter(
+    input: {
+      consultationId: UUID;
+      generation: number;
+      workerId: UUID;
+      workerEpoch: number;
+      writerEpoch: number;
+    },
+    tx: Transaction,
+  ): Promise<boolean>;
   fulfillExpectedArtifact(
     expectedId: UUID,
     objectId: UUID,

@@ -25,6 +25,8 @@
   --amber-room-tint: rgba(217, 144, 0, 0.13);
   --amber-room-line: rgba(217, 144, 0, 0.4);
   --shadow-color: rgba(16, 27, 53, 0.09);
+  --room-foreground: #f5f7fb;
+  --room-foreground-muted: #c4cee2;
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -220,6 +222,25 @@ p {
   align-items: center;
 }
 
+.inlineConfirmation {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 32rem;
+  padding: var(--space-3);
+  border-left: var(--space-1) solid var(--amber);
+  background: var(--amber-tint);
+}
+
+.inlineConfirmation p {
+  margin: 0;
+}
+
+.logoutControl {
+  display: grid;
+  gap: var(--space-1);
+  justify-items: end;
+}
+
 .button {
   min-height: 2.75rem;
   max-width: 100%;
@@ -385,8 +406,95 @@ td code,
   overflow-wrap: anywhere;
 }
 
+.logoutControl .error {
+  max-width: 18rem;
+  font-size: 0.75rem;
+}
+
 td code {
   word-break: break-word;
+}
+
+.status.danger::before {
+  background: var(--danger);
+}
+
+.failureList {
+  display: grid;
+}
+
+.failureItem {
+  display: grid;
+  grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
+  gap: var(--space-6);
+  padding: var(--space-6) 0;
+  border-top: 1px solid var(--line);
+}
+
+.failureIdentity {
+  display: grid;
+  align-content: start;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.failureHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.failureIdentity h2 {
+  max-width: none;
+  margin: 0;
+  color: var(--danger);
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.failureMetadata {
+  margin: 0;
+}
+
+.failureMetadata dt,
+.failureEvidenceLabel {
+  margin: 0 0 var(--space-1);
+  color: var(--ink-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.failureMetadata dd {
+  margin: 0;
+}
+
+.failureMetadata code {
+  overflow-wrap: anywhere;
+}
+
+.failureLink {
+  justify-self: start;
+  margin-top: var(--space-2);
+}
+
+.failureEvidence {
+  min-width: 0;
+}
+
+.failureEvidence pre {
+  max-height: 18rem;
+  margin: 0;
+  overflow: auto;
+  border-left: 0.25rem solid var(--danger);
+  background: var(--paper);
+  padding: var(--space-4);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .empty {
@@ -447,6 +555,11 @@ td code {
 
 .archiveActions form {
   min-width: 0;
+}
+
+.archiveHoldRow {
+  display: grid;
+  gap: var(--space-3);
 }
 
 .archiveHoldReason {
@@ -566,6 +679,15 @@ td code {
 
   .nav .button {
     width: auto;
+  }
+
+  .failureItem {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-4);
+  }
+
+  .failureLink {
+    justify-self: stretch;
   }
 
   .row {

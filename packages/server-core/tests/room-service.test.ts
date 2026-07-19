@@ -318,4 +318,97 @@ describe("RoomService webhook fences", () => {
     expect(removeParticipant).toHaveBeenCalledWith(ROOM_NAME, ID);
     expect(enqueue).not.toHaveBeenCalled();
   });
+  it("revokes a stale-generation join from the room named by the event", async () => {
+    const staleRoom = "00000000-0000-4000-8000-000000000099";
+    const removeParticipant = mock(async () => undefined);
+    const current = consultation();
+    const service = new RoomService(
+      {
+        transaction: async <T>(work: (entry: Transaction) => Promise<T>) => work(transaction),
+        lock: async () => current,
+      } as unknown as ConsultationRepository,
+      { acceptInbox: async () => true } as unknown as EffectRepository,
+      { removeParticipant } as never,
+      {} as never,
+      {
+        verify: async () => ({
+          id: "stale-join",
+          consultationId: ID,
+          generation: 1,
+          occurredAt: NOW,
+          kind: "participant_joined" as const,
+          roomName: staleRoom,
+          identity: ID,
+          payload: {},
+        }),
+      },
+      {} as never,
+      { now: () => NOW },
+      { uuid: () => OTHER },
+      { sha256: () => "a".repeat(64) },
+    );
+
+    await service.acceptWebhook(new Uint8Array(), {});
+
+    expect(removeParticipant).toHaveBeenCalledWith(staleRoom, ID);
+  });
+
+  it("rechecks the admission fence before persisting a capture grant", async () => {
+    let value = consultation();
+    const clearParticipantEgressBinding = mock(async () => true);
+    const stop = mock(async () => undefined);
+    const updateParticipant = mock(async (input: { canPublish: boolean }) => {
+      if (input.canPublish) {
+        value = { ...value, admissionFencedAt: NOW };
+      }
+    });
+    const service = new RoomService(
+      {
+        get: async () => value,
+        transaction: async <T>(work: (entry: Transaction) => Promise<T>) => work(transaction),
+        lock: async () => value,
+        save: async (next: Consultation) => {
+          value = next;
+          return true;
+        },
+        clearParticipantEgressBinding,
+      } as unknown as ConsultationRepository,
+      { enqueue: async () => undefined } as unknown as EffectRepository,
+      { updateParticipant } as never,
+      {
+        get: async () => null,
+        startParticipant: async () => ({
+          egressId: "egress-new",
+          state: "EGRESS_ACTIVE",
+        }),
+        stop,
+      } as never,
+      {
+        verify: async () => {
+          throw new Error("unused");
+        },
+      },
+      {} as never,
+      { now: () => NOW },
+      { uuid: () => OTHER },
+      { sha256: () => "a".repeat(64) },
+    );
+
+    await expect(service.executeCaptureBarrier(ID, OTHER)).rejects.toThrowError(
+      /FENCED_GENERATION/,
+    );
+
+    expect(updateParticipant).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ identity: OTHER, canPublish: false }),
+    );
+    expect(stop).toHaveBeenCalledWith("egress-new");
+    expect(clearParticipantEgressBinding).toHaveBeenCalledWith(
+      ID,
+      2,
+      OTHER,
+      "egress-new",
+      transaction,
+    );
+  });
 });

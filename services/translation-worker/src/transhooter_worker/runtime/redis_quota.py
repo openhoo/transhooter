@@ -56,22 +56,25 @@ class RedisQuotaGate:
 local now = tonumber(ARGV[1])
 local expiry = tonumber(ARGV[2])
 local member = ARGV[3]
-local limit = tonumber(ARGV[4])
 
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
-
-if redis.call('ZSCORE', KEYS[1], member) then
-    redis.call('ZADD', KEYS[1], expiry, member)
-    redis.call('PEXPIRE', KEYS[1], expiry - now)
-    return 1
+for index = 1, #KEYS do
+    redis.call('ZREMRANGEBYSCORE', KEYS[index], '-inf', now)
+    if not redis.call('ZSCORE', KEYS[index], member)
+        and redis.call('ZCARD', KEYS[index]) >= tonumber(ARGV[index + 3]) then
+        return 0
+    end
 end
 
-if redis.call('ZCARD', KEYS[1]) >= limit then
-    return 0
+for index = 1, #KEYS do
+    redis.call('ZADD', KEYS[index], expiry, member)
+    redis.call('PEXPIRE', KEYS[index], expiry - now)
 end
-
-redis.call('ZADD', KEYS[1], expiry, member)
-redis.call('PEXPIRE', KEYS[1], expiry - now)
+return 1
+"""
+    _ACTIVE_RELEASE_SCRIPT = """
+for index = 1, #KEYS do
+    redis.call('ZREM', KEYS[index], ARGV[1])
+end
 return 1
 """
     _WINDOW_RESERVATION_SCRIPT = """
@@ -156,11 +159,16 @@ return 1
         reservation_id: str,
         ttl_ms: int = 15_000,
     ) -> None:
-        for dimension, capacity in self._limits.get(stage, {}).items():
-            if dimension not in _ACTIVE_DIMENSIONS:
-                continue
-            now_ms = int(time.time() * 1000)
-            key = _quota_key(
+        dimensions = [
+            (dimension, capacity)
+            for dimension, capacity in self._limits.get(stage, {}).items()
+            if dimension in _ACTIVE_DIMENSIONS
+        ]
+        if not dimensions:
+            return
+        now_ms = int(time.time() * 1000)
+        keys = [
+            _quota_key(
                 self._provider,
                 self._account,
                 self._region,
@@ -168,34 +176,36 @@ return 1
                 dimension,
                 "active",
             )
-            accepted = await self._eval(
-                self._ACTIVE_RESERVATION_SCRIPT,
-                [key],
-                [
-                    str(now_ms),
-                    str(now_ms + ttl_ms),
-                    reservation_id,
-                    str(_headroom_limit(capacity)),
-                ],
-            )
-            if not accepted:
-                raise RuntimeError(f"provider active quota rejected: {stage}/{dimension}")
+            for dimension, _ in dimensions
+        ]
+        accepted = await self._eval(
+            self._ACTIVE_RESERVATION_SCRIPT,
+            keys,
+            [
+                str(now_ms),
+                str(now_ms + ttl_ms),
+                reservation_id,
+                *(str(_headroom_limit(capacity)) for _, capacity in dimensions),
+            ],
+        )
+        if not accepted:
+            raise RuntimeError(f"provider active quota rejected: {stage}")
 
     async def release_active(self, stage: str, reservation_id: str) -> None:
-        for dimension in self._limits.get(stage, {}):
-            if dimension in _ACTIVE_DIMENSIONS:
-                await self._execute_redis_command(
-                    "ZREM",
-                    _quota_key(
-                        self._provider,
-                        self._account,
-                        self._region,
-                        stage,
-                        dimension,
-                        "active",
-                    ),
-                    reservation_id,
-                )
+        keys = [
+            _quota_key(
+                self._provider,
+                self._account,
+                self._region,
+                stage,
+                dimension,
+                "active",
+            )
+            for dimension in self._limits.get(stage, {})
+            if dimension in _ACTIVE_DIMENSIONS
+        ]
+        if keys:
+            await self._eval(self._ACTIVE_RELEASE_SCRIPT, keys, [reservation_id])
 
     async def _eval(self, script: str, keys: list[str], arguments: list[str]) -> bool:
         return (

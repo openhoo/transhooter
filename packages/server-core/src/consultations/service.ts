@@ -231,17 +231,11 @@ export class ConsultationService {
     const preflightHash = preflight.snapshotHash;
     const result = await this.consultations.transaction<JoinTransactionResult>(async (tx) => {
       const current = await this.requiredLocked(consultationId, tx);
-      const slot = slotForUser(current, userId);
       if (current.state === "ready" || current.state === "active") {
         return { current, newlyPlanned: false };
       }
 
       const eligibility = joinEligibility(current);
-      const ownConsentRecorded =
-        current.snapshotHash !== null && slot.consent?.snapshotHash === current.snapshotHash;
-      if (eligibility === "CONSENT_REQUIRED" && ownConsentRecorded) {
-        return { current, newlyPlanned: false };
-      }
       if (eligibility !== "eligible") {
         throw new DomainError(eligibility);
       }

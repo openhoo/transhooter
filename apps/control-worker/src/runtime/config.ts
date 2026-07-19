@@ -58,7 +58,7 @@ export interface RuntimeConfig {
   readonly healthPort: number;
   readonly livekit: LivekitRuntimeConfig;
   readonly egressLayoutUrl: string;
-  readonly internalToken: string;
+  readonly internalToken: () => Promise<string>;
   readonly egressLayoutSigningKey: string;
   readonly testFaultControlFile: string | null;
   readonly s3: S3RuntimeConfig;
@@ -73,21 +73,14 @@ export async function loadConfig(environment: NodeJS.ProcessEnv): Promise<Runtim
     throw new Error("test fault controls require APP_ENV=test");
   }
 
-  const [
-    databaseUrlValue,
-    redisUrlValue,
-    livekitValue,
-    internalToken,
-    egressLayoutSigningKey,
-    s3Value,
-  ] = await Promise.all([
-    readSecret(parsedEnvironment.DATABASE_URL_FILE),
-    readSecret(parsedEnvironment.REDIS_URL_FILE),
-    readJsonSecret(parsedEnvironment.LIVEKIT_CREDENTIALS_FILE),
-    readSecret(parsedEnvironment.INTERNAL_TOKEN_FILE),
-    readSecret(parsedEnvironment.EGRESS_LAYOUT_SIGNING_KEY_FILE),
-    readJsonSecret(parsedEnvironment.S3_CREDENTIALS_FILE),
-  ]);
+  const [databaseUrlValue, redisUrlValue, livekitValue, egressLayoutSigningKey, s3Value] =
+    await Promise.all([
+      readSecret(parsedEnvironment.DATABASE_URL_FILE),
+      readSecret(parsedEnvironment.REDIS_URL_FILE),
+      readJsonSecret(parsedEnvironment.LIVEKIT_CREDENTIALS_FILE),
+      readSecret(parsedEnvironment.EGRESS_LAYOUT_SIGNING_KEY_FILE),
+      readJsonSecret(parsedEnvironment.S3_CREDENTIALS_FILE),
+    ]);
 
   const livekitCredentials = livekitCredentialsSchema.parse(livekitValue);
   const s3Credentials = s3CredentialsSchema.parse(s3Value);
@@ -104,7 +97,7 @@ export async function loadConfig(environment: NodeJS.ProcessEnv): Promise<Runtim
       parsedEnvironment.APP_ENV === "test"
         ? (parsedEnvironment.TEST_FAULT_CONTROL_FILE ?? null)
         : null,
-    internalToken,
+    internalToken: async () => readSecret(parsedEnvironment.INTERNAL_TOKEN_FILE),
     egressLayoutSigningKey,
     livekit: {
       url: parsedEnvironment.LIVEKIT_INTERNAL_URL,

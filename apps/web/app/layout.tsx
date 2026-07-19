@@ -24,6 +24,7 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
             <nav className="nav" aria-label="Primary">
               <Link href="/consultations">Consultations</Link>
               {viewer.staffRole && <Link href="/admin/languages">Languages</Link>}
+              {viewer.staffRole && <Link href="/admin/failures">Failures</Link>}
               <LogoutButton />
             </nav>
           )}

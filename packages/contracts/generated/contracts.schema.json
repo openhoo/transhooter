@@ -56,6 +56,38 @@
     "ArchiveGap": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "sampleRange": {
+              "not": {
+                "type": "null"
+              }
+            }
+          },
+          "required": [
+            "sampleRange"
+          ]
+        },
+        {
+          "properties": {
+            "segmentEnd": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "segmentStart": {
+              "not": {
+                "type": "null"
+              }
+            }
+          },
+          "required": [
+            "segmentStart",
+            "segmentEnd"
+          ]
+        }
+      ],
       "properties": {
         "objectClass": {
           "enum": [
@@ -105,7 +137,10 @@
                 "start",
                 "end"
               ],
-              "type": "object"
+              "type": "object",
+              "x-transhooter-runtime-refinements": [
+                "end must exceed start"
+              ]
             },
             {
               "type": "null"
@@ -145,7 +180,10 @@
         "segmentEnd",
         "reason"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "segmentEnd must not precede segmentStart"
+      ]
     },
     "ArchiveObjectClass": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -243,7 +281,10 @@
                 "start",
                 "end"
               ],
-              "type": "object"
+              "type": "object",
+              "x-transhooter-runtime-refinements": [
+                "end must exceed start"
+              ]
             },
             {
               "type": "null"
@@ -375,7 +416,10 @@
                         "start",
                         "end"
                       ],
-                      "type": "object"
+                      "type": "object",
+                      "x-transhooter-runtime-refinements": [
+                        "end must exceed start"
+                      ]
                     },
                     {
                       "type": "null"
@@ -476,6 +520,38 @@
                 "gaps": {
                   "items": {
                     "additionalProperties": false,
+                    "anyOf": [
+                      {
+                        "properties": {
+                          "sampleRange": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "sampleRange"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "segmentEnd": {
+                            "not": {
+                              "type": "null"
+                            }
+                          },
+                          "segmentStart": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "segmentStart",
+                          "segmentEnd"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "objectClass": {
                         "enum": [
@@ -525,7 +601,10 @@
                               "start",
                               "end"
                             ],
-                            "type": "object"
+                            "type": "object",
+                            "x-transhooter-runtime-refinements": [
+                              "end must exceed start"
+                            ]
                           },
                           {
                             "type": "null"
@@ -565,7 +644,10 @@
                       "segmentEnd",
                       "reason"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-transhooter-runtime-refinements": [
+                      "segmentEnd must not precede segmentStart"
+                    ]
                   },
                   "type": "array"
                 },
@@ -633,7 +715,10 @@
                 "terminal",
                 "occurredAtMs"
               ],
-              "type": "object"
+              "type": "object",
+              "x-transhooter-runtime-refinements": [
+                "sourceParticipantId must differ from destinationParticipantId"
+              ]
             }
           },
           "required": [
@@ -651,6 +736,16 @@
             },
             "value": {
               "additionalProperties": false,
+              "if": {
+                "properties": {
+                  "status": {
+                    "const": "complete"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              },
               "properties": {
                 "consultationId": {
                   "format": "uuid",
@@ -673,6 +768,38 @@
                       "gaps": {
                         "items": {
                           "additionalProperties": false,
+                          "anyOf": [
+                            {
+                              "properties": {
+                                "sampleRange": {
+                                  "not": {
+                                    "type": "null"
+                                  }
+                                }
+                              },
+                              "required": [
+                                "sampleRange"
+                              ]
+                            },
+                            {
+                              "properties": {
+                                "segmentEnd": {
+                                  "not": {
+                                    "type": "null"
+                                  }
+                                },
+                                "segmentStart": {
+                                  "not": {
+                                    "type": "null"
+                                  }
+                                }
+                              },
+                              "required": [
+                                "segmentStart",
+                                "segmentEnd"
+                              ]
+                            }
+                          ],
                           "properties": {
                             "objectClass": {
                               "enum": [
@@ -722,7 +849,10 @@
                                     "start",
                                     "end"
                                   ],
-                                  "type": "object"
+                                  "type": "object",
+                                  "x-transhooter-runtime-refinements": [
+                                    "end must exceed start"
+                                  ]
                                 },
                                 {
                                   "type": "null"
@@ -762,7 +892,10 @@
                             "segmentEnd",
                             "reason"
                           ],
-                          "type": "object"
+                          "type": "object",
+                          "x-transhooter-runtime-refinements": [
+                            "segmentEnd must not precede segmentStart"
+                          ]
                         },
                         "type": "array"
                       },
@@ -857,6 +990,38 @@
                 "missing": {
                   "items": {
                     "additionalProperties": false,
+                    "anyOf": [
+                      {
+                        "properties": {
+                          "sampleRange": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "sampleRange"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "segmentEnd": {
+                            "not": {
+                              "type": "null"
+                            }
+                          },
+                          "segmentStart": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "segmentStart",
+                          "segmentEnd"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "objectClass": {
                         "enum": [
@@ -906,7 +1071,10 @@
                               "start",
                               "end"
                             ],
-                            "type": "object"
+                            "type": "object",
+                            "x-transhooter-runtime-refinements": [
+                              "end must exceed start"
+                            ]
                           },
                           {
                             "type": "null"
@@ -946,7 +1114,10 @@
                       "segmentEnd",
                       "reason"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-transhooter-runtime-refinements": [
+                      "segmentEnd must not precede segmentStart"
+                    ]
                   },
                   "type": "array"
                 },
@@ -1025,7 +1196,10 @@
                               "start",
                               "end"
                             ],
-                            "type": "object"
+                            "type": "object",
+                            "x-transhooter-runtime-refinements": [
+                              "end must exceed start"
+                            ]
                           },
                           {
                             "type": "null"
@@ -1165,6 +1339,48 @@
                 "errors",
                 "createdAtMs"
               ],
+              "then": {
+                "properties": {
+                  "egressResults": {
+                    "items": {
+                      "properties": {
+                        "gaps": {
+                          "maxItems": 0
+                        },
+                        "outcome": {
+                          "const": "complete"
+                        }
+                      },
+                      "required": [
+                        "outcome",
+                        "gaps"
+                      ]
+                    }
+                  },
+                  "errors": {
+                    "maxItems": 0
+                  },
+                  "missing": {
+                    "maxItems": 0
+                  },
+                  "workerTerminal": {
+                    "properties": {
+                      "outcome": {
+                        "const": "clean"
+                      }
+                    },
+                    "required": [
+                      "outcome"
+                    ]
+                  }
+                },
+                "required": [
+                  "workerTerminal",
+                  "egressResults",
+                  "missing",
+                  "errors"
+                ]
+              },
               "type": "object"
             }
           },
@@ -1259,7 +1475,10 @@
                               "start",
                               "end"
                             ],
-                            "type": "object"
+                            "type": "object",
+                            "x-transhooter-runtime-refinements": [
+                              "end must exceed start"
+                            ]
                           },
                           {
                             "type": "null"
@@ -1502,7 +1721,11 @@
         "sourceSampleEnd",
         "occurredAtMs"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "sourceParticipantId must differ from destinationParticipantId",
+        "sourceSampleEnd must exceed sourceSampleStart"
+      ]
     },
     "CaptureReadyStatus": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2011,6 +2234,38 @@
         "gaps": {
           "items": {
             "additionalProperties": false,
+            "anyOf": [
+              {
+                "properties": {
+                  "sampleRange": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "sampleRange"
+                ]
+              },
+              {
+                "properties": {
+                  "segmentEnd": {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
+                  "segmentStart": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "segmentStart",
+                  "segmentEnd"
+                ]
+              }
+            ],
             "properties": {
               "objectClass": {
                 "enum": [
@@ -2060,7 +2315,10 @@
                       "start",
                       "end"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-transhooter-runtime-refinements": [
+                      "end must exceed start"
+                    ]
                   },
                   {
                     "type": "null"
@@ -2100,7 +2358,10 @@
               "segmentEnd",
               "reason"
             ],
-            "type": "object"
+            "type": "object",
+            "x-transhooter-runtime-refinements": [
+              "segmentEnd must not precede segmentStart"
+            ]
           },
           "type": "array"
         },
@@ -2167,6 +2428,16 @@
     "FinalInventory": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
+      "if": {
+        "properties": {
+          "status": {
+            "const": "complete"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
       "properties": {
         "consultationId": {
           "format": "uuid",
@@ -2189,6 +2460,38 @@
               "gaps": {
                 "items": {
                   "additionalProperties": false,
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "sampleRange": {
+                          "not": {
+                            "type": "null"
+                          }
+                        }
+                      },
+                      "required": [
+                        "sampleRange"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "segmentEnd": {
+                          "not": {
+                            "type": "null"
+                          }
+                        },
+                        "segmentStart": {
+                          "not": {
+                            "type": "null"
+                          }
+                        }
+                      },
+                      "required": [
+                        "segmentStart",
+                        "segmentEnd"
+                      ]
+                    }
+                  ],
                   "properties": {
                     "objectClass": {
                       "enum": [
@@ -2238,7 +2541,10 @@
                             "start",
                             "end"
                           ],
-                          "type": "object"
+                          "type": "object",
+                          "x-transhooter-runtime-refinements": [
+                            "end must exceed start"
+                          ]
                         },
                         {
                           "type": "null"
@@ -2278,7 +2584,10 @@
                     "segmentEnd",
                     "reason"
                   ],
-                  "type": "object"
+                  "type": "object",
+                  "x-transhooter-runtime-refinements": [
+                    "segmentEnd must not precede segmentStart"
+                  ]
                 },
                 "type": "array"
               },
@@ -2373,6 +2682,38 @@
         "missing": {
           "items": {
             "additionalProperties": false,
+            "anyOf": [
+              {
+                "properties": {
+                  "sampleRange": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "sampleRange"
+                ]
+              },
+              {
+                "properties": {
+                  "segmentEnd": {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
+                  "segmentStart": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "segmentStart",
+                  "segmentEnd"
+                ]
+              }
+            ],
             "properties": {
               "objectClass": {
                 "enum": [
@@ -2422,7 +2763,10 @@
                       "start",
                       "end"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-transhooter-runtime-refinements": [
+                      "end must exceed start"
+                    ]
                   },
                   {
                     "type": "null"
@@ -2462,7 +2806,10 @@
               "segmentEnd",
               "reason"
             ],
-            "type": "object"
+            "type": "object",
+            "x-transhooter-runtime-refinements": [
+              "segmentEnd must not precede segmentStart"
+            ]
           },
           "type": "array"
         },
@@ -2541,7 +2888,10 @@
                       "start",
                       "end"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-transhooter-runtime-refinements": [
+                      "end must exceed start"
+                    ]
                   },
                   {
                     "type": "null"
@@ -2681,7 +3031,727 @@
         "errors",
         "createdAtMs"
       ],
+      "then": {
+        "properties": {
+          "egressResults": {
+            "items": {
+              "properties": {
+                "gaps": {
+                  "maxItems": 0
+                },
+                "outcome": {
+                  "const": "complete"
+                }
+              },
+              "required": [
+                "outcome",
+                "gaps"
+              ]
+            }
+          },
+          "errors": {
+            "maxItems": 0
+          },
+          "missing": {
+            "maxItems": 0
+          },
+          "workerTerminal": {
+            "properties": {
+              "outcome": {
+                "const": "clean"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          }
+        },
+        "required": [
+          "workerTerminal",
+          "egressResults",
+          "missing",
+          "errors"
+        ]
+      },
       "type": "object"
+    },
+    "GrpcMessageReference": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "direction": {
+          "enum": [
+            "sent",
+            "received"
+          ],
+          "type": "string"
+        },
+        "ordinal": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "pattern": "^v1\\/meetings\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\/[a-z0-9][a-z0-9._/-]*$",
+              "type": "string"
+            },
+            "objectId": {
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "type": "string"
+            },
+            "sha256": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            "size": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "objectId",
+            "key",
+            "sha256",
+            "size"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "ordinal",
+        "direction",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "GrpcProviderAttemptTerminal": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "else": {
+        "properties": {
+          "error": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "properties": {
+        "attemptId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "credentialFingerprint": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "credentialVersion": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "attemptId": {
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "authentication",
+                    "quota",
+                    "rate_limit",
+                    "transport",
+                    "provider",
+                    "invalid_request",
+                    "invalid_response",
+                    "internal",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                },
+                "providerCode": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "providerRequestId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "providerRetryAdvice": {
+                  "enum": [
+                    "never",
+                    "retry_after",
+                    "unspecified"
+                  ],
+                  "type": "string"
+                },
+                "rawObjectIds": {
+                  "items": {
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "retryDelayMs": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "scope": {
+                  "enum": [
+                    "operation",
+                    "session"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "scope",
+                "providerRetryAdvice",
+                "providerCode",
+                "providerRequestId",
+                "retryDelayMs",
+                "attemptId",
+                "rawObjectIds"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "occurredAtMs": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "operationId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "rawReference": {
+          "additionalProperties": false,
+          "properties": {
+            "initialMetadata": {
+              "items": {
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "redacted": {
+                    "type": "boolean"
+                  },
+                  "secretReference": {
+                    "anyOf": [
+                      {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "value",
+                  "redacted",
+                  "secretReference"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "messages": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "direction": {
+                    "enum": [
+                      "sent",
+                      "received"
+                    ],
+                    "type": "string"
+                  },
+                  "ordinal": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "payload": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "key": {
+                        "maxLength": 1024,
+                        "minLength": 1,
+                        "pattern": "^v1\\/meetings\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\/[a-z0-9][a-z0-9._/-]*$",
+                        "type": "string"
+                      },
+                      "objectId": {
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "pattern": "^[a-f0-9]{64}$",
+                        "type": "string"
+                      },
+                      "size": {
+                        "maximum": 9007199254740991,
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "objectId",
+                      "key",
+                      "sha256",
+                      "size"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "ordinal",
+                  "direction",
+                  "payload"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "method": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "statusCode": {
+              "anyOf": [
+                {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "statusDetails": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "trailingMetadata": {
+              "items": {
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "redacted": {
+                    "type": "boolean"
+                  },
+                  "secretReference": {
+                    "anyOf": [
+                      {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "value",
+                  "redacted",
+                  "secretReference"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "transport": {
+              "const": "grpc",
+              "type": "string"
+            }
+          },
+          "required": [
+            "transport",
+            "method",
+            "messages",
+            "initialMetadata",
+            "statusCode",
+            "statusDetails",
+            "trailingMetadata"
+          ],
+          "type": "object"
+        },
+        "retryDecision": {
+          "additionalProperties": false,
+          "else": {
+            "properties": {
+              "retryAtMs": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
+          "if": {
+            "properties": {
+              "action": {
+                "const": "retry"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          },
+          "properties": {
+            "action": {
+              "enum": [
+                "retry",
+                "do_not_retry",
+                "degrade"
+              ],
+              "type": "string"
+            },
+            "previousAttemptId": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "retryAtMs": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "action",
+            "reason",
+            "retryAtMs",
+            "previousAttemptId"
+          ],
+          "then": {
+            "properties": {
+              "retryAtMs": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
+          "type": "object"
+        },
+        "retryOfAttemptId": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "enum": [
+            "stt",
+            "translation",
+            "tts"
+          ],
+          "type": "string"
+        },
+        "terminalId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "transport": {
+          "const": "grpc",
+          "type": "string"
+        },
+        "watermarks": {
+          "additionalProperties": false,
+          "properties": {
+            "acceptedInputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "acceptedInputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "emittedOutputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "emittedOutputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "receivedOutputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "receivedOutputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "acceptedInputSequence",
+            "acceptedInputSampleEnd",
+            "receivedOutputSequence",
+            "receivedOutputSampleEnd",
+            "emittedOutputSequence",
+            "emittedOutputSampleEnd"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "terminalId",
+        "operationId",
+        "attemptId",
+        "stage",
+        "outcome",
+        "error",
+        "retryDecision",
+        "retryOfAttemptId",
+        "watermarks",
+        "credentialVersion",
+        "credentialFingerprint",
+        "occurredAtMs",
+        "transport",
+        "rawReference"
+      ],
+      "then": {
+        "properties": {
+          "error": {
+            "not": {
+              "type": "null"
+            }
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "error.attemptId must equal attemptId",
+        "retryDecision.previousAttemptId must be null or equal attemptId",
+        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "retryOfAttemptId must differ from attemptId"
+      ]
     },
     "GrpcRawReference": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2690,6 +3760,38 @@
         "initialMetadata": {
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "redacted": {
+                    "const": true
+                  },
+                  "secretReference": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              },
+              {
+                "properties": {
+                  "redacted": {
+                    "const": false
+                  },
+                  "secretReference": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              }
+            ],
             "properties": {
               "name": {
                 "minLength": 1,
@@ -2809,6 +3911,38 @@
         "trailingMetadata": {
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "redacted": {
+                    "const": true
+                  },
+                  "secretReference": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              },
+              {
+                "properties": {
+                  "redacted": {
+                    "const": false
+                  },
+                  "secretReference": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              }
+            ],
             "properties": {
               "name": {
                 "minLength": 1,
@@ -2858,9 +3992,662 @@
       ],
       "type": "object"
     },
+    "HttpProviderAttemptTerminal": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "else": {
+        "properties": {
+          "error": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "properties": {
+        "attemptId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "credentialFingerprint": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "credentialVersion": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "attemptId": {
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "authentication",
+                    "quota",
+                    "rate_limit",
+                    "transport",
+                    "provider",
+                    "invalid_request",
+                    "invalid_response",
+                    "internal",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                },
+                "providerCode": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "providerRequestId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "providerRetryAdvice": {
+                  "enum": [
+                    "never",
+                    "retry_after",
+                    "unspecified"
+                  ],
+                  "type": "string"
+                },
+                "rawObjectIds": {
+                  "items": {
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "retryDelayMs": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "scope": {
+                  "enum": [
+                    "operation",
+                    "session"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "scope",
+                "providerRetryAdvice",
+                "providerCode",
+                "providerRequestId",
+                "retryDelayMs",
+                "attemptId",
+                "rawObjectIds"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "occurredAtMs": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "operationId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "rawReference": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "properties": {
+                "url": {
+                  "format": "uri",
+                  "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://",
+                  "type": "string"
+                }
+              }
+            }
+          ],
+          "properties": {
+            "method": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "requestBody": {
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "maxLength": 1024,
+                  "minLength": 1,
+                  "pattern": "^v1\\/meetings\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\/[a-z0-9][a-z0-9._/-]*$",
+                  "type": "string"
+                },
+                "objectId": {
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "size": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "objectId",
+                "key",
+                "sha256",
+                "size"
+              ],
+              "type": "object"
+            },
+            "requestHeaders": {
+              "items": {
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "redacted": {
+                    "type": "boolean"
+                  },
+                  "secretReference": {
+                    "anyOf": [
+                      {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "value",
+                  "redacted",
+                  "secretReference"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "responseBody": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "key": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "pattern": "^v1\\/meetings\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\/[a-z0-9][a-z0-9._/-]*$",
+                      "type": "string"
+                    },
+                    "objectId": {
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "type": "string"
+                    },
+                    "sha256": {
+                      "pattern": "^[a-f0-9]{64}$",
+                      "type": "string"
+                    },
+                    "size": {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "objectId",
+                    "key",
+                    "sha256",
+                    "size"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "responseHeaders": {
+              "items": {
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "redacted": {
+                    "type": "boolean"
+                  },
+                  "secretReference": {
+                    "anyOf": [
+                      {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "value",
+                  "redacted",
+                  "secretReference"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "status": {
+              "anyOf": [
+                {
+                  "maximum": 599,
+                  "minimum": 100,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "transport": {
+              "const": "http",
+              "type": "string"
+            },
+            "url": {
+              "format": "uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "transport",
+            "method",
+            "url",
+            "status",
+            "requestHeaders",
+            "requestBody",
+            "responseHeaders",
+            "responseBody"
+          ],
+          "type": "object"
+        },
+        "retryDecision": {
+          "additionalProperties": false,
+          "else": {
+            "properties": {
+              "retryAtMs": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
+          "if": {
+            "properties": {
+              "action": {
+                "const": "retry"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          },
+          "properties": {
+            "action": {
+              "enum": [
+                "retry",
+                "do_not_retry",
+                "degrade"
+              ],
+              "type": "string"
+            },
+            "previousAttemptId": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "retryAtMs": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "action",
+            "reason",
+            "retryAtMs",
+            "previousAttemptId"
+          ],
+          "then": {
+            "properties": {
+              "retryAtMs": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
+          "type": "object"
+        },
+        "retryOfAttemptId": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "enum": [
+            "stt",
+            "translation",
+            "tts"
+          ],
+          "type": "string"
+        },
+        "terminalId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "transport": {
+          "const": "http",
+          "type": "string"
+        },
+        "watermarks": {
+          "additionalProperties": false,
+          "properties": {
+            "acceptedInputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "acceptedInputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "emittedOutputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "emittedOutputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "receivedOutputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "receivedOutputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "acceptedInputSequence",
+            "acceptedInputSampleEnd",
+            "receivedOutputSequence",
+            "receivedOutputSampleEnd",
+            "emittedOutputSequence",
+            "emittedOutputSampleEnd"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "terminalId",
+        "operationId",
+        "attemptId",
+        "stage",
+        "outcome",
+        "error",
+        "retryDecision",
+        "retryOfAttemptId",
+        "watermarks",
+        "credentialVersion",
+        "credentialFingerprint",
+        "occurredAtMs",
+        "transport",
+        "rawReference"
+      ],
+      "then": {
+        "properties": {
+          "error": {
+            "not": {
+              "type": "null"
+            }
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "error.attemptId must equal attemptId",
+        "retryDecision.previousAttemptId must be null or equal attemptId",
+        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "retryOfAttemptId must differ from attemptId"
+      ]
+    },
     "HttpRawReference": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "properties": {
+            "url": {
+              "format": "uri",
+              "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://",
+              "type": "string"
+            }
+          }
+        }
+      ],
       "properties": {
         "method": {
           "minLength": 1,
@@ -2901,6 +4688,38 @@
         "requestHeaders": {
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "redacted": {
+                    "const": true
+                  },
+                  "secretReference": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              },
+              {
+                "properties": {
+                  "redacted": {
+                    "const": false
+                  },
+                  "secretReference": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              }
+            ],
             "properties": {
               "name": {
                 "minLength": 1,
@@ -2976,6 +4795,38 @@
         "responseHeaders": {
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "redacted": {
+                    "const": true
+                  },
+                  "secretReference": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              },
+              {
+                "properties": {
+                  "redacted": {
+                    "const": false
+                  },
+                  "secretReference": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              }
+            ],
             "properties": {
               "name": {
                 "minLength": 1,
@@ -3157,7 +5008,10 @@
                       "start",
                       "end"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-transhooter-runtime-refinements": [
+                      "end must exceed start"
+                    ]
                   },
                   {
                     "type": "null"
@@ -3308,6 +5162,72 @@
         }
       ]
     },
+    "OrderedHeader": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "redacted": {
+              "const": true
+            },
+            "secretReference": {
+              "not": {
+                "type": "null"
+              }
+            }
+          },
+          "required": [
+            "redacted",
+            "secretReference"
+          ]
+        },
+        {
+          "properties": {
+            "redacted": {
+              "const": false
+            },
+            "secretReference": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "redacted",
+            "secretReference"
+          ]
+        }
+      ],
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "redacted": {
+          "type": "boolean"
+        },
+        "secretReference": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value",
+        "redacted",
+        "secretReference"
+      ],
+      "type": "object"
+    },
     "Participant": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -3443,7 +5363,10 @@
             "start",
             "end"
           ],
-          "type": "object"
+          "type": "object",
+          "x-transhooter-runtime-refinements": [
+            "end must exceed start"
+          ]
         }
       },
       "required": [
@@ -3455,9 +5378,116 @@
       ],
       "type": "object"
     },
+    "ProviderAttemptRawReference": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "mediaType": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "objectId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "ordinal": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "objectId",
+        "ordinal",
+        "sha256",
+        "size",
+        "mediaType"
+      ],
+      "type": "object"
+    },
     "ProviderAttemptReport": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
+          },
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "error"
+            ]
+          }
+        },
+        {
+          "else": {
+            "properties": {
+              "retryOfAttemptId": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "retryOfAttemptId"
+            ]
+          },
+          "if": {
+            "properties": {
+              "attemptNumber": {
+                "const": 1
+              }
+            },
+            "required": [
+              "attemptNumber"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryOfAttemptId": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "retryOfAttemptId"
+            ]
+          }
+        }
+      ],
       "properties": {
         "attemptId": {
           "format": "uuid",
@@ -3638,6 +5668,26 @@
         },
         "retryDecision": {
           "additionalProperties": false,
+          "else": {
+            "properties": {
+              "retryAtMs": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
+          "if": {
+            "properties": {
+              "action": {
+                "const": "retry"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          },
           "properties": {
             "action": {
               "enum": [
@@ -3682,6 +5732,18 @@
             "retryAtMs",
             "previousAttemptId"
           ],
+          "then": {
+            "properties": {
+              "retryAtMs": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
           "type": "object"
         },
         "retryOfAttemptId": {
@@ -3833,13 +5895,41 @@
         "startedAtMs",
         "occurredAtMs"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "error.attemptId must equal attemptId",
+        "retryDecision.previousAttemptId must be null or equal attemptId",
+        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "retryOfAttemptId must differ from attemptId",
+        "occurredAtMs must not precede startedAtMs",
+        "rawReferences ordinals must be unique"
+      ]
     },
     "ProviderAttemptTerminal": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "anyOf": [
         {
           "additionalProperties": false,
+          "else": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
+          },
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
           "properties": {
             "attemptId": {
               "format": "uuid",
@@ -3971,6 +6061,17 @@
             },
             "rawReference": {
               "additionalProperties": false,
+              "allOf": [
+                {
+                  "properties": {
+                    "url": {
+                      "format": "uri",
+                      "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://",
+                      "type": "string"
+                    }
+                  }
+                }
+              ],
               "properties": {
                 "method": {
                   "minLength": 1,
@@ -4011,6 +6112,38 @@
                 "requestHeaders": {
                   "items": {
                     "additionalProperties": false,
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": true
+                          },
+                          "secretReference": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": false
+                          },
+                          "secretReference": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "name": {
                         "minLength": 1,
@@ -4086,6 +6219,38 @@
                 "responseHeaders": {
                   "items": {
                     "additionalProperties": false,
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": true
+                          },
+                          "secretReference": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": false
+                          },
+                          "secretReference": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "name": {
                         "minLength": 1,
@@ -4154,6 +6319,26 @@
             },
             "retryDecision": {
               "additionalProperties": false,
+              "else": {
+                "properties": {
+                  "retryAtMs": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "retryAtMs"
+                ]
+              },
+              "if": {
+                "properties": {
+                  "action": {
+                    "const": "retry"
+                  }
+                },
+                "required": [
+                  "action"
+                ]
+              },
               "properties": {
                 "action": {
                   "enum": [
@@ -4198,6 +6383,18 @@
                 "retryAtMs",
                 "previousAttemptId"
               ],
+              "then": {
+                "properties": {
+                  "retryAtMs": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "retryAtMs"
+                ]
+              },
               "type": "object"
             },
             "retryOfAttemptId": {
@@ -4332,10 +6529,48 @@
             "transport",
             "rawReference"
           ],
-          "type": "object"
+          "then": {
+            "properties": {
+              "error": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "error"
+            ]
+          },
+          "type": "object",
+          "x-transhooter-runtime-refinements": [
+            "error.attemptId must equal attemptId",
+            "retryDecision.previousAttemptId must be null or equal attemptId",
+            "retry action requires retryDecision.previousAttemptId to equal attemptId",
+            "retryOfAttemptId must differ from attemptId"
+          ]
         },
         {
           "additionalProperties": false,
+          "else": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
+          },
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
           "properties": {
             "attemptId": {
               "format": "uuid",
@@ -4467,6 +6702,17 @@
             },
             "rawReference": {
               "additionalProperties": false,
+              "allOf": [
+                {
+                  "properties": {
+                    "url": {
+                      "format": "uri",
+                      "pattern": "^[Ww][Ss][Ss]?://",
+                      "type": "string"
+                    }
+                  }
+                }
+              ],
               "properties": {
                 "closeCode": {
                   "anyOf": [
@@ -4571,6 +6817,38 @@
                 "upgradeRequestHeaders": {
                   "items": {
                     "additionalProperties": false,
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": true
+                          },
+                          "secretReference": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": false
+                          },
+                          "secretReference": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "name": {
                         "minLength": 1,
@@ -4607,6 +6885,38 @@
                 "upgradeResponseHeaders": {
                   "items": {
                     "additionalProperties": false,
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": true
+                          },
+                          "secretReference": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": false
+                          },
+                          "secretReference": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "name": {
                         "minLength": 1,
@@ -4658,6 +6968,26 @@
             },
             "retryDecision": {
               "additionalProperties": false,
+              "else": {
+                "properties": {
+                  "retryAtMs": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "retryAtMs"
+                ]
+              },
+              "if": {
+                "properties": {
+                  "action": {
+                    "const": "retry"
+                  }
+                },
+                "required": [
+                  "action"
+                ]
+              },
               "properties": {
                 "action": {
                   "enum": [
@@ -4702,6 +7032,18 @@
                 "retryAtMs",
                 "previousAttemptId"
               ],
+              "then": {
+                "properties": {
+                  "retryAtMs": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "retryAtMs"
+                ]
+              },
               "type": "object"
             },
             "retryOfAttemptId": {
@@ -4836,10 +7178,48 @@
             "transport",
             "rawReference"
           ],
-          "type": "object"
+          "then": {
+            "properties": {
+              "error": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "error"
+            ]
+          },
+          "type": "object",
+          "x-transhooter-runtime-refinements": [
+            "error.attemptId must equal attemptId",
+            "retryDecision.previousAttemptId must be null or equal attemptId",
+            "retry action requires retryDecision.previousAttemptId to equal attemptId",
+            "retryOfAttemptId must differ from attemptId"
+          ]
         },
         {
           "additionalProperties": false,
+          "else": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
+          },
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
           "properties": {
             "attemptId": {
               "format": "uuid",
@@ -4975,6 +7355,38 @@
                 "initialMetadata": {
                   "items": {
                     "additionalProperties": false,
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": true
+                          },
+                          "secretReference": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": false
+                          },
+                          "secretReference": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "name": {
                         "minLength": 1,
@@ -5094,6 +7506,38 @@
                 "trailingMetadata": {
                   "items": {
                     "additionalProperties": false,
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": true
+                          },
+                          "secretReference": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "redacted": {
+                            "const": false
+                          },
+                          "secretReference": {
+                            "type": "null"
+                          }
+                        },
+                        "required": [
+                          "redacted",
+                          "secretReference"
+                        ]
+                      }
+                    ],
                     "properties": {
                       "name": {
                         "minLength": 1,
@@ -5145,6 +7589,26 @@
             },
             "retryDecision": {
               "additionalProperties": false,
+              "else": {
+                "properties": {
+                  "retryAtMs": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "retryAtMs"
+                ]
+              },
+              "if": {
+                "properties": {
+                  "action": {
+                    "const": "retry"
+                  }
+                },
+                "required": [
+                  "action"
+                ]
+              },
               "properties": {
                 "action": {
                   "enum": [
@@ -5189,6 +7653,18 @@
                 "retryAtMs",
                 "previousAttemptId"
               ],
+              "then": {
+                "properties": {
+                  "retryAtMs": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "retryAtMs"
+                ]
+              },
               "type": "object"
             },
             "retryOfAttemptId": {
@@ -5323,8 +7799,64 @@
             "transport",
             "rawReference"
           ],
-          "type": "object"
+          "then": {
+            "properties": {
+              "error": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "error"
+            ]
+          },
+          "type": "object",
+          "x-transhooter-runtime-refinements": [
+            "error.attemptId must equal attemptId",
+            "retryDecision.previousAttemptId must be null or equal attemptId",
+            "retry action requires retryDecision.previousAttemptId to equal attemptId",
+            "retryOfAttemptId must differ from attemptId"
+          ]
         }
+      ],
+      "else": {
+        "properties": {
+          "error": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "error": {
+            "not": {
+              "type": "null"
+            }
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "x-transhooter-runtime-refinements": [
+        "error.attemptId must equal attemptId",
+        "retryDecision.previousAttemptId must be null or equal attemptId",
+        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "retryOfAttemptId must differ from attemptId"
       ]
     },
     "ProviderError": {
@@ -5510,6 +8042,17 @@
       "anyOf": [
         {
           "additionalProperties": false,
+          "allOf": [
+            {
+              "properties": {
+                "url": {
+                  "format": "uri",
+                  "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://",
+                  "type": "string"
+                }
+              }
+            }
+          ],
           "properties": {
             "method": {
               "minLength": 1,
@@ -5550,6 +8093,38 @@
             "requestHeaders": {
               "items": {
                 "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
                 "properties": {
                   "name": {
                     "minLength": 1,
@@ -5625,6 +8200,38 @@
             "responseHeaders": {
               "items": {
                 "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
                 "properties": {
                   "name": {
                     "minLength": 1,
@@ -5693,6 +8300,17 @@
         },
         {
           "additionalProperties": false,
+          "allOf": [
+            {
+              "properties": {
+                "url": {
+                  "format": "uri",
+                  "pattern": "^[Ww][Ss][Ss]?://",
+                  "type": "string"
+                }
+              }
+            }
+          ],
           "properties": {
             "closeCode": {
               "anyOf": [
@@ -5797,6 +8415,38 @@
             "upgradeRequestHeaders": {
               "items": {
                 "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
                 "properties": {
                   "name": {
                     "minLength": 1,
@@ -5833,6 +8483,38 @@
             "upgradeResponseHeaders": {
               "items": {
                 "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
                 "properties": {
                   "name": {
                     "minLength": 1,
@@ -5888,6 +8570,38 @@
             "initialMetadata": {
               "items": {
                 "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
                 "properties": {
                   "name": {
                     "minLength": 1,
@@ -6007,6 +8721,38 @@
             "trailingMetadata": {
               "items": {
                 "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
                 "properties": {
                   "name": {
                     "minLength": 1,
@@ -6061,6 +8807,26 @@
     "RetryDecision": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
+      "else": {
+        "properties": {
+          "retryAtMs": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "retryAtMs"
+        ]
+      },
+      "if": {
+        "properties": {
+          "action": {
+            "const": "retry"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
       "properties": {
         "action": {
           "enum": [
@@ -6105,6 +8871,18 @@
         "retryAtMs",
         "previousAttemptId"
       ],
+      "then": {
+        "properties": {
+          "retryAtMs": {
+            "not": {
+              "type": "null"
+            }
+          }
+        },
+        "required": [
+          "retryAtMs"
+        ]
+      },
       "type": "object"
     },
     "RoomCloseRecord": {
@@ -6989,7 +9767,12 @@
         "participantIds",
         "directions"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "participantIds must be distinct",
+        "direction endpoints must be distinct room participants",
+        "there must be exactly one direction per source participant"
+      ]
     },
     "SameLanguageBypassStatus": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7050,7 +9833,10 @@
         "destinationParticipantId",
         "shutdownAtMs"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "sourceParticipantId must differ from destinationParticipantId"
+      ]
     },
     "SameLanguageDirectionSelection": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7187,7 +9973,10 @@
         "start",
         "end"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "end must exceed start"
+      ]
     },
     "ShutdownStatus": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7365,7 +10154,10 @@
             "destinationParticipantId",
             "shutdownAtMs"
           ],
-          "type": "object"
+          "type": "object",
+          "x-transhooter-runtime-refinements": [
+            "sourceParticipantId must differ from destinationParticipantId"
+          ]
         },
         {
           "additionalProperties": false,
@@ -7999,9 +10791,742 @@
       ],
       "type": "object"
     },
+    "WebSocketFrameReference": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "direction": {
+          "enum": [
+            "sent",
+            "received"
+          ],
+          "type": "string"
+        },
+        "fin": {
+          "type": "boolean"
+        },
+        "opcode": {
+          "enum": [
+            "continuation",
+            "text",
+            "binary",
+            "close",
+            "ping",
+            "pong"
+          ],
+          "type": "string"
+        },
+        "ordinal": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "key": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "pattern": "^v1\\/meetings\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\/[a-z0-9][a-z0-9._/-]*$",
+              "type": "string"
+            },
+            "objectId": {
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "type": "string"
+            },
+            "sha256": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            "size": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "objectId",
+            "key",
+            "sha256",
+            "size"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "ordinal",
+        "direction",
+        "opcode",
+        "fin",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "WebSocketProviderAttemptTerminal": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "else": {
+        "properties": {
+          "error": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "properties": {
+        "attemptId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "credentialFingerprint": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "credentialVersion": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "attemptId": {
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "authentication",
+                    "quota",
+                    "rate_limit",
+                    "transport",
+                    "provider",
+                    "invalid_request",
+                    "invalid_response",
+                    "internal",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                },
+                "providerCode": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "providerRequestId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "providerRetryAdvice": {
+                  "enum": [
+                    "never",
+                    "retry_after",
+                    "unspecified"
+                  ],
+                  "type": "string"
+                },
+                "rawObjectIds": {
+                  "items": {
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "retryDelayMs": {
+                  "anyOf": [
+                    {
+                      "maximum": 9007199254740991,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "scope": {
+                  "enum": [
+                    "operation",
+                    "session"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "scope",
+                "providerRetryAdvice",
+                "providerCode",
+                "providerRequestId",
+                "retryDelayMs",
+                "attemptId",
+                "rawObjectIds"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "occurredAtMs": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "operationId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "rawReference": {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "properties": {
+                "url": {
+                  "format": "uri",
+                  "pattern": "^[Ww][Ss][Ss]?://",
+                  "type": "string"
+                }
+              }
+            }
+          ],
+          "properties": {
+            "closeCode": {
+              "anyOf": [
+                {
+                  "maximum": 4999,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "closeReason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "frames": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "direction": {
+                    "enum": [
+                      "sent",
+                      "received"
+                    ],
+                    "type": "string"
+                  },
+                  "fin": {
+                    "type": "boolean"
+                  },
+                  "opcode": {
+                    "enum": [
+                      "continuation",
+                      "text",
+                      "binary",
+                      "close",
+                      "ping",
+                      "pong"
+                    ],
+                    "type": "string"
+                  },
+                  "ordinal": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "payload": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "key": {
+                        "maxLength": 1024,
+                        "minLength": 1,
+                        "pattern": "^v1\\/meetings\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\/[a-z0-9][a-z0-9._/-]*$",
+                        "type": "string"
+                      },
+                      "objectId": {
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "type": "string"
+                      },
+                      "sha256": {
+                        "pattern": "^[a-f0-9]{64}$",
+                        "type": "string"
+                      },
+                      "size": {
+                        "maximum": 9007199254740991,
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "objectId",
+                      "key",
+                      "sha256",
+                      "size"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "ordinal",
+                  "direction",
+                  "opcode",
+                  "fin",
+                  "payload"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "transport": {
+              "const": "websocket",
+              "type": "string"
+            },
+            "upgradeRequestHeaders": {
+              "items": {
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "redacted": {
+                    "type": "boolean"
+                  },
+                  "secretReference": {
+                    "anyOf": [
+                      {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "value",
+                  "redacted",
+                  "secretReference"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "upgradeResponseHeaders": {
+              "items": {
+                "additionalProperties": false,
+                "oneOf": [
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": true
+                      },
+                      "secretReference": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "redacted": {
+                        "const": false
+                      },
+                      "secretReference": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "redacted",
+                      "secretReference"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "redacted": {
+                    "type": "boolean"
+                  },
+                  "secretReference": {
+                    "anyOf": [
+                      {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "value",
+                  "redacted",
+                  "secretReference"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "url": {
+              "format": "uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "transport",
+            "url",
+            "upgradeRequestHeaders",
+            "upgradeResponseHeaders",
+            "frames",
+            "closeCode",
+            "closeReason"
+          ],
+          "type": "object"
+        },
+        "retryDecision": {
+          "additionalProperties": false,
+          "else": {
+            "properties": {
+              "retryAtMs": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
+          "if": {
+            "properties": {
+              "action": {
+                "const": "retry"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          },
+          "properties": {
+            "action": {
+              "enum": [
+                "retry",
+                "do_not_retry",
+                "degrade"
+              ],
+              "type": "string"
+            },
+            "previousAttemptId": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "retryAtMs": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "action",
+            "reason",
+            "retryAtMs",
+            "previousAttemptId"
+          ],
+          "then": {
+            "properties": {
+              "retryAtMs": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "retryAtMs"
+            ]
+          },
+          "type": "object"
+        },
+        "retryOfAttemptId": {
+          "anyOf": [
+            {
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "enum": [
+            "stt",
+            "translation",
+            "tts"
+          ],
+          "type": "string"
+        },
+        "terminalId": {
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+          "type": "string"
+        },
+        "transport": {
+          "const": "websocket",
+          "type": "string"
+        },
+        "watermarks": {
+          "additionalProperties": false,
+          "properties": {
+            "acceptedInputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "acceptedInputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "emittedOutputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "emittedOutputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "receivedOutputSampleEnd": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "receivedOutputSequence": {
+              "anyOf": [
+                {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "acceptedInputSequence",
+            "acceptedInputSampleEnd",
+            "receivedOutputSequence",
+            "receivedOutputSampleEnd",
+            "emittedOutputSequence",
+            "emittedOutputSampleEnd"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "terminalId",
+        "operationId",
+        "attemptId",
+        "stage",
+        "outcome",
+        "error",
+        "retryDecision",
+        "retryOfAttemptId",
+        "watermarks",
+        "credentialVersion",
+        "credentialFingerprint",
+        "occurredAtMs",
+        "transport",
+        "rawReference"
+      ],
+      "then": {
+        "properties": {
+          "error": {
+            "not": {
+              "type": "null"
+            }
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "error.attemptId must equal attemptId",
+        "retryDecision.previousAttemptId must be null or equal attemptId",
+        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "retryOfAttemptId must differ from attemptId"
+      ]
+    },
     "WebSocketRawReference": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "properties": {
+            "url": {
+              "format": "uri",
+              "pattern": "^[Ww][Ss][Ss]?://",
+              "type": "string"
+            }
+          }
+        }
+      ],
       "properties": {
         "closeCode": {
           "anyOf": [
@@ -8106,6 +11631,38 @@
         "upgradeRequestHeaders": {
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "redacted": {
+                    "const": true
+                  },
+                  "secretReference": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              },
+              {
+                "properties": {
+                  "redacted": {
+                    "const": false
+                  },
+                  "secretReference": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              }
+            ],
             "properties": {
               "name": {
                 "minLength": 1,
@@ -8142,6 +11699,38 @@
         "upgradeResponseHeaders": {
           "items": {
             "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "redacted": {
+                    "const": true
+                  },
+                  "secretReference": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              },
+              {
+                "properties": {
+                  "redacted": {
+                    "const": false
+                  },
+                  "secretReference": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "redacted",
+                  "secretReference"
+                ]
+              }
+            ],
             "properties": {
               "name": {
                 "minLength": 1,
@@ -8231,6 +11820,38 @@
         "gaps": {
           "items": {
             "additionalProperties": false,
+            "anyOf": [
+              {
+                "properties": {
+                  "sampleRange": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "sampleRange"
+                ]
+              },
+              {
+                "properties": {
+                  "segmentEnd": {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
+                  "segmentStart": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "required": [
+                  "segmentStart",
+                  "segmentEnd"
+                ]
+              }
+            ],
             "properties": {
               "objectClass": {
                 "enum": [
@@ -8280,7 +11901,10 @@
                       "start",
                       "end"
                     ],
-                    "type": "object"
+                    "type": "object",
+                    "x-transhooter-runtime-refinements": [
+                      "end must exceed start"
+                    ]
                   },
                   {
                     "type": "null"
@@ -8320,7 +11944,10 @@
               "segmentEnd",
               "reason"
             ],
-            "type": "object"
+            "type": "object",
+            "x-transhooter-runtime-refinements": [
+              "segmentEnd must not precede segmentStart"
+            ]
           },
           "type": "array"
         },
@@ -8388,7 +12015,10 @@
         "terminal",
         "occurredAtMs"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "sourceParticipantId must differ from destinationParticipantId"
+      ]
     },
     "WorkerJobMetadata": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -9289,7 +12919,12 @@
             "participantIds",
             "directions"
           ],
-          "type": "object"
+          "type": "object",
+          "x-transhooter-runtime-refinements": [
+            "participantIds must be distinct",
+            "direction endpoints must be distinct room participants",
+            "there must be exactly one direction per source participant"
+          ]
         },
         "roomName": {
           "format": "uuid",
@@ -9333,7 +12968,12 @@
         "providerSelection",
         "snapshotHash"
       ],
-      "type": "object"
+      "type": "object",
+      "x-transhooter-runtime-refinements": [
+        "expected participant IDs and LiveKit identities must each be distinct",
+        "worker identity must differ from human identities",
+        "expected participant IDs must match the provider selection"
+      ]
     },
     "WorkerTerminalRecord": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

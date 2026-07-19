@@ -11,7 +11,12 @@ spec:
       app.kubernetes.io/component: web
   template:
     metadata:
-      annotations: {{- toYaml .Values.podAnnotations | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        transhooter.io/runtime-secret-revision: {{ .Values.rollout.runtimeSecretRevision | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
         {{- include "transhooter.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: web
@@ -24,7 +29,7 @@ spec:
         - name: web
           image: {{ include "transhooter.image" .Values.images.web | quote }}
           imagePullPolicy: {{ .Values.images.web.pullPolicy }}
-          command: [bun, run, --filter, "@transhooter/web", start]
+          command: [bun, apps/web/server.js]
           envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" . }}}}]
           env:
             - {name: INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/transhooter/token}

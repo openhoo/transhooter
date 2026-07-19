@@ -325,4 +325,27 @@ describe("AuthService", () => {
     ).rejects.toThrow(/INVALID_EXCHANGE_CONTEXT/);
     expect(requireFirstMagicLink(fixture.state).consumedAt).toBeNull();
   });
+  it("normalizes absent and malformed Origin to INVALID_EXCHANGE_CONTEXT", async () => {
+    const fixture = createAuthFixture();
+    await requestKnownSignIn(fixture, {
+      ip: "1",
+      publicBaseUrl: PUBLIC_BASE_URL,
+    });
+    const token = tokenFromMagicLinkUrl(
+      requireLastMagicLinkUrl(fixture.mail.sendMagicLink.mock.calls),
+    );
+    const pending = await fixture.service.beginExchange(token);
+
+    for (const origin of ["", "not a url", "://"]) {
+      await expect(
+        fixture.service.verifyExchange(pending.exchangeNonce, {
+          csrfToken: pending.verificationCsrfToken,
+          origin,
+          publicBaseUrl: PUBLIC_BASE_URL,
+          requestIp: "1",
+        }),
+      ).rejects.toThrow(/INVALID_EXCHANGE_CONTEXT/);
+    }
+    expect(requireFirstMagicLink(fixture.state).consumedAt).toBeNull();
+  });
 });

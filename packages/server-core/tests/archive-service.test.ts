@@ -16,6 +16,7 @@ const OTHER_HOLD_ID = "00000000-0000-4000-8000-000000000011";
 const SESSION_ID = "00000000-0000-4000-8000-000000000020";
 const ACTOR_ID = "00000000-0000-4000-8000-000000000021";
 const OBJECT_ID = "00000000-0000-4000-8000-000000000099";
+const OTHER_OBJECT_ID = "00000000-0000-4000-8000-000000000097";
 const EXPECTATION_ID = "00000000-0000-4000-8000-000000000098";
 const NOW = new Date("2026-01-01T00:00:00Z");
 const FINAL_HASH = "a".repeat(64);
@@ -315,6 +316,25 @@ describe("ArchiveService invariants", () => {
       renewHoldOperation: async () => true,
       completeHoldOperation: async () => true,
       recordHoldResults: async () => undefined,
+      inventoryObjects: async () => [
+        {
+          id: OBJECT_ID,
+          consultationId: CONSULTATION,
+          objectClass: "pipeline_exchange",
+          causalKey: "exchange:1",
+          key: "a",
+          versionId: "1",
+          size: 1,
+          sha256: FINAL_HASH,
+          s3Checksum: "crc",
+          contentType: "application/octet-stream",
+          sampleStart: null,
+          sampleEnd: null,
+          attempt: 1,
+          sequence: 0,
+          writerEpoch: 2,
+        },
+      ],
       removeHold,
     } as unknown as ArchiveRepository;
     const storage = {
@@ -394,6 +414,7 @@ describe("ArchiveService invariants", () => {
       setLegalHold: async () => {
         order.push("hold");
       },
+      verify: async () => true,
     } as unknown as ObjectStoragePort;
     const service = createService(repository, storage);
     const object = {
@@ -478,5 +499,426 @@ describe("ArchiveService invariants", () => {
     await expect(service.drainDeletion(CONSULTATION, 7)).resolves.toBe(false);
 
     expect(storage.listMultipart).not.toHaveBeenCalled();
+  });
+  it("verifies an exact storage version before recording an ordinary object", async () => {
+    const recordObject = mock(async () => undefined);
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () => lockedArchive({ state: "recording" }),
+      activeHolds: async () => [],
+      recordObject,
+    } as unknown as ArchiveRepository;
+    const verify = mock(async () => false);
+    const service = createService(repository, { verify } as unknown as ObjectStoragePort);
+
+    await expect(
+      service.recordObject(CONSULTATION, 2, "exchange:1", {
+        objectId: OBJECT_ID,
+        class: "pipeline_exchange",
+        key: "v1/meetings/x/exchange",
+        versionId: "v1",
+        size: 1,
+        sha256: CONFLICTING_HASH,
+        s3Checksum: "crc",
+        contentType: "application/octet-stream",
+        sampleRange: null,
+        attempt: 1,
+        sequence: 0,
+      }),
+    ).rejects.toThrowError(/ARCHIVE_OBJECT_VERIFICATION_FAILED/);
+
+    expect(verify).toHaveBeenCalledWith({
+      key: "v1/meetings/x/exchange",
+      versionId: "v1",
+      size: 1,
+      checksum: "crc",
+    });
+    expect(recordObject).not.toHaveBeenCalled();
+  });
+
+  it("atomically rejects a stale worker reservation before recording", async () => {
+    const recordObject = mock(async () => undefined);
+    const lockActiveWorkerWriter = mock(async () => false);
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () => lockedArchive({ state: "recording" }),
+      lockActiveWorkerWriter,
+      recordObject,
+    } as unknown as ArchiveRepository;
+    const verify = mock(async () => true);
+    const service = createService(repository, { verify } as unknown as ObjectStoragePort);
+
+    await expect(
+      service.recordWorkerObject(
+        CONSULTATION,
+        {
+          generation: 3,
+          workerId: ACTOR_ID,
+          workerEpoch: 4,
+        },
+        2,
+        "exchange:1",
+        {
+          objectId: OBJECT_ID,
+          class: "pipeline_exchange",
+          key: "v1/meetings/x/exchange",
+          versionId: "v1",
+          size: 1,
+          sha256: CONFLICTING_HASH,
+          s3Checksum: "crc",
+          contentType: "application/octet-stream",
+          sampleRange: null,
+          attempt: 1,
+          sequence: 0,
+        },
+      ),
+    ).rejects.toThrowError(/ARCHIVE_WRITER_FENCED/);
+
+    expect(lockActiveWorkerWriter).toHaveBeenCalledWith(
+      {
+        consultationId: CONSULTATION,
+        generation: 3,
+        workerId: ACTOR_ID,
+        workerEpoch: 4,
+        writerEpoch: 2,
+      },
+      transaction,
+    );
+    expect(verify).not.toHaveBeenCalled();
+    expect(recordObject).not.toHaveBeenCalled();
+  });
+
+  it("stably rescans and releases a version created during final-hold release", async () => {
+    let scans = 0;
+    const removeHold = mock(async () => undefined);
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () => lockedArchive(),
+      activeHolds: async () => [
+        {
+          id: HOLD_ID,
+          reason: "case",
+          actorId: ACTOR_ID,
+          state: "active" as const,
+        },
+      ],
+      claimStaleHoldOperation: async () => null,
+      beginHoldOperation: async () => true,
+      renewHoldOperation: async () => true,
+      completeHoldOperation: async () => true,
+      transitionHoldState: async () => true,
+      recordHoldResults: async () => undefined,
+      inventoryObjects: async () => [
+        {
+          id: OBJECT_ID,
+          consultationId: CONSULTATION,
+          objectClass: "pipeline_exchange",
+          causalKey: "exchange:1",
+          key: "a",
+          versionId: "1",
+          size: 1,
+          sha256: FINAL_HASH,
+          s3Checksum: "crc",
+          contentType: "application/octet-stream",
+          sampleStart: null,
+          sampleEnd: null,
+          attempt: 1,
+          sequence: 0,
+          writerEpoch: 2,
+        },
+        {
+          id: OTHER_OBJECT_ID,
+          consultationId: CONSULTATION,
+          objectClass: "pipeline_exchange",
+          causalKey: "exchange:2",
+          key: "b",
+          versionId: "2",
+          size: 1,
+          sha256: FINAL_HASH,
+          s3Checksum: "crc",
+          contentType: "application/octet-stream",
+          sampleStart: null,
+          sampleEnd: null,
+          attempt: 1,
+          sequence: 1,
+          writerEpoch: 2,
+        },
+      ],
+      removeHold,
+    } as unknown as ArchiveRepository;
+    const setLegalHold = mock(async () => undefined);
+    const storage = {
+      listMeetingVersions: async () => {
+        scans += 1;
+        return {
+          versions:
+            scans === 1
+              ? [{ key: "a", versionId: "1" }]
+              : [
+                  { key: "a", versionId: "1" },
+                  { key: "b", versionId: "2" },
+                ],
+          cursor: null,
+        };
+      },
+      setLegalHold,
+    } as unknown as ObjectStoragePort;
+    const service = createService(repository, storage);
+
+    await service.releaseHold(CONSULTATION, HOLD_ID, reauthenticatedSession());
+
+    expect(scans).toBe(3);
+    expect(setLegalHold).toHaveBeenCalledWith("a", "1", false);
+    expect(setLegalHold).toHaveBeenCalledWith("b", "2", false);
+    expect(removeHold).toHaveBeenCalledTimes(1);
+  });
+
+  it("revalidates recorded exact versions under the archive lock before dropping the final hold", async () => {
+    const order: string[] = [];
+    let inventoryReads = 0;
+    let lateObjectCommitted = false;
+    const removeHold = mock(async () => {
+      order.push("hold-removed");
+    });
+    const completeHoldOperation = mock(async () => true);
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () => lockedArchive(),
+      activeHolds: async () => [
+        {
+          id: HOLD_ID,
+          reason: "case",
+          actorId: ACTOR_ID,
+          state: "active" as const,
+        },
+      ],
+      claimStaleHoldOperation: async () => null,
+      beginHoldOperation: async () => true,
+      renewHoldOperation: async () => true,
+      completeHoldOperation,
+      transitionHoldState: async () => true,
+      recordHoldResults: async () => undefined,
+      inventoryObjects: async () => {
+        inventoryReads += 1;
+        order.push("recorded-set-revalidated");
+        const objects = [
+          {
+            id: OBJECT_ID,
+            consultationId: CONSULTATION,
+            objectClass: "pipeline_exchange",
+            causalKey: "exchange:1",
+            key: "a",
+            versionId: "1",
+            size: 1,
+            sha256: FINAL_HASH,
+            s3Checksum: "crc",
+            contentType: "application/octet-stream",
+            sampleStart: null,
+            sampleEnd: null,
+            attempt: 1,
+            sequence: 0,
+            writerEpoch: 2,
+          },
+          {
+            id: OTHER_OBJECT_ID,
+            consultationId: CONSULTATION,
+            objectClass: "inventory_supplement",
+            causalKey: "inventory:supplement:late",
+            key: "late-supplement",
+            versionId: "late-version",
+            size: 1,
+            sha256: FINAL_HASH,
+            s3Checksum: "crc",
+            contentType: "application/json",
+            sampleStart: null,
+            sampleEnd: null,
+            attempt: null,
+            sequence: null,
+            writerEpoch: 2,
+          },
+        ];
+        return lateObjectCommitted ? objects : objects.slice(0, 1);
+      },
+      removeHold,
+    } as unknown as ArchiveRepository;
+    let scans = 0;
+    const storage = {
+      listMeetingVersions: async () => {
+        scans += 1;
+        if (scans === 2) {
+          lateObjectCommitted = true;
+          order.push("late-object-committed");
+        }
+        return {
+          versions: [{ key: "a", versionId: "1" }],
+          cursor: null,
+        };
+      },
+      setLegalHold: async (key: string, versionId: string, enabled: boolean) => {
+        order.push(`${enabled ? "protect" : "release"}:${key}:${versionId}`);
+      },
+    } as unknown as ObjectStoragePort;
+    const service = createService(repository, storage);
+
+    await service.releaseHold(CONSULTATION, HOLD_ID, reauthenticatedSession());
+
+    expect(scans).toBe(2);
+    expect(inventoryReads).toBe(2);
+    expect(completeHoldOperation).toHaveBeenCalledTimes(1);
+    expect(order).toEqual([
+      "release:a:1",
+      "late-object-committed",
+      "recorded-set-revalidated",
+      "release:late-supplement:late-version",
+      "recorded-set-revalidated",
+      "hold-removed",
+    ]);
+  });
+
+  it("treats an identical concurrent final inventory commit as a hash replay", async () => {
+    let locks = 0;
+    let hashReads = 0;
+    const recordObject = mock(async () => undefined);
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () => {
+        locks += 1;
+        return lockedArchive({
+          state: locks === 1 ? "reconciling" : "complete",
+          finalInventoryHash: locks === 1 ? null : FINAL_HASH,
+          writeEpoch: 0,
+        });
+      },
+      finalInventoryHash: async () => {
+        hashReads += 1;
+        return hashReads === 1 ? null : FINAL_HASH;
+      },
+      unresolvedExpectations: async () => [],
+      inventoryObjects: async () => [],
+      completePrerequisites: async () => true,
+      recordObject,
+    } as unknown as ArchiveRepository;
+    const storage = {
+      putCreateOnce: async () => ({ versionId: "v1", size: 1, checksum: FINAL_HASH }),
+      verify: async () => true,
+    } as unknown as ObjectStoragePort;
+    const service = createService(repository, storage);
+
+    await expect(service.finalizeInventory(CONSULTATION, finalInventory())).resolves.toEqual({
+      created: false,
+      sha256: FINAL_HASH,
+    });
+    expect(recordObject).not.toHaveBeenCalled();
+  });
+  it("rejects duplicate claimed IDs and key-version pairs instead of length-only matching", async () => {
+    const claimed = {
+      objectId: OBJECT_ID,
+      class: "checkpoint" as const,
+      key: `v1/meetings/${CONSULTATION}/inventory/checkpoint`,
+      versionId: "v1",
+      size: 1,
+      sha256: CONFLICTING_HASH,
+      s3Checksum: "crc",
+      contentType: "application/json",
+      sampleRange: null,
+      attempt: null,
+      sequence: null,
+    };
+    const persisted = [
+      {
+        id: OBJECT_ID,
+        consultationId: CONSULTATION,
+        objectClass: "checkpoint",
+        causalKey: "checkpoint:1",
+        key: claimed.key,
+        versionId: claimed.versionId,
+        size: claimed.size,
+        sha256: claimed.sha256,
+        s3Checksum: claimed.s3Checksum,
+        contentType: claimed.contentType,
+        sampleStart: null,
+        sampleEnd: null,
+        attempt: null,
+        sequence: null,
+        writerEpoch: 2,
+      },
+      {
+        id: OTHER_OBJECT_ID,
+        consultationId: CONSULTATION,
+        objectClass: "checkpoint",
+        causalKey: "checkpoint:2",
+        key: `v1/meetings/${CONSULTATION}/inventory/checkpoint-2`,
+        versionId: "v2",
+        size: 1,
+        sha256: CONFLICTING_HASH,
+        s3Checksum: "crc",
+        contentType: "application/json",
+        sampleStart: null,
+        sampleEnd: null,
+        attempt: null,
+        sequence: null,
+        writerEpoch: 2,
+      },
+    ];
+    const putCreateOnce = mock();
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () =>
+        lockedArchive({ state: "reconciling", finalInventoryHash: null }),
+      finalInventoryHash: async () => null,
+      unresolvedExpectations: async () => [],
+      inventoryObjects: async () => persisted,
+      completePrerequisites: async () => true,
+    } as unknown as ArchiveRepository;
+    const service = createService(repository, { putCreateOnce } as unknown as ObjectStoragePort);
+    for (const objects of [
+      [
+        claimed,
+        {
+          ...claimed,
+          key: `v1/meetings/${CONSULTATION}/inventory/checkpoint-2`,
+          versionId: "v2",
+        },
+      ],
+      [claimed, { ...claimed, objectId: OTHER_OBJECT_ID }],
+    ]) {
+      await expect(
+        service.finalizeInventory(CONSULTATION, {
+          ...finalInventory(),
+          objects,
+        }),
+      ).rejects.toThrowError(/INVENTORY_OBJECT_MISMATCH/);
+    }
+    expect(putCreateOnce).not.toHaveBeenCalled();
+  });
+  it("rejects spool-drainer writes after archive finalization", async () => {
+    const verify = mock(async () => true);
+    const recordObject = mock(async () => undefined);
+    const service = createService(
+      {
+        transaction: runTransaction,
+        lockByConsultation: async () => lockedArchive({ state: "complete" }),
+        recordObject,
+      } as unknown as ArchiveRepository,
+      { verify } as unknown as ObjectStoragePort,
+    );
+
+    await expect(
+      service.recordDrainerObject(CONSULTATION, "exchange:late", {
+        objectId: OBJECT_ID,
+        class: "pipeline_exchange",
+        key: "v1/meetings/x/late",
+        versionId: "v1",
+        size: 1,
+        sha256: CONFLICTING_HASH,
+        s3Checksum: "crc",
+        contentType: "application/octet-stream",
+        sampleRange: null,
+        attempt: 1,
+        sequence: 0,
+      }),
+    ).rejects.toThrowError(/ARCHIVE_WRITER_FENCED/);
+    expect(verify).not.toHaveBeenCalled();
+    expect(recordObject).not.toHaveBeenCalled();
   });
 });

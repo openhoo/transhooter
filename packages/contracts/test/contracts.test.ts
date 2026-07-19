@@ -1,28 +1,36 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import {
+  ArchiveGapSchema,
   ArchiveObjectRecordSchema,
   ArchiveRecordSchema,
   ArchiveStateSchema,
   CAPTION_TOPIC,
   CaptionPacketSchema,
+  CONTRACT_SCHEMAS,
   ConsultationStateSchema,
   ExternalEffectStateSchema,
   FinalInventorySchema,
+  HttpRawReferenceSchema,
   InterpretationTrackNameSchema,
   InventorySupplementSchema,
   MagicLinkPurposeSchema,
   NullableStaffRoleSchema,
+  OrderedHeaderSchema,
   ParticipantAttributesSchema,
   ParticipantRoleSchema,
   PcmSidecarSchema,
   ProviderAttemptReportSchema,
   ProviderAttemptTerminalSchema,
+  RetryDecisionSchema,
   RoomProviderSelectionSchema,
   SampleRangeSchema,
   STATUS_TOPIC,
   StaffRoleSchema,
   StatusPacketSchema,
+  WebSocketRawReferenceSchema,
   type WorkerCheckpoint,
   WorkerCheckpointSchema,
   WorkerJobMetadataSchema,
@@ -34,6 +42,75 @@ const customerId = "018f1f3c-0f63-7d65-8eb1-1f250f9f9893";
 const attemptId = "018f1f3c-0f63-7d65-8eb1-1f250f9f9894";
 const objectId = "018f1f3c-0f63-7d65-8eb1-1f250f9f9895";
 const sha256 = "a".repeat(64);
+
+type GeneratedBundle = {
+  schemas: Record<string, Record<string, unknown>>;
+};
+
+const generatedBundle = JSON.parse(
+  readFileSync(new URL("../generated/contracts.schema.json", import.meta.url), "utf8"),
+) as GeneratedBundle;
+
+function assertGeneratedRejects(fixtures: ReadonlyArray<readonly [string, unknown]>): void {
+  const validation = spawnSync(
+    "python",
+    [
+      "-c",
+      [
+        "import json, sys",
+        "from jsonschema import Draft202012Validator",
+        "payload = json.load(sys.stdin)",
+        "for name, instance in payload['fixtures']:",
+        "    if Draft202012Validator(payload['schemas'][name]).is_valid(instance):",
+        "        print(name)",
+        "        sys.exit(1)",
+      ].join("\n"),
+    ],
+    {
+      input: JSON.stringify({ schemas: generatedBundle.schemas, fixtures }),
+      encoding: "utf8",
+    },
+  );
+  assert.equal(
+    validation.status,
+    0,
+    validation.stderr || `generated schema accepted ${validation.stdout}`,
+  );
+}
+
+function assertGeneratedAccepts(fixtures: ReadonlyArray<readonly [string, unknown]>): void {
+  const validation = spawnSync(
+    "python",
+    [
+      "-c",
+      [
+        "import json, sys",
+        "from jsonschema import Draft202012Validator",
+        "payload = json.load(sys.stdin)",
+        "for name, instance in payload['fixtures']:",
+        "    errors = list(Draft202012Validator(payload['schemas'][name]).iter_errors(instance))",
+        "    if errors:",
+        "        print(f'{name}: {errors[0].message}')",
+        "        sys.exit(1)",
+      ].join("\n"),
+    ],
+    {
+      input: JSON.stringify({ schemas: generatedBundle.schemas, fixtures }),
+      encoding: "utf8",
+    },
+  );
+  assert.equal(
+    validation.status,
+    0,
+    validation.stderr || `generated schema rejected ${validation.stdout}`,
+  );
+}
+
+function runtimeRefinements(name: string): string[] {
+  const refinements = generatedBundle.schemas[name]?.["x-transhooter-runtime-refinements"];
+  assert.ok(Array.isArray(refinements), `${name} must disclose runtime-only refinements`);
+  return refinements as string[];
+}
 const pipelineObjectKey = `v1/meetings/${consultationId}/pipeline/translation/fixture/${attemptId}/000001.json`;
 
 const providerCredential = {
@@ -396,6 +473,22 @@ test("provider terminal permits exactly one matching raw transport reference", (
       },
     }),
   );
+  assert.throws(() =>
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      outcome: "failed",
+      error: {
+        kind: "provider",
+        scope: "operation",
+        providerRetryAdvice: "never",
+        providerCode: "failure",
+        providerRequestId: null,
+        retryDelayMs: null,
+        attemptId: employeeId,
+        rawObjectIds: [objectId],
+      },
+    }),
+  );
 });
 
 test("provider attempt reports reject malformed and terminally inconsistent evidence", () => {
@@ -429,6 +522,27 @@ test("provider attempt reports reject malformed and terminally inconsistent evid
   } as const;
 
   assert.deepEqual(ProviderAttemptReportSchema.parse(report), report);
+  const retryingReport = {
+    ...report,
+    outcome: "failed" as const,
+    error: {
+      kind: "rate_limit" as const,
+      scope: "operation" as const,
+      providerRetryAdvice: "retry_after" as const,
+      providerCode: "429",
+      providerRequestId: null,
+      retryDelayMs: 250,
+      attemptId,
+      rawObjectIds: [objectId],
+    },
+    retryDecision: {
+      action: "retry" as const,
+      reason: "safe uncommitted replay",
+      retryAtMs: report.occurredAtMs + 250,
+      previousAttemptId: attemptId,
+    },
+  };
+  assert.deepEqual(ProviderAttemptReportSchema.parse(retryingReport), retryingReport);
   assert.throws(() =>
     ProviderAttemptReportSchema.parse({ ...report, outcome: "failed", error: null }),
   );
@@ -448,6 +562,13 @@ test("provider attempt reports reject malformed and terminally inconsistent evid
   assert.throws(() =>
     ProviderAttemptReportSchema.parse({
       ...report,
+      attemptNumber: 2,
+      retryOfAttemptId: attemptId,
+    }),
+  );
+  assert.throws(() =>
+    ProviderAttemptReportSchema.parse({
+      ...report,
       rawReferences: [...report.rawReferences, report.rawReferences[0]],
     }),
   );
@@ -455,6 +576,17 @@ test("provider attempt reports reject malformed and terminally inconsistent evid
     ProviderAttemptReportSchema.parse({
       ...report,
       unexpectedProvider: "untrusted",
+    }),
+  );
+  assert.throws(() =>
+    ProviderAttemptReportSchema.parse({
+      ...report,
+      attemptNumber: 2,
+      retryOfAttemptId: employeeId,
+      retryDecision: {
+        ...report.retryDecision,
+        previousAttemptId: customerId,
+      },
     }),
   );
 });
@@ -519,6 +651,12 @@ test("worker checkpoints require canonical direction and sample watermarks", () 
       compatibilityWatermark: 4000,
     }),
   );
+  assert.throws(() =>
+    WorkerCheckpointSchema.parse({
+      ...checkpoint,
+      destinationParticipantId: checkpoint.sourceParticipantId,
+    }),
+  );
 });
 
 test("archive records are opaque, strict, and inventories preserve create-once relationships", () => {
@@ -562,6 +700,48 @@ test("archive records are opaque, strict, and inventories preserve create-once r
       },
     ],
   };
+  const segmentGap = {
+    owner: "participant-egress",
+    objectClass: "participant_media",
+    sampleRange: null,
+    segmentStart: 9,
+    segmentEnd: 3,
+    reason: "unordered",
+  } as const;
+  const failedWorkerInventory = {
+    ...inventory,
+    workerTerminal: { ...inventory.workerTerminal, outcome: "failed" },
+  } as const;
+  const fencedWorkerInventory = {
+    ...inventory,
+    workerTerminal: { ...inventory.workerTerminal, outcome: "fenced" },
+  } as const;
+  const failedEgressInventory = {
+    ...inventory,
+    egressResults: [
+      {
+        egressId: "egress-1",
+        kind: "participant",
+        subjectParticipantId: employeeId,
+        outcome: "failed",
+        objectIds: [],
+        gaps: [],
+      },
+    ],
+  } as const;
+  const gappedEgressInventory = {
+    ...inventory,
+    egressResults: [
+      {
+        egressId: "egress-2",
+        kind: "participant",
+        subjectParticipantId: employeeId,
+        outcome: "complete",
+        objectIds: [],
+        gaps: [{ ...segmentGap, segmentStart: 3, segmentEnd: 9 }],
+      },
+    ],
+  } as const;
   const supplement = {
     schemaVersion: 1,
     supplementId: "018f1f3c-0f63-7d65-8eb1-1f250f9f9823",
@@ -594,7 +774,162 @@ test("archive records are opaque, strict, and inventories preserve create-once r
   assert.deepEqual(parsedArchiveRecord, archiveRecord);
   assert.deepEqual(parsedInventory, inventory);
   assert.throws(() => FinalInventorySchema.parse(missingInventory));
+  assert.throws(() => ArchiveGapSchema.parse(segmentGap));
+  assert.throws(() => FinalInventorySchema.parse(failedWorkerInventory));
+  assert.throws(() => FinalInventorySchema.parse(fencedWorkerInventory));
+  assert.throws(() => FinalInventorySchema.parse(failedEgressInventory));
+  assert.throws(() => FinalInventorySchema.parse(gappedEgressInventory));
+  assertGeneratedRejects([
+    ["FinalInventory", missingInventory],
+    ["FinalInventory", failedWorkerInventory],
+    ["FinalInventory", fencedWorkerInventory],
+    ["FinalInventory", failedEgressInventory],
+    ["FinalInventory", gappedEgressInventory],
+  ]);
   assert.deepEqual(parsedSupplement, supplement);
+});
+
+test("transport references enforce network URL schemes with runtime and generated parity", () => {
+  const acceptedHttpReferences = [
+    "HTTP://fixture.invalid/translate",
+    "hTtPs://fixture.invalid/translate",
+  ].map((url) => ({ ...httpRawReference, url }));
+  const websocketReference = {
+    transport: "websocket",
+    url: "wss://fixture.invalid/listen",
+    upgradeRequestHeaders: [],
+    upgradeResponseHeaders: [],
+    frames: [],
+    closeCode: 1000,
+    closeReason: "complete",
+  } as const;
+  const acceptedWebSocketReferences = [
+    "WS://fixture.invalid/listen",
+    "WsS://fixture.invalid/listen",
+  ].map((url) => ({ ...websocketReference, url }));
+  const invalidHttp = { ...httpRawReference, url: "ftp://fixture.invalid/translate" };
+  const invalidWebSocket = { ...websocketReference, url: "https://fixture.invalid/listen" };
+
+  for (const reference of acceptedHttpReferences) {
+    assert.deepEqual(HttpRawReferenceSchema.parse(reference), reference);
+  }
+  for (const reference of acceptedWebSocketReferences) {
+    assert.deepEqual(WebSocketRawReferenceSchema.parse(reference), reference);
+  }
+  assert.throws(() => HttpRawReferenceSchema.parse(invalidHttp));
+  assert.deepEqual(WebSocketRawReferenceSchema.parse(websocketReference), websocketReference);
+  assert.throws(() => WebSocketRawReferenceSchema.parse(invalidWebSocket));
+  assertGeneratedAccepts([
+    ...acceptedHttpReferences.map((reference) => ["HttpRawReference", reference] as const),
+    ...acceptedWebSocketReferences.map(
+      (reference) => ["WebSocketRawReference", reference] as const,
+    ),
+  ]);
+  assertGeneratedRejects([
+    ["HttpRawReference", invalidHttp],
+    ["WebSocketRawReference", invalidWebSocket],
+  ]);
+});
+
+test("generated schemas preserve representable refinements and disclose value comparisons", () => {
+  const gapWithoutRange = {
+    owner: "worker",
+    objectClass: "checkpoint",
+    sampleRange: null,
+    segmentStart: null,
+    segmentEnd: null,
+    reason: "unknown",
+  } as const;
+  const retryWithoutTime = {
+    action: "retry",
+    reason: "safe replay",
+    retryAtMs: null,
+    previousAttemptId: null,
+  } as const;
+  const malformedHeader = {
+    name: "authorization",
+    value: "[redacted]",
+    redacted: true,
+    secretReference: null,
+  } as const;
+  const failedTerminalWithoutError = {
+    ...providerTerminal,
+    outcome: "failed",
+    error: null,
+  } as const;
+
+  assert.throws(() => ArchiveGapSchema.parse(gapWithoutRange));
+  assert.throws(() => RetryDecisionSchema.parse(retryWithoutTime));
+  assert.throws(() => OrderedHeaderSchema.parse(malformedHeader));
+  assert.throws(() => ProviderAttemptTerminalSchema.parse(failedTerminalWithoutError));
+  assertGeneratedRejects([
+    ["ArchiveGap", gapWithoutRange],
+    ["RetryDecision", retryWithoutTime],
+    ["OrderedHeader", malformedHeader],
+    ["ProviderAttemptTerminal", failedTerminalWithoutError],
+    ["HttpProviderAttemptTerminal", failedTerminalWithoutError],
+  ]);
+
+  const retryLinkRefinements = [
+    "retryDecision.previousAttemptId must be null or equal attemptId",
+    "retry action requires retryDecision.previousAttemptId to equal attemptId",
+    "retryOfAttemptId must differ from attemptId",
+  ];
+  for (const name of [
+    "GrpcProviderAttemptTerminal",
+    "HttpProviderAttemptTerminal",
+    "ProviderAttemptTerminal",
+    "WebSocketProviderAttemptTerminal",
+  ]) {
+    assert.deepEqual(runtimeRefinements(name), [
+      "error.attemptId must equal attemptId",
+      ...retryLinkRefinements,
+    ]);
+  }
+  assert.deepEqual(runtimeRefinements("ProviderAttemptReport"), [
+    "error.attemptId must equal attemptId",
+    ...retryLinkRefinements,
+    "occurredAtMs must not precede startedAtMs",
+    "rawReferences ordinals must be unique",
+  ]);
+
+  const runtimeOnlySchemas = [
+    "ArchiveGap",
+    "CaptionPacket",
+    "GrpcProviderAttemptTerminal",
+    "HttpProviderAttemptTerminal",
+    "ProviderAttemptReport",
+    "ProviderAttemptTerminal",
+    "RoomProviderSelection",
+    "SameLanguageBypassStatus",
+    "SampleRange",
+    "WebSocketProviderAttemptTerminal",
+    "WorkerCheckpoint",
+    "WorkerJobMetadata",
+  ];
+  for (const name of runtimeOnlySchemas) assert.ok(runtimeRefinements(name).length > 0);
+});
+
+test("generated artifact registers every public transport and raw evidence schema", () => {
+  assert.deepEqual(
+    Object.keys(generatedBundle.schemas).sort(),
+    Object.keys(CONTRACT_SCHEMAS).sort(),
+  );
+  for (const name of [
+    "OrderedHeader",
+    "WebSocketFrameReference",
+    "GrpcMessageReference",
+    "HttpRawReference",
+    "WebSocketRawReference",
+    "GrpcRawReference",
+    "RawTransportReference",
+    "HttpProviderAttemptTerminal",
+    "WebSocketProviderAttemptTerminal",
+    "GrpcProviderAttemptTerminal",
+    "ProviderAttemptRawReference",
+  ]) {
+    assert.ok(generatedBundle.schemas[name], `${name} missing from generated artifact`);
+  }
 });
 
 test("database literal schemas reject unapproved states and roles", () => {

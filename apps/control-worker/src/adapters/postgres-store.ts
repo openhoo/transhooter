@@ -3,7 +3,6 @@ import { type RoomProviderSelection, RoomProviderSelectionSchema } from "@transh
 import {
   consultationParticipants,
   consultations,
-  externalEffects,
   workerReservations,
 } from "@transhooter/server-core/persistence";
 import { and, eq, inArray, type SQL, sql } from "drizzle-orm";
@@ -82,6 +81,11 @@ interface WorkerDispatchRow extends PostgresRow {
   readonly write_epoch: number;
 }
 
+interface WorkerDirectionRow extends PostgresRow {
+  readonly source_participant_id: string;
+  readonly destination_participant_id: string;
+}
+
 interface ParticipantIdentityRow extends PostgresRow {
   readonly id: string;
   readonly livekit_identity: string;
@@ -111,6 +115,21 @@ interface ArchiveObjectRow extends PostgresRow {
   readonly sha256: string;
   readonly s3_checksum: string;
   readonly content_type: string;
+}
+
+interface ProviderGapRow extends PostgresRow {
+  readonly attempt_id: string;
+  readonly stage: string;
+  readonly provider: string;
+  readonly direction_id: string;
+  readonly operation_id: string;
+  readonly attempt_number: number;
+  readonly outcome: string;
+  readonly error_kind: string | null;
+  readonly accepted_input_watermark: number | null;
+  readonly received_output_watermark: number | null;
+  readonly emitted_output_watermark: number | null;
+  readonly retry_decision: unknown;
 }
 
 interface CheckpointRow extends PostgresRow {
@@ -295,30 +314,9 @@ export class PostgresStore implements DurableStore {
   }
 
   async scheduleEffect(input: PlannedEffect): Promise<void> {
-    await this.db
-      .insert(externalEffects)
-      .values({
-        id: input.id,
-        consultationId: input.consultationId,
-        generation: input.generation,
-        effectKind: input.kind,
-        subjectId: input.subjectId,
-        occurrenceKey: input.occurrenceKey,
-        state: "planned",
-        result: { plan: input.plan },
-        attempts: 0,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .onConflictDoNothing({
-        target: [
-          externalEffects.consultationId,
-          externalEffects.generation,
-          externalEffects.effectKind,
-          externalEffects.subjectId,
-          externalEffects.occurrenceKey,
-        ],
-      });
+    await this.client.begin(async (transaction) => {
+      await insertPlannedEffects(transaction, [input]);
+    });
   }
 
   async claimDeadlines(options: ClaimOptions): Promise<readonly Deadline[]> {
@@ -598,50 +596,33 @@ export class PostgresStore implements DurableStore {
       if (fenced.length !== 1) {
         return false;
       }
+      const terminalCheckpointId = await persistSupervisorTerminalCheckpoints(
+        transaction,
+        reservation,
+        reason,
+      );
+      const terminalized = await transaction<
+        { readonly terminal_checkpoint_id: string }[]
+      >`UPDATE worker_job_epochs SET fenced_at=COALESCE(fenced_at,now()),
+          terminal_checkpoint_id=${terminalCheckpointId},terminal_outcome='failed',terminal_at=now()
+        WHERE consultation_id=${reservation.consultationId}
+          AND generation=${reservation.generation}
+          AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}
+          AND terminal_at IS NULL
+        RETURNING terminal_checkpoint_id`;
+      if (terminalized.length !== 1) {
+        throw new Error("worker epoch was not terminalized after supervisor checkpoints");
+      }
+      await transaction`UPDATE worker_reservations
+        SET accepting_load=false,released_at=COALESCE(released_at,now())
+        WHERE consultation_id=${reservation.consultationId}
+          AND generation=${reservation.generation}
+          AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}`;
       await transaction`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
         VALUES (gen_random_uuid(),${reservation.consultationId},NULL,'worker.supervisor_terminal',now(),
-          jsonb_build_object('generation',${reservation.generation}::integer,'fencedEpoch',${reservation.epoch}::integer,'owner',${owner}::uuid,'reason',${reason}::text,
-            'lastCheckpoint',(SELECT to_jsonb(checkpoint) FROM worker_checkpoints checkpoint
-              WHERE checkpoint.consultation_id=${reservation.consultationId} AND checkpoint.worker_epoch=${reservation.epoch}
-              ORDER BY checkpoint.high_watermark DESC LIMIT 1),
-            'unknownGaps',jsonb_build_array(jsonb_build_object(
-              'reason',CASE WHEN EXISTS (SELECT 1 FROM worker_checkpoints checkpoint
-                WHERE checkpoint.consultation_id=${reservation.consultationId} AND checkpoint.worker_epoch=${reservation.epoch})
-                THEN 'after_last_checkpoint' ELSE 'checkpoint_missing' END,
-              'sampleStart',(SELECT checkpoint.high_watermark FROM worker_checkpoints checkpoint
-                WHERE checkpoint.consultation_id=${reservation.consultationId} AND checkpoint.worker_epoch=${reservation.epoch}
-                ORDER BY checkpoint.high_watermark DESC LIMIT 1),
-              'sampleEnd',NULL))))`;
-      const terminalIdentity = supervisorTerminalIdentity(reservation, reason);
-      const { id: terminalId, hash: terminalHash, objectKey: terminalObjectKey } = terminalIdentity;
-      const terminal = await transaction<{ id: string }[]>`WITH previous AS (
-          SELECT checkpoint_hash,high_watermark,expected_ids,observed_ids,gaps
-          FROM worker_checkpoints WHERE consultation_id=${reservation.consultationId} AND worker_epoch=${reservation.epoch}
-          ORDER BY high_watermark DESC LIMIT 1
-        )
-        INSERT INTO worker_checkpoints(
-          id,consultation_id,generation,worker_id,worker_epoch,write_epoch,high_watermark,
-          previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,object_key,object_version_id,created_at
-        )
-        SELECT ${terminalId},${reservation.consultationId},${reservation.generation},${reservation.workerId},${reservation.epoch},
-          COALESCE((SELECT write_epoch FROM archives WHERE consultation_id=${reservation.consultationId}),0),
-          COALESCE(previous.high_watermark+1,0),previous.checkpoint_hash,${terminalHash},
-          COALESCE(previous.expected_ids,'[]'::jsonb),COALESCE(previous.observed_ids,'[]'::jsonb),
-          COALESCE(previous.gaps,'[]'::jsonb) || jsonb_build_array(jsonb_build_object(
-            'reason',CASE WHEN previous.high_watermark IS NULL THEN 'checkpoint_missing' ELSE 'after_last_checkpoint' END,
-            'sampleStart',previous.high_watermark,'sampleEnd',NULL)),
-          true,${terminalObjectKey},NULL,now()
-        FROM (SELECT 1) seed LEFT JOIN previous ON true RETURNING id`;
-      const terminalCheckpoint = terminal[0];
-      if (terminalCheckpoint === undefined) {
-        throw new Error("supervisor terminal checkpoint was not persisted");
-      }
-      await transaction`UPDATE worker_job_epochs SET fenced_at=now(),terminal_checkpoint_id=${terminalCheckpoint.id},
-        terminal_outcome='failed',terminal_at=now()
-        WHERE consultation_id=${reservation.consultationId} AND generation=${reservation.generation} AND epoch=${reservation.epoch}
-          AND terminal_at IS NULL`;
-      await transaction`UPDATE worker_reservations SET accepting_load=false,released_at=COALESCE(released_at,now())
-        WHERE consultation_id=${reservation.consultationId} AND generation=${reservation.generation} AND epoch=${reservation.epoch}`;
+          jsonb_build_object('generation',${reservation.generation}::integer,
+            'fencedEpoch',${reservation.epoch}::integer,'owner',${owner}::uuid,
+            'reason',${reason}::text,'terminalCheckpointId',${terminalCheckpointId}::uuid))`;
       await insertPlannedEffects(transaction, effects);
       return true;
     });
@@ -680,49 +661,27 @@ export class PostgresStore implements DurableStore {
           AND generation=${resourceGeneration} AND worker_id=${reservation.workerId}
           AND epoch=${reservation.epoch} FOR UPDATE`;
         if (epochs[0]?.terminal_at === null) {
+          const terminalCheckpointId = await persistSupervisorTerminalCheckpoints(
+            transaction,
+            reservation,
+            reason,
+          );
+          const terminalized = await transaction<
+            { readonly terminal_checkpoint_id: string }[]
+          >`UPDATE worker_job_epochs SET fenced_at=COALESCE(fenced_at,now()),
+              terminal_checkpoint_id=${terminalCheckpointId},terminal_outcome='failed',terminal_at=now()
+            WHERE consultation_id=${consultationId} AND generation=${resourceGeneration}
+              AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}
+              AND terminal_at IS NULL
+            RETURNING terminal_checkpoint_id`;
+          if (terminalized.length !== 1) {
+            throw new Error("cancellation worker epoch was not terminalized after checkpoints");
+          }
           await transaction`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
             VALUES (gen_random_uuid(),${consultationId},NULL,'worker.supervisor_terminal',now(),
-              jsonb_build_object('generation',${resourceGeneration}::integer,'fencedEpoch',${reservation.epoch}::integer,
-                'owner',${owner}::uuid,'reason',${reason}::text,
-                'lastCheckpoint',(SELECT to_jsonb(checkpoint) FROM worker_checkpoints checkpoint
-                  WHERE checkpoint.consultation_id=${consultationId} AND checkpoint.worker_epoch=${reservation.epoch}
-                  ORDER BY checkpoint.high_watermark DESC LIMIT 1),
-                'unknownGaps',jsonb_build_array(jsonb_build_object(
-                  'reason',CASE WHEN EXISTS (SELECT 1 FROM worker_checkpoints checkpoint
-                    WHERE checkpoint.consultation_id=${consultationId} AND checkpoint.worker_epoch=${reservation.epoch})
-                    THEN 'after_last_checkpoint' ELSE 'checkpoint_missing' END,
-                  'sampleStart',(SELECT checkpoint.high_watermark FROM worker_checkpoints checkpoint
-                    WHERE checkpoint.consultation_id=${consultationId} AND checkpoint.worker_epoch=${reservation.epoch}
-                    ORDER BY checkpoint.high_watermark DESC LIMIT 1),
-                  'sampleEnd',NULL))))`;
-          const { id, hash, objectKey } = supervisorTerminalIdentity(reservation, reason);
-          const terminals = await transaction<{ readonly id: string }[]>`WITH previous AS (
-              SELECT checkpoint_hash,high_watermark,expected_ids,observed_ids,gaps
-              FROM worker_checkpoints WHERE consultation_id=${consultationId}
-                AND worker_epoch=${reservation.epoch} ORDER BY high_watermark DESC LIMIT 1
-            )
-            INSERT INTO worker_checkpoints(
-              id,consultation_id,generation,worker_id,worker_epoch,write_epoch,high_watermark,
-              previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,
-              object_key,object_version_id,created_at
-            )
-            SELECT ${id},${consultationId},${resourceGeneration},${reservation.workerId},
-              ${reservation.epoch},COALESCE((SELECT write_epoch FROM archives WHERE consultation_id=${consultationId}),0),
-              COALESCE(previous.high_watermark+1,0),previous.checkpoint_hash,${hash},
-              COALESCE(previous.expected_ids,'[]'::jsonb),COALESCE(previous.observed_ids,'[]'::jsonb),
-              COALESCE(previous.gaps,'[]'::jsonb) || jsonb_build_array(jsonb_build_object(
-                'reason',CASE WHEN previous.high_watermark IS NULL THEN 'checkpoint_missing' ELSE 'after_last_checkpoint' END,
-                'sampleStart',previous.high_watermark,'sampleEnd',NULL)),
-              true,${objectKey},NULL,now()
-            FROM (SELECT 1) seed LEFT JOIN previous ON true RETURNING id`;
-          const terminal = terminals[0];
-          if (terminal === undefined) {
-            throw new Error("cancellation supervisor terminal checkpoint was not persisted");
-          }
-          await transaction`UPDATE worker_job_epochs SET fenced_at=COALESCE(fenced_at,now()),
-            terminal_checkpoint_id=${terminal.id},terminal_outcome='failed',terminal_at=now()
-            WHERE consultation_id=${consultationId} AND generation=${resourceGeneration}
-              AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch} AND terminal_at IS NULL`;
+              jsonb_build_object('generation',${resourceGeneration}::integer,
+                'fencedEpoch',${reservation.epoch}::integer,'owner',${owner}::uuid,
+                'reason',${reason}::text,'terminalCheckpointId',${terminalCheckpointId}::uuid))`;
         }
         await transaction`UPDATE worker_reservations SET fenced_at=COALESCE(fenced_at,now()),
           fence_reason=COALESCE(fence_reason,${reason}),accepting_load=false,
@@ -825,8 +784,21 @@ export class PostgresStore implements DurableStore {
     consultationId: Uuid,
     cleanupGeneration: number,
     resourceGeneration: number,
-  ): Promise<ReconciliationSnapshot> {
+  ): Promise<ReconciliationSnapshot | null> {
     return this.client.begin(async (transaction) => {
+      const archiveStates = await transaction<
+        { readonly id: string; readonly state: string }[]
+      >`SELECT id,state FROM archives WHERE consultation_id=${consultationId}`;
+      const archiveState = archiveStates[0];
+      if (archiveState === undefined) {
+        throw new Error("consultation archive is unavailable");
+      }
+      if (["complete", "incomplete", "deleting", "deleted"].includes(archiveState.state)) {
+        return null;
+      }
+      if (archiveState.state !== "reconciling") {
+        throw new Error(`archive is not reconciling: ${archiveState.state}`);
+      }
       const archives = await transaction<
         ArchiveClaimRow[]
       >`SELECT id,state,reconciliation_deadline_at FROM archives WHERE consultation_id=${consultationId} AND state='reconciling' FOR UPDATE SKIP LOCKED`;
@@ -843,7 +815,7 @@ export class PostgresStore implements DurableStore {
             AND checkpoint.generation=${resourceGeneration} AND checkpoint.worker_id=reservation.worker_id
             AND checkpoint.worker_epoch=reservation.epoch AND checkpoint.terminal=true)`;
       const archiveId = String(archive.id);
-      const [expectations, objects, checkpoints, egress, drains] = await Promise.all([
+      const [expectations, objects, checkpoints, egress, drains, providerGaps] = await Promise.all([
         transaction<
           ExpectationRow[]
         >`SELECT id,object_class,causal_key,sample_start,sample_end,fulfilled_object_id
@@ -864,6 +836,17 @@ export class PostgresStore implements DurableStore {
           DrainResultRow[]
         >`SELECT result FROM external_effects WHERE consultation_id=${consultationId} AND generation=${cleanupGeneration}
           AND effect_kind='ROOM_DELETE' AND state='done' ORDER BY updated_at DESC LIMIT 1`,
+        transaction<
+          ProviderGapRow[]
+        >`SELECT attempt.id AS attempt_id,attempt.stage,attempt.provider,
+          attempt.direction_id,attempt.operation_id,attempt.attempt_number,attempt.outcome,attempt.error_kind,
+          attempt.accepted_input_watermark,attempt.received_output_watermark,attempt.emitted_output_watermark,
+          attempt.retry_decision
+          FROM provider_attempts attempt
+          WHERE attempt.consultation_id=${consultationId} AND attempt.terminal_at IS NOT NULL
+          AND attempt.outcome <> 'succeeded'
+          AND NOT EXISTS (SELECT 1 FROM provider_attempts retry WHERE retry.retry_of=attempt.id)
+          ORDER BY attempt.stage,attempt.direction_id,attempt.operation_id,attempt.attempt_number`,
       ]);
       return mapReconciliationSnapshot(
         archiveId,
@@ -873,6 +856,7 @@ export class PostgresStore implements DurableStore {
         checkpoints,
         egress,
         drains,
+        providerGaps,
       );
     });
   }
@@ -928,11 +912,122 @@ export class PostgresStore implements DurableStore {
   }
 }
 
+export async function persistSupervisorTerminalCheckpoints(
+  transaction: TransactionSql,
+  reservation: WorkerReservation,
+  reason: string,
+): Promise<Uuid> {
+  const directions = await transaction<
+    WorkerDirectionRow[]
+  >`SELECT direction->>'sourceParticipantId' AS source_participant_id,
+      direction->>'destinationParticipantId' AS destination_participant_id
+    FROM room_provider_selections selection
+    CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
+    WHERE selection.consultation_id=${reservation.consultationId}`;
+  if (directions.length !== 2) {
+    throw new Error("worker supervisor settlement requires two frozen directions");
+  }
+
+  for (const direction of directions) {
+    const { id, hash, objectKey } = supervisorTerminalIdentity(
+      reservation,
+      reason,
+      direction.source_participant_id,
+      direction.destination_participant_id,
+    );
+    await transaction`WITH previous AS (
+        SELECT accepted_input_sequence,high_watermark,received_output,emitted_output,
+          checkpoint_hash,expected_ids,observed_ids,gaps
+        FROM worker_checkpoints
+        WHERE consultation_id=${reservation.consultationId}
+          AND generation=${reservation.generation}
+          AND worker_id=${reservation.workerId}
+          AND worker_epoch=${reservation.epoch}
+          AND source_participant_id=${direction.source_participant_id}
+          AND destination_participant_id=${direction.destination_participant_id}
+        ORDER BY accepted_input_sequence DESC,high_watermark DESC LIMIT 1
+      )
+      INSERT INTO worker_checkpoints(
+        id,consultation_id,generation,worker_id,worker_epoch,write_epoch,
+        source_participant_id,destination_participant_id,
+        accepted_input_sequence,high_watermark,received_output,emitted_output,
+        previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,
+        object_key,object_version_id,created_at
+      )
+      SELECT ${id},${reservation.consultationId},${reservation.generation},
+        ${reservation.workerId},${reservation.epoch},
+        COALESCE((SELECT write_epoch FROM archives WHERE consultation_id=${reservation.consultationId}),0),
+        ${direction.source_participant_id},${direction.destination_participant_id},
+        COALESCE(previous.accepted_input_sequence+1,0),
+        COALESCE(previous.high_watermark+1,0),
+        COALESCE(previous.received_output,0),
+        COALESCE(previous.emitted_output,0),
+        previous.checkpoint_hash,${hash},
+        COALESCE(previous.expected_ids,'[]'::jsonb),COALESCE(previous.observed_ids,'[]'::jsonb),
+        COALESCE(previous.gaps,'[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+          'reason',CASE WHEN previous.high_watermark IS NULL THEN 'checkpoint_missing' ELSE 'after_last_checkpoint' END,
+          'sampleStart',previous.high_watermark,'sampleEnd',NULL)),
+        true,${objectKey},NULL,now()
+      FROM (SELECT 1) seed LEFT JOIN previous ON true
+      WHERE NOT EXISTS (
+        SELECT 1 FROM worker_checkpoints terminal
+        WHERE terminal.consultation_id=${reservation.consultationId}
+          AND terminal.generation=${reservation.generation}
+          AND terminal.worker_id=${reservation.workerId}
+          AND terminal.worker_epoch=${reservation.epoch}
+          AND terminal.source_participant_id=${direction.source_participant_id}
+          AND terminal.destination_participant_id=${direction.destination_participant_id}
+          AND terminal.terminal
+      )`;
+  }
+
+  const terminals = await transaction<{ readonly id: string }[]>`SELECT latest.id
+    FROM room_provider_selections selection
+    CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
+    CROSS JOIN LATERAL (
+      SELECT checkpoint.id FROM worker_checkpoints checkpoint
+      WHERE checkpoint.consultation_id=${reservation.consultationId}
+        AND checkpoint.generation=${reservation.generation}
+        AND checkpoint.worker_id=${reservation.workerId}
+        AND checkpoint.worker_epoch=${reservation.epoch}
+        AND checkpoint.source_participant_id=(direction->>'sourceParticipantId')::uuid
+        AND checkpoint.destination_participant_id=(direction->>'destinationParticipantId')::uuid
+        AND checkpoint.terminal
+      ORDER BY checkpoint.high_watermark DESC LIMIT 1
+    ) latest
+    WHERE selection.consultation_id=${reservation.consultationId}`;
+  if (terminals.length !== 2 || terminals[0] === undefined) {
+    throw new Error("supervisor terminal checkpoints were not persisted for both directions");
+  }
+  return terminals[0].id;
+}
+
 async function insertPlannedEffects(
   transaction: TransactionSql,
   effects: readonly PlannedEffect[],
 ): Promise<void> {
   for (const effect of effects) {
+    if (effect.kind === "ROOM_COMPOSITE_EGRESS" || effect.kind === "PARTICIPANT_EGRESS") {
+      const outputPrefix = effect.plan.outputPrefix;
+      if (typeof outputPrefix !== "string" || outputPrefix.length === 0) {
+        throw new Error("Egress effect omitted its immutable output prefix");
+      }
+      const objectClass =
+        effect.kind === "ROOM_COMPOSITE_EGRESS" ? "room_composite" : "participant_original";
+      await transaction`INSERT INTO expected_archive_artifacts(
+          id,archive_id,profile_id,profile_revision,object_class,causal_key,
+          sample_start,sample_end,owner_epoch,disposition,created_at
+        )
+        SELECT ${effect.id},archive.id,consultation.provider_profile_id,
+          consultation.provider_profile_revision,${objectClass},${outputPrefix},
+          NULL,NULL,archive.write_epoch,'expected',now()
+        FROM consultations consultation
+        JOIN archives archive ON archive.consultation_id=consultation.id
+        WHERE consultation.id=${effect.consultationId}
+          AND consultation.generation=${effect.generation}
+          AND archive.state NOT IN ('deleting','deleted')
+        ON CONFLICT (archive_id,object_class,causal_key) DO NOTHING`;
+    }
     await transaction`INSERT INTO external_effects(id,consultation_id,generation,effect_kind,subject_id,occurrence_key,state,result,attempts,created_at,updated_at)
           VALUES (${effect.id},${effect.consultationId},${effect.generation},${effect.kind},${effect.subjectId},${effect.occurrenceKey},'planned',
             ${JSON.stringify({ plan: effect.plan })}::jsonb,0,now(),now())
@@ -957,6 +1052,25 @@ async function insertReconciliationObjects(
           SELECT ${object.id}::uuid,id,${object.objectClass}::text,${object.key}::text,${object.key}::text,${object.versionId}::text,${object.size}::bigint,${object.sha256}::text,${object.checksum}::text,${object.contentType}::text,write_epoch,now()
           FROM archives WHERE id=${archiveId} ON CONFLICT (key,version_id) DO NOTHING`;
   }
+  await transaction`WITH matches AS (
+      SELECT expected.id AS expectation_id,(
+        SELECT object.id
+        FROM archive_objects object
+        WHERE object.archive_id=expected.archive_id
+          AND object.object_class=expected.object_class
+          AND object.key LIKE expected.causal_key || '/%'
+        ORDER BY object.key,object.version_id,object.id
+        LIMIT 1
+      ) AS object_id
+      FROM expected_archive_artifacts expected
+      WHERE expected.archive_id=${archiveId}
+        AND expected.fulfilled_object_id IS NULL
+        AND expected.object_class IN ('room_composite','participant_original')
+    )
+    UPDATE expected_archive_artifacts expected
+    SET fulfilled_object_id=matches.object_id,disposition='fulfilled'
+    FROM matches
+    WHERE expected.id=matches.expectation_id AND matches.object_id IS NOT NULL`;
 }
 
 function markAppliedStatement(
@@ -970,12 +1084,12 @@ function markAppliedStatement(
         result=COALESCE(result,'{}'::jsonb) || ${JSON.stringify({ remoteId, value: result })}::jsonb,updated_at=now()
       WHERE id=${effectId} AND lease_owner=${owner} AND state='calling' RETURNING *
     ), egress_inserted AS (
-      INSERT INTO egress_jobs(id,consultation_id,generation,kind,subject_id,egress_id,request_hash,state,output_prefix,created_at)
+      INSERT INTO egress_jobs(id,consultation_id,generation,kind,subject_id,egress_id,request_hash,state,output_prefix,expected_artifact_id,created_at)
       SELECT id,consultation_id,generation,CASE effect_kind WHEN 'ROOM_COMPOSITE_EGRESS' THEN 'room_composite' ELSE 'participant' END,subject_id,result->>'remoteId',request_hash,
-        COALESCE(result->'value'->>'status','requested'),result->'plan'->>'outputPrefix',now()
+        COALESCE(result->'value'->>'status','requested'),result->'plan'->>'outputPrefix',id,now()
       FROM changed WHERE effect_kind IN ('ROOM_COMPOSITE_EGRESS','PARTICIPANT_EGRESS')
       ON CONFLICT (consultation_id,generation,kind,subject_id) DO UPDATE SET
-        egress_id=EXCLUDED.egress_id,state=EXCLUDED.state RETURNING id
+        egress_id=EXCLUDED.egress_id,state=EXCLUDED.state,expected_artifact_id=EXCLUDED.expected_artifact_id RETURNING id
     ), egress_updated AS (
       UPDATE egress_jobs job SET state=terminal->>'status',terminal_at=now(),terminal_result=terminal
       FROM changed, LATERAL jsonb_array_elements(
@@ -1086,11 +1200,13 @@ function mapWorkerDispatchMetadata(
 function supervisorTerminalIdentity(
   reservation: WorkerReservation,
   reason: string,
+  sourceParticipantId: string,
+  destinationParticipantId: string,
 ): { readonly id: Uuid; readonly hash: string; readonly objectKey: string } {
   const id = randomUUID();
   const hash = createHash("sha256")
     .update(
-      `${id}:${reservation.consultationId}:${String(reservation.generation)}:${String(reservation.epoch)}:${reason}`,
+      `${id}:${reservation.consultationId}:${String(reservation.generation)}:${String(reservation.epoch)}:${sourceParticipantId}:${destinationParticipantId}:${reason}`,
     )
     .digest("hex");
   return {
@@ -1177,6 +1293,7 @@ function mapReconciliationSnapshot(
   checkpoints: readonly CheckpointRow[],
   egress: readonly EgressResultRow[],
   drains: readonly DrainResultRow[],
+  providerGaps: readonly ProviderGapRow[],
 ): ReconciliationSnapshot {
   return {
     archiveId,
@@ -1189,6 +1306,20 @@ function mapReconciliationSnapshot(
         ? { terminal: false, gaps: [{ reason: "worker_terminal_missing" }] }
         : { terminal: true, checkpoint: checkpoints[0].checkpoint },
     egressResults: egress.map(mapReconciliationEgress),
+    providerGaps: providerGaps.map((gap) => ({
+      attemptId: gap.attempt_id,
+      stage: gap.stage,
+      provider: gap.provider,
+      directionId: gap.direction_id,
+      operationId: gap.operation_id,
+      attemptNumber: gap.attempt_number,
+      outcome: gap.outcome,
+      errorKind: gap.error_kind,
+      acceptedInputWatermark: gap.accepted_input_watermark,
+      receivedOutputWatermark: gap.received_output_watermark,
+      emittedOutputWatermark: gap.emitted_output_watermark,
+      retryDecision: gap.retry_decision,
+    })),
     expectations: expectations.map(mapReconciliationExpectation),
     objects: objects.map(mapArchiveObject),
   };

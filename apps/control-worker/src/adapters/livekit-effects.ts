@@ -42,7 +42,7 @@ export interface LiveKitConfig {
     readonly region: string;
     readonly forcePathStyle: boolean;
   };
-  readonly internalToken: string;
+  readonly internalToken: () => Promise<string>;
   readonly egressLayoutSigningKey: string;
   readonly egressLayoutUrl: string;
 }
@@ -144,6 +144,17 @@ export class LiveKitEffects implements RemoteEffects {
     if (effect.kind === "PARTICIPANT_GRANT" || effect.kind === "PARTICIPANT_REMOVE") {
       return this.adoptParticipantEffect(effect, request);
     }
+    if (effect.kind === "STATUS_PACKET") {
+      const roomName = requiredString(request, "roomName");
+      if ((await this.rooms.listRooms([roomName])).length === 0) {
+        return {
+          remoteId: effect.id,
+          matchesRequest: true,
+          terminal: true,
+          result: { sent: false, skipped: "room_absent" },
+        };
+      }
+    }
     return null;
   }
 
@@ -212,28 +223,40 @@ export class LiveKitEffects implements RemoteEffects {
   }
 
   async compensate(effect: Effect): Promise<void> {
-    if (effect.remoteId === null) {
-      return;
+    let remoteId = effect.remoteId;
+    if (remoteId === null) {
+      const adoption = await this.adopt(effect, effect.plan);
+      if (adoption === null || !adoption.matchesRequest) {
+        return;
+      }
+      remoteId = adoption.remoteId;
     }
 
     if (effect.kind === "WORKER_DISPATCH") {
-      await this.dispatch
-        .deleteDispatch(effect.remoteId, roomNameFor(effect, effect.plan))
-        .catch(() => undefined);
+      const roomName = roomNameFor(effect, effect.plan);
+      const found = (await this.dispatch.listDispatch(roomName)).find(({ id }) => id === remoteId);
+      if (found !== undefined) {
+        await this.dispatch.deleteDispatch(remoteId, roomName);
+      }
       return;
     }
-
     if (
       effect.kind === "ROOM_COMPOSITE_EGRESS" ||
       effect.kind === "PARTICIPANT_EGRESS" ||
       effect.kind === "EGRESS_STOP"
     ) {
-      await this.egress.stopEgress(effect.remoteId).catch(() => undefined);
+      const found = (await this.egress.listEgress({ egressId: remoteId }))[0];
+      if (found !== undefined && !isTerminalEgress(found.status)) {
+        await this.egress.stopEgress(remoteId);
+      }
       return;
     }
 
     if (effect.kind === "ROOM_CREATE" || effect.kind === "ROOM_DELETE") {
-      await this.rooms.deleteRoom(roomNameFor(effect, effect.plan)).catch(() => undefined);
+      const roomName = roomNameFor(effect, effect.plan);
+      if ((await this.rooms.listRooms([roomName])).length > 0) {
+        await this.rooms.deleteRoom(roomName);
+      }
     }
   }
 
@@ -260,9 +283,12 @@ export class LiveKitEffects implements RemoteEffects {
         return null;
       }
       const terminals = await this.egress.listEgress({ roomName });
+      if (terminals.some((info) => !isTerminalEgress(info.status))) {
+        return null;
+      }
       return {
         remoteId: effect.id,
-        matchesRequest: terminals.every((info) => isTerminalEgress(info.status)),
+        matchesRequest: true,
         terminal: true,
         result: {
           roomClosed: true,
@@ -341,12 +367,12 @@ export class LiveKitEffects implements RemoteEffects {
       const participant = await this.rooms
         .getParticipant(roomName, participantIdentity)
         .catch(() => undefined);
-      if (participant === undefined || participant.permission?.canPublish !== true) {
+      if (participant === undefined || !hasExactCaptureGrant(participant.permission)) {
         return null;
       }
       return {
         remoteId: participant.sid,
-        matchesRequest: !participant.permission.canPublishData,
+        matchesRequest: true,
         terminal: false,
       };
     }
@@ -698,7 +724,7 @@ export class LiveKitEffects implements RemoteEffects {
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${this.config.internalToken}`,
+        authorization: `Bearer ${await this.config.internalToken()}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({ consultationId, ...extra }),
@@ -818,6 +844,31 @@ function isTerminalEgress(status: EgressStatus): boolean {
     status === EgressStatus.EGRESS_FAILED ||
     status === EgressStatus.EGRESS_ABORTED ||
     status === EgressStatus.EGRESS_LIMIT_REACHED
+  );
+}
+
+function hasExactCaptureGrant(
+  permission:
+    | {
+        readonly canSubscribe?: boolean;
+        readonly canPublish?: boolean;
+        readonly canPublishData?: boolean;
+        readonly canPublishSources?: readonly TrackSource[];
+      }
+    | undefined,
+): boolean {
+  if (
+    permission?.canSubscribe !== true ||
+    permission.canPublish !== true ||
+    permission.canPublishData !== false
+  ) {
+    return false;
+  }
+  const sources = permission.canPublishSources ?? [];
+  return (
+    sources.length === 2 &&
+    sources.includes(TrackSource.MICROPHONE) &&
+    sources.includes(TrackSource.CAMERA)
   );
 }
 

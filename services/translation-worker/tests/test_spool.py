@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import sqlite3
+from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event, Lock, get_ident
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from transhooter_worker.adapters.spool import (
     CapacityProbe,
@@ -20,7 +25,14 @@ from transhooter_worker.adapters.spool import (
 from transhooter_worker.application.compactor import PcmCompactor
 from transhooter_worker.domain.models import SampleRange
 from transhooter_worker.ports.archive import ObjectRecord
-from transhooter_worker.runtime.spool_drainer import upload_committed_objects
+from transhooter_worker.runtime.control_client import PermanentControlRequestError
+from transhooter_worker.runtime.spool_drainer import (
+    ArchiveObjectRegistrationClient,
+    PermanentRegistrationError,
+    RetryableRegistrationError,
+    upload_committed_objects,
+    upload_committed_objects_async,
+)
 
 TEST_KEYRING = {"v1": b"k" * 32}
 
@@ -120,12 +132,256 @@ def test_terminal_drain_uploads_current_meeting_non_pcm_before_reconciliation(
         payload=b"other meeting",
     )
 
-    upload_committed_objects(spool, AlwaysVerifiedArchive(), meeting_id)
+    registrations: list[UUID] = []
+    upload_committed_objects(
+        spool,
+        AlwaysVerifiedArchive(),
+        lambda _meeting, object_id, _object_class, _record: registrations.append(object_id),
+        meeting_id,
+    )
 
     committed_ids = {ref.object_id for ref, _ in spool.committed()}
     assert caption.object_id not in committed_ids
     assert pcm.object_id in committed_ids
     assert other.object_id in committed_ids
+    assert registrations == [caption.object_id]
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (503, RetryableRegistrationError),
+        (429, RetryableRegistrationError),
+        (409, PermanentRegistrationError),
+    ],
+)
+def test_archive_registration_classifies_only_retryable_http_failures(
+    tmp_path: Path,
+    status: int,
+    error_type: type[RuntimeError],
+) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("token", "utf-8")
+    client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(status)))
+    registration = ArchiveObjectRegistrationClient("http://web:3000", bearer_file, client)
+    record = ObjectRecord("object", "key", "version", 1, "a" * 64, "checksum", "application/json")
+
+    with pytest.raises(error_type) as caught:
+        registration.register(uuid4(), uuid4(), "pipeline_exchange", record)
+    assert type(caught.value) is error_type
+
+
+def test_non_pcm_upload_is_not_acknowledged_until_ledger_registration_succeeds(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    evidence = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="translation",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"translation":"Guten Morgen"}',
+    )
+    attempts = 0
+
+    def reject_registration(
+        _meeting: UUID,
+        _object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("ledger unavailable")
+
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        upload_committed_objects(
+            spool,
+            AlwaysVerifiedArchive(),
+            reject_registration,
+            meeting_id,
+        )
+    assert evidence.object_id in {ref.object_id for ref, _ in spool.committed()}
+
+    registered: list[tuple[UUID, str]] = []
+    upload_committed_objects(
+        spool,
+        AlwaysVerifiedArchive(),
+        lambda _meeting, object_id, object_class, _record: registered.append(
+            (object_id, object_class)
+        ),
+        meeting_id,
+    )
+    assert attempts == 1
+    assert registered == [(evidence.object_id, "pipeline_exchange")]
+    assert evidence.object_id not in {ref.object_id for ref, _ in spool.committed()}
+
+
+def test_permanently_rejected_evidence_is_quarantined_without_blocking_later_records(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    rejected = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="control-heartbeat",
+        transport="http",
+        direction="out",
+        media_type="application/json",
+        payload=b'{"health":"ready"}',
+    )
+    accepted = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="translation",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"translation":"Guten Morgen"}',
+    )
+    registered: list[UUID] = []
+
+    def register(
+        _meeting: UUID,
+        object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        if object_id == rejected.object_id:
+            raise PermanentRegistrationError("ARCHIVE_NOT_RECORDING")
+        registered.append(object_id)
+
+    upload_committed_objects(
+        spool,
+        AlwaysVerifiedArchive(),
+        register,
+        meeting_id,
+    )
+
+    assert registered == [accepted.object_id]
+    assert rejected.object_id not in {ref.object_id for ref, _ in spool.committed()}
+    assert spool.read(rejected.object_id) == b'{"health":"ready"}'
+
+
+@pytest.mark.asyncio
+async def test_inline_terminal_drain_quarantines_permanent_rejection_and_continues(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    rejected = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="terminal",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"outcome":"failed"}',
+    )
+    accepted = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="translation",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"translation":"Guten Morgen"}',
+    )
+    registered: list[UUID] = []
+
+    async def register(
+        _meeting: UUID,
+        object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        if object_id == rejected.object_id:
+            raise PermanentControlRequestError("ARCHIVE_NOT_RECORDING")
+        registered.append(object_id)
+
+    await upload_committed_objects_async(
+        spool,
+        AlwaysVerifiedArchive(),
+        register,
+        meeting_id,
+    )
+
+    assert registered == [accepted.object_id]
+    assert spool.committed() == []
+    assert spool.read(rejected.object_id) == b'{"outcome":"failed"}'
+
+
+@pytest.mark.asyncio
+async def test_inline_terminal_drain_keeps_retryable_rejection_committed(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    evidence = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="terminal",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"outcome":"failed"}',
+    )
+
+    async def reject(
+        _meeting: UUID,
+        _object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        raise RuntimeError("control unavailable")
+
+    with pytest.raises(RuntimeError, match="control unavailable"):
+        await upload_committed_objects_async(
+            spool,
+            AlwaysVerifiedArchive(),
+            reject,
+            meeting_id,
+        )
+
+    assert [reference.object_id for reference, _ in spool.committed()] == [evidence.object_id]
+
+
+@pytest.mark.asyncio
+async def test_inline_terminal_drain_archives_on_connection_owner_thread(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="terminal",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"outcome":"succeeded"}',
+    )
+    owner_thread = get_ident()
+
+    class ThreadBoundArchive(AlwaysVerifiedArchive):
+        def put_create_once(
+            self, key: str, body: bytes, content_type: str, sha256: str
+        ) -> ObjectRecord:
+            assert get_ident() == owner_thread
+            return super().put_create_once(key, body, content_type, sha256)
+
+    await upload_committed_objects_async(
+        spool,
+        ThreadBoundArchive(),
+        lambda *_arguments: asyncio.sleep(0),
+        meeting_id,
+    )
+
+    assert spool.committed() == []
 
 
 def test_spool_encrypts_fsyncs_and_authenticates(tmp_path: Path) -> None:
@@ -240,6 +496,79 @@ def test_recovery_imports_authenticated_orphan_final(tmp_path: Path) -> None:
     recovered = make_spool(tmp_path, database_name="recovered.sqlite3")
     assert recovered.read(ref.object_id) == b"orphan"
     assert recovered.committed()[0][0].object_id == ref.object_id
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("transport", "websocket"),
+        ("direction", "out"),
+        ("media_type", "text/plain"),
+        ("sample_start", 99),
+        ("context", {"workerEpoch": 999}),
+    ],
+)
+def test_orphan_recovery_rejects_tampered_full_header(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    first = make_spool(tmp_path, database_name="first.sqlite3")
+    first.append(
+        meeting_id=uuid4(),
+        attempt_id=uuid4(),
+        stage="stt",
+        transport="grpc",
+        direction="in",
+        media_type="application/protobuf",
+        payload=b"orphan",
+        sample_range=SampleRange(0, 1),
+    )
+    path = next((tmp_path / "payloads").glob("*.wal"))
+    header, encrypted = EncryptedSpool._unpack(path.read_bytes())
+    header[field] = replacement
+    path.write_bytes(EncryptedSpool._pack(header, encrypted))
+    first._db.close()
+
+    recovered = make_spool(tmp_path, database_name="recovered.sqlite3")
+
+    assert recovered.committed() == []
+    assert path.with_suffix(".quarantine").exists()
+
+
+def test_orphan_recovery_explicitly_quarantines_valid_legacy_aad(tmp_path: Path) -> None:
+    first = make_spool(tmp_path, database_name="first.sqlite3")
+    ref = first.append(
+        meeting_id=uuid4(),
+        attempt_id=uuid4(),
+        stage="stt",
+        transport="grpc",
+        direction="in",
+        media_type="application/protobuf",
+        payload=b"legacy-orphan",
+    )
+    path = next((tmp_path / "payloads").glob("*.wal"))
+    header, _ = EncryptedSpool._unpack(path.read_bytes())
+    header["aad_version"] = 2
+    metadata = tuple(tuple(str(value) for value in item) for item in header["metadata"])
+    nonce = b64decode(header["nonce"])
+    aad = EncryptedSpool._envelope_aad(
+        UUID(header["meeting_id"]),
+        UUID(header["attempt_id"]),
+        ref.object_id,
+        header["stage"],
+        metadata,
+        version=2,
+    )
+    encrypted = AESGCM(TEST_KEYRING["v1"]).encrypt(nonce, b"legacy-orphan", aad)
+    header["ciphertext_sha256"] = hashlib.sha256(encrypted).hexdigest()
+    path.write_bytes(EncryptedSpool._pack(header, encrypted))
+    first._db.close()
+
+    recovered = make_spool(tmp_path, database_name="recovered.sqlite3")
+
+    assert recovered.committed() == []
+    assert path.with_suffix(".quarantine").exists()
 
 
 def test_checkpoint_coverage_is_stage_and_direction_scoped(tmp_path: Path) -> None:

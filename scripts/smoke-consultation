@@ -8,6 +8,14 @@ load_state
 export PROVIDER_PROFILE="$profile"
 export COMPOSE_PROFILES=e2e
 
+LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
+LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
+exec 9>"$LOCK_FILE"
+if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
+  printf 'Timed out after %s seconds waiting for the compose harness lock.\n' "$LOCK_WAIT_SECONDS" >&2
+  exit 1
+fi
+
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
@@ -18,6 +26,7 @@ cleanup() {
     fi
     printf 'Consultation-smoke cleanup failed.\n' >&2
   fi
+  flock -u 9
   exit "$status"
 }
 

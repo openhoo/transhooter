@@ -125,6 +125,21 @@ export interface ArchivedObject {
   readonly contentType: string;
 }
 
+export interface ReconciliationProviderGap {
+  readonly attemptId: Uuid;
+  readonly stage: string;
+  readonly provider: string;
+  readonly directionId: Uuid;
+  readonly operationId: Uuid;
+  readonly attemptNumber: number;
+  readonly outcome: string;
+  readonly errorKind: string | null;
+  readonly acceptedInputWatermark: number | null;
+  readonly receivedOutputWatermark: number | null;
+  readonly emittedOutputWatermark: number | null;
+  readonly retryDecision: unknown;
+}
+
 export interface ReconciliationSnapshot {
   readonly archiveId: Uuid;
   readonly state: "reconciling";
@@ -132,6 +147,7 @@ export interface ReconciliationSnapshot {
   readonly roomClose: unknown;
   readonly workerTerminal: unknown;
   readonly egressResults: readonly unknown[];
+  readonly providerGaps: readonly ReconciliationProviderGap[];
   readonly expectations: readonly ReconciliationExpectation[];
   readonly objects: readonly ArchivedObject[];
 }
@@ -242,7 +258,7 @@ export interface DurableStore {
     consultationId: Uuid,
     cleanupGeneration: number,
     resourceGeneration: number,
-  ): Promise<ReconciliationSnapshot>;
+  ): Promise<ReconciliationSnapshot | null>;
   completeReconciliation(
     consultationId: Uuid,
     snapshot: ReconciliationSnapshot,

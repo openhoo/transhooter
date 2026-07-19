@@ -109,14 +109,9 @@ export class RoomService {
         current.participants.some((slot) => slot.livekitIdentity === event.identity);
 
       if (current.roomName !== event.roomName || current.generation !== target.generation) {
-        if (
-          event.kind === "participant_joined" &&
-          isAllowedIdentity &&
-          current.roomName &&
-          event.identity
-        ) {
+        if (event.kind === "participant_joined" && isAllowedIdentity && event.identity) {
           revocation.value = {
-            roomName: current.roomName,
+            roomName: event.roomName,
             identity: event.identity,
           };
         }
@@ -360,6 +355,7 @@ export class RoomService {
     await this.enqueue(tx, next, "archive.failed", {
       reasonCode: "ARCHIVE_FAILED",
       egressId: event.egressId,
+      resourceGeneration: current.generation,
     });
     return next;
   }
@@ -433,7 +429,7 @@ export class RoomService {
   ): Promise<Consultation> {
     return this.consultations.transaction(async (tx) => {
       const current = await this.requiredLocked(consultationId, tx);
-      if (current.generation !== generation) {
+      if (current.generation !== generation || current.admissionFencedAt) {
         throw new DomainError("FENCED_GENERATION");
       }
       const next = grantCapture(current, participantId, egressId, this.clock.now());

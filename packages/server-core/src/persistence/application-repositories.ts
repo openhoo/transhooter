@@ -39,6 +39,8 @@ import {
   providerProfileRevisions,
   providerProfiles,
   roomProviderSelections,
+  workerJobEpochs,
+  workerReservations,
 } from "./schema";
 
 type CapabilitySnapshot = (
@@ -916,7 +918,16 @@ export class DrizzleProviderSnapshotRepository
 
 export class DrizzleArchiveRepository extends DrizzleRepository implements ArchiveRepository {
   async lockByConsultation(consultationId: UUID, tx: Transaction) {
-    const result = await unwrap(tx).execute<ArchiveLockRow>(
+    const database = unwrap(tx);
+    // Coupled consultation/archive operations always lock the consultation first.
+    // This matches consultation lifecycle transactions and prevents inverse-order deadlocks.
+    await database.execute<{ id: UUID }>(sql`
+      SELECT id
+      FROM consultations
+      WHERE id = ${consultationId}
+      FOR UPDATE
+    `);
+    const result = await database.execute<ArchiveLockRow>(
       sql`
         SELECT
           a.id,
@@ -1116,6 +1127,54 @@ export class DrizzleArchiveRepository extends DrizzleRepository implements Archi
     ) {
       throw new DomainError("ARCHIVE_WRITER_FENCED");
     }
+  }
+  async lockActiveWorkerWriter(
+    input: {
+      consultationId: UUID;
+      generation: number;
+      workerId: UUID;
+      workerEpoch: number;
+      writerEpoch: number;
+    },
+    tx: Transaction,
+  ): Promise<boolean> {
+    const rows = await unwrap(tx)
+      .select({ workerId: workerReservations.workerId })
+      .from(workerReservations)
+      .innerJoin(
+        workerJobEpochs,
+        and(
+          eq(workerJobEpochs.consultationId, workerReservations.consultationId),
+          eq(workerJobEpochs.generation, workerReservations.generation),
+          eq(workerJobEpochs.workerId, workerReservations.workerId),
+          eq(workerJobEpochs.epoch, workerReservations.epoch),
+        ),
+      )
+      .innerJoin(
+        consultations,
+        and(
+          eq(consultations.id, workerReservations.consultationId),
+          eq(consultations.generation, workerReservations.generation),
+        ),
+      )
+      .innerJoin(archives, eq(archives.consultationId, workerReservations.consultationId))
+      .where(
+        and(
+          eq(workerReservations.consultationId, input.consultationId),
+          eq(workerReservations.generation, input.generation),
+          eq(workerReservations.workerId, input.workerId),
+          eq(workerReservations.epoch, input.workerEpoch),
+          isNull(workerReservations.releasedAt),
+          gt(workerReservations.leaseExpiresAt, sql`now()`),
+          isNull(workerReservations.fencedAt),
+          isNull(workerJobEpochs.fencedAt),
+          isNull(workerJobEpochs.terminalAt),
+          eq(workerJobEpochs.writeEpoch, input.writerEpoch),
+          eq(archives.writeEpoch, input.writerEpoch),
+        ),
+      )
+      .for("update", { of: [workerReservations, workerJobEpochs] });
+    return rows.length === 1;
   }
 
   async fulfillExpectedArtifact(

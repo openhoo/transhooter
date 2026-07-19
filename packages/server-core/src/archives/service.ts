@@ -48,6 +48,42 @@ interface UploadedObject {
   size: number;
   checksum: string;
 }
+interface RecordObjectInput {
+  objectId: UUID;
+  class: ArchiveObject["objectClass"];
+  key: string;
+  versionId: string;
+  size: number;
+  sha256: string;
+  s3Checksum: string;
+  contentType: string;
+  sampleRange: { start: number; end: number } | null;
+  attempt: number | null;
+  sequence: number | null;
+}
+interface LockedArchive {
+  id: UUID;
+  state:
+    | "pending"
+    | "recording"
+    | "reconciling"
+    | "complete"
+    | "incomplete"
+    | "deleting"
+    | "deleted";
+  consultationState:
+    | "invited"
+    | "ready"
+    | "active"
+    | "finalizing"
+    | "ended"
+    | "cancelled"
+    | "deleted";
+  writeEpoch: number;
+  completedDeletionEpoch: number | null;
+  finalInventoryHash: string | null;
+  reconciliationDeadlineAt: Date | null;
+}
 
 interface HoldProgress extends ObjectVersion {
   phase: "apply" | "retry" | "release" | "compensate";
@@ -140,19 +176,7 @@ export class ArchiveService {
     consultationId: UUID,
     writerEpoch: number,
     causalKey: string,
-    object: {
-      objectId: UUID;
-      class: ArchiveObject["objectClass"];
-      key: string;
-      versionId: string;
-      size: number;
-      sha256: string;
-      s3Checksum: string;
-      contentType: string;
-      sampleRange: { start: number; end: number } | null;
-      attempt: number | null;
-      sequence: number | null;
-    },
+    object: RecordObjectInput,
   ): Promise<void> {
     await this.archives.transaction((tx) =>
       this.recordProtectedObject(
@@ -176,6 +200,58 @@ export class ArchiveService {
         tx,
       ),
     );
+  }
+  async recordWorkerObject(
+    consultationId: UUID,
+    worker: {
+      generation: number;
+      workerId: UUID;
+      workerEpoch: number;
+    },
+    writerEpoch: number,
+    causalKey: string,
+    object: RecordObjectInput,
+  ): Promise<void> {
+    await this.archives.transaction(async (tx) => {
+      const archiveObject = this.toArchiveObject(consultationId, writerEpoch, causalKey, object);
+      const archive = await this.required(consultationId, tx);
+      const active = await this.archives.lockActiveWorkerWriter(
+        {
+          consultationId,
+          generation: worker.generation,
+          workerId: worker.workerId,
+          workerEpoch: worker.workerEpoch,
+          writerEpoch,
+        },
+        tx,
+      );
+      if (!active) {
+        throw new DomainError("ARCHIVE_WRITER_FENCED");
+      }
+      await this.recordProtectedObject(archiveObject, tx, archive);
+    });
+  }
+
+  async recordDrainerObject(
+    consultationId: UUID,
+    causalKey: string,
+    object: RecordObjectInput,
+  ): Promise<void> {
+    await this.archives.transaction(async (tx) => {
+      const archive = await this.required(consultationId, tx);
+      if (
+        archive.state !== "pending" &&
+        archive.state !== "recording" &&
+        archive.state !== "reconciling"
+      ) {
+        throw new DomainError("ARCHIVE_WRITER_FENCED");
+      }
+      await this.recordProtectedObject(
+        this.toArchiveObject(consultationId, archive.writeEpoch, causalKey, object),
+        tx,
+        archive,
+      );
+    });
   }
 
   async addSupplement(
@@ -660,7 +736,20 @@ export class ArchiveService {
   ): Promise<boolean> {
     return this.archives.transaction(async (tx) => {
       const locked = await this.required(consultationId, tx);
-      if (locked.id !== archiveId || locked.state !== "reconciling") {
+      if (locked.id !== archiveId) {
+        throw new DomainError("ARCHIVE_FENCED");
+      }
+      if (locked.state !== "reconciling") {
+        const existingHash = await this.archives.finalInventoryHash(locked.id, tx);
+        if (
+          (locked.state === "complete" || locked.state === "incomplete") &&
+          existingHash === sha256
+        ) {
+          return false;
+        }
+        if (existingHash !== null && existingHash !== sha256) {
+          throw new DomainError("FINAL_INVENTORY_CONFLICT");
+        }
         throw new DomainError("ARCHIVE_FENCED");
       }
       const object: ArchiveObject = {
@@ -929,45 +1018,62 @@ export class ArchiveService {
     previous?: unknown,
   ): Promise<boolean> {
     const results = holdProgress(previous);
-    const released: ObjectVersion[] = [];
-    const versions = await this.allVersions(consultationId);
-    for (const version of versions) {
-      const latest = results.findLast(
-        (result) => result.key === version.key && result.versionId === version.versionId,
-      );
-      if (latest?.phase === "release" && latest.ok) {
-        released.push(version);
-        continue;
-      }
+    const released = new Map<string, ObjectVersion>();
+    const discovered = new Map<string, ObjectVersion>();
+    let previousScan: string | null = null;
+    let stableScans = 0;
 
-      try {
-        await this.storage.setLegalHold(version.key, version.versionId, false);
-        results.push({
-          ...version,
-          phase: "release",
-          ok: true,
-          error: null,
-        });
-        released.push(version);
-      } catch (error) {
-        results.push({
-          ...version,
-          phase: "release",
-          ok: false,
-          error: error instanceof Error ? error.message : "unknown",
-        });
+    while (stableScans < 2) {
+      const versions = await this.allVersions(consultationId);
+      const signature = versions
+        .map((version) => `${version.key}\u0000${version.versionId}`)
+        .sort()
+        .join("\u0001");
+      stableScans = signature === previousScan ? stableScans + 1 : 1;
+      previousScan = signature;
+
+      for (const version of versions) {
+        const versionKey = `${version.key}\u0000${version.versionId}`;
+        discovered.set(versionKey, version);
+        const latest = results.findLast(
+          (result) => result.key === version.key && result.versionId === version.versionId,
+        );
+        if (latest?.phase === "release") {
+          if (latest.ok) {
+            released.set(versionKey, version);
+          }
+          continue;
+        }
+
+        try {
+          await this.storage.setLegalHold(version.key, version.versionId, false);
+          results.push({
+            ...version,
+            phase: "release",
+            ok: true,
+            error: null,
+          });
+          released.set(versionKey, version);
+        } catch (error) {
+          results.push({
+            ...version,
+            phase: "release",
+            ok: false,
+            error: error instanceof Error ? error.message : "unknown",
+          });
+        }
+        await this.renewHoldLease(consultationId, archiveId, holdId, owner, results);
       }
-      await this.renewHoldLease(consultationId, archiveId, holdId, owner, results);
     }
 
-    const releaseFailed = versions.some((version) => {
+    const releaseFailed = [...discovered.values()].some((version) => {
       const latest = results.findLast(
         (result) => result.key === version.key && result.versionId === version.versionId,
       );
       return latest?.phase !== "release" || !latest.ok;
     });
     if (releaseFailed) {
-      for (const version of released) {
+      for (const version of released.values()) {
         try {
           await this.storage.setLegalHold(version.key, version.versionId, true);
           results.push({
@@ -990,23 +1096,104 @@ export class ArchiveService {
 
     const compensationFailed =
       releaseFailed &&
-      released.some((version) => {
+      [...released.values()].some((version) => {
         const latest = results.findLast(
           (result) => result.key === version.key && result.versionId === version.versionId,
         );
         return latest?.phase !== "compensate" || !latest.ok;
       });
-    await this.completeHoldRelease(
-      consultationId,
-      archiveId,
-      holdId,
-      owner,
-      actorId,
-      results,
-      releaseFailed,
-      compensationFailed,
-    );
-    return releaseFailed;
+    if (releaseFailed) {
+      await this.completeHoldRelease(
+        consultationId,
+        archiveId,
+        holdId,
+        owner,
+        actorId,
+        results,
+        true,
+        compensationFailed,
+      );
+      return true;
+    }
+
+    while (true) {
+      const pending = await this.completeHoldRelease(
+        consultationId,
+        archiveId,
+        holdId,
+        owner,
+        actorId,
+        results,
+        false,
+        false,
+      );
+      if (pending.length === 0) {
+        return false;
+      }
+      for (const version of pending) {
+        try {
+          await this.storage.setLegalHold(version.key, version.versionId, false);
+          results.push({
+            ...version,
+            phase: "release",
+            ok: true,
+            error: null,
+          });
+          released.set(`${version.key}\u0000${version.versionId}`, version);
+        } catch (error) {
+          results.push({
+            ...version,
+            phase: "release",
+            ok: false,
+            error: error instanceof Error ? error.message : "unknown",
+          });
+        }
+        await this.renewHoldLease(consultationId, archiveId, holdId, owner, results);
+      }
+      const pendingReleaseFailed = pending.some((version) => {
+        const latest = results.findLast(
+          (result) => result.key === version.key && result.versionId === version.versionId,
+        );
+        return latest?.phase !== "release" || !latest.ok;
+      });
+      if (pendingReleaseFailed) {
+        for (const version of released.values()) {
+          try {
+            await this.storage.setLegalHold(version.key, version.versionId, true);
+            results.push({
+              ...version,
+              phase: "compensate",
+              ok: true,
+              error: null,
+            });
+          } catch (error) {
+            results.push({
+              ...version,
+              phase: "compensate",
+              ok: false,
+              error: error instanceof Error ? error.message : "unknown",
+            });
+          }
+          await this.renewHoldLease(consultationId, archiveId, holdId, owner, results);
+        }
+        await this.completeHoldRelease(
+          consultationId,
+          archiveId,
+          holdId,
+          owner,
+          actorId,
+          results,
+          true,
+          [...released.values()].some((version) => {
+            const latest = results.findLast(
+              (result) => result.key === version.key && result.versionId === version.versionId,
+            );
+            return latest?.phase !== "compensate" || !latest.ok;
+          }),
+        );
+        return true;
+      }
+    }
   }
 
   private async completeHoldRelease(
@@ -1018,12 +1205,49 @@ export class ArchiveService {
     results: HoldProgress[],
     releaseFailed: boolean,
     compensationFailed: boolean,
-  ): Promise<void> {
-    await this.archives.transaction(async (tx) => {
+  ): Promise<ObjectVersion[]> {
+    return this.archives.transaction(async (tx) => {
       const archive = await this.required(consultationId, tx);
-      const completed =
-        archive.id === archiveId &&
-        (await this.archives.completeHoldOperation(archive.id, holdId, owner, tx));
+      if (archive.id !== archiveId) {
+        throw new DomainError("HOLD_OPERATION_FENCED");
+      }
+
+      if (!releaseFailed) {
+        const recorded = new Map(
+          (await this.archives.inventoryObjects(archive.id, tx)).map(({ key, versionId }) => [
+            `${key}\u0000${versionId}`,
+            { key, versionId },
+          ]),
+        );
+        const pending = [...recorded.values()].filter((version) => {
+          const latest = results.findLast(
+            (result) => result.key === version.key && result.versionId === version.versionId,
+          );
+          return latest?.phase !== "release" || !latest.ok;
+        });
+        if (pending.length > 0) {
+          const now = this.clock.now();
+          const renewed = await this.archives.renewHoldOperation(
+            archive.id,
+            holdId,
+            owner,
+            addMilliseconds(now, 300_000),
+            tx,
+          );
+          if (!renewed) {
+            throw new DomainError("HOLD_OPERATION_FENCED");
+          }
+          await this.archives.recordHoldResults(
+            holdId,
+            { inProgress: true, pendingVersions: pending.length },
+            results,
+            tx,
+          );
+          return pending;
+        }
+      }
+
+      const completed = await this.archives.completeHoldOperation(archive.id, holdId, owner, tx);
       if (!completed) {
         throw new DomainError("HOLD_OPERATION_FENCED");
       }
@@ -1043,7 +1267,7 @@ export class ArchiveService {
         if (!transitioned) {
           throw new DomainError("HOLD_OPERATION_FENCED");
         }
-        return;
+        return [];
       }
 
       const now = this.clock.now();
@@ -1059,6 +1283,7 @@ export class ArchiveService {
         },
         tx,
       );
+      return [];
     });
   }
 
@@ -1288,33 +1513,54 @@ export class ArchiveService {
     persisted: readonly ArchiveObject[],
     exact: boolean,
   ): void {
-    if (exact && claimed.length !== persisted.length) {
+    const claimedIds = new Set(claimed.map((object) => object.objectId));
+    const claimedVersions = new Set(
+      claimed.map((object) => `${object.key}\u0000${object.versionId}`),
+    );
+    if (claimedIds.size !== claimed.length || claimedVersions.size !== claimed.length) {
       throw new DomainError("INVENTORY_OBJECT_MISMATCH");
     }
-    const hasMismatch = claimed.some(
-      (object) =>
-        !persisted.some(
-          (stored) =>
-            stored.id === object.objectId &&
-            stored.objectClass === object.class &&
-            stored.key === object.key &&
-            stored.versionId === object.versionId &&
-            stored.size === object.size &&
-            stored.sha256 === object.sha256 &&
-            stored.s3Checksum === object.s3Checksum &&
-            stored.sampleStart === (object.sampleRange?.start ?? null) &&
-            stored.sampleEnd === (object.sampleRange?.end ?? null) &&
-            stored.attempt === object.attempt &&
-            stored.sequence === object.sequence,
-        ),
+
+    const persistedById = new Map(persisted.map((object) => [object.id, object]));
+    const persistedVersions = new Set(
+      persisted.map((object) => `${object.key}\u0000${object.versionId}`),
     );
+    if (
+      exact &&
+      (claimed.length !== persisted.length ||
+        persistedById.size !== persisted.length ||
+        persistedVersions.size !== persisted.length)
+    ) {
+      throw new DomainError("INVENTORY_OBJECT_MISMATCH");
+    }
+
+    const hasMismatch = claimed.some((object) => {
+      const stored = persistedById.get(object.objectId);
+      return (
+        !stored ||
+        stored.objectClass !== object.class ||
+        stored.key !== object.key ||
+        stored.versionId !== object.versionId ||
+        stored.size !== object.size ||
+        stored.sha256 !== object.sha256 ||
+        stored.s3Checksum !== object.s3Checksum ||
+        stored.sampleStart !== (object.sampleRange?.start ?? null) ||
+        stored.sampleEnd !== (object.sampleRange?.end ?? null) ||
+        stored.attempt !== object.attempt ||
+        stored.sequence !== object.sequence
+      );
+    });
     if (hasMismatch) {
       throw new DomainError("INVENTORY_OBJECT_MISMATCH");
     }
   }
 
-  private async recordProtectedObject(object: ArchiveObject, tx: Transaction): Promise<void> {
-    const archive = await this.required(object.consultationId, tx);
+  private async recordProtectedObject(
+    object: ArchiveObject,
+    tx: Transaction,
+    lockedArchive?: LockedArchive,
+  ): Promise<void> {
+    const archive = lockedArchive ?? (await this.required(object.consultationId, tx));
     if (
       archive.writeEpoch !== object.writerEpoch ||
       archive.state === "deleting" ||
@@ -1322,10 +1568,44 @@ export class ArchiveService {
     ) {
       throw new DomainError("ARCHIVE_WRITER_FENCED");
     }
+    const verified = await this.storage.verify({
+      key: object.key,
+      versionId: object.versionId,
+      size: object.size,
+      checksum: object.s3Checksum,
+    });
+    if (!verified) {
+      throw new DomainError("ARCHIVE_OBJECT_VERIFICATION_FAILED");
+    }
     if ((await this.archives.activeHolds(archive.id, tx)).length > 0) {
       await this.storage.setLegalHold(object.key, object.versionId, true);
     }
     await this.archives.recordObject(object, tx);
+  }
+
+  private toArchiveObject(
+    consultationId: UUID,
+    writerEpoch: number,
+    causalKey: string,
+    object: RecordObjectInput,
+  ): ArchiveObject {
+    return {
+      id: object.objectId,
+      consultationId,
+      objectClass: object.class,
+      causalKey,
+      key: object.key,
+      versionId: object.versionId,
+      size: object.size,
+      sha256: object.sha256,
+      s3Checksum: object.s3Checksum,
+      contentType: object.contentType,
+      sampleStart: object.sampleRange?.start ?? null,
+      sampleEnd: object.sampleRange?.end ?? null,
+      attempt: object.attempt,
+      sequence: object.sequence,
+      writerEpoch,
+    };
   }
 }
 

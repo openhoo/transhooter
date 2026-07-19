@@ -445,7 +445,6 @@ services:
       language-refresh: {condition: service_completed_successfully}
       egress-ready: {condition: service_completed_successfully}
       translation-worker: {condition: service_healthy}
-      spool-drainer: {condition: service_healthy}
     environment:
       <<: [*server-env, *control-worker-env]
       INSTANCE_ID: 11111111-1111-4111-8111-111111111111
@@ -482,7 +481,7 @@ services:
       language-refresh: {condition: service_completed_successfully}
       egress-ready: {condition: service_completed_successfully}
       translation-worker: {condition: service_healthy}
-      spool-drainer: {condition: service_healthy}
+      spool-drainer: {condition: service_started}
       control-worker-1: {condition: service_healthy}
       control-worker-2: {condition: service_healthy}
     environment:
@@ -550,7 +549,7 @@ services:
     environment:
       APP_ENV: test
       BASE_URL: http://web:3000
-    command: [bun, failure-smoke.mjs]
+    command: [bun, ../failure-smoke/failure-smoke.mjs]
 
   test:
     profiles: [test]

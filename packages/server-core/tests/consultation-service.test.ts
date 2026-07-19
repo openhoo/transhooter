@@ -47,6 +47,7 @@ function createConsultationFixture() {
     } as never,
     {
       currentEnabledRevision: async () => ENABLED_PROFILE_REVISION,
+      assertFreshAndHealthy: async () => undefined,
     } as never,
     { issue: async () => "token" },
     { append: async () => undefined },
@@ -65,6 +66,9 @@ function createConsultationFixture() {
     service,
     revokeConsultationLinks,
     enqueue,
+    setAggregate: (value: Consultation) => {
+      aggregate = value;
+    },
   };
 }
 
@@ -99,6 +103,43 @@ describe("ConsultationService", () => {
           resourceGeneration: 0,
         },
       }),
+      TRANSACTION,
+    );
+  });
+  it("returns CONSENT_REQUIRED while only one participant has consented", async () => {
+    const fixture = createConsultationFixture();
+    const created = await fixture.service.create({
+      employeeUserId: EMPLOYEE_ID,
+      customerUserId: CUSTOMER_ID,
+      providerProfileId: "google-eu",
+    });
+    fixture.setAggregate({
+      ...created,
+      providerSelection: {} as Consultation["providerSelection"],
+      snapshotHash: "hash",
+      participants: [
+        {
+          ...created.participants[0],
+          language: "en-US",
+          consent: {
+            version: 1,
+            copyHash: "copy",
+            snapshotHash: "hash",
+            consentedAt: NOW,
+          },
+        },
+        {
+          ...created.participants[1],
+          language: "de-DE",
+        },
+      ],
+    });
+
+    await expect(fixture.service.join(created.id, EMPLOYEE_ID)).rejects.toThrowError(
+      /CONSENT_REQUIRED/,
+    );
+    expect(fixture.enqueue).not.toHaveBeenCalledWith(
+      expect.objectContaining({ topic: "consultation.provisioning_requested" }),
       TRANSACTION,
     );
   });

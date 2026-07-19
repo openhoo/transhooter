@@ -14,13 +14,21 @@ export BOOTSTRAP_ADMIN_NAME="${BOOTSTRAP_ADMIN_NAME:-Test Administrator}"
 export RTC_SUBNET="${TEST_RTC_SUBNET:-10.254.232.0/24}"
 export RTC_NODE_IP="${TEST_RTC_NODE_IP:-10.254.232.250}"
 
+LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
+LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
+exec 9>"$LOCK_FILE"
+if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
+  printf 'Timed out after %s seconds waiting for the compose harness lock.\n' "$LOCK_WAIT_SECONDS" >&2
+  exit 1
+fi
+
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
   if [ "$status" -ne 0 ]; then
     announce_phase "Capturing failure-smoke diagnostics"
     compose ps || true
-    compose logs --no-color --tail=80 translation-worker spool-drainer control-worker-1 control-worker-2 || true
+    compose logs --no-color --tail=80 web translation-worker spool-drainer control-worker-1 control-worker-2 || true
   fi
   announce_phase "Cleaning failure-smoke stack"
   if ! compose down --volumes --remove-orphans; then
@@ -29,6 +37,7 @@ cleanup() {
     fi
     printf 'Failure-smoke stack cleanup failed.\n' >&2
   fi
+  flock -u 9
   exit "$status"
 }
 
@@ -41,4 +50,4 @@ compose run --rm --no-deps secrets-init
 announce_phase "Building failure-smoke application and harness images from the current source tree"
 build_runtime_and_harness_images failure-smoke
 announce_phase "Running failure injection scenarios"
-compose run --rm failure-smoke bun run test -- "$@"
+compose run --rm failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@"

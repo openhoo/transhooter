@@ -5,6 +5,7 @@ import type { FormEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/browser-api";
 import { describeLobbyPhase, type LobbyPhase } from "@/lib/lobby-phase";
+import { persistDevicePreference } from "./interface-state";
 import styles from "./lobby.module.css";
 
 const CONSENT_COPY =
@@ -236,7 +237,10 @@ function PreferencesForm({
           Preview camera and microphone
         </button>
       </fieldset>
-      <fieldset className={`${styles.preferenceGroup ?? ""} stack panel`} disabled={busy}>
+      <fieldset
+        className={`${styles.preferenceGroup ?? ""} stack panel`}
+        disabled={busy || languages.length === 0}
+      >
         <legend className="srOnly">Consultation preferences</legend>
         <div className="field">
           <label htmlFor="displayName">Display name</label>
@@ -253,6 +257,12 @@ function PreferencesForm({
             ))}
           </select>
         </div>
+        {languages.length === 0 && (
+          <p className="notice warning" role="status">
+            No languages are available for this provider profile. Ask an administrator to refresh
+            provider capabilities before continuing.
+          </p>
+        )}
         <div className="field">
           <label htmlFor="microphone">Microphone</label>
           <select aria-describedby="device-preference-hint" id="microphone" name="microphone">
@@ -278,7 +288,7 @@ function PreferencesForm({
         <p className="muted" id="device-preference-hint">
           Preview to choose a specific device. Otherwise, the browser uses your system defaults.
         </p>
-        <button className="button" type="submit">
+        <button className="button" disabled={languages.length === 0} type="submit">
           {busy ? "Saving…" : "Save and continue"}
         </button>
       </fieldset>
@@ -435,12 +445,8 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
     const microphoneId = typeof microphoneValue === "string" ? microphoneValue : "";
     const cameraId = typeof cameraValue === "string" ? cameraValue : "";
 
-    if (microphoneId) {
-      window.sessionStorage.setItem("transhooter.microphone", microphoneId);
-    }
-    if (cameraId) {
-      window.sessionStorage.setItem("transhooter.camera", cameraId);
-    }
+    persistDevicePreference(window.sessionStorage, "transhooter.microphone", microphoneId);
+    persistDevicePreference(window.sessionStorage, "transhooter.camera", cameraId);
 
     try {
       const next = await api<LobbyState>(`/api/consultations/${consultationId}/preferences`, {

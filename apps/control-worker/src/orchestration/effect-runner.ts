@@ -30,6 +30,14 @@ interface CanonicalEffectRequest {
   readonly sha256: string;
 }
 
+interface LeaseRenewal {
+  timer: NodeJS.Timeout | undefined;
+  lost: boolean;
+  monitoring: boolean;
+}
+
+class LeaseLostError extends Error {}
+
 export class EffectRunner {
   constructor(
     private readonly store: DurableStore,
@@ -51,7 +59,23 @@ export class EffectRunner {
   }
 
   private async run(claimed: Effect): Promise<void> {
-    if (await this.compensateIfRequired(claimed)) {
+    const generation = await this.store.currentGeneration(claimed.consultationId);
+    if (claimed.state === "compensating" || generation !== claimed.generation) {
+      const renewal = this.startLeaseRenewal(claimed);
+      try {
+        if (claimed.state !== "compensating") {
+          await this.requireOwnership(claimed, renewal);
+          await this.store.markCompensating(claimed.id, this.options.owner, "generation fenced");
+        }
+        await this.compensateOwned(claimed, renewal);
+      } catch (error) {
+        if (!(error instanceof LeaseLostError)) {
+          throw error;
+        }
+      } finally {
+        renewal.monitoring = false;
+        clearInterval(renewal.timer);
+      }
       return;
     }
 
@@ -75,10 +99,20 @@ export class EffectRunner {
     if (calling === null) {
       return;
     }
-    await this.faults.afterPersist(calling.kind, calling.consultationId);
 
     const renewal = this.startLeaseRenewal(calling);
     try {
+      await this.requireOwnership(calling, renewal);
+      if ((await this.store.currentGeneration(calling.consultationId)) !== calling.generation) {
+        await this.store.markCompensating(
+          calling.id,
+          this.options.owner,
+          "generation fenced before remote call",
+        );
+        await this.compensateOwned(calling, renewal);
+        return;
+      }
+      await this.faults.afterPersist(calling.kind, calling.consultationId);
       if (calling.kind === "ARCHIVE_RECONCILE") {
         await this.reconcileArchive(calling);
         return;
@@ -87,26 +121,15 @@ export class EffectRunner {
         await this.deleteArchive(calling);
         return;
       }
-      await this.executeRemoteEffect(calling);
+      await this.executeRemoteEffect(calling, renewal);
+    } catch (error) {
+      if (!(error instanceof LeaseLostError)) {
+        throw error;
+      }
     } finally {
-      clearInterval(renewal);
+      renewal.monitoring = false;
+      clearInterval(renewal.timer);
     }
-  }
-
-  private async compensateIfRequired(claimed: Effect): Promise<boolean> {
-    if (claimed.state === "compensating") {
-      await this.remote.compensate(claimed);
-      await this.store.markDone(claimed.id, this.options.owner);
-      return true;
-    }
-    const generation = await this.store.currentGeneration(claimed.consultationId);
-    if (generation === claimed.generation) {
-      return false;
-    }
-    await this.store.markCompensating(claimed.id, this.options.owner, "generation fenced");
-    await this.remote.compensate(claimed);
-    await this.store.markDone(claimed.id, this.options.owner);
-    return true;
   }
 
   private canonicalEffectRequest(effect: Effect): CanonicalEffectRequest {
@@ -120,32 +143,97 @@ export class EffectRunner {
     };
   }
 
-  private startLeaseRenewal(effect: Effect): NodeJS.Timeout {
-    const renewal = setInterval(
+  private startLeaseRenewal(effect: Effect): LeaseRenewal {
+    const renewal: LeaseRenewal = {
+      timer: undefined,
+      lost: false,
+      monitoring: true,
+    };
+    renewal.timer = setInterval(
       () => {
         const leaseExpiresAt = new Date(this.clock.now().getTime() + this.options.leaseMs);
         void this.store
           .renewEffectLease(effect.id, this.options.owner, leaseExpiresAt)
-          .catch(() => undefined);
+          .then((accepted) => {
+            if (renewal.monitoring && !accepted) {
+              renewal.lost = true;
+            }
+          })
+          .catch(() => {
+            if (renewal.monitoring) {
+              renewal.lost = true;
+            }
+          });
       },
       Math.max(100, Math.floor(this.options.leaseMs / 3)),
     );
-    renewal.unref();
+    renewal.timer.unref();
     return renewal;
   }
 
-  private async executeRemoteEffect(effect: Effect): Promise<void> {
+  private async requireOwnership(effect: Effect, renewal: LeaseRenewal): Promise<void> {
+    if (renewal.lost) {
+      throw new LeaseLostError("effect lease lost");
+    }
+    const leaseExpiresAt = new Date(this.clock.now().getTime() + this.options.leaseMs);
+    if (!(await this.store.renewEffectLease(effect.id, this.options.owner, leaseExpiresAt))) {
+      renewal.lost = true;
+      throw new LeaseLostError("effect lease lost");
+    }
+  }
+
+  private async executeRemoteEffect(effect: Effect, renewal: LeaseRenewal): Promise<void> {
     try {
       await this.faults.shouldFail(effect.kind, effect.consultationId);
       const adopted = await this.remote.adopt(effect, effect.plan);
       if (adopted !== null) {
-        await this.applyAdoption(effect, adopted);
+        await this.applyAdoption(effect, adopted, renewal);
         return;
       }
       const result = await this.remote.execute(effect, effect.plan);
+      await this.requireOwnership(effect, renewal);
+      if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
+        await this.store.markCompensating(
+          effect.id,
+          this.options.owner,
+          "generation fenced after remote call",
+        );
+        await this.compensateOwned({ ...effect, remoteId: result.remoteId }, renewal);
+        return;
+      }
       await this.store.markApplied(effect.id, this.options.owner, result.remoteId, result.result);
+      renewal.monitoring = false;
+      renewal.lost = false;
+      clearInterval(renewal.timer);
+      if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
+        await this.store.markCompensating(
+          effect.id,
+          this.options.owner,
+          "generation fenced during completion",
+        );
+        renewal.lost = false;
+        await this.compensateOwned({ ...effect, remoteId: result.remoteId }, renewal);
+        return;
+      }
       await this.store.markDone(effect.id, this.options.owner);
     } catch (error) {
+      if (error instanceof LeaseLostError) {
+        throw error;
+      }
+      const generation = await this.store.currentGeneration(effect.consultationId);
+      if (generation !== effect.generation) {
+        const adoption = await this.remote.adopt(effect, effect.plan);
+        if (adoption?.matchesRequest === true) {
+          await this.requireOwnership(effect, renewal);
+          await this.store.markCompensating(
+            effect.id,
+            this.options.owner,
+            "ambiguous stale remote call",
+          );
+          await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
+          return;
+        }
+      }
       const message = error instanceof Error ? error.message : "unknown remote effect failure";
       const delay = Math.min(60_000, 250 * 2 ** Math.min(effect.attempt, 8));
       await this.store.markFailed(
@@ -157,14 +245,13 @@ export class EffectRunner {
     }
   }
 
-  private async applyAdoption(effect: Effect, adoption: Adoption): Promise<void> {
+  private async applyAdoption(
+    effect: Effect,
+    adoption: Adoption,
+    renewal: LeaseRenewal,
+  ): Promise<void> {
+    await this.requireOwnership(effect, renewal);
     if (!adoption.matchesRequest) {
-      await this.store.markCompensating(
-        effect.id,
-        this.options.owner,
-        "deterministic identity collision",
-      );
-      await this.remote.compensate(effect);
       await this.store.markFailed(
         effect.id,
         this.options.owner,
@@ -173,13 +260,48 @@ export class EffectRunner {
       );
       return;
     }
+    if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
+      await this.store.markCompensating(
+        effect.id,
+        this.options.owner,
+        "generation fenced after adoption",
+      );
+      await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
+      return;
+    }
     await this.store.markApplied(
       effect.id,
       this.options.owner,
       adoption.remoteId,
       adoption.result ?? { adopted: true, terminal: adoption.terminal },
     );
+    renewal.monitoring = false;
+    renewal.lost = false;
+    clearInterval(renewal.timer);
+    if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
+      await this.store.markCompensating(
+        effect.id,
+        this.options.owner,
+        "generation fenced during adoption completion",
+      );
+      renewal.lost = false;
+      await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
+      return;
+    }
     await this.store.markDone(effect.id, this.options.owner);
+  }
+
+  private async compensateOwned(
+    effect: Effect,
+    renewal: LeaseRenewal,
+    markDone = true,
+  ): Promise<void> {
+    await this.requireOwnership(effect, renewal);
+    await this.remote.compensate(effect);
+    await this.requireOwnership(effect, renewal);
+    if (markDone) {
+      await this.store.markDone(effect.id, this.options.owner);
+    }
   }
 
   private async reconcileArchive(effect: Effect): Promise<void> {
@@ -191,6 +313,10 @@ export class EffectRunner {
           ? effect.plan.resourceGeneration
           : effect.generation,
       );
+      if (snapshot === null) {
+        await this.store.markDone(effect.id, this.options.owner);
+        return;
+      }
       const knownObjects = new Set(snapshot.objects.map(archiveObjectIdentity));
       const discoveredObjects = (
         await this.remote.discoverArchiveObjects(`v1/meetings/${effect.consultationId}/`)
@@ -287,23 +413,57 @@ export class EffectRunner {
     invalidObjectIds: ReadonlySet<string>,
     objects: readonly ArchivedObject[],
   ): MissingInventoryEntry[] {
+    const resolvedExpectationIds = new Map(
+      snapshot.expectations.map((expected) => {
+        const discovered =
+          expected.fulfilledObjectId === null &&
+          (expected.objectClass === "room_composite" ||
+            expected.objectClass === "participant_original")
+            ? (objects
+                .filter(
+                  (object) =>
+                    object.objectClass === expected.objectClass &&
+                    object.key.startsWith(`${expected.causalKey}/`),
+                )
+                .sort((left, right) =>
+                  `${left.key}\u0000${left.versionId}\u0000${left.id}`.localeCompare(
+                    `${right.key}\u0000${right.versionId}\u0000${right.id}`,
+                  ),
+                )[0]?.id ?? null)
+            : null;
+        return [expected.id, expected.fulfilledObjectId ?? discovered] as const;
+      }),
+    );
     const missing: MissingInventoryEntry[] = snapshot.expectations
-      .filter(
-        (expected) =>
-          expected.fulfilledObjectId === null || invalidObjectIds.has(expected.fulfilledObjectId),
-      )
-      .map((expected) => ({
-        expectationId: expected.id,
-        class: expected.objectClass,
-        causalKey: expected.causalKey,
-        sampleStart: expected.sampleStart,
-        sampleEnd: expected.sampleEnd,
-        reason: expected.fulfilledObjectId === null ? "unfulfilled" : "object_verification_failed",
-      }));
+      .filter((expected) => {
+        const objectId = resolvedExpectationIds.get(expected.id) ?? null;
+        return objectId === null || invalidObjectIds.has(objectId);
+      })
+      .map((expected) => {
+        const objectId = resolvedExpectationIds.get(expected.id) ?? null;
+        return {
+          expectationId: expected.id,
+          class: expected.objectClass,
+          causalKey: expected.causalKey,
+          sampleStart: expected.sampleStart,
+          sampleEnd: expected.sampleEnd,
+          reason:
+            objectId !== null && invalidObjectIds.has(objectId)
+              ? "object_verification_failed"
+              : "unfulfilled",
+        };
+      });
     const expectedObjectIds = new Set(
-      snapshot.expectations.flatMap((expected) =>
-        expected.fulfilledObjectId === null ? [] : [expected.fulfilledObjectId],
+      [...resolvedExpectationIds.values()].filter(
+        (objectId): objectId is string => objectId !== null,
       ),
+    );
+    missing.push(
+      ...snapshot.providerGaps.map((gap) => ({
+        class: "provider_terminal",
+        reason: "provider_attempt_failed",
+        ...gap,
+      })),
     );
     for (const objectId of invalidObjectIds) {
       if (!expectedObjectIds.has(objectId)) {

@@ -323,31 +323,72 @@ class DeepLAttempt:
         self._task: asyncio.Task[TranslationOutcome] | None = None
         self._terminal: OperationTerminal | None = None
         self._lock = asyncio.Lock()
+        self._cancel_lock = asyncio.Lock()
+        self._cancel_task: asyncio.Task[OperationTerminal] | None = None
+        self._inbound: RawRef | None = None
+        self._cancelling = False
+        self._cancelled_terminal_ready = asyncio.Event()
         self._credential = config.credential_fingerprint
 
     async def result(self) -> TranslationOutcome:
         async with self._lock:
-            if self._task is not None and not self._task.cancelled():
+            if self._task is not None:
                 task = self._task
             elif self._terminal:
                 return TranslationOutcome(None, self._terminal)
+            elif self._cancelling:
+                task = None
             else:
                 self._task = asyncio.create_task(self._execute())
                 task = self._task
+        if task is None:
+            await self._cancelled_terminal_ready.wait()
+            assert self._terminal is not None
+            return TranslationOutcome(None, self._terminal)
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            if self._terminal is not None:
+            async with self._lock:
+                cancelling = self._cancelling
+                terminal = self._terminal
+            if terminal is not None:
+                return TranslationOutcome(None, terminal)
+            if cancelling:
+                await self._cancelled_terminal_ready.wait()
+                assert self._terminal is not None
                 return TranslationOutcome(None, self._terminal)
             raise
 
     async def cancel(self) -> OperationTerminal:
-        terminal = await self._accept_terminal(Outcome.CANCELLED, None, (self._outbound,), 0)
-        async with self._lock:
-            task = self._task
+        async with self._cancel_lock:
+            async with self._lock:
+                if self._terminal is not None:
+                    return self._terminal
+                if self._cancel_task is None:
+                    self._cancelling = True
+                    task = self._task
+                    if task is not None:
+                        task.cancel()
+                    self._cancel_task = asyncio.create_task(self._finish_cancellation(task))
+                cancellation = self._cancel_task
+        assert cancellation is not None
+        return await asyncio.shield(cancellation)
+
+    async def _finish_cancellation(
+        self, task: asyncio.Task[TranslationOutcome] | None
+    ) -> OperationTerminal:
         if task is not None:
-            task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        references = (
+            (self._outbound, self._inbound) if self._inbound is not None else (self._outbound,)
+        )
+        terminal = await self._accept_terminal(
+            Outcome.CANCELLED,
+            None,
+            references,
+            1 if self._inbound is not None else 0,
+        )
+        self._cancelled_terminal_ready.set()
         return terminal
 
     async def _execute(self) -> TranslationOutcome:
@@ -362,6 +403,7 @@ class DeepLAttempt:
                 response,
                 sample_range=self._request.source_range,
             )
+            self._inbound = inbound
             references: tuple[RawRef, ...] = (self._outbound, inbound)
             if response.status_code != 200:
                 error = self._http_error(response, references)
@@ -460,6 +502,9 @@ class DeepLAttempt:
         async with self._lock:
             if self._terminal is not None:
                 return self._terminal
+            if self._cancelling and outcome is not Outcome.CANCELLED:
+                outcome = Outcome.CANCELLED
+                error = None
             self._terminal = OperationTerminal(
                 uuid4(),
                 self._request.operation_id,

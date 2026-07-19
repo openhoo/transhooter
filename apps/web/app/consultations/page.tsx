@@ -66,16 +66,29 @@ function ConsultationRow({
         )}
       </div>
       <div className="actions">
-        <Link className="button secondary" href={{ pathname: consultation.href }}>
+        <Link
+          aria-label={`Open consultation with ${consultation.customerName}`}
+          className="button secondary"
+          href={{ pathname: consultation.href }}
+        >
           Open
         </Link>
         {canManage && consultation.canResend && (
-          <ConsultationAction id={consultation.id} action="resend">
+          <ConsultationAction
+            contextLabel={consultation.customerName}
+            id={consultation.id}
+            action="resend"
+          >
             Resend invite
           </ConsultationAction>
         )}
         {consultation.canCancel && (
-          <ConsultationAction id={consultation.id} action="cancel" danger>
+          <ConsultationAction
+            contextLabel={consultation.customerName}
+            id={consultation.id}
+            action="cancel"
+            danger
+          >
             Cancel
           </ConsultationAction>
         )}

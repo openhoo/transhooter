@@ -30,7 +30,8 @@ announce_phase "Building the current secret initializer"
 compose build secrets-init
 announce_phase "Initializing missing runtime secrets"
 compose run --rm --no-deps secrets-init
+write_compose_state
+announce_phase "Recorded recoverable Compose state"
 announce_phase "Building current sources and waiting for semantic readiness"
 compose up --build --wait --remove-orphans web
-write_compose_state
 printf 'Transhooter is ready with profile %s.\n' "$profile"

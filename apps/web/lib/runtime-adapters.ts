@@ -3,7 +3,6 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   AbortMultipartUploadCommand,
   DeleteObjectsCommand,
-  GetObjectAttributesCommand,
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
@@ -257,16 +256,14 @@ export class S3ArchiveAdapter implements ObjectStoragePort {
     checksum: string;
   }): Promise<boolean> {
     const result = await this.#client.send(
-      new GetObjectAttributesCommand({
+      new HeadObjectCommand({
         Bucket: this.config.s3Bucket,
         Key: input.key,
         VersionId: input.versionId,
-        ObjectAttributes: ["ObjectSize", "Checksum"],
+        ChecksumMode: "ENABLED",
       }),
     );
-    return (
-      result.ObjectSize === input.size && result.Checksum?.ChecksumCRC64NVME === input.checksum
-    );
+    return result.ContentLength === input.size && result.ChecksumCRC64NVME === input.checksum;
   }
 
   async listMeetingVersions(consultationId: UUID, cursor?: string) {
@@ -511,7 +508,7 @@ function createWebhookVerifier(webhookReceiver: WebhookReceiver): WebhookVerifie
       }
 
       const roomName = event.room?.name ?? event.egressInfo?.roomName;
-      if (!event.id || !event.createdAt || !roomName) {
+      if (!event.id || !event.createdAt || (kind !== "ignored" && !roomName)) {
         throw new Error("Incomplete LiveKit webhook");
       }
 
@@ -538,7 +535,7 @@ function createWebhookVerifier(webhookReceiver: WebhookReceiver): WebhookVerifie
         id: event.id,
         occurredAt: new Date(Number(event.createdAt) * 1000),
         kind,
-        roomName,
+        roomName: roomName ?? "",
         ...(binding ? binding : {}),
         ...(participantIdentity ? { identity: participantIdentity as UUID } : {}),
         ...(event.egressInfo?.egressId ? { egressId: event.egressInfo.egressId } : {}),

@@ -152,7 +152,7 @@ services:
       language-refresh: {condition: service_completed_successfully}
       egress-ready: {condition: service_completed_successfully}
       translation-worker: {condition: service_healthy}
-      spool-drainer: {condition: service_healthy}
+      spool-drainer: {condition: service_started}
       control-worker-1: {condition: service_healthy}
       control-worker-2: {condition: service_healthy}
     environment:

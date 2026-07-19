@@ -56,6 +56,7 @@ class S3Archive:
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.executescript(_MULTIPART_SCHEMA)
+            self.abort_abandoned(self._now_ms() - 24 * 60 * 60 * 1000)
 
     def put_create_once(
         self, key: str, body: bytes, content_type: str, sha256: str
@@ -90,10 +91,40 @@ class S3Archive:
             raise
         return self._verified_record(key, len(body), sha256, content_type, response)
 
-    def _put_multipart(self, key: str, body: bytes, content_type: str, sha256: str) -> ObjectRecord:
+    def _put_multipart(
+        self,
+        key: str,
+        body: bytes,
+        content_type: str,
+        sha256: str,
+        *,
+        allow_restart: bool = True,
+    ) -> ObjectRecord:
         database = self._multipart_db()
         upload_id = self._load_or_create_upload(database, key, content_type, sha256)
-        remote_parts = self._list_remote_parts(key, upload_id)
+        try:
+            remote_parts = self._list_remote_parts(key, upload_id)
+        except ClientError as exc:
+            recovered = self._recover_ambiguous(key, len(body), sha256, content_type)
+            if recovered is not None:
+                self._verify_multipart_size(recovered, len(body))
+                self._mark_upload_complete(database, key)
+                return recovered
+            if allow_restart and self._is_missing_upload(exc):
+                self._forget_upload(database, key)
+                return self._put_multipart(key, body, content_type, sha256, allow_restart=False)
+            raise
+        expected_numbers = set(range(1, (len(body) - 1) // self.PART_SIZE + 2))
+        if set(remote_parts) - expected_numbers:
+            if not allow_restart:
+                raise ArchiveConflict(key)
+            self.client.abort_multipart_upload(
+                Bucket=self.bucket,
+                Key=key,
+                UploadId=upload_id,
+            )
+            self._forget_upload(database, key)
+            return self._put_multipart(key, body, content_type, sha256, allow_restart=False)
         completion_parts = [
             self._persist_multipart_part(
                 database=database,
@@ -114,18 +145,29 @@ class S3Archive:
                 IfNoneMatch="*",
             )
         except ClientError as exc:
-            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if status not in (409, 412):
-                raise
             recovered = self._recover_ambiguous(key, len(body), sha256, content_type)
-            if recovered is None:
+            if recovered is not None:
+                self._verify_multipart_size(recovered, len(body))
+                self._mark_upload_complete(database, key)
+                return recovered
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if allow_restart and self._is_missing_upload(exc):
+                self._forget_upload(database, key)
+                return self._put_multipart(key, body, content_type, sha256, allow_restart=False)
+            if status in (409, 412):
                 raise ArchiveConflict(key) from exc
-            self._mark_upload_complete(database, key)
-            return recovered
+            raise
+        except Exception:
+            recovered = self._recover_ambiguous(key, len(body), sha256, content_type)
+            if recovered is not None:
+                self._verify_multipart_size(recovered, len(body))
+                self._mark_upload_complete(database, key)
+                return recovered
+            raise
 
-        self._mark_upload_complete(database, key)
         record = self._verified_record(key, len(body), sha256, content_type, response)
         self._verify_multipart_size(record, len(body))
+        self._mark_upload_complete(database, key)
         return record
 
     def _multipart_db(self) -> sqlite3.Connection:
@@ -219,6 +261,23 @@ class S3Archive:
             "ChecksumCRC64NVME": checksum,
         }
 
+    @staticmethod
+    def _is_missing_upload(exc: ClientError) -> bool:
+        error = exc.response.get("Error", {})
+        code: object = error.get("Code")
+        return isinstance(code, str) and code == "NoSuchUpload"
+
+    @staticmethod
+    def _forget_upload(database: sqlite3.Connection, key: str) -> None:
+        database.execute("BEGIN IMMEDIATE")
+        try:
+            database.execute("DELETE FROM multipart_parts WHERE key = ?", (key,))
+            database.execute("DELETE FROM multipart_uploads WHERE key = ?", (key,))
+        except BaseException:
+            database.execute("ROLLBACK")
+            raise
+        database.execute("COMMIT")
+
     def _mark_upload_complete(self, database: sqlite3.Connection, key: str) -> None:
         database.execute(
             """
@@ -256,13 +315,26 @@ class S3Archive:
         ).fetchall()
         aborted = 0
         for key, upload_id in rows:
-            if not self._remote_parts_match_local_count(key, upload_id):
+            try:
+                self._reconcile_remote_parts(key, upload_id)
+            except ClientError as exc:
+                if not self._is_missing_upload(exc):
+                    raise
+                self._forget_upload(self._db, key)
+                aborted += 1
                 continue
-            self.client.abort_multipart_upload(
-                Bucket=self.bucket,
-                Key=key,
-                UploadId=upload_id,
-            )
+            try:
+                self.client.abort_multipart_upload(
+                    Bucket=self.bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                )
+            except ClientError as exc:
+                if not self._is_missing_upload(exc):
+                    raise
+                self._forget_upload(self._db, key)
+                aborted += 1
+                continue
             self._db.execute(
                 """
                 UPDATE multipart_uploads
@@ -274,15 +346,26 @@ class S3Archive:
             aborted += 1
         return aborted
 
-    def _remote_parts_match_local_count(self, key: str, upload_id: str) -> bool:
+    def _reconcile_remote_parts(self, key: str, upload_id: str) -> None:
         assert self._db is not None
-        remote_count = len(self._list_remote_parts(key, upload_id))
-        row = self._db.execute(
-            "SELECT COUNT(*) FROM multipart_parts WHERE key = ?",
-            (key,),
-        ).fetchone()
-        local_count = int(row[0])
-        return remote_count == local_count
+        for number, remote in self._list_remote_parts(key, upload_id).items():
+            checksum = str(remote.get("ChecksumCRC64NVME", ""))
+            if not checksum:
+                raise RuntimeError("remote multipart part has no CRC64NVME checksum")
+            self._db.execute(
+                """
+                INSERT OR REPLACE INTO multipart_parts(
+                    key, part_number, etag, checksum, size
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    key,
+                    number,
+                    str(remote["ETag"]),
+                    checksum,
+                    int(remote.get("Size", 0)),
+                ),
+            )
 
     def _recover_ambiguous(
         self, key: str, size: int, sha256: str, content_type: str

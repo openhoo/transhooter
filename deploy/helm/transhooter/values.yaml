@@ -30,6 +30,10 @@ existingSecret: transhooter-runtime
 providerSecretName: transhooter-provider
 providerSecretKeys: [google-adc.json]
 egressConfigSecret: transhooter-egress-config
+rollout:
+  runtimeSecretRevision: "1"
+  providerSecretRevision: "1"
+  egressConfigSecretRevision: "1"
 spool:
   existingClaim: transhooter-spool
 
@@ -40,9 +44,12 @@ config:
   s3Endpoint: https://s3.example.invalid
   s3Region: eu-central-1
   s3Bucket: transhooter
+  s3KmsKeyId: example-kms-key-id
   archiveRequireKms: true
   publicUrl: https://transhooter.example.invalid
   publicLivekitUrl: wss://livekit.example.invalid
+  # The ingress/LB must overwrite this single-IP header and strip any client value.
+  trustedClientIpHeader: x-transhooter-client-ip
   internalIssuer: https://kubernetes.default.svc
   internalAudience: transhooter-internal
   kubernetesApiAudience: https://kubernetes.default.svc
@@ -95,7 +102,9 @@ ingress:
 egress:
   enabled: true
   replicas: 1
-  seccompLocalhostProfile: chrome-sandboxing-seccomp-profile.json
+  seccomp:
+    type: RuntimeDefault
+    localhostProfile: ""
   resources:
     requests: {cpu: "4", memory: 4Gi}
     limits: {cpu: "8", memory: 8Gi}

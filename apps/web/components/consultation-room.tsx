@@ -40,7 +40,6 @@ type InitialRoom = {
   participantIdentity: string;
   otherParticipantId: string;
   otherIdentity: string;
-  workerIdentity: string;
   generation: number;
   liveKitUrl: string;
   displayName: string;
@@ -101,10 +100,6 @@ function decodeReliablePacket(payload: Uint8Array) {
 }
 
 function handleCaptionPacket(decoded: unknown, context: CaptionHandlerContext) {
-  if (!context.participant?.isAgent) {
-    return;
-  }
-
   const parsed = CaptionPacketSchema.safeParse(decoded);
   if (!parsed.success) {
     return;
@@ -118,6 +113,7 @@ function handleCaptionPacket(decoded: unknown, context: CaptionHandlerContext) {
       destinationParticipantId: context.initial.participantId,
       sourceParticipantId: context.initial.otherParticipantId,
     },
+    context.participant?.isAgent === true,
   );
   if (!accepted) {
     return;
@@ -614,6 +610,19 @@ function JoinPanel({
   );
 }
 
+function LeftPanel({ consultationId }: { consultationId: string }) {
+  return (
+    <section className={styles.join} aria-labelledby="room-left-title">
+      <p className="eyebrow">Left locally</p>
+      <h1 id="room-left-title">You have left the consultation.</h1>
+      <p>Your camera and microphone are off. The employee’s consultation continues without you.</p>
+      <a className="button secondary" href={`/consultations/${consultationId}/room`}>
+        Rejoin safely
+      </a>
+    </section>
+  );
+}
+
 function RecordingStatus({
   archiveFailed,
   callState,
@@ -720,7 +729,12 @@ function TranslationRibbon({
           "Translation desk"
         )}
       </div>
-      <section className={styles.caption} aria-label="Current translated and source caption">
+      <section
+        className={styles.caption}
+        aria-label="Current translated and source caption. Scroll for longer captions."
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: The fixed-height caption viewport must be keyboard-scrollable.
+        tabIndex={0}
+      >
         <p className={styles.translation} dir="auto">
           {caption?.translatedText ?? "Listening for the other speaker…"}
         </p>
@@ -863,6 +877,7 @@ export function ConsultationRoom({ initial }: ConsultationRoomProps) {
   const [caption, setCaption] = useState<CaptionPacket | null>(null);
   const [shutdownAt, setShutdownAt] = useState<number | null>(null);
   const [error, setError] = useState("");
+  const [leftLocally, setLeftLocally] = useState(false);
   const media = useRef({
     localVideo,
     remoteVideo,
@@ -911,6 +926,15 @@ export function ConsultationRoom({ initial }: ConsultationRoomProps) {
     }
   }
 
+  function leaveConsultationLocally() {
+    leaveLocally();
+    setLeftLocally(true);
+  }
+
+  if (leftLocally) {
+    return <LeftPanel consultationId={initial.consultationId} />;
+  }
+
   if (!connected) {
     return <JoinPanel connecting={connecting} error={error} onConnect={connect} />;
   }
@@ -939,7 +963,7 @@ export function ConsultationRoom({ initial }: ConsultationRoomProps) {
         callState={callState}
         mode={mode}
         onEnd={endConsultation}
-        onLeave={leaveLocally}
+        onLeave={leaveConsultationLocally}
         onModeChange={setMode}
         role={initial.role}
         seconds={seconds}
