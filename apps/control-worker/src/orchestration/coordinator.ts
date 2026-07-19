@@ -5,6 +5,7 @@ import {
   ORCHESTRATION_TOPICS,
 } from "@transhooter/server-core/rooms";
 import { z } from "zod";
+import { recordDurableOperation, recordWorkClaimed, withControlSpan } from "../runtime/telemetry";
 import {
   type Clock,
   type ConsultationState,
@@ -137,11 +138,25 @@ export class Coordinator {
       this.store.claimStaleReservations(claim),
       this.store.preparePendingArchiveDeletes(claim),
     ]);
+    recordWorkClaimed("coordinator_outbox", outbox.length);
+    recordWorkClaimed("coordinator_deadline", deadlines.length);
+    recordWorkClaimed("coordinator_stale_reservation", staleReservations.length);
 
     await Promise.all([
       ...outbox.map(async (item) => this.consumeOutbox(item)),
-      ...deadlines.map(async (deadline) => this.consumeDeadline(deadline)),
-      ...staleReservations.map(async (reservation) => this.recoverWorker(reservation)),
+      ...deadlines.map(async (deadline) =>
+        this.durableOperation(
+          "deadline",
+          deadlineOperation(deadline.kind),
+          async () => this.consumeDeadline(deadline),
+          (result) => result,
+        ),
+      ),
+      ...staleReservations.map(async (reservation) =>
+        this.durableOperation("worker_reservation", "recover", async () =>
+          this.recoverWorker(reservation),
+        ),
+      ),
     ]);
 
     return outbox.length + deadlines.length + staleReservations.length;
@@ -149,8 +164,10 @@ export class Coordinator {
 
   private async consumeOutbox(item: OutboxItem): Promise<void> {
     try {
-      await this.dispatchOutbox(item);
-      await this.store.completeOutbox(item.id, this.options.owner);
+      await this.durableOperation("outbox", outboxOperation(item.type), async () => {
+        await this.dispatchOutbox(item);
+        await this.store.completeOutbox(item.id, this.options.owner);
+      });
     } catch (error) {
       const delay = Math.min(60_000, 500 * 2 ** Math.min(item.attempts, 7));
       const message = error instanceof Error ? error.message : "outbox handler failed";
@@ -169,7 +186,13 @@ export class Coordinator {
       return;
     }
     if (item.type === "livekit.webhook.verified") {
-      await this.consumeWebhook(webhookSchema.parse(item.payload));
+      const event = webhookSchema.parse(item.payload);
+      await this.durableOperation(
+        "webhook",
+        webhookOperation(event.kind),
+        async () => this.consumeWebhook(event),
+        (result) => result,
+      );
       return;
     }
     if (item.type === ORCHESTRATION_TOPICS.effectPlan) {
@@ -184,15 +207,21 @@ export class Coordinator {
       return;
     }
     if (item.type === ORCHESTRATION_TOPICS.provisioningRequested) {
-      await this.handleProvisioningRequested(item);
+      await this.durableOperation("consultation", "provision", async () =>
+        this.handleProvisioningRequested(item),
+      );
       return;
     }
     if (item.type === ORCHESTRATION_TOPICS.finalizationRequested) {
-      await this.handleFinalizationRequested(item);
+      await this.durableOperation("consultation", "finalize", async () =>
+        this.handleFinalizationRequested(item),
+      );
       return;
     }
     if (item.type === "consultation.cancelled") {
-      await this.handleCancellation(item);
+      await this.durableOperation("consultation", "cancel", async () =>
+        this.handleCancellation(item),
+      );
       return;
     }
     if (item.type === ORCHESTRATION_TOPICS.effectApplied) {
@@ -631,34 +660,36 @@ export class Coordinator {
     );
   }
 
-  private async consumeWebhook(event: VerifiedWebhook): Promise<void> {
+  private async consumeWebhook(event: VerifiedWebhook): Promise<"done" | "ignored"> {
     const applied = await this.store.applyVerifiedWebhook(event);
     if (!applied) {
-      return;
+      return "ignored";
     }
     const generation = await this.store.currentGeneration(event.consultationId);
     if (generation === null || generation !== event.generation) {
-      return;
+      return "ignored";
     }
 
     if (event.kind === "PARTICIPANT_JOINED" && event.participantId !== null) {
       await this.handleParticipantJoined(event, generation);
-      return;
+      return "done";
     }
     if (event.kind === "EGRESS_ACTIVE" && event.participantId === null) {
       await this.handleCompositeEgressActive(event, generation);
-      return;
+      return "done";
     }
     if (event.kind === "EGRESS_ACTIVE" && event.participantId !== null) {
       await this.handleParticipantEgressActive(event, generation);
-      return;
+      return "done";
     }
     if (
       event.kind === "EGRESS_TERMINAL" &&
       egressTerminalOutcome(event.egressStatus) === "failed"
     ) {
       await this.handleTerminalEgressFailure(event, generation);
+      return "done";
     }
+    return "ignored";
   }
 
   private async handleParticipantJoined(event: VerifiedWebhook, generation: number): Promise<void> {
@@ -734,11 +765,11 @@ export class Coordinator {
     await this.store.planFailureEffects(event.consultationId, generation, reason, effects);
   }
 
-  private async consumeDeadline(deadline: Deadline): Promise<void> {
+  private async consumeDeadline(deadline: Deadline): Promise<"done" | "retained"> {
     const generation = await this.store.currentGeneration(deadline.consultationId);
     if (generation !== deadline.generation) {
       await this.store.completeDeadline(deadline, this.options.owner);
-      return;
+      return "done";
     }
     let complete = true;
     if (deadline.kind === "archive-reconcile") {
@@ -754,7 +785,9 @@ export class Coordinator {
     }
     if (complete) {
       await this.store.completeDeadline(deadline, this.options.owner);
+      return "done";
     }
+    return "retained";
   }
 
   private async handleRoomDeadline(deadline: Deadline): Promise<boolean> {
@@ -815,6 +848,37 @@ export class Coordinator {
     return true;
   }
 
+  private async durableOperation<T>(
+    family: string,
+    operation: string,
+    work: () => Promise<T>,
+    successOutcome?: (result: T) => string,
+  ): Promise<T> {
+    const startedAt = performance.now();
+    let outcome = "done";
+    let failure: unknown;
+    try {
+      const result = await withControlSpan(
+        "control.durable_operation",
+        { "control.family": family, "control.operation": operation },
+        work,
+      );
+      outcome = successOutcome?.(result) ?? "done";
+      return result;
+    } catch (error) {
+      outcome = "failed";
+      failure = error;
+      throw error;
+    } finally {
+      recordDurableOperation(
+        family,
+        operation,
+        outcome,
+        (performance.now() - startedAt) / 1_000,
+        failure,
+      );
+    }
+  }
   private async requireGeneration(consultationId: Uuid, item: OutboxItem): Promise<number> {
     const current = await this.store.currentGeneration(consultationId);
     if (current === null || current !== item.generation) {
@@ -1056,6 +1120,54 @@ export class Coordinator {
       occurrenceIdentity,
     );
     await this.store.scheduleEffect(effect);
+  }
+}
+const OUTBOX_OPERATIONS: Readonly<Record<string, string>> = {
+  "worker.heartbeat": "heartbeat",
+  "livekit.webhook.verified": "webhook",
+  [ORCHESTRATION_TOPICS.effectPlan]: "effect_plan",
+  [ORCHESTRATION_TOPICS.provisioningRequested]: "provision",
+  [ORCHESTRATION_TOPICS.finalizationRequested]: "finalize",
+  "consultation.cancelled": "cancel",
+  [ORCHESTRATION_TOPICS.effectApplied]: "effect_applied",
+  "room.capture_requested": "capture_requested",
+  "archive.failed": "archive_failed",
+  "translation.same-language-bypass": "same_language_bypass",
+  "worker.failure": "worker_failure",
+  "egress.failure": "egress_failure",
+};
+
+function outboxOperation(topic: string): string {
+  return OUTBOX_OPERATIONS[topic] ?? "other";
+}
+
+function webhookOperation(kind: VerifiedWebhook["kind"]): string {
+  switch (kind) {
+    case "PARTICIPANT_JOINED":
+      return "participant_joined";
+    case "PARTICIPANT_LEFT":
+      return "participant_left";
+    case "EGRESS_ACTIVE":
+      return "egress_active";
+    case "EGRESS_TERMINAL":
+      return "egress_terminal";
+    default:
+      return "other";
+  }
+}
+
+function deadlineOperation(kind: Deadline["kind"]): string {
+  switch (kind) {
+    case "ready":
+      return "ready";
+    case "absence":
+      return "absence";
+    case "finalize":
+      return "finalize";
+    case "archive-reconcile":
+      return "archive_reconcile";
+    default:
+      return "other";
   }
 }
 

@@ -1,0 +1,114 @@
+{{- if and .Values.telemetry.enabled .Values.telemetry.collector.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transhooter-otel-collector
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+spec:
+  replicas: {{ .Values.telemetry.collector.replicas }}
+  selector:
+    matchLabels:
+      {{- include "transhooter.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: otel-collector
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/otel-collector-configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "transhooter.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: otel-collector
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: otel-collector
+          image: {{ include "transhooter.image" .Values.telemetry.collector.image | quote }}
+          imagePullPolicy: {{ .Values.telemetry.collector.image.pullPolicy }}
+          args: ["--config=/etc/otelcol-contrib/config.yaml"]
+          ports:
+            - {name: otlp-grpc, containerPort: {{ .Values.telemetry.collector.ports.otlpGrpc }}, protocol: TCP}
+            - {name: otlp-http, containerPort: {{ .Values.telemetry.collector.ports.otlpHttp }}, protocol: TCP}
+            - {name: prometheus, containerPort: {{ .Values.telemetry.collector.ports.prometheus }}, protocol: TCP}
+            - {name: health, containerPort: {{ .Values.telemetry.collector.ports.health }}, protocol: TCP}
+          readinessProbe:
+            httpGet: {path: /, port: health}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /, port: health}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml .Values.telemetry.collector.resources | nindent 12 }}
+          volumeMounts:
+            - {name: config, mountPath: /etc/otelcol-contrib, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap:
+            name: transhooter-otel-collector
+            defaultMode: 0444
+            items:
+              - {key: config.yaml, path: config.yaml}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: transhooter-otel-collector
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "transhooter.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: otel-collector
+  ports:
+    - {name: otlp-grpc, port: {{ .Values.telemetry.collector.ports.otlpGrpc }}, targetPort: otlp-grpc, protocol: TCP}
+    - {name: otlp-http, port: {{ .Values.telemetry.collector.ports.otlpHttp }}, targetPort: otlp-http, protocol: TCP}
+    - {name: prometheus, port: {{ .Values.telemetry.collector.ports.prometheus }}, targetPort: prometheus, protocol: TCP}
+    - {name: health, port: {{ .Values.telemetry.collector.ports.health }}, targetPort: health, protocol: TCP}
+{{- if .Values.egress.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "transhooter.fullname" . }}-egress-metrics
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+    app.kubernetes.io/component: egress-metrics
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "transhooter.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: egress
+  ports:
+    - {name: metrics, port: 9090, targetPort: metrics, protocol: TCP}
+{{- end }}
+{{- end }}

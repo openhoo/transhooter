@@ -1,7 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
-  "required": ["images", "existingSecret", "providerSecretName", "spool", "config", "rollout"],
+  "required": [
+    "images",
+    "existingSecret",
+    "providerSecretName",
+    "spool",
+    "config",
+    "rollout",
+    "telemetry"
+  ],
   "oneOf": [
     {
       "required": ["config", "providerSecretKeys"],
@@ -81,6 +89,81 @@
           "repository": { "type": "string", "minLength": 1 },
           "tag": { "type": "string", "minLength": 1, "not": { "const": "latest" } },
           "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "endpoint",
+        "traceSampleRatio",
+        "metricExportIntervalMillis",
+        "collector"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "endpoint": {
+          "type": "string",
+          "anyOf": [{ "const": "" }, { "pattern": "^https?://[^/\\s]+(?::[0-9]+)?(?:/.*)?$" }]
+        },
+        "traceSampleRatio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "metricExportIntervalMillis": { "type": "integer", "minimum": 1000 },
+        "collector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "image", "replicas", "ports", "resources"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["repository", "tag", "pullPolicy"],
+              "properties": {
+                "repository": { "const": "otel/opentelemetry-collector-contrib" },
+                "tag": { "type": "string", "minLength": 1, "not": { "const": "latest" } },
+                "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+              }
+            },
+            "replicas": { "type": "integer", "minimum": 1 },
+            "ports": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["otlpGrpc", "otlpHttp", "prometheus", "health"],
+              "properties": {
+                "otlpGrpc": { "const": 4317 },
+                "otlpHttp": { "const": 4318 },
+                "prometheus": { "const": 8889 },
+                "health": { "const": 13133 }
+              }
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["requests", "limits"],
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["cpu", "memory"],
+                  "properties": {
+                    "cpu": { "type": "string", "minLength": 1 },
+                    "memory": { "type": "string", "minLength": 1 }
+                  }
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["cpu", "memory"],
+                  "properties": {
+                    "cpu": { "type": "string", "minLength": 1 },
+                    "memory": { "type": "string", "minLength": 1 }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

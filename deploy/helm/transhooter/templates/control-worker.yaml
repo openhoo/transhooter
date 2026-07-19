@@ -37,6 +37,15 @@ spec:
             - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
             - {name: INSTANCE_ID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
             - {name: EGRESS_LAYOUT_SIGNING_KEY_FILE, value: /run/secrets/egress-layout-signing-key}
+            {{- if .Values.telemetry.enabled }}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ .Values.telemetry.endpoint | quote }}}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
+            - {name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio}
+            - {name: OTEL_TRACES_SAMPLER_ARG, value: {{ .Values.telemetry.traceSampleRatio | quote }}}
+            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: {{ .Values.telemetry.metricExportIntervalMillis | quote }}}
+            - {name: OTEL_RESOURCE_ATTRIBUTES, value: {{ printf "service.namespace=transhooter,deployment.environment.name=%s" .Values.config.appEnv | quote }}}
+            - {name: OTEL_SERVICE_NAME, value: transhooter-control-worker}
+            {{- end }}
           ports: [{name: health, containerPort: 8080}]
           readinessProbe: {httpGet: {path: /health/ready, port: health}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
           livenessProbe: {httpGet: {path: /health/live, port: health}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}

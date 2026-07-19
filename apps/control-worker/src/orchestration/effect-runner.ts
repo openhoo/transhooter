@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { type CaptionPacket, CaptionPacketSchema } from "@transhooter/contracts";
 import { deterministicUuid } from "@transhooter/server-core/rooms";
 import { type EffectFaultControl, noEffectFaults } from "../runtime/fault-control";
+import { recordEffect, recordWorkClaimed, withControlSpan } from "../runtime/telemetry";
 import type {
   ArchivedObject,
   Clock,
@@ -11,7 +12,7 @@ import type {
   ReconciliationSnapshot,
   Uuid,
 } from "./model";
-import { canonicalRequest } from "./model";
+import { canonicalRequest, EFFECT_KINDS } from "./model";
 import type { Adoption, RemoteEffects } from "./remote";
 
 export interface RunnerOptions {
@@ -37,6 +38,7 @@ interface LeaseRenewal {
 }
 
 class LeaseLostError extends Error {}
+type EffectOutcome = "compensated" | "failed" | "lease_lost" | "not_owned" | "done";
 
 export class EffectRunner {
   constructor(
@@ -54,11 +56,29 @@ export class EffectRunner {
       leaseMs: this.options.leaseMs,
       limit: this.options.batchSize,
     });
-    await Promise.all(effects.map(async (effect) => this.run(effect)));
+    recordWorkClaimed("effect", effects.length);
+    await Promise.all(effects.map(async (effect) => this.observeEffect(effect)));
     return effects.length;
   }
 
-  private async run(claimed: Effect): Promise<void> {
+  private async observeEffect(effect: Effect): Promise<void> {
+    const startedAt = performance.now();
+    const kind = EFFECT_KINDS.includes(effect.kind) ? effect.kind : "other";
+    let outcome: EffectOutcome = "failed";
+    let failure: unknown;
+    try {
+      outcome = await withControlSpan("control.effect", { "control.effect.kind": kind }, async () =>
+        this.run(effect),
+      );
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      recordEffect(kind, outcome, (performance.now() - startedAt) / 1_000, failure);
+    }
+  }
+
+  private async run(claimed: Effect): Promise<EffectOutcome> {
     const generation = await this.store.currentGeneration(claimed.consultationId);
     if (claimed.state === "compensating" || generation !== claimed.generation) {
       const renewal = this.startLeaseRenewal(claimed);
@@ -68,15 +88,16 @@ export class EffectRunner {
           await this.store.markCompensating(claimed.id, this.options.owner, "generation fenced");
         }
         await this.compensateOwned(claimed, renewal);
+        return "compensated";
       } catch (error) {
-        if (!(error instanceof LeaseLostError)) {
-          throw error;
+        if (error instanceof LeaseLostError) {
+          return "lease_lost";
         }
+        throw error;
       } finally {
         renewal.monitoring = false;
         clearInterval(renewal.timer);
       }
-      return;
     }
 
     const canonical = this.canonicalEffectRequest(claimed);
@@ -87,7 +108,7 @@ export class EffectRunner {
         "immutable request hash mismatch",
         null,
       );
-      return;
+      return "failed";
     }
 
     const calling = await this.store.persistCalling(
@@ -97,7 +118,7 @@ export class EffectRunner {
       canonical.sha256,
     );
     if (calling === null) {
-      return;
+      return "not_owned";
     }
 
     const renewal = this.startLeaseRenewal(calling);
@@ -110,22 +131,21 @@ export class EffectRunner {
           "generation fenced before remote call",
         );
         await this.compensateOwned(calling, renewal);
-        return;
+        return "compensated";
       }
       await this.faults.afterPersist(calling.kind, calling.consultationId);
       if (calling.kind === "ARCHIVE_RECONCILE") {
-        await this.reconcileArchive(calling);
-        return;
+        return await this.reconcileArchive(calling);
       }
       if (calling.kind === "ARCHIVE_DELETE") {
-        await this.deleteArchive(calling);
-        return;
+        return await this.deleteArchive(calling);
       }
-      await this.executeRemoteEffect(calling, renewal);
+      return await this.executeRemoteEffect(calling, renewal);
     } catch (error) {
-      if (!(error instanceof LeaseLostError)) {
-        throw error;
+      if (error instanceof LeaseLostError) {
+        return "lease_lost";
       }
+      throw error;
     } finally {
       renewal.monitoring = false;
       clearInterval(renewal.timer);
@@ -182,13 +202,12 @@ export class EffectRunner {
     }
   }
 
-  private async executeRemoteEffect(effect: Effect, renewal: LeaseRenewal): Promise<void> {
+  private async executeRemoteEffect(effect: Effect, renewal: LeaseRenewal): Promise<EffectOutcome> {
     try {
       await this.faults.shouldFail(effect.kind, effect.consultationId);
       const adopted = await this.remote.adopt(effect, effect.plan);
       if (adopted !== null) {
-        await this.applyAdoption(effect, adopted, renewal);
-        return;
+        return await this.applyAdoption(effect, adopted, renewal);
       }
       const result = await this.remote.execute(effect, effect.plan);
       await this.requireOwnership(effect, renewal);
@@ -199,7 +218,7 @@ export class EffectRunner {
           "generation fenced after remote call",
         );
         await this.compensateOwned({ ...effect, remoteId: result.remoteId }, renewal);
-        return;
+        return "compensated";
       }
       await this.store.markApplied(effect.id, this.options.owner, result.remoteId, result.result);
       renewal.monitoring = false;
@@ -213,9 +232,10 @@ export class EffectRunner {
         );
         renewal.lost = false;
         await this.compensateOwned({ ...effect, remoteId: result.remoteId }, renewal);
-        return;
+        return "compensated";
       }
       await this.store.markDone(effect.id, this.options.owner);
+      return "done";
     } catch (error) {
       if (error instanceof LeaseLostError) {
         throw error;
@@ -231,7 +251,7 @@ export class EffectRunner {
             "ambiguous stale remote call",
           );
           await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
-          return;
+          return "compensated";
         }
       }
       const message = error instanceof Error ? error.message : "unknown remote effect failure";
@@ -242,6 +262,7 @@ export class EffectRunner {
         message,
         new Date(this.clock.now().getTime() + delay),
       );
+      return "failed";
     }
   }
 
@@ -249,7 +270,7 @@ export class EffectRunner {
     effect: Effect,
     adoption: Adoption,
     renewal: LeaseRenewal,
-  ): Promise<void> {
+  ): Promise<EffectOutcome> {
     await this.requireOwnership(effect, renewal);
     if (!adoption.matchesRequest) {
       await this.store.markFailed(
@@ -258,7 +279,7 @@ export class EffectRunner {
         "deterministic identity collision",
         null,
       );
-      return;
+      return "failed";
     }
     if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
       await this.store.markCompensating(
@@ -267,7 +288,7 @@ export class EffectRunner {
         "generation fenced after adoption",
       );
       await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
-      return;
+      return "compensated";
     }
     await this.store.markApplied(
       effect.id,
@@ -286,9 +307,10 @@ export class EffectRunner {
       );
       renewal.lost = false;
       await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
-      return;
+      return "compensated";
     }
     await this.store.markDone(effect.id, this.options.owner);
+    return "done";
   }
 
   private async compensateOwned(
@@ -304,7 +326,7 @@ export class EffectRunner {
     }
   }
 
-  private async reconcileArchive(effect: Effect): Promise<void> {
+  private async reconcileArchive(effect: Effect): Promise<EffectOutcome> {
     try {
       const snapshot = await this.store.reconciliationSnapshot(
         effect.consultationId,
@@ -315,7 +337,7 @@ export class EffectRunner {
       );
       if (snapshot === null) {
         await this.store.markDone(effect.id, this.options.owner);
-        return;
+        return "done";
       }
       const knownObjects = new Set(snapshot.objects.map(archiveObjectIdentity));
       const discoveredObjects = (
@@ -379,6 +401,7 @@ export class EffectRunner {
       } as const;
       await this.uploadAndCompleteInventory(effect, snapshot, inventory, derivedObjects);
       await this.store.markDone(effect.id, this.options.owner);
+      return "done";
     } catch (error) {
       const message = error instanceof Error ? error.message : "archive reconciliation failed";
       await this.store.markFailed(
@@ -387,6 +410,7 @@ export class EffectRunner {
         message,
         new Date(this.clock.now().getTime() + 1_000),
       );
+      return "failed";
     }
   }
 
@@ -608,7 +632,7 @@ export class EffectRunner {
     return latest;
   }
 
-  private async deleteArchive(effect: Effect): Promise<void> {
+  private async deleteArchive(effect: Effect): Promise<EffectOutcome> {
     try {
       const empty = await this.remote.drainArchive(effect.consultationId);
       if (!empty) {
@@ -618,7 +642,7 @@ export class EffectRunner {
           "archive deletion has remaining versions or multipart uploads",
           this.clock.now(),
         );
-        return;
+        return "failed";
       }
       const writeEpoch = effect.plan.writeEpoch;
       if (typeof writeEpoch !== "number" || !Number.isInteger(writeEpoch) || writeEpoch < 0) {
@@ -627,14 +651,15 @@ export class EffectRunner {
       const transitioned = await this.remote.notifyDeleteDrain(effect.consultationId, writeEpoch);
       if (transitioned) {
         await this.store.markDone(effect.id, this.options.owner);
-      } else {
-        await this.store.markFailed(
-          effect.id,
-          this.options.owner,
-          `archive deletion failed for write epoch ${String(writeEpoch)}`,
-          null,
-        );
+        return "done";
       }
+      await this.store.markFailed(
+        effect.id,
+        this.options.owner,
+        `archive deletion failed for write epoch ${String(writeEpoch)}`,
+        null,
+      );
+      return "failed";
     } catch (error) {
       const message = error instanceof Error ? error.message : "archive delete failed";
       await this.store.markFailed(
@@ -643,6 +668,7 @@ export class EffectRunner {
         message,
         new Date(this.clock.now().getTime() + 1_000),
       );
+      return "failed";
     }
   }
 }

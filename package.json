@@ -12,12 +12,12 @@
     "tests/*"
   ],
   "scripts": {
-    "build": "bun run --filter @transhooter/contracts build && bun run --filter @transhooter/server-core build && bun run --filter @transhooter/control-worker build && bun run --filter @transhooter/web build",
-    "typecheck": "bun run --filter @transhooter/contracts typecheck && bun run --filter @transhooter/server-core typecheck && bun run --filter @transhooter/control-worker typecheck && bun run --filter @transhooter/web typecheck",
+    "build": "bun run --filter @transhooter/contracts build && bun run --filter @transhooter/server-core build && bun run --filter @transhooter/telemetry build && bun run --filter @transhooter/control-worker build && bun run --filter @transhooter/web build",
+    "typecheck": "bun run --filter @transhooter/contracts typecheck && bun run --filter @transhooter/server-core typecheck && bun run --filter @transhooter/telemetry typecheck && bun run --filter @transhooter/control-worker typecheck && bun run --filter @transhooter/web typecheck",
     "lint": "biome ci .",
     "format": "biome check --write . && uv run --project services/translation-worker --frozen ruff format services/translation-worker",
     "format:check": "biome format . && uv run --project services/translation-worker --frozen ruff format --check services/translation-worker",
-    "test": "bun test packages/contracts/test packages/server-core/tests apps/control-worker/test apps/web/lib && uv run --project services/translation-worker --frozen pytest",
+    "test": "bun test packages/contracts/test packages/server-core/tests packages/telemetry/test apps/control-worker/test apps/web/lib && uv run --project services/translation-worker --frozen pytest",
     "test:hermetic": "./scripts/run-tests",
     "smoke:consultation": "./scripts/smoke-consultation",
     "failure-smoke": "./scripts/failure-smoke",

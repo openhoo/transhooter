@@ -24,6 +24,8 @@ case "$profile" in
     ;;
 esac
 
+export OTEL_SDK_DISABLED=false
+
 announce_phase "Validating ${profile} Compose configuration"
 compose config --quiet
 announce_phase "Building the current secret initializer"
@@ -33,5 +35,5 @@ compose run --rm --no-deps secrets-init
 write_compose_state
 announce_phase "Recorded recoverable Compose state"
 announce_phase "Building current sources and waiting for semantic readiness"
-compose up --build --wait --remove-orphans web
+compose up --build --wait --remove-orphans otel-collector web
 printf 'Transhooter is ready with profile %s.\n' "$profile"

@@ -14,6 +14,7 @@ import { z } from "zod";
 import { configuredApplication } from "./composition";
 import { webConfig } from "./config";
 import { durableConsultationDestination } from "./consultation-routing";
+import { withWebOperation } from "./telemetry";
 
 const UuidSchema = z.uuid();
 const ObjectSchema = z.record(z.string(), z.unknown());
@@ -1015,7 +1016,7 @@ function errorResponse(error: DomainError | z.ZodError): Response {
   );
 }
 
-export async function execute(
+async function executeApplication(
   operation: string,
   request: Request,
   params: Record<string, string> = {},
@@ -1138,7 +1139,16 @@ export async function execute(
     throw error;
   }
 }
-export async function requirePageData<T>(
+
+export function execute(
+  operation: string,
+  request: Request,
+  params: Record<string, string> = {},
+): Promise<Response> {
+  return withWebOperation(operation, "api", () => executeApplication(operation, request, params));
+}
+
+async function requirePageDataApplication<T>(
   operation: string,
   params: Record<string, string> = {},
   query: Record<string, string> = {},
@@ -1177,6 +1187,16 @@ export async function requirePageData<T>(
     }
     throw error;
   }
+}
+
+export function requirePageData<T>(
+  operation: string,
+  params: Record<string, string> = {},
+  query: Record<string, string> = {},
+): Promise<T> {
+  return withWebOperation(operation, "page", () =>
+    requirePageDataApplication<T>(operation, params, query),
+  );
 }
 
 export async function requireSignedEgressLayout(input: {

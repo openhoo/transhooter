@@ -20,7 +20,16 @@ x-worker-health: &worker-health
   retries: 12
   start_period: 20s
 
+x-otel-env: &otel-env
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-true}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-60000}
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACE_SAMPLE_RATIO:-0.01}
+
 x-control-worker-env: &control-worker-env
+  <<: *otel-env
   LIVEKIT_INTERNAL_URL: ws://livekit:7880
   LIVEKIT_CREDENTIALS_FILE: /run/secrets/livekit-credentials
   S3_CREDENTIALS_FILE: /run/secrets/minio-credentials
@@ -29,6 +38,9 @@ x-control-worker-env: &control-worker-env
   SMTP_URL: smtp://mailpit:1025
 
 x-web-runtime-env: &web-runtime-env
+  <<: *otel-env
+  HOSTNAME: 0.0.0.0
+  PORT: 3000
   LIVEKIT_INTERNAL_URL: ws://livekit:7880
   LIVEKIT_CREDENTIALS_FILE: /run/secrets/livekit-credentials
   S3_CREDENTIALS_FILE: /run/secrets/minio-credentials
@@ -242,6 +254,35 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.130.1
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    networks: [backend]
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    expose: ["4317", "4318", "8889", "13133"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: [--config=/etc/otelcol-contrib/config.yaml]
+    healthcheck:
+      test: [CMD, /otelcol-contrib, validate, --config=http://127.0.0.1:13133/]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+        limits:
+          cpus: "0.50"
+          memory: 512M
+          pids: 128
+
 
   egress-ready:
     image: *bootstrap-runtime-image
@@ -337,10 +378,11 @@ services:
       migrate: {condition: service_completed_successfully}
     environment:
       <<: [*server-env, *web-runtime-env]
+      OTEL_SERVICE_NAME: transhooter-capability-publisher
       PUBLIC_BASE_URL: http://capability-publisher:3000
       PUBLIC_LIVEKIT_URL: ws://livekit:7880
     volumes: *web-runtime-volumes
-    command: [bun, run, --filter, "@transhooter/web", start]
+    command: [bun, apps/web/.next/standalone/apps/web/server.js]
     healthcheck:
       test: [CMD, bun, -e, "fetch('http://127.0.0.1:3000/api/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 5s
@@ -386,6 +428,8 @@ services:
       redis: {condition: service_healthy}
       minio-bootstrap: {condition: service_completed_successfully}
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: transhooter-translation-worker
       APP_ENV: ${APP_ENV:-development}
       PROVIDER_PROFILE: ${PROVIDER_PROFILE:?set PROVIDER_PROFILE}
       DATABASE_URL_FILE: /run/secrets/database-url
@@ -423,6 +467,7 @@ services:
   spool-drainer:
     extends: translation-worker
     environment:
+      OTEL_SERVICE_NAME: transhooter-spool-drainer
       INTERNAL_TOKEN_FILE: /run/secrets/internal-token
     volumes:
       - ../../.secrets/internal-spool-drainer-token:/run/secrets/internal-token:ro
@@ -447,6 +492,7 @@ services:
       translation-worker: {condition: service_healthy}
     environment:
       <<: [*server-env, *control-worker-env]
+      OTEL_SERVICE_NAME: transhooter-control-worker
       INSTANCE_ID: 11111111-1111-4111-8111-111111111111
     volumes:
       - ../../.secrets/database-url:/run/secrets/database-url:ro
@@ -486,11 +532,12 @@ services:
       control-worker-2: {condition: service_healthy}
     environment:
       <<: [*server-env, *web-runtime-env]
+      OTEL_SERVICE_NAME: transhooter-web
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
       PUBLIC_LIVEKIT_URL: ${PUBLIC_LIVEKIT_URL:-ws://localhost:7880}
       LIVEKIT_BROWSER_URL: ${PUBLIC_LIVEKIT_URL:-ws://localhost:7880}
     volumes: *web-runtime-volumes
-    command: [bun, run, --filter, "@transhooter/web", start]
+    command: [bun, apps/web/.next/standalone/apps/web/server.js]
     healthcheck:
       test: [CMD, bun, -e, "fetch('http://127.0.0.1:3000/api/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 10s

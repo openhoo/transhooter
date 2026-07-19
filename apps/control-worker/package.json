@@ -13,8 +13,9 @@
   },
   "dependencies": {
     "@livekit/protocol": "1.50.0",
-    "@transhooter/server-core": "workspace:*",
     "@transhooter/contracts": "workspace:*",
+    "@transhooter/server-core": "workspace:*",
+    "@transhooter/telemetry": "workspace:*",
     "@aws-sdk/client-s3": "3.1090.0",
     "drizzle-orm": "0.45.2",
     "ioredis": "5.8.2",

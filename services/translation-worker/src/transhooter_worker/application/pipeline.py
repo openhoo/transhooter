@@ -6,7 +6,11 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID, uuid4
+
+from opentelemetry import metrics, trace
+from opentelemetry.trace import Span, Status, StatusCode
 
 from transhooter_worker.application.retry import FrozenRetryPolicy
 from transhooter_worker.domain.models import (
@@ -23,6 +27,101 @@ from transhooter_worker.domain.models import (
     TranslationRequest,
 )
 from transhooter_worker.ports.providers import TextTranslationProvider
+from transhooter_worker.telemetry import bounded_error_kind
+
+AttemptResult = Literal["success", "retryable", "permanent", "cancelled", "error"]
+QueueResult = Literal["accepted", "dropped", "failed"]
+
+_TRACER = trace.get_tracer("transhooter.translation_worker.pipeline")
+_METER = metrics.get_meter("transhooter.translation_worker.pipeline")
+_TRANSLATION_ATTEMPTS = _METER.create_counter(
+    "transhooter.worker.translation.attempts",
+    description="Translation provider attempts by bounded result",
+)
+_TRANSLATION_ATTEMPT_DURATION = _METER.create_histogram(
+    "transhooter.worker.translation.attempt.duration",
+    unit="s",
+    description="Translation provider attempt latency",
+)
+_ORDERED_QUEUE_SUBMISSIONS = _METER.create_counter(
+    "transhooter.worker.ordered_stage_queue.submissions",
+    description="Ordered-stage queue submissions by bounded result",
+)
+_ORDERED_QUEUE_DEPTH = _METER.create_up_down_counter(
+    "transhooter.worker.ordered_stage_queue.depth",
+    description="Current number of queued ordered-stage items",
+)
+
+_PROVIDER_ERROR_KINDS = {
+    "authentication": "validation",
+    "quota": "unavailable",
+    "rate_limit": "unavailable",
+    "transport": "unavailable",
+    "invalid_request": "validation",
+    "provider": "unavailable",
+    "cancelled": "aborted",
+    "internal": "other",
+}
+
+
+def _start_span(name: str, attributes: dict[str, str]) -> Span | None:
+    try:
+        return _TRACER.start_span(name, attributes=attributes)
+    except Exception:
+        return None
+
+
+def _finish_translation_attempt(
+    span: Span | None,
+    result: AttemptResult,
+    duration_seconds: float,
+    error_kind: str | None = None,
+) -> None:
+    attributes = {"stage": "translation", "result": result}
+    if error_kind is not None:
+        attributes["error.kind"] = error_kind
+    try:
+        _TRANSLATION_ATTEMPTS.add(1, attributes)
+        _TRANSLATION_ATTEMPT_DURATION.record(duration_seconds, attributes)
+    except Exception:
+        pass
+    if span is None:
+        return
+    try:
+        span.set_attribute("result", result)
+        if error_kind is not None:
+            span.set_attribute("error.kind", error_kind)
+        span.set_status(Status(StatusCode.OK if result == "success" else StatusCode.ERROR))
+    except Exception:
+        pass
+    finally:
+        try:
+            span.end()
+        except Exception:
+            pass
+
+
+def _provider_error_kind(error: object | None) -> str:
+    if error is None:
+        return "other"
+    return _PROVIDER_ERROR_KINDS.get(str(getattr(error, "kind", "")), "other")
+
+
+def _record_queue_result(result: QueueResult) -> None:
+    try:
+        _ORDERED_QUEUE_SUBMISSIONS.add(1, {"stage": "ordered", "result": result})
+    except Exception:
+        pass
+
+
+def _change_queue_depth(amount: int) -> None:
+    if amount == 0:
+        return
+    try:
+        _ORDERED_QUEUE_DEPTH.add(amount, {"stage": "ordered"})
+    except Exception:
+        pass
+
 
 StageGate = Callable[[str, int], Awaitable[None]]
 EvidenceSink = Callable[[object], Awaitable[None]]
@@ -144,9 +243,35 @@ class UtteranceAssembler:
                 samples,
             )
             started_at_ms = int(time.time() * 1000)
-            outcome = await self._run_translation_attempt(request)
+            if self._stage_gate is not None:
+                await self._stage_gate("translation", len(request.text))
+            attempt_started = time.monotonic()
+            span = _start_span(
+                "translation.provider_attempt",
+                {"stage": "translation"},
+            )
+            try:
+                outcome = await self._run_translation_attempt(request)
+            except asyncio.CancelledError as error:
+                _finish_translation_attempt(
+                    span,
+                    "cancelled",
+                    time.monotonic() - attempt_started,
+                    bounded_error_kind(error),
+                )
+                raise
+            except BaseException as error:
+                _finish_translation_attempt(
+                    span,
+                    "error",
+                    time.monotonic() - attempt_started,
+                    bounded_error_kind(error),
+                )
+                raise
+            duration_seconds = time.monotonic() - attempt_started
             occurred_at_ms = int(time.time() * 1000)
             if outcome.result is not None:
+                _finish_translation_attempt(span, "success", duration_seconds)
                 await self._report_terminal(
                     outcome.terminal,
                     attempt_number,
@@ -164,9 +289,39 @@ class UtteranceAssembler:
                     outcome.result.text,
                     samples,
                 )
-            decision = await self._handle_failed_translation(
-                outcome.terminal,
-                attempt_number,
+            try:
+                decision = await self._handle_failed_translation(
+                    outcome.terminal,
+                    attempt_number,
+                )
+            except asyncio.CancelledError as error:
+                _finish_translation_attempt(
+                    span,
+                    "cancelled",
+                    duration_seconds,
+                    bounded_error_kind(error),
+                )
+                raise
+            except BaseException as error:
+                _finish_translation_attempt(
+                    span,
+                    "error",
+                    duration_seconds,
+                    bounded_error_kind(error),
+                )
+                raise
+            result: AttemptResult
+            if outcome.terminal.outcome is Outcome.CANCELLED:
+                result = "cancelled"
+            elif decision.action is RetryAction.RETRY:
+                result = "retryable"
+            else:
+                result = "permanent"
+            _finish_translation_attempt(
+                span,
+                result,
+                duration_seconds,
+                _provider_error_kind(outcome.terminal.error),
             )
             await self._report_terminal(
                 outcome.terminal,
@@ -183,8 +338,6 @@ class UtteranceAssembler:
         raise RuntimeError("translation retry policy exhausted")
 
     async def _run_translation_attempt(self, request: TranslationRequest) -> TranslationOutcome:
-        if self._stage_gate is not None:
-            await self._stage_gate("translation", len(request.text))
         attempt = await self._translate.start(request)
         return await attempt.result()
 
@@ -251,16 +404,21 @@ class OrderedStageQueue:
     async def submit(self, final: bool, work: Callable[[], Awaitable[None]]) -> None:
         async with self._condition:
             if self._error is not None:
+                _record_queue_result("failed")
                 raise self._error
             if not final and len(self._queue) >= self._maximum:
+                _record_queue_result("dropped")
                 return
             while len(self._queue) >= self._maximum:
                 await self._condition.wait()
                 if self._error is not None:
+                    _record_queue_result("failed")
                     raise self._error
             self._queue.append(work)
             self._unfinished += 1
             self._joined.clear()
+            _record_queue_result("accepted")
+            _change_queue_depth(1)
             self._condition.notify()
 
     async def run(self) -> None:
@@ -271,14 +429,18 @@ class OrderedStageQueue:
                         raise self._error
                     await self._condition.wait()
                 work = self._queue.popleft()
+                _change_queue_depth(-1)
                 self._condition.notify_all()
             try:
                 await work()
             except BaseException as exc:
                 async with self._condition:
                     self._error = exc
-                    self._unfinished -= 1 + len(self._queue)
+                    discarded = len(self._queue)
+                    self._unfinished -= 1 + discarded
                     self._queue.clear()
+                    _change_queue_depth(-discarded)
+                    _record_queue_result("failed")
                     if self._unfinished == 0:
                         self._joined.set()
                     self._condition.notify_all()

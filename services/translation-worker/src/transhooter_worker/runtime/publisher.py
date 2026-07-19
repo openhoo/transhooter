@@ -1,12 +1,71 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from typing import Literal
 from uuid import UUID
 
 from livekit import rtc
+from opentelemetry import metrics, trace
+from opentelemetry.trace import Span, Status, StatusCode
 
 from transhooter_worker.domain.models import SampleRange
 from transhooter_worker.ports.exchange_journal import PublicationJournal
+from transhooter_worker.telemetry import bounded_error_kind
+
+CaptureResult = Literal["success", "cancelled", "error"]
+
+_TRACER = trace.get_tracer("transhooter.translation_worker.publisher")
+_METER = metrics.get_meter("transhooter.translation_worker.publisher")
+_FRAME_CAPTURES = _METER.create_counter(
+    "transhooter.worker.publisher.frame_captures",
+    description="Journaled publisher frame capture attempts by bounded result",
+)
+_FRAME_CAPTURE_DURATION = _METER.create_histogram(
+    "transhooter.worker.publisher.frame_capture.duration",
+    unit="s",
+    description="Journaled publisher frame capture latency",
+)
+
+
+def _start_capture_span() -> Span | None:
+    try:
+        return _TRACER.start_span(
+            "publisher.frame_capture",
+            attributes={"stage": "capture"},
+        )
+    except Exception:
+        return None
+
+
+def _finish_capture(
+    span: Span | None,
+    result: CaptureResult,
+    duration_seconds: float,
+    error: BaseException | None = None,
+) -> None:
+    attributes = {"stage": "capture", "result": result}
+    if error is not None:
+        attributes["error.kind"] = bounded_error_kind(error)
+    try:
+        _FRAME_CAPTURES.add(1, attributes)
+        _FRAME_CAPTURE_DURATION.record(duration_seconds, attributes)
+    except Exception:
+        pass
+    if span is None:
+        return
+    try:
+        span.set_attribute("result", result)
+        if error is not None:
+            span.set_attribute("error.kind", bounded_error_kind(error))
+        span.set_status(Status(StatusCode.OK if result == "success" else StatusCode.ERROR))
+    except Exception:
+        pass
+    finally:
+        try:
+            span.end()
+        except Exception:
+            pass
 
 
 class PreservedAudioPublisher:
@@ -49,7 +108,31 @@ class PreservedAudioPublisher:
                     num_channels=1,
                     samples_per_channel=self.FRAME_SAMPLES,
                 )
-                await self._source.capture_frame(frame)
+                capture_started = time.monotonic()
+                capture_span = _start_capture_span()
+                try:
+                    await self._source.capture_frame(frame)
+                except asyncio.CancelledError as error:
+                    _finish_capture(
+                        capture_span,
+                        "cancelled",
+                        time.monotonic() - capture_started,
+                        error,
+                    )
+                    raise
+                except BaseException as error:
+                    _finish_capture(
+                        capture_span,
+                        "error",
+                        time.monotonic() - capture_started,
+                        error,
+                    )
+                    raise
+                _finish_capture(
+                    capture_span,
+                    "success",
+                    time.monotonic() - capture_started,
+                )
                 self._first_accepted.set()
                 self._sequence += 1
                 self._sample = span.end

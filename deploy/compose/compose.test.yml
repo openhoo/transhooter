@@ -28,6 +28,7 @@ x-fixture-runtime-env: &fixture-runtime-env
   APP_ENV: test
   PROVIDER_PROFILE: fixture
   PROVIDER_NETWORK_DISABLED: "true"
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-true}
 
 services:
   minio:

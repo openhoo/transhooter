@@ -4,6 +4,7 @@ COPY package.json bun.lock ./
 COPY apps/control-worker/package.json ./apps/control-worker/package.json
 COPY apps/web/package.json ./apps/web/package.json
 COPY packages/contracts/package.json ./packages/contracts/package.json
+COPY packages/telemetry/package.json ./packages/telemetry/package.json
 COPY packages/server-core/package.json ./packages/server-core/package.json
 COPY tests/e2e/package.json ./tests/e2e/package.json
 COPY tests/failure-smoke/package.json ./tests/failure-smoke/package.json
@@ -26,6 +27,7 @@ RUN groupadd --gid 10001 transhooter \
 WORKDIR /workspace
 COPY --from=dependencies --chown=10001:10001 /workspace /workspace
 COPY --from=build --chown=10001:10001 /workspace/apps /workspace/apps
+COPY --from=build --chown=10001:10001 /workspace/apps/web/.next/static /workspace/apps/web/.next/standalone/apps/web/.next/static
 COPY --from=build --chown=10001:10001 /workspace/packages /workspace/packages
 COPY --from=build --chown=10001:10001 /workspace/deploy /workspace/deploy
 USER 10001:10001

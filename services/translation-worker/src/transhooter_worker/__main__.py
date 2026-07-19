@@ -38,6 +38,7 @@ from transhooter_worker.runtime.provider_registry import (
     ProviderRegistry,
     resolve_profile_config,
 )
+from transhooter_worker.telemetry import configure_telemetry
 
 
 def _add_provider_command_arguments(command: argparse.ArgumentParser) -> None:
@@ -818,17 +819,31 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
 
 
 def main() -> None:
-    if len(sys.argv) == 1:
-        sys.argv.append("start")
-    if sys.argv[1] != "providers":
-        run_worker()
-        return
-    args = parser().parse_args()
+    raw_interval = os.environ.get("OTEL_METRIC_EXPORT_INTERVAL", "").strip()
     try:
-        result = asyncio.run(run(args))
-    except Exception as exc:
-        raise SystemExit(f"provider command failed: {exc}") from exc
-    print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        metric_export_interval_millis = int(raw_interval) if raw_interval else None
+    except ValueError:
+        metric_export_interval_millis = None
+    telemetry = configure_telemetry(
+        service_name=os.environ.get("OTEL_SERVICE_NAME") or "transhooter-translation-worker",
+        endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        environment=os.environ.get("APP_ENV"),
+        metric_export_interval_millis=metric_export_interval_millis,
+    )
+    try:
+        if len(sys.argv) == 1:
+            sys.argv.append("start")
+        if sys.argv[1] != "providers":
+            run_worker()
+            return
+        args = parser().parse_args()
+        try:
+            result = asyncio.run(run(args))
+        except Exception as exc:
+            raise SystemExit(f"provider command failed: {exc}") from exc
+        print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+    finally:
+        telemetry.shutdown()
 
 
 if __name__ == "__main__":

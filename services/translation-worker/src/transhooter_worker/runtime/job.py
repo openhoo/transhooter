@@ -14,6 +14,8 @@ from uuid import UUID, uuid4, uuid5
 
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
 from livekit import agents, rtc
+from opentelemetry import metrics, trace
+from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from transhooter_worker.adapters.s3_archive import S3Archive
@@ -56,6 +58,101 @@ from transhooter_worker.runtime.spool_drainer import (
     build_archive,
     upload_committed_objects_async,
 )
+from transhooter_worker.telemetry import bounded_error_kind
+
+_tracer = trace.get_tracer(__name__)
+_meter = metrics.get_meter(__name__)
+_active_jobs = _meter.create_up_down_counter(
+    "transhooter.worker.jobs.active",
+    description="Currently active translation worker consultation jobs.",
+    unit="{job}",
+)
+_jobs_total = _meter.create_counter(
+    "transhooter.worker.jobs.total",
+    description="Translation worker consultation jobs by terminal result.",
+    unit="{job}",
+)
+_job_duration = _meter.create_histogram(
+    "transhooter.worker.job.duration",
+    description="Translation worker consultation job duration.",
+    unit="s",
+)
+_provider_operation_duration = _meter.create_histogram(
+    "transhooter.worker.provider.operation.duration",
+    description="Provider operation duration reported at its deduplicated terminal.",
+    unit="s",
+)
+_spool_utilization = _meter.create_histogram(
+    "transhooter.worker.spool.utilization",
+    description="Encrypted spool utilization ratio observed by worker heartbeats.",
+    unit="1",
+)
+_preflight_duration = _meter.create_histogram(
+    "transhooter.worker.preflight.duration",
+    description="Frozen provider preflight duration.",
+    unit="s",
+)
+
+
+def _add_metric(instrument: Any, value: int, attributes: dict[str, str]) -> None:
+    try:
+        instrument.add(value, attributes)
+    except Exception:
+        pass
+
+
+def _record_metric(instrument: Any, value: float, attributes: dict[str, str]) -> None:
+    try:
+        instrument.record(value, attributes)
+    except Exception:
+        pass
+
+
+def _start_span(name: str) -> Any | None:
+    try:
+        return _tracer.start_span(name)
+    except Exception:
+        return None
+
+
+def _set_ok_status(span: Any | None) -> None:
+    if span is None:
+        return
+    try:
+        span.set_status(Status(StatusCode.OK))
+    except Exception:
+        pass
+
+
+def _end_span(span: Any | None) -> None:
+    if span is None:
+        return
+    try:
+        span.end()
+    except Exception:
+        pass
+
+
+def _job_failure_phase(error: BaseException) -> str:
+    if isinstance(error, SpoolUnavailable):
+        return "preservation"
+    error_kind = bounded_error_kind(error)
+    if error_kind == "aborted":
+        return "cancellation"
+    if error_kind == "validation":
+        return "admission"
+    return "runtime"
+
+
+def _set_error_status(span: Any | None, error: BaseException, phase: str) -> None:
+    if span is None:
+        return
+    try:
+        span.set_attribute("error.kind", bounded_error_kind(error))
+        span.set_attribute("failure.phase", phase)
+        span.set_status(Status(StatusCode.ERROR))
+    except Exception:
+        pass
 
 
 @dataclass(slots=True)
@@ -251,9 +348,18 @@ async def _reported_preflight(
     report: Callable[[dict[str, object]], Awaitable[None]],
     snapshot_hash: str,
 ) -> Any:
+    started = time.monotonic()
+    result = "succeeded"
+    error_kind: str | None = None
+    span = _start_span("transhooter.worker.provider.preflight")
     try:
-        return await operation()
+        value = await operation()
+        _set_ok_status(span)
+        return value
     except BaseException as error:
+        result = "failed"
+        error_kind = bounded_error_kind(error)
+        _set_error_status(span, error, "preflight")
         try:
             await report(
                 {
@@ -267,6 +373,16 @@ async def _reported_preflight(
         except Exception:
             pass
         raise
+    finally:
+        attributes = {"result": result}
+        if error_kind is not None:
+            attributes["error.kind"] = error_kind
+        _record_metric(
+            _preflight_duration,
+            time.monotonic() - started,
+            attributes,
+        )
+        _end_span(span)
 
 
 def _selection_scope(metadata: JobMetadata) -> tuple[tuple[str, str], ...]:
@@ -437,6 +553,7 @@ async def _heartbeat_loop(
 ) -> None:
     while True:
         usage = spool.usage_ratio()
+        _record_metric(_spool_utilization, usage, {"role": "heartbeat"})
         if usage >= 0.80:
             raise RuntimeError("encrypted spool reached fail-closed 80% capacity")
         await asyncio.gather(
@@ -1276,6 +1393,19 @@ def _build_provider_terminal_sink(
                     payload=terminal_bytes_payload,
                 )
             reported_terminal_ids.add(terminal.terminal_id)
+            retry_action = (
+                "do_not_retry" if decision.action is RetryAction.STOP else decision.action.value
+            )
+            _record_metric(
+                _provider_operation_duration,
+                max(0, occurred_at_ms - started_at_ms) / 1000,
+                {
+                    "stage": stage,
+                    "transport": terminal.transport.value,
+                    "outcome": terminal.outcome.value,
+                    "retry.action": retry_action,
+                },
+            )
             await control.provider_attempt(payload, event_id=terminal.terminal_id)
 
     return report
@@ -1846,16 +1976,39 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
     )
 
 
-
-
 async def consultation_entrypoint(ctx: agents.JobContext) -> None:
+    started = time.monotonic()
+    result = "succeeded"
+    failure_phase: str | None = None
+    error_kind: str | None = None
+    span = _start_span("transhooter.worker.job")
+    _add_metric(_active_jobs, 1, {})
     try:
-        await _run_consultation(ctx)
+        try:
+            await _run_consultation(ctx)
+        except BaseException as error:
+            result = "cancelled" if bounded_error_kind(error) == "aborted" else "failed"
+            failure_phase = _job_failure_phase(error)
+            error_kind = bounded_error_kind(error)
+            _set_error_status(span, error, failure_phase)
+            raise
+        else:
+            _set_ok_status(span)
     except SpoolUnavailable:
         supervisor_pid = os.environ.get("TRANSHOOTER_WORKER_SUPERVISOR_PID")
         if supervisor_pid is not None:
             os.kill(int(supervisor_pid), signal.SIGTERM)
         raise
+    finally:
+        attributes = {"result": result}
+        if failure_phase is not None:
+            attributes["failure.phase"] = failure_phase
+        if error_kind is not None:
+            attributes["error.kind"] = error_kind
+        _add_metric(_active_jobs, -1, {})
+        _add_metric(_jobs_total, 1, attributes)
+        _record_metric(_job_duration, time.monotonic() - started, attributes)
+        _end_span(span)
 
 
 def run_worker() -> None:

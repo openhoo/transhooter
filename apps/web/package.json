@@ -21,6 +21,7 @@
     "@livekit/egress-sdk": "0.2.1",
     "@transhooter/contracts": "workspace:*",
     "@transhooter/server-core": "workspace:*",
+    "@transhooter/telemetry": "workspace:*",
     "drizzle-orm": "0.45.2",
     "ioredis": "5.8.2",
     "jose": "6.2.3",

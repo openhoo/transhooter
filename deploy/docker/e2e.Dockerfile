@@ -8,6 +8,7 @@ COPY --chown=transhooter:transhooter package.json bun.lock ./
 COPY --chown=transhooter:transhooter apps/control-worker/package.json apps/control-worker/package.json
 COPY --chown=transhooter:transhooter apps/web/package.json apps/web/package.json
 COPY --chown=transhooter:transhooter packages/contracts/package.json packages/contracts/package.json
+COPY --chown=transhooter:transhooter packages/telemetry/package.json packages/telemetry/package.json
 COPY --chown=transhooter:transhooter packages/server-core/package.json packages/server-core/package.json
 COPY --chown=transhooter:transhooter tests/e2e/package.json tests/e2e/package.json
 COPY --chown=transhooter:transhooter tests/failure-smoke/package.json tests/failure-smoke/package.json
