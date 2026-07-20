@@ -22,6 +22,7 @@ class ErrorKind(StrEnum):
     RATE_LIMIT = "rate_limit"
     TRANSPORT = "transport"
     INVALID_REQUEST = "invalid_request"
+    INVALID_RESPONSE = "invalid_response"
     PROVIDER = "provider"
     CANCELLED = "cancelled"
     INTERNAL = "internal"
@@ -36,13 +37,38 @@ class RetryAdvice(StrEnum):
 class RetryAction(StrEnum):
     RETRY = "retry"
     DEGRADE = "degrade"
-    STOP = "stop"
+    STOP = "do_not_retry"
 
 
 class Outcome(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+_RETRYABLE_ERROR_KINDS = frozenset(
+    {
+        ErrorKind.QUOTA,
+        ErrorKind.RATE_LIMIT,
+        ErrorKind.TRANSPORT,
+        ErrorKind.PROVIDER,
+        ErrorKind.INVALID_RESPONSE,
+        ErrorKind.INTERNAL,
+    }
+)
+
+
+def _validate_terminal_error(
+    outcome: Outcome, error: ProviderError | None, attempt_id: UUID
+) -> None:
+    if outcome is Outcome.SUCCEEDED and error is not None:
+        raise ValueError("successful terminals cannot carry an error")
+    if outcome is Outcome.FAILED and (error is None or error.kind is ErrorKind.CANCELLED):
+        raise ValueError("failed terminals require a non-cancellation error")
+    if outcome is Outcome.CANCELLED and error is not None and error.kind is not ErrorKind.CANCELLED:
+        raise ValueError("cancelled terminals can carry only a cancellation error")
+    if error is not None and error.attempt_id != attempt_id:
+        raise ValueError("error attempt_id must match the terminal attempt")
 
 
 class Transport(StrEnum):
@@ -199,6 +225,13 @@ class RetryDecision:
     reason: str
     previous_attempt_id: UUID | None
 
+    def __post_init__(self) -> None:
+        retries = self.action is RetryAction.RETRY
+        if retries != (self.delay_ms is not None):
+            raise ValueError("only retries have a delay")
+        if retries and self.previous_attempt_id is None:
+            raise ValueError("retry decisions require the terminal attempt link")
+
 
 @dataclass(frozen=True, slots=True)
 class OperationTerminal:
@@ -215,6 +248,21 @@ class OperationTerminal:
     raw_refs: tuple[RawRef, ...]
     credential_fingerprint: str
 
+    def __post_init__(self) -> None:
+        _validate_terminal_error(self.outcome, self.error, self.attempt_id)
+        if self.outcome is not Outcome.FAILED and self.retry.action is not RetryAction.STOP:
+            raise ValueError("successful and cancelled terminals cannot carry retry advice")
+        if self.outcome is not Outcome.FAILED and self.retry.previous_attempt_id is not None:
+            raise ValueError("successful and cancelled terminals cannot link a retry decision")
+        if self.retry.previous_attempt_id not in {None, self.attempt_id}:
+            raise ValueError("retry decision must link to the terminal attempt")
+        if self.retry.action is RetryAction.RETRY and (
+            self.error is None
+            or self.error.provider_retry_advice is RetryAdvice.NEVER
+            or self.error.kind not in _RETRYABLE_ERROR_KINDS
+        ):
+            raise ValueError("retries require a retryable failed provider error")
+
 
 @dataclass(frozen=True, slots=True)
 class SessionTerminal:
@@ -227,6 +275,9 @@ class SessionTerminal:
     emitted_output: int
     transport: Transport
     raw_refs: tuple[RawRef, ...]
+
+    def __post_init__(self) -> None:
+        _validate_terminal_error(self.outcome, self.error, self.session_id)
 
 
 @dataclass(frozen=True, slots=True)

@@ -79,6 +79,9 @@ export class EffectRunner {
   }
 
   private async run(claimed: Effect): Promise<EffectOutcome> {
+    if (claimed.state === "applied") {
+      return await this.resumeAppliedEffect(claimed);
+    }
     const generation = await this.store.currentGeneration(claimed.consultationId);
     if (claimed.state === "compensating" || generation !== claimed.generation) {
       const renewal = this.startLeaseRenewal(claimed);
@@ -135,12 +138,38 @@ export class EffectRunner {
       }
       await this.faults.afterPersist(calling.kind, calling.consultationId);
       if (calling.kind === "ARCHIVE_RECONCILE") {
-        return await this.reconcileArchive(calling);
+        return await this.reconcileArchive(calling, renewal);
       }
       if (calling.kind === "ARCHIVE_DELETE") {
         return await this.deleteArchive(calling);
       }
       return await this.executeRemoteEffect(calling, renewal);
+    } catch (error) {
+      if (error instanceof LeaseLostError) {
+        return "lease_lost";
+      }
+      throw error;
+    } finally {
+      renewal.monitoring = false;
+      clearInterval(renewal.timer);
+    }
+  }
+
+  private async resumeAppliedEffect(effect: Effect): Promise<EffectOutcome> {
+    const renewal = this.startLeaseRenewal(effect);
+    try {
+      await this.requireOwnership(effect, renewal);
+      if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
+        await this.store.markCompensating(
+          effect.id,
+          this.options.owner,
+          "generation fenced after applied recovery",
+        );
+        await this.compensateOwned(effect, renewal);
+        return "compensated";
+      }
+      await this.store.markDone(effect.id, this.options.owner);
+      return "done";
     } catch (error) {
       if (error instanceof LeaseLostError) {
         return "lease_lost";
@@ -326,7 +355,7 @@ export class EffectRunner {
     }
   }
 
-  private async reconcileArchive(effect: Effect): Promise<EffectOutcome> {
+  private async reconcileArchive(effect: Effect, renewal: LeaseRenewal): Promise<EffectOutcome> {
     try {
       const snapshot = await this.store.reconciliationSnapshot(
         effect.consultationId,
@@ -369,8 +398,14 @@ export class EffectRunner {
       ];
       const invalidObjectIds = await this.verifyObjects(persistedObjects);
       const missing = this.missingInventoryEntries(snapshot, invalidObjectIds, persistedObjects);
-      if (missing.length > 0 && this.clock.now() < snapshot.reconciliationDeadlineAt) {
-        throw new Error("archive evidence is still pending");
+      if (
+        missing.length > 0 &&
+        effect.plan.forceIncomplete !== true &&
+        this.clock.now() < snapshot.reconciliationDeadlineAt
+      ) {
+        throw new Error(
+          `archive evidence is still pending: ${JSON.stringify(missing.slice(0, 20))}`,
+        );
       }
       const captionObjects = persistedObjects.filter(
         (object) =>
@@ -382,12 +417,21 @@ export class EffectRunner {
         (object) => !persistedIdentities.has(archiveObjectIdentity(object)),
       );
       const derivedObjects = [...discoveredObjects, ...vttObjects];
+      const inventoryObjects = [
+        ...persistedObjects,
+        ...vttObjects.map(derivedToArchivedObject),
+      ].sort((left, right) =>
+        `${left.key}\u0000${left.versionId}\u0000${left.id}`.localeCompare(
+          `${right.key}\u0000${right.versionId}\u0000${right.id}`,
+        ),
+      );
       const inventory = {
+        consultationId: effect.consultationId,
         status: missing.length === 0 ? "complete" : "incomplete",
         roomClose: snapshot.roomClose,
         workerTerminal: snapshot.workerTerminal,
         egressResults: snapshot.egressResults,
-        objects: [...persistedObjects, ...vttObjects.map(derivedToArchivedObject)],
+        objects: inventoryObjects,
         missing,
         errors:
           invalidObjectIds.size === 0
@@ -399,8 +443,7 @@ export class EffectRunner {
                 },
               ],
       } as const;
-      await this.uploadAndCompleteInventory(effect, snapshot, inventory, derivedObjects);
-      await this.store.markDone(effect.id, this.options.owner);
+      await this.uploadAndCompleteInventory(effect, renewal, snapshot, inventory, derivedObjects);
       return "done";
     } catch (error) {
       const message = error instanceof Error ? error.message : "archive reconciliation failed";
@@ -530,6 +573,7 @@ export class EffectRunner {
 
   private async uploadAndCompleteInventory(
     effect: Effect,
+    renewal: LeaseRenewal,
     snapshot: ReconciliationSnapshot,
     inventory: Readonly<Record<string, unknown>>,
     vttObjects: readonly DerivedArchiveObject[],
@@ -541,8 +585,11 @@ export class EffectRunner {
       contentType: "application/json",
       sha256: canonical.sha256,
     });
+    await this.requireOwnership(effect, renewal);
     const completed = await this.store.completeReconciliation(
-      effect.consultationId,
+      effect,
+      this.options.owner,
+      this.clock.now(),
       snapshot,
       inventory,
       canonical.sha256,
@@ -588,8 +635,8 @@ export class EffectRunner {
         sha256,
       });
       derived.push({
-        id: deterministicUuid(consultationId, `vtt:${destination}`),
-        objectClass: "caption_vtt",
+        id: deterministicUuid(consultationId, `archive-object:${key}:${uploaded.versionId}`),
+        objectClass: archiveObjectClass(key),
         key,
         versionId: uploaded.versionId,
         size: uploaded.size,
@@ -634,6 +681,14 @@ export class EffectRunner {
 
   private async deleteArchive(effect: Effect): Promise<EffectOutcome> {
     try {
+      const writeEpoch = effect.plan.writeEpoch;
+      if (typeof writeEpoch !== "number" || !Number.isInteger(writeEpoch) || writeEpoch < 0) {
+        throw new Error("archive deletion write epoch is invalid");
+      }
+      const reason = effect.plan.reason;
+      if (typeof reason !== "string" || reason.trim().length === 0) {
+        throw new Error("archive deletion reason is invalid");
+      }
       const empty = await this.remote.drainArchive(effect.consultationId);
       if (!empty) {
         await this.store.markFailed(
@@ -644,11 +699,11 @@ export class EffectRunner {
         );
         return "failed";
       }
-      const writeEpoch = effect.plan.writeEpoch;
-      if (typeof writeEpoch !== "number" || !Number.isInteger(writeEpoch) || writeEpoch < 0) {
-        throw new Error("archive deletion write epoch is invalid");
-      }
-      const transitioned = await this.remote.notifyDeleteDrain(effect.consultationId, writeEpoch);
+      const transitioned = await this.remote.notifyDeleteDrain(
+        effect.consultationId,
+        writeEpoch,
+        reason,
+      );
       if (transitioned) {
         await this.store.markDone(effect.id, this.options.owner);
         return "done";

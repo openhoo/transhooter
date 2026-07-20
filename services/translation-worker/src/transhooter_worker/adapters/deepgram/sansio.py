@@ -16,6 +16,11 @@ class SansIoWebSocket:
     """Adapter-owned TLS transport exposing every HTTP and WebSocket protocol boundary."""
 
     _INBOUND_QUEUE_SIZE = 64
+    _CONNECT_TIMEOUT_SECONDS = 10.0
+    _UPGRADE_TIMEOUT_SECONDS = 10.0
+    _READ_TIMEOUT_SECONDS = 30.0
+    _WRITE_TIMEOUT_SECONDS = 10.0
+    _CLOSE_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -46,15 +51,30 @@ class SansIoWebSocket:
         journal: JournalFrame,
     ) -> SansIoWebSocket:
         uri = parse_uri(url)
-        reader, writer = await cls._open_tls_stream(uri.host, uri.port)
+        reader, writer = await asyncio.wait_for(
+            cls._open_tls_stream(uri.host, uri.port),
+            cls._CONNECT_TIMEOUT_SECONDS,
+        )
         try:
             protocol = ClientProtocol(uri, max_size=2**24)
-            await cls._send_upgrade_request(protocol, writer, authorization, journal)
-            await cls._receive_upgrade_response(protocol, reader, journal)
+            await asyncio.wait_for(
+                cls._send_upgrade_request(protocol, writer, authorization, journal),
+                cls._UPGRADE_TIMEOUT_SECONDS,
+            )
+            await asyncio.wait_for(
+                cls._receive_upgrade_response(protocol, reader, journal),
+                cls._UPGRADE_TIMEOUT_SECONDS,
+            )
             return cls(reader, writer, protocol, journal)
         except BaseException:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await asyncio.wait_for(
+                    writer.wait_closed(),
+                    cls._CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                pass
             raise
 
     @staticmethod
@@ -104,6 +124,7 @@ class SansIoWebSocket:
         reader: asyncio.StreamReader,
         journal: JournalFrame,
     ) -> None:
+        response_received = False
         while protocol.state.name == "CONNECTING":
             data = await reader.read(65536)
             if not data:
@@ -117,8 +138,13 @@ class SansIoWebSocket:
                         event.serialize(),
                         ((":status", str(event.status_code)), *tuple(event.headers.raw_items())),
                     )
+                    response_received = True
                 elif isinstance(event, Frame):
                     raise ConnectionError("WebSocket frame arrived before completed upgrade")
+            if response_received:
+                break
+        if protocol.handshake_exc is not None:
+            raise protocol.handshake_exc
 
     async def send(self, message: str | bytes) -> None:
         body = message.encode() if isinstance(message, str) else message
@@ -128,26 +154,42 @@ class SansIoWebSocket:
             self._protocol.send_text(body)
         else:
             self._protocol.send_binary(body)
-        await self._flush()
+        await asyncio.wait_for(self._flush(), self._WRITE_TIMEOUT_SECONDS)
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
-        if self._protocol.state.name not in {"CLOSING", "CLOSED"}:
-            self._journal(
-                "frame-out", "close", reason.encode(), (("code", str(code)), ("fin", "true"))
-            )
-            self._protocol.send_close(code, reason)
-            await self._flush()
         try:
-            await asyncio.wait_for(self._reader_task, 5)
-        except TimeoutError:
-            self._writer.close()
-            await self._writer.wait_closed()
+            if self._protocol.state.name not in {"CLOSING", "CLOSED"}:
+                self._journal(
+                    "frame-out",
+                    "close",
+                    reason.encode(),
+                    (("code", str(code)), ("fin", "true")),
+                )
+                self._protocol.send_close(code, reason)
+                await asyncio.wait_for(self._flush(), self._CLOSE_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                asyncio.shield(self._reader_task),
+                self._CLOSE_TIMEOUT_SECONDS,
+            )
+        finally:
+            if not self._reader_task.done():
+                self._writer.close()
+                try:
+                    await asyncio.wait_for(
+                        self._writer.wait_closed(),
+                        self._CLOSE_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    pass
+                self._reader_task.cancel()
+                await asyncio.gather(self._reader_task, return_exceptions=True)
 
     def __aiter__(self) -> AsyncIterator[str | bytes]:
         async def iterator() -> AsyncIterator[str | bytes]:
             while True:
                 value = await self._queue.get()
                 if value is None:
+                    await self._reader_task
                     return
                 self._message_slots.release()
                 yield value
@@ -157,7 +199,10 @@ class SansIoWebSocket:
     async def _read(self) -> None:
         try:
             while True:
-                data = await self._reader.read(65536)
+                data = await asyncio.wait_for(
+                    self._reader.read(65536),
+                    self._READ_TIMEOUT_SECONDS,
+                )
                 if data:
                     self._protocol.receive_data(data)
                 else:
@@ -165,16 +210,28 @@ class SansIoWebSocket:
 
                 for event in self._protocol.events_received():
                     if isinstance(event, Frame) and await self._handle_frame(event):
-                        await self._flush()
+                        await asyncio.wait_for(
+                            self._flush(),
+                            self._WRITE_TIMEOUT_SECONDS,
+                        )
                         return
 
-                await self._flush()
+                await asyncio.wait_for(
+                    self._flush(),
+                    self._WRITE_TIMEOUT_SECONDS,
+                )
                 if not data:
-                    await self._queue.put(None)
                     return
         finally:
+            await self._queue.put(None)
             self._writer.close()
-            await self._writer.wait_closed()
+            try:
+                await asyncio.wait_for(
+                    self._writer.wait_closed(),
+                    self._CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                pass
 
     async def _handle_frame(self, frame: Frame) -> bool:
         opcode_name = frame.opcode.name.lower()
@@ -193,7 +250,6 @@ class SansIoWebSocket:
         if frame.opcode is Opcode.CLOSE:
             self.close_code = self._protocol.close_code
             self.close_reason = self._protocol.close_reason
-            await self._queue.put(None)
             return True
 
         await self._append_message_fragment(frame)
@@ -201,8 +257,7 @@ class SansIoWebSocket:
 
     async def _reply_to_ping(self, payload: bytes) -> None:
         self._journal("frame-out", "pong", payload, (("fin", "true"),))
-        self._protocol.send_pong(payload)
-        await self._flush()
+        await asyncio.wait_for(self._flush(), self._WRITE_TIMEOUT_SECONDS)
 
     async def _append_message_fragment(self, frame: Frame) -> None:
         if frame.opcode in {Opcode.TEXT, Opcode.BINARY}:

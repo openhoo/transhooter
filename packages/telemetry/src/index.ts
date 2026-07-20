@@ -1,7 +1,7 @@
 import { type Meter, metrics, type Tracer, trace } from "@opentelemetry/api";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
-import { resourceFromAttributes } from "@opentelemetry/resources";
+import { defaultResource, resourceFromAttributes } from "@opentelemetry/resources";
 import {
   AggregationType,
   InstrumentType,
@@ -122,7 +122,7 @@ function signalEndpoint(baseEndpoint: string, signal: "traces" | "metrics"): str
   const withoutTrailingSlash = url.pathname.replace(/\/+$/u, "");
   const basePath = withoutTrailingSlash.replace(/\/v1\/(?:traces|metrics)$/u, "");
   url.pathname = `${basePath}/v1/${signal}`;
-  url.search = "";
+  // Query parameters can carry exporter configuration and must apply to both signals.
   url.hash = "";
   return url.toString();
 }
@@ -168,18 +168,32 @@ export function startNodeTelemetry(options: StartNodeTelemetryOptions): NodeTele
     return existingHandle;
   }
 
-  const endpoint = (options.endpoint ?? process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "").trim();
-  if (process.env.OTEL_SDK_DISABLED?.trim().toLowerCase() === "true" || endpoint === "") {
+  const explicitEndpoint = options.endpoint;
+  const endpointConfigured =
+    explicitEndpoint !== undefined
+      ? explicitEndpoint.trim() !== ""
+      : [
+          process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+          process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+          process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+        ].some((value) => value?.trim());
+  if (process.env.OTEL_SDK_DISABLED?.trim().toLowerCase() === "true" || !endpointConfigured) {
     return disabledHandle(options.serviceName, options.serviceVersion);
   }
 
   try {
-    const traceExporter = new OTLPTraceExporter({
-      url: signalEndpoint(endpoint, "traces"),
-    });
-    const metricExporter = new OTLPMetricExporter({
-      url: signalEndpoint(endpoint, "metrics"),
-    });
+    const traceExporter =
+      explicitEndpoint === undefined
+        ? new OTLPTraceExporter()
+        : new OTLPTraceExporter({
+            url: signalEndpoint(explicitEndpoint.trim(), "traces"),
+          });
+    const metricExporter =
+      explicitEndpoint === undefined
+        ? new OTLPMetricExporter()
+        : new OTLPMetricExporter({
+            url: signalEndpoint(explicitEndpoint.trim(), "metrics"),
+          });
     const spanProcessor = new BatchSpanProcessor({ exporter: traceExporter });
     const interval = metricExportInterval(options.metricExportIntervalMillis);
     const metricReader = new PeriodicExportingMetricReader({
@@ -188,11 +202,11 @@ export function startNodeTelemetry(options: StartNodeTelemetryOptions): NodeTele
       exportTimeoutMillis: Math.min(interval, 30_000),
     });
     const sdk = new NodeSDK({
-      autoDetectResources: false,
+      autoDetectResources: true,
       instrumentations: [],
       logRecordProcessors: [],
       metricReaders: [metricReader],
-      resource: resourceFromAttributes(resourceAttributes(options)),
+      resource: defaultResource().merge(resourceFromAttributes(resourceAttributes(options))),
       spanProcessors: [spanProcessor],
       views: histogramViews(options.serviceName),
     });

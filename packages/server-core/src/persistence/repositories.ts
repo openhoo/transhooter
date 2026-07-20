@@ -1,11 +1,14 @@
 import type { ExtractTablesWithRelations } from "drizzle-orm";
-import { and, eq, gt, isNull, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, lte, or, sql } from "drizzle-orm";
 import type { NodePgDatabase, NodePgTransaction } from "drizzle-orm/node-postgres";
 import { DomainError, type Instant, type UUID } from "../domain/model";
 import type {
+  ActiveMagicLink,
   AuthRepository,
   EffectRepository,
   ExternalEffect,
+  MagicLinkCandidate,
+  MagicLinkIdentity,
   MagicLinkRecord,
   OutboxMessage,
   PendingExchangeRecord,
@@ -109,14 +112,13 @@ export class DrizzleEffectRepository implements EffectRepository {
   }
 
   async lock(effectId: UUID, tx: Transaction): Promise<ExternalEffect | null> {
-    const result = await unwrap(tx).execute<EffectLockRow>(sql`
-      SELECT *
-      FROM external_effects
-      WHERE id = ${effectId}
-      FOR UPDATE
-    `);
-    const row = result.rows[0];
-    return row ? mapRawEffect(row) : null;
+    const [row] = await unwrap(tx)
+      .select()
+      .from(effects)
+      .where(eq(effects.id, effectId))
+      .limit(1)
+      .for("update");
+    return row ? mapEffect(row) : null;
   }
 
   async beginCall(
@@ -376,40 +378,118 @@ export class DrizzleAuthRepository implements AuthRepository {
     return row ? mapSession(row) : null;
   }
 
-  async createMagicLink(link: MagicLinkRecord, tx?: Transaction): Promise<void> {
-    const database = tx ? unwrap(tx) : this.database;
-    await database.insert(magicLinks).values({
-      id: link.id,
-      userId: link.userId,
-      consultationId: link.consultationId,
-      sessionId: link.sessionId,
-      purpose: link.purpose,
-      tokenHash: link.tokenHash,
-      expiresAt: link.expiresAt,
-      consumedAt: link.consumedAt,
-      revokedAt: link.revokedAt,
-      createdAt: sql`now()`,
+  async getOrCreateActiveMagicLink(
+    identity: MagicLinkIdentity,
+    candidate: MagicLinkCandidate,
+    now: Instant,
+  ): Promise<ActiveMagicLink> {
+    if (
+      candidate.record.userId !== identity.userId ||
+      candidate.record.purpose !== identity.purpose ||
+      candidate.record.consultationId !== identity.consultationId ||
+      candidate.record.sessionId !== identity.sessionId ||
+      candidate.record.consumedAt !== null ||
+      candidate.record.revokedAt !== null ||
+      candidate.record.expiresAt <= now ||
+      candidate.sealedRawToken.length === 0 ||
+      candidate.keyId.length === 0
+    ) {
+      throw new DomainError("INVALID_MAGIC_LINK_CANDIDATE");
+    }
+
+    return this.database.transaction(async (database) => {
+      await database.execute<AdvisoryLockRow>(sql`
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(
+            jsonb_build_array(
+              ${identity.userId}::uuid,
+              ${identity.purpose}::magic_link_purpose,
+              ${identity.consultationId}::uuid,
+              ${identity.sessionId}::uuid
+            )::text,
+            2
+          )
+        )
+      `);
+
+      const [current] = await database
+        .select()
+        .from(magicLinks)
+        .where(
+          and(
+            sql`${magicLinks.userId} IS NOT DISTINCT FROM ${identity.userId}::uuid`,
+            eq(magicLinks.purpose, identity.purpose),
+            sql`${magicLinks.consultationId} IS NOT DISTINCT FROM ${identity.consultationId}::uuid`,
+            sql`${magicLinks.sessionId} IS NOT DISTINCT FROM ${identity.sessionId}::uuid`,
+            isNull(magicLinks.consumedAt),
+            isNull(magicLinks.revokedAt),
+          ),
+        )
+        .orderBy(desc(magicLinks.createdAt), desc(magicLinks.id))
+        .limit(1)
+        .for("update");
+      if (current && current.expiresAt > now) {
+        if (!current.sealedRawToken || !current.sealedTokenKeyId) {
+          throw new DomainError("MAGIC_LINK_DELIVERY_UNRECOVERABLE");
+        }
+        return {
+          record: mapMagicLink(current),
+          sealedRawToken: current.sealedRawToken,
+          keyId: current.sealedTokenKeyId,
+          created: false,
+        };
+      }
+
+      if (current) {
+        await database
+          .update(magicLinks)
+          .set({ revokedAt: now })
+          .where(
+            and(
+              eq(magicLinks.id, current.id),
+              isNull(magicLinks.consumedAt),
+              isNull(magicLinks.revokedAt),
+              lte(magicLinks.expiresAt, now),
+            ),
+          );
+      }
+
+      await database.insert(magicLinks).values({
+        id: candidate.record.id,
+        userId: candidate.record.userId,
+        consultationId: candidate.record.consultationId,
+        sessionId: candidate.record.sessionId,
+        purpose: candidate.record.purpose,
+        tokenHash: candidate.record.tokenHash,
+        expiresAt: candidate.record.expiresAt,
+        consumedAt: null,
+        revokedAt: null,
+        createdAt: now,
+        sealedRawToken: candidate.sealedRawToken,
+        sealedTokenKeyId: candidate.keyId,
+      });
+      return { ...candidate, created: true };
     });
   }
 
   async lockMagicLinkByTokenHash(hash: string, tx: Transaction): Promise<MagicLinkRecord | null> {
-    const result = await unwrap(tx).execute<MagicLinkLockRow>(sql`
-      SELECT *
-      FROM magic_links
-      WHERE token_hash = ${hash}
-      FOR UPDATE
-    `);
-    return result.rows[0] ? mapRawMagicLink(result.rows[0]) : null;
+    const [row] = await unwrap(tx)
+      .select()
+      .from(magicLinks)
+      .where(eq(magicLinks.tokenHash, hash))
+      .limit(1)
+      .for("update");
+    return row ? mapMagicLink(row) : null;
   }
 
   async lockMagicLinkById(id: UUID, tx: Transaction): Promise<MagicLinkRecord | null> {
-    const result = await unwrap(tx).execute<MagicLinkLockRow>(sql`
-      SELECT *
-      FROM magic_links
-      WHERE id = ${id}
-      FOR UPDATE
-    `);
-    return result.rows[0] ? mapRawMagicLink(result.rows[0]) : null;
+    const [row] = await unwrap(tx)
+      .select()
+      .from(magicLinks)
+      .where(eq(magicLinks.id, id))
+      .limit(1)
+      .for("update");
+    return row ? mapMagicLink(row) : null;
   }
 
   async createPendingExchange(exchange: PendingExchangeRecord, tx: Transaction): Promise<void> {
@@ -428,13 +508,13 @@ export class DrizzleAuthRepository implements AuthRepository {
     hash: string,
     tx: Transaction,
   ): Promise<PendingExchangeRecord | null> {
-    const result = await unwrap(tx).execute<PendingExchangeLockRow>(sql`
-      SELECT *
-      FROM pending_exchanges
-      WHERE nonce_hash = ${hash}
-      FOR UPDATE
-    `);
-    return result.rows[0] ? mapRawExchange(result.rows[0]) : null;
+    const [row] = await unwrap(tx)
+      .select()
+      .from(pendingExchanges)
+      .where(eq(pendingExchanges.nonceHash, hash))
+      .limit(1)
+      .for("update");
+    return row ? mapExchange(row) : null;
   }
 
   async consumeExchangeAndLink(
@@ -570,42 +650,6 @@ export class DrizzleAuthRepository implements AuthRepository {
   }
 }
 
-type EffectLockRow = {
-  id: UUID;
-  consultation_id: UUID;
-  generation: number;
-  effect_kind: string;
-  subject_id: UUID;
-  state: ExternalEffect["state"];
-  request_bytes: Uint8Array | null;
-  request_hash: string | null;
-  lease_owner: UUID | null;
-  lease_expires_at: Date | null;
-  result: unknown;
-  attempts: number;
-};
-
-type MagicLinkLockRow = {
-  id: UUID;
-  user_id: UUID | null;
-  consultation_id: UUID | null;
-  session_id: UUID | null;
-  purpose: MagicLinkRecord["purpose"];
-  token_hash: string;
-  expires_at: Date;
-  consumed_at: Date | null;
-  revoked_at: Date | null;
-};
-
-type PendingExchangeLockRow = {
-  id: UUID;
-  magic_link_id: UUID;
-  nonce_hash: string;
-  csrf_hash: string;
-  expires_at: Date;
-  consumed_at: Date | null;
-};
-
 type OutboxClaimRow = {
   id: UUID;
   topic: string;
@@ -642,28 +686,28 @@ function mapSession(row: typeof sessions.$inferSelect): SessionRecord {
   };
 }
 
-function mapRawMagicLink(row: MagicLinkLockRow): MagicLinkRecord {
+function mapMagicLink(row: typeof magicLinks.$inferSelect): MagicLinkRecord {
   return {
     id: row.id,
-    userId: row.user_id,
-    consultationId: row.consultation_id,
-    sessionId: row.session_id,
+    userId: row.userId,
+    consultationId: row.consultationId,
+    sessionId: row.sessionId,
     purpose: row.purpose,
-    tokenHash: row.token_hash,
-    expiresAt: row.expires_at,
-    consumedAt: row.consumed_at,
-    revokedAt: row.revoked_at,
+    tokenHash: row.tokenHash,
+    expiresAt: row.expiresAt,
+    consumedAt: row.consumedAt,
+    revokedAt: row.revokedAt,
   };
 }
 
-function mapRawExchange(row: PendingExchangeLockRow): PendingExchangeRecord {
+function mapExchange(row: typeof pendingExchanges.$inferSelect): PendingExchangeRecord {
   return {
     id: row.id,
-    magicLinkId: row.magic_link_id,
-    nonceHash: row.nonce_hash,
-    csrfHash: row.csrf_hash,
-    expiresAt: row.expires_at,
-    consumedAt: row.consumed_at,
+    magicLinkId: row.magicLinkId,
+    nonceHash: row.nonceHash,
+    csrfHash: row.csrfHash,
+    expiresAt: row.expiresAt,
+    consumedAt: row.consumedAt,
   };
 }
 
@@ -679,23 +723,6 @@ function mapEffect(row: typeof effects.$inferSelect): ExternalEffect {
     requestHash: row.requestHash,
     leaseOwner: row.leaseOwner,
     leaseExpiresAt: row.leaseExpiresAt,
-    result: row.result,
-    attempts: row.attempts,
-  };
-}
-
-function mapRawEffect(row: EffectLockRow): ExternalEffect {
-  return {
-    id: row.id,
-    consultationId: row.consultation_id,
-    generation: row.generation,
-    kind: row.effect_kind,
-    subjectId: row.subject_id,
-    state: row.state,
-    requestBytes: row.request_bytes,
-    requestHash: row.request_hash,
-    leaseOwner: row.lease_owner,
-    leaseExpiresAt: row.lease_expires_at,
     result: row.result,
     attempts: row.attempts,
   };

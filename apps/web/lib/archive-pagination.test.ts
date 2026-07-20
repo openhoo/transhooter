@@ -1,5 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { previousArchiveCursor, rememberArchiveCursor } from "../components/archive-actions.tsx";
+
+mock.module("server-only", () => ({}));
+// Import after replacing Next's server-only guard so the page boundary can run in Bun.
+const { lastArchiveQueryValue } = await import("../app/archives/[id]/page.tsx");
 
 class MemoryStorage {
   readonly values = new Map<string, string>();
@@ -12,6 +16,17 @@ class MemoryStorage {
     this.values.set(key, value);
   }
 }
+
+describe("archive query normalization", () => {
+  test("uses the last repeated cursor value", () => {
+    expect(lastArchiveQueryValue(["stale-cursor", "current-cursor"])).toBe("current-cursor");
+  });
+
+  test("preserves single and absent cursor values", () => {
+    expect(lastArchiveQueryValue("current-cursor")).toBe("current-cursor");
+    expect(lastArchiveQueryValue(undefined)).toBeUndefined();
+  });
+});
 
 describe("archive pagination cursor state", () => {
   test("retains immediate predecessors without growing query-string history", () => {

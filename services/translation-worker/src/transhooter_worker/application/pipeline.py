@@ -31,6 +31,7 @@ from transhooter_worker.telemetry import bounded_error_kind
 
 AttemptResult = Literal["success", "retryable", "permanent", "cancelled", "error"]
 QueueResult = Literal["accepted", "dropped", "failed"]
+QueueExecutionResult = Literal["success", "failed"]
 
 _TRACER = trace.get_tracer("transhooter.translation_worker.pipeline")
 _METER = metrics.get_meter("transhooter.translation_worker.pipeline")
@@ -46,6 +47,10 @@ _TRANSLATION_ATTEMPT_DURATION = _METER.create_histogram(
 _ORDERED_QUEUE_SUBMISSIONS = _METER.create_counter(
     "transhooter.worker.ordered_stage_queue.submissions",
     description="Ordered-stage queue submissions by bounded result",
+)
+_ORDERED_QUEUE_EXECUTIONS = _METER.create_counter(
+    "transhooter.worker.ordered_stage_queue.executions",
+    description="Ordered-stage queue executions by bounded result",
 )
 _ORDERED_QUEUE_DEPTH = _METER.create_up_down_counter(
     "transhooter.worker.ordered_stage_queue.depth",
@@ -110,6 +115,13 @@ def _provider_error_kind(error: object | None) -> str:
 def _record_queue_result(result: QueueResult) -> None:
     try:
         _ORDERED_QUEUE_SUBMISSIONS.add(1, {"stage": "ordered", "result": result})
+    except Exception:
+        pass
+
+
+def _record_queue_execution(result: QueueExecutionResult) -> None:
+    try:
+        _ORDERED_QUEUE_EXECUTIONS.add(1, {"stage": "ordered", "result": result})
     except Exception:
         pass
 
@@ -440,12 +452,13 @@ class OrderedStageQueue:
                     self._unfinished -= 1 + discarded
                     self._queue.clear()
                     _change_queue_depth(-discarded)
-                    _record_queue_result("failed")
+                    _record_queue_execution("failed")
                     if self._unfinished == 0:
                         self._joined.set()
                     self._condition.notify_all()
                 raise
             else:
+                _record_queue_execution("success")
                 async with self._condition:
                     self._unfinished -= 1
                     if self._unfinished == 0:

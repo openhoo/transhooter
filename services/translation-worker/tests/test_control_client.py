@@ -52,6 +52,55 @@ def make_client(
 
 
 @pytest.mark.asyncio
+async def test_control_client_closes_internally_created_http_client(tmp_path: Path) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("secret", "utf-8")
+    client = ControlClient(
+        "http://control.test",
+        bearer_file,
+        UUID(int=1),
+        1,
+        UUID(int=2),
+        1,
+        RecordingSpool(),  # type: ignore[arg-type]
+    )
+    owned_client = client._client
+
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        async with client:
+            assert not owned_client.is_closed
+            raise RuntimeError("preflight failed")
+
+    assert owned_client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_control_client_preserves_injected_http_client_ownership(tmp_path: Path) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("secret", "utf-8")
+    injected_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(204))
+    )
+    client = ControlClient(
+        "http://control.test",
+        bearer_file,
+        UUID(int=1),
+        1,
+        UUID(int=2),
+        1,
+        RecordingSpool(),  # type: ignore[arg-type]
+        injected_client,
+    )
+
+    with pytest.raises(RuntimeError, match="request failed"):
+        async with client:
+            raise RuntimeError("request failed")
+
+    assert not injected_client.is_closed
+    await injected_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_provider_attempt_posts_shared_envelope_and_body(tmp_path: Path) -> None:
     bearer_file = tmp_path / "bearer"
     bearer_file.write_text("secret", "utf-8")
@@ -353,6 +402,23 @@ class RecordingArchive:
         )
 
 
+class BlockingCheckpointControl:
+    def __init__(self) -> None:
+        self.first_checkpoint_entered = asyncio.Event()
+        self.release_first_checkpoint = asyncio.Event()
+        self.checkpoints: list[dict[str, Any]] = []
+
+    async def record_object(self, _: dict[str, Any], *, event_id: UUID | None = None) -> None:
+        assert event_id is not None
+
+    async def checkpoint(self, payload: dict[str, Any], *, event_id: UUID | None = None) -> None:
+        assert event_id is not None
+        self.checkpoints.append(payload)
+        if len(self.checkpoints) == 1:
+            self.first_checkpoint_entered.set()
+            await self.release_first_checkpoint.wait()
+
+
 def checkpoint_metadata(meeting_id: UUID) -> Any:
     return type(
         "Metadata",
@@ -369,6 +435,71 @@ def encrypted_spool(root: Path, database: Path) -> EncryptedSpool:
         "v1",
         capacity_probe=deterministic_roomy_capacity,
     )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_checkpoints_for_one_source_form_one_serial_chain(
+    tmp_path: Path,
+) -> None:
+    meeting_id = UUID(int=30)
+    source_id = UUID(int=31)
+    destination_id = UUID(int=32)
+    spool = encrypted_spool(tmp_path / "payloads", tmp_path / "journal.sqlite3")
+    archive = RecordingArchive()
+    control = BlockingCheckpointControl()
+    state = CheckpointChainState.empty()
+    metadata = checkpoint_metadata(meeting_id)
+
+    first = asyncio.create_task(
+        _persist_checkpoint(
+            metadata,
+            spool,
+            archive,  # type: ignore[arg-type]
+            control,  # type: ignore[arg-type]
+            state,
+            source_id,
+            destination_id,
+            4_000,
+            1_920,
+            False,
+            input_sequence=1,
+            provider_output_sample=2_400,
+        )
+    )
+    await control.first_checkpoint_entered.wait()
+
+    second = asyncio.create_task(
+        _persist_checkpoint(
+            metadata,
+            spool,
+            archive,  # type: ignore[arg-type]
+            control,  # type: ignore[arg-type]
+            state,
+            source_id,
+            destination_id,
+            8_000,
+            3_840,
+            False,
+            input_sequence=2,
+            provider_output_sample=4_800,
+        )
+    )
+    second_had_turn = asyncio.Event()
+    asyncio.get_running_loop().call_soon(second_had_turn.set)
+    await second_had_turn.wait()
+
+    assert len(control.checkpoints) == 1
+    assert len(spool.list_checkpoint_deliveries(meeting_id, 3)) == 1
+
+    control.release_first_checkpoint.set()
+    await asyncio.gather(first, second)
+
+    deliveries = spool.list_checkpoint_deliveries(meeting_id, 3)
+    assert len(deliveries) == 2
+    assert deliveries[0].previous_hash is None
+    assert deliveries[1].previous_hash == deliveries[0].checkpoint_hash
+    assert all(delivery.acknowledged for delivery in deliveries)
+    assert state.watermarks[source_id] == (2, 8_000, 4_800, 3_840, False)
 
 
 @pytest.mark.asyncio

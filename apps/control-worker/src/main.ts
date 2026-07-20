@@ -1,4 +1,5 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
+import { setTimeout as sleepTimer } from "node:timers/promises";
 import { boundedErrorKind } from "@transhooter/telemetry";
 import { Redis } from "ioredis";
 import { LiveKitEffects } from "./adapters/livekit-effects";
@@ -291,21 +292,13 @@ async function cleanupResources(resources: RuntimeResources): Promise<void> {
 }
 
 async function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
-  await new Promise<void>((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
+  try {
+    await sleepTimer(milliseconds, undefined, { signal });
+  } catch (error) {
+    if (!signal.aborted || !(error instanceof Error) || error.name !== "AbortError") {
+      throw error;
     }
-    const timer = setTimeout(resolve, milliseconds);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
-  });
+  }
 }
 
 initializeControlTelemetry();

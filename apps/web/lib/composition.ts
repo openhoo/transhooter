@@ -16,6 +16,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import { Pool } from "pg";
 import { type WebConfig, webConfig } from "./config";
 import {
+  AesGcmMagicLinkTokenSealer,
   cryptoPrimitives,
   liveKitAdapters,
   S3ArchiveAdapter,
@@ -221,6 +222,7 @@ export function configuredApplication(): ConfiguredWebApplication {
     internalPrincipalVerifier: internalPrincipalVerifier(config, primitives),
     ...primitives,
     authSecrets: { rateLimitKey: config.sessionSecret },
+    magicLinkTokenSealer: new AesGcmMagicLinkTokenSealer(config.magicLinkSealKeyring),
     publicBaseUrl: config.publicUrl,
     clientIp: (request) =>
       trustedClientIp(

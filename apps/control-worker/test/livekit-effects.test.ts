@@ -1,6 +1,5 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import { TrackSource } from "@livekit/protocol";
 import { EgressStatus } from "livekit-server-sdk";
 import { egressStatusName, LiveKitEffects } from "../src/adapters/livekit-effects";
@@ -48,34 +47,96 @@ function createAdapter(internalToken: () => Promise<string> = async () => token)
   );
 }
 
-test("composite Egress request persists the generation-bound signed layout URL", () => {
+test("canonical Egress intent contains only durable identities and semantic output", () => {
   const adapter = createAdapter();
-  const expires = 123_456;
   const request = {
     roomName: "50000000-0000-4000-8000-000000000003",
     outputPrefix: `v1/meetings/${consultationId}/media/composite/6`,
-    layoutExpiresAtMs: expires,
+    layoutExpiresAtMs: 123_456,
   };
-  const encoded = JSON.parse(
-    Buffer.from(adapter.canonicalRequest(effect, request)).toString("utf8"),
-  ) as {
-    customBaseUrl: string;
-    roomName: string;
-    segmentOutputs: unknown[];
-    kind?: string;
-  };
-  const url = new URL(encoded.customBaseUrl);
-  const expectedSignature = createHmac("sha256", signingKey)
-    .update(`${consultationId}\n6\n${expires}`)
-    .digest("hex");
+  const bytes = Buffer.from(adapter.canonicalRequest(effect, request));
+  const encoded = JSON.parse(bytes.toString("utf8"));
 
-  assert.equal(encoded.kind, undefined);
-  assert.equal(encoded.roomName, request.roomName);
-  assert.equal(encoded.segmentOutputs.length, 1);
-  assert.equal(url.pathname, "/egress-layout");
-  assert.equal(url.searchParams.get("generation"), "6");
-  assert.equal(url.searchParams.get("expires"), String(expires));
-  assert.equal(url.searchParams.get("signature"), expectedSignature);
+  assert.deepEqual(encoded, {
+    consultationId,
+    egressIdentity: effect.id,
+    generation: 6,
+    kind: "ROOM_COMPOSITE_EGRESS",
+    output: {
+      format: "segmented_hls",
+      segmentDurationSeconds: 2,
+    },
+    render: {
+      audioOnly: false,
+      layout: "speaker",
+      videoOnly: false,
+    },
+    roomName: request.roomName,
+  });
+  for (const forbidden of [
+    request.outputPrefix,
+    String(request.layoutExpiresAtMs),
+    "customBaseUrl",
+    "access",
+    "secret",
+    "http://minio:9000",
+    "archive",
+  ]) {
+    assert.equal(bytes.includes(forbidden), false, `persisted ${forbidden}`);
+  }
+});
+
+test("Egress creation returns the durable accepted status without claiming ACTIVE", async () => {
+  const adapter = createAdapter();
+  Object.assign(adapter, {
+    egress: {
+      startRoomCompositeEgress: async () => ({
+        egressId: "EG_starting",
+        status: EgressStatus.EGRESS_STARTING,
+      }),
+    },
+  });
+
+  const result = await adapter.execute(effect, {
+    roomName: "50000000-0000-4000-8000-000000000003",
+    outputPrefix: `v1/meetings/${consultationId}/media/composite/6`,
+    layoutExpiresAtMs: Date.now() + 60_000,
+  });
+
+  assert.deepEqual(result, {
+    remoteId: "EG_starting",
+    result: { egressId: "EG_starting", status: "EGRESS_STARTING" },
+  });
+});
+
+test("Egress adoption preserves STARTING until verified ACTIVE evidence arrives", async () => {
+  const adapter = createAdapter();
+  const roomName = "50000000-0000-4000-8000-000000000003";
+  Object.assign(adapter, {
+    egress: {
+      listEgress: async () => [
+        {
+          egressId: "EG_adopted",
+          roomName,
+          request: { effectId: effect.id },
+          status: EgressStatus.EGRESS_STARTING,
+        },
+      ],
+    },
+  });
+
+  const adoption = await adapter.adopt(effect, {
+    roomName,
+    outputPrefix: `v1/meetings/${consultationId}/media/composite/6`,
+    layoutExpiresAtMs: Date.now() + 60_000,
+  });
+
+  assert.deepEqual(adoption, {
+    remoteId: "EG_adopted",
+    matchesRequest: true,
+    terminal: false,
+    result: { egressId: "EG_adopted", status: "EGRESS_STARTING" },
+  });
 });
 
 test("delete drain callback carries the fenced archive write epoch", async () => {
@@ -93,16 +154,25 @@ test("delete drain callback carries the fenced archive write epoch", async () =>
 
   try {
     const adapter = createAdapter();
-    const drained = await adapter.notifyDeleteDrain(consultationId, 9);
+    const drained = await adapter.notifyDeleteDrain(consultationId, 9, "retention_delete");
 
     assert.equal(drained, true);
     assert.deepEqual(submitted, {
       consultationId,
       writeEpoch: 9,
+      reason: "retention_delete",
     });
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("delete drain rejects a blank durable reason", async () => {
+  const adapter = createAdapter();
+  await assert.rejects(
+    () => adapter.notifyDeleteDrain(consultationId, 9, "  "),
+    /reason must be nonblank/,
+  );
 });
 
 test("internal callback reloads a rotated projected bearer for every request", async () => {
@@ -119,9 +189,9 @@ test("internal callback reloads a rotated projected bearer for every request", a
 
   try {
     const adapter = createAdapter(async () => projectedToken);
-    await adapter.notifyDeleteDrain(consultationId, 9);
+    await adapter.notifyDeleteDrain(consultationId, 9, "retention_delete");
     projectedToken = "second";
-    await adapter.notifyDeleteDrain(consultationId, 9);
+    await adapter.notifyDeleteDrain(consultationId, 9, "retention_delete");
     assert.deepEqual(authorizations, ["Bearer first", "Bearer second"]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -206,6 +276,55 @@ test("room drain adoption waits for every Egress terminal", async () => {
   assert.equal((await adapter.adopt(drain, drain.plan))?.matchesRequest, true);
 });
 
+test("participant Egress adoption uses the persisted resource room and Egress identity", async () => {
+  const adapter = createAdapter();
+  const resourceRoomName = "50000000-0000-4000-8000-000000000003";
+  const participantIdentity = "50000000-0000-4000-8000-000000000004";
+  const queriedRooms: string[] = [];
+  Object.assign(adapter, {
+    egress: {
+      listEgress: async ({ roomName }: { roomName: string }) => {
+        queriedRooms.push(roomName);
+        return [
+          {
+            egressId: "EG_stale",
+            roomName: resourceRoomName,
+            status: EgressStatus.EGRESS_ACTIVE,
+            request: { segmentOutputs: [{ filenamePrefix: "archive/old-effect-id" }] },
+          },
+          {
+            egressId: "EG_current",
+            roomName: resourceRoomName,
+            status: EgressStatus.EGRESS_ACTIVE,
+            request: {
+              identity: participantIdentity,
+              segmentOutputs: [{ filenamePrefix: `archive/${effect.id}` }],
+            },
+          },
+        ];
+      },
+    },
+  });
+  const participantEgress = {
+    ...effect,
+    kind: "PARTICIPANT_EGRESS" as const,
+  };
+  const request = {
+    roomName: "cleanup-generation-room",
+    resourceRoomName,
+    participantIdentity,
+    outputPrefix: `v1/meetings/${consultationId}/media/participants/6`,
+  };
+
+  assert.deepEqual(await adapter.adopt(participantEgress, request), {
+    remoteId: "EG_current",
+    matchesRequest: true,
+    terminal: false,
+    result: { egressId: "EG_current", status: "EGRESS_ACTIVE" },
+  });
+  assert.deepEqual(queriedRooms, [resourceRoomName]);
+});
+
 test("participant grant adoption retries until the exact least-privilege grant exists", async () => {
   const adapter = createAdapter();
   let permission = {
@@ -239,6 +358,84 @@ test("participant grant adoption retries until the exact least-privilege grant e
     canPublishSources: [TrackSource.MICROPHONE, TrackSource.CAMERA],
   };
   assert.equal((await adapter.adopt(grant, grant.plan))?.matchesRequest, true);
+});
+
+test("participant grant compensation revokes the exact persisted identity", async () => {
+  const adapter = createAdapter();
+  const updates: unknown[] = [];
+  const roomName = "50000000-0000-4000-8000-000000000003";
+  const participantIdentity = "50000000-0000-4000-8000-000000000004";
+
+  Object.assign(adapter, {
+    rooms: {
+      getParticipant: async (room: string, identity: string) => {
+        assert.equal(room, roomName);
+        assert.equal(identity, participantIdentity);
+        return { sid: "PA_untrusted_for_cleanup" };
+      },
+      updateParticipant: async (room: string, identity: string, update: unknown) => {
+        updates.push({ room, identity, update });
+      },
+    },
+  });
+
+  await adapter.compensate({
+    ...effect,
+    kind: "PARTICIPANT_GRANT",
+    remoteId: "PA_untrusted_for_cleanup",
+    plan: { roomName, participantIdentity },
+  });
+
+  assert.deepEqual(updates, [
+    {
+      room: roomName,
+      identity: participantIdentity,
+      update: {
+        permission: {
+          canSubscribe: false,
+          canPublish: false,
+          canPublishData: false,
+          canPublishSources: [],
+        },
+      },
+    },
+  ]);
+});
+
+test("participant removal targets the persisted resource room", async () => {
+  const adapter = createAdapter();
+  const resourceRoomName = "50000000-0000-4000-8000-000000000003";
+  const participantIdentity = "50000000-0000-4000-8000-000000000004";
+  const rooms: string[] = [];
+  Object.assign(adapter, {
+    rooms: {
+      listParticipants: async (roomName: string) => {
+        rooms.push(roomName);
+        return [];
+      },
+      removeParticipant: async (roomName: string, identity: string) => {
+        rooms.push(roomName);
+        assert.equal(identity, participantIdentity);
+      },
+    },
+  });
+  const removal = {
+    ...effect,
+    kind: "PARTICIPANT_REMOVE" as const,
+  };
+  const request = {
+    roomName: "cleanup-generation-room",
+    resourceRoomName,
+    participantIdentity,
+  };
+  const canonical = JSON.parse(
+    Buffer.from(adapter.canonicalRequest(removal, request)).toString("utf8"),
+  ) as { room: string };
+
+  assert.equal(canonical.room, resourceRoomName);
+  assert.equal((await adapter.adopt(removal, request))?.terminal, true);
+  await adapter.execute(removal, request);
+  assert.deepEqual(rooms, [resourceRoomName, resourceRoomName]);
 });
 
 test("compensation discovers an ambiguous deterministic room create", async () => {

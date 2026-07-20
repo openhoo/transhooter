@@ -22,7 +22,7 @@ images:
 
 telemetry:
   enabled: false
-  endpoint: http://transhooter-otel-collector:4318
+  endpoint: ""
   traceSampleRatio: 0.01
   metricExportIntervalMillis: 60000
   collector:
@@ -48,6 +48,12 @@ replicas:
   spoolDrainer: 1
 
 existingSecret: transhooter-runtime
+magicLinkSealKeys:
+  existingSecret: transhooter-runtime
+  # Project this key into the web pod. Rotate the JSON keyring in-place while
+  # retaining decrypt-only keys, then bump rollout.runtimeSecretRevision.
+  secretKey: magic-link-seal-keys
+  mountPath: /run/secrets/magic-link-seal-keys
 providerSecretName: transhooter-provider
 providerSecretKeys: [google-adc.json]
 egressConfigSecret: transhooter-egress-config
@@ -63,6 +69,7 @@ config:
   providerProfile: google-eu
   livekitUrl: wss://livekit.example.invalid
   s3Endpoint: https://s3.example.invalid
+  s3PublicEndpoint: https://s3.example.invalid
   s3Region: eu-central-1
   s3Bucket: transhooter
   s3KmsKeyId: example-kms-key-id

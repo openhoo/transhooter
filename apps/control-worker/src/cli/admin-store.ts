@@ -73,15 +73,27 @@ export async function setLanguage(databaseUrl: string, input: SetLanguageInput):
   const client = postgres(databaseUrl, { max: 1, prepare: false });
   try {
     const result = await client`
-      UPDATE provider_direction_capabilities
-      SET admin_enabled=${input.enabled},updated_at=now()
-      WHERE profile_id=${input.profileId}
-        AND profile_revision=${input.revision}
-        AND source_locale=${input.source}
-        AND target_locale=${input.target}
+      WITH candidate AS (
+        SELECT capability.id
+        FROM language_capabilities AS capability
+        JOIN provider_profiles AS profile
+          ON profile.id=capability.profile_id
+         AND profile.current_revision=capability.revision
+        WHERE capability.profile_id=${input.profileId}
+          AND capability.revision=${input.revision}
+          AND capability.source_locale=${input.source}
+          AND capability.target_locale=${input.target}
+      )
+      UPDATE language_capabilities
+      SET enabled=${input.enabled}
+      WHERE id=(
+        SELECT id
+        FROM candidate
+        WHERE (SELECT count(*) FROM candidate)=1
+      )
     `;
     if (result.count !== 1) {
-      throw new Error("exactly one immutable profile direction must match");
+      throw new Error("language capability revision is stale or does not exist");
     }
   } finally {
     await client.end({ timeout: 5 });

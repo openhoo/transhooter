@@ -88,6 +88,25 @@ function runTransaction<T>(work: (value: Transaction) => Promise<T>): Promise<T>
   return work(transaction);
 }
 
+function finalizingRepository(): ArchiveRepository {
+  return {
+    transaction: runTransaction,
+    lockByConsultation: async () =>
+      lockedArchive({
+        state: "reconciling",
+        writeEpoch: 0,
+        finalInventoryHash: null,
+      }),
+    finalInventoryHash: async () => null,
+    unresolvedExpectations: async () => [],
+    inventoryObjects: async () => [],
+    completePrerequisites: async () => true,
+    recordObject: async () => undefined,
+    createFinalInventory: async () => true,
+    transition: async () => true,
+  } as unknown as ArchiveRepository;
+}
+
 describe("ArchiveService invariants", () => {
   it("rejects a different create-once final inventory hash before storage", async () => {
     const storage = {
@@ -111,9 +130,143 @@ describe("ArchiveService invariants", () => {
     expect(storage.putCreateOnce).not.toHaveBeenCalled();
   });
 
+  it("rethrows the original PUT error when create-once recovery finds no object", async () => {
+    const putError = new Error("temporary object storage failure");
+    const storage = {
+      putCreateOnce: async () => {
+        throw putError;
+      },
+      head: async () => null,
+    } as unknown as ObjectStoragePort;
+    const service = createService(finalizingRepository(), storage);
+
+    await expect(service.finalizeInventory(CONSULTATION, finalInventory())).rejects.toBe(putError);
+  });
+
+  it("reports an immutable conflict only when recovery finds a different hash", async () => {
+    const storage = {
+      putCreateOnce: async () => {
+        throw new Error("precondition failed");
+      },
+      head: async () => ({
+        versionId: "existing-version",
+        size: 1,
+        checksum: CONFLICTING_HASH,
+        sha256: CONFLICTING_HASH,
+      }),
+    } as unknown as ObjectStoragePort;
+    const service = createService(finalizingRepository(), storage);
+
+    await expect(service.finalizeInventory(CONSULTATION, finalInventory())).rejects.toMatchObject({
+      code: "FINAL_INVENTORY_CONFLICT",
+    });
+  });
+
+  it("accepts an existing create-once object with the expected hash", async () => {
+    const verify = mock(async () => true);
+    const storage = {
+      putCreateOnce: async () => {
+        throw new Error("precondition failed");
+      },
+      head: async () => ({
+        versionId: "existing-version",
+        size: 1,
+        checksum: FINAL_HASH,
+        sha256: FINAL_HASH,
+      }),
+      verify,
+    } as unknown as ObjectStoragePort;
+    const service = createService(finalizingRepository(), storage);
+
+    await expect(service.finalizeInventory(CONSULTATION, finalInventory())).resolves.toEqual({
+      created: true,
+      sha256: FINAL_HASH,
+    });
+    expect(verify).toHaveBeenCalledWith({
+      key: `v1/meetings/${CONSULTATION}/inventory/final.json`,
+      versionId: "existing-version",
+      size: 1,
+      checksum: FINAL_HASH,
+    });
+  });
+
+  it("rejects expired sessions and future reauthentication timestamps before mutation", async () => {
+    const transactionCall = mock(runTransaction);
+    const service = createService(
+      { transaction: transactionCall } as unknown as ArchiveRepository,
+      {} as ObjectStoragePort,
+    );
+
+    await expect(
+      service.addHold(
+        CONSULTATION,
+        {
+          ...reauthenticatedSession(),
+          expiresAt: NOW,
+        },
+        "case",
+      ),
+    ).rejects.toMatchObject({ code: "REAUTH_REQUIRED" });
+    await expect(
+      service.addHold(
+        CONSULTATION,
+        {
+          ...reauthenticatedSession(),
+          reauthenticatedAt: new Date(NOW.getTime() + 1),
+        },
+        "case",
+      ),
+    ).rejects.toMatchObject({ code: "REAUTH_REQUIRED" });
+
+    expect(transactionCall).not.toHaveBeenCalled();
+  });
+
+  it("records the deletion actor and required reason in durable admission records", async () => {
+    const appended: unknown[] = [];
+    const enqueued: unknown[] = [];
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () => lockedArchive(),
+      claimStaleHoldOperation: async () => null,
+      activeHolds: async () => [],
+      incrementWriteEpoch: async () => 3,
+      fenceWritersForDeletion: async () => undefined,
+      transition: async () => true,
+    } as unknown as ArchiveRepository;
+    const service = new ArchiveService(
+      repository,
+      {} as ObjectStoragePort,
+      { append: async (event: unknown) => void appended.push(event) } as never,
+      clock,
+      ids,
+      hash,
+      { enqueue: async (effect: unknown) => void enqueued.push(effect) } as never,
+    );
+
+    await service.beginDelete(CONSULTATION, reauthenticatedSession(), "  retention elapsed  ");
+
+    expect(appended).toContainEqual(
+      expect.objectContaining({
+        actorId: ACTOR_ID,
+        kind: "archive.deletion_admitted",
+        details: { writeEpoch: 3, reason: "retention elapsed" },
+      }),
+    );
+    expect(enqueued).toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          actorId: ACTOR_ID,
+          reason: "retention elapsed",
+        }),
+      }),
+    );
+  });
+
   it("requires two epoch-bound empty deletion scans before deleted", async () => {
     let state = "deleting";
     const scans: number[] = [];
+    const results: unknown[] = [];
+    let versionListings = 0;
     const repository = {
       transaction: runTransaction,
       lockByConsultation: async () =>
@@ -122,8 +275,9 @@ describe("ArchiveService invariants", () => {
           writeEpoch: 7,
         }),
       deletionWritersDrained: async () => true,
-      recordDeletionScan: async (input: { consecutiveEmpty: number }) => {
+      recordDeletionScan: async (input: { consecutiveEmpty: number; result: unknown }) => {
         scans.push(input.consecutiveEmpty);
+        results.push(input.result);
       },
       completeDeletion: async () => {
         state = "deleted";
@@ -133,15 +287,33 @@ describe("ArchiveService invariants", () => {
     } as unknown as ArchiveRepository;
     const storage = {
       listMultipart: async () => [],
-      listMeetingVersions: async () => ({ versions: [], cursor: null }),
+      listMeetingVersions: async () => ({
+        versions:
+          versionListings++ === 0 ? [{ key: "v1/meetings/x/object", versionId: "version-1" }] : [],
+        cursor: null,
+      }),
       abortMultipart: async () => undefined,
       deleteVersions: async () => undefined,
     } as unknown as ObjectStoragePort;
     const service = createService(repository, storage);
 
-    await expect(service.drainDeletion(CONSULTATION, 7)).resolves.toBe(true);
+    await expect(service.drainDeletion(CONSULTATION, 7, "retention expired")).resolves.toBe(true);
 
     expect(scans).toEqual([1, 2]);
+    expect(results[0]).toEqual({
+      deletedVersions: 1,
+      abortedUploads: 0,
+      writersDrained: true,
+      reason: "retention expired",
+      versions: [
+        {
+          key: "v1/meetings/x/object",
+          versionId: "version-1",
+          outcome: "deleted",
+          reason: "retention expired",
+        },
+      ],
+    });
     expect(state).toBe("deleted");
   });
 
@@ -270,6 +442,30 @@ describe("ArchiveService invariants", () => {
     await expect(service.addHold(CONSULTATION, reauthenticatedSession(), "case")).resolves.toBe(
       GENERATED_ID,
     );
+  });
+
+  it("terminates version pagination when a continuation cursor repeats", async () => {
+    const listMeetingVersions = mock(async () => ({
+      versions: [],
+      cursor: "repeated-cursor",
+    }));
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () => lockedArchive(),
+      claimStaleHoldOperation: async () => null,
+      beginHoldOperation: async () => true,
+      addHold: async () => undefined,
+    } as unknown as ArchiveRepository;
+    const storage = { listMeetingVersions } as unknown as ObjectStoragePort;
+    const service = createService(repository, storage);
+
+    await expect(
+      service.addHold(CONSULTATION, reauthenticatedSession(), "case"),
+    ).rejects.toMatchObject({
+      code: "ARCHIVE_STORAGE_PROTOCOL_ERROR",
+      message: "version listing repeated continuation cursor: repeated-cursor",
+    });
+    expect(listMeetingVersions).toHaveBeenCalledTimes(2);
   });
 
   it("rejects a concurrent hold mutation while an archive operation owner is active", async () => {
@@ -454,7 +650,9 @@ describe("ArchiveService invariants", () => {
     } as unknown as ArchiveRepository;
     const service = createService(repository, storage);
 
-    await expect(service.drainDeletion(CONSULTATION, 7)).rejects.toThrowError(/ARCHIVE_FENCED/);
+    await expect(service.drainDeletion(CONSULTATION, 7, "retention expired")).rejects.toThrowError(
+      /ARCHIVE_FENCED/,
+    );
 
     expect(storage.listMultipart).not.toHaveBeenCalled();
   });
@@ -476,7 +674,7 @@ describe("ArchiveService invariants", () => {
     } as unknown as ArchiveRepository;
     const service = createService(repository, storage);
 
-    await expect(service.drainDeletion(CONSULTATION, 7)).resolves.toBe(true);
+    await expect(service.drainDeletion(CONSULTATION, 7, "retention expired")).resolves.toBe(true);
 
     expect(storage.listMultipart).not.toHaveBeenCalled();
   });
@@ -496,7 +694,7 @@ describe("ArchiveService invariants", () => {
     } as unknown as ArchiveRepository;
     const service = createService(repository, storage);
 
-    await expect(service.drainDeletion(CONSULTATION, 7)).resolves.toBe(false);
+    await expect(service.drainDeletion(CONSULTATION, 7, "retention expired")).resolves.toBe(false);
 
     expect(storage.listMultipart).not.toHaveBeenCalled();
   });
@@ -891,6 +1089,59 @@ describe("ArchiveService invariants", () => {
     }
     expect(putCreateOnce).not.toHaveBeenCalled();
   });
+  it("rejects a false content-type claim even when every other object field matches", async () => {
+    const claimed = {
+      objectId: OBJECT_ID,
+      class: "checkpoint" as const,
+      key: `v1/meetings/${CONSULTATION}/inventory/checkpoint`,
+      versionId: "v1",
+      size: 1,
+      sha256: CONFLICTING_HASH,
+      s3Checksum: "crc",
+      contentType: "application/json",
+      sampleRange: null,
+      attempt: null,
+      sequence: null,
+    };
+    const putCreateOnce = mock();
+    const repository = {
+      transaction: runTransaction,
+      lockByConsultation: async () =>
+        lockedArchive({ state: "reconciling", finalInventoryHash: null }),
+      finalInventoryHash: async () => null,
+      unresolvedExpectations: async () => [],
+      inventoryObjects: async () => [
+        {
+          id: OBJECT_ID,
+          consultationId: CONSULTATION,
+          objectClass: claimed.class,
+          causalKey: "checkpoint:1",
+          key: claimed.key,
+          versionId: claimed.versionId,
+          size: claimed.size,
+          sha256: claimed.sha256,
+          s3Checksum: claimed.s3Checksum,
+          contentType: "application/octet-stream",
+          sampleStart: null,
+          sampleEnd: null,
+          attempt: null,
+          sequence: null,
+          writerEpoch: 2,
+        },
+      ],
+      completePrerequisites: async () => true,
+    } as unknown as ArchiveRepository;
+    const service = createService(repository, { putCreateOnce } as unknown as ObjectStoragePort);
+
+    await expect(
+      service.finalizeInventory(CONSULTATION, {
+        ...finalInventory(),
+        objects: [claimed],
+      }),
+    ).rejects.toMatchObject({ code: "INVENTORY_OBJECT_MISMATCH" });
+    expect(putCreateOnce).not.toHaveBeenCalled();
+  });
+
   it("rejects spool-drainer writes after archive finalization", async () => {
     const verify = mock(async () => true);
     const recordObject = mock(async () => undefined);

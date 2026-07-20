@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 
+import transhooter_worker.application.pipeline as pipeline_module
 from transhooter_worker.adapters.fixture.provider import (
     FixtureSttProvider,
     FixtureTranslationProvider,
@@ -422,3 +423,43 @@ async def test_two_fixture_directions_report_every_provider_terminal_once(
         assert {report[0] for report in direction_reports} == {"stt", "translation", "tts"}
     assert all(report[2] == 1 for report in reports)
     assert all(report[5] <= report[6] for report in reports)
+
+
+@pytest.mark.asyncio
+async def test_ordered_queue_processing_failure_does_not_count_as_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingCounter:
+        def __init__(self) -> None:
+            self.measurements: list[tuple[int, dict[str, str]]] = []
+
+        def add(self, amount: int, attributes: dict[str, str]) -> None:
+            self.measurements.append((amount, attributes))
+
+    submissions = RecordingCounter()
+    executions = RecordingCounter()
+    monkeypatch.setattr(pipeline_module, "_ORDERED_QUEUE_SUBMISSIONS", submissions)
+    monkeypatch.setattr(pipeline_module, "_ORDERED_QUEUE_EXECUTIONS", executions)
+    queue = pipeline_module.OrderedStageQueue(maximum=2)
+    discarded_work_ran = False
+
+    async def fail_during_processing() -> None:
+        raise RuntimeError("processing failed")
+
+    async def discarded_work() -> None:
+        nonlocal discarded_work_ran
+        discarded_work_ran = True
+
+    await queue.submit(final=False, work=fail_during_processing)
+    await queue.submit(final=False, work=discarded_work)
+
+    with pytest.raises(RuntimeError, match="processing failed"):
+        await queue.run()
+
+    assert sum(amount for amount, _ in submissions.measurements) == 2
+    assert [attributes["result"] for _, attributes in submissions.measurements] == [
+        "accepted",
+        "accepted",
+    ]
+    assert executions.measurements == [(1, {"stage": "ordered", "result": "failed"})]
+    assert discarded_work_ran is False

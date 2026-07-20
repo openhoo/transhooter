@@ -3,8 +3,8 @@
 import { Room } from "livekit-client";
 import type { FormEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "@/lib/browser-api";
-import { describeLobbyPhase, type LobbyPhase } from "@/lib/lobby-phase";
+import { ApiError, api } from "@/lib/browser-api";
+import { describeLobbyPhase, type LobbyPhase, LobbyPreviewFence } from "@/lib/lobby-phase";
 import { persistDevicePreference } from "./interface-state";
 import styles from "./lobby.module.css";
 
@@ -71,6 +71,7 @@ function useLobbyPolling(
 
     let active = true;
     let timer: number | undefined;
+    let joinRequested = false;
 
     async function poll() {
       const requestGeneration = pollGeneration.current;
@@ -83,6 +84,25 @@ function useLobbyPolling(
         setPollError("");
         if (next.redirectTo) {
           window.location.replace(next.redirectTo);
+        } else if (next.phase === "ready" && next.snapshotHash && !joinRequested) {
+          joinRequested = true;
+          try {
+            const joined = await api<{ redirectTo?: string }>(
+              `/api/consultations/${consultationId}/join`,
+              {
+                method: "POST",
+                body: JSON.stringify({ snapshotHash: next.snapshotHash }),
+              },
+            );
+            if (joined.redirectTo) {
+              window.location.replace(joined.redirectTo);
+            } else {
+              setData(next);
+            }
+          } catch (cause) {
+            joinRequested = false;
+            throw cause;
+          }
         } else {
           setData(next);
         }
@@ -114,14 +134,19 @@ function useLobbyPolling(
 
 function useLocalDevicePreview(setError: (message: string) => void) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const stream = useRef<MediaStream | null>(null);
+  const previewFence = useRef(new LobbyPreviewFence<MediaStream>());
   const audioUnlockRoom = useRef<Room | null>(null);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
 
   const stopPreview = useCallback(() => {
-    stream.current?.getTracks().forEach((track) => {
-      track.stop();
-    });
+    previewFence.current.cancel();
+    try {
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    } catch {
+      // The video element may disappear while an acquisition is settling.
+    }
   }, []);
 
   useEffect(() => {
@@ -133,40 +158,78 @@ function useLocalDevicePreview(setError: (message: string) => void) {
 
   const preview = useCallback(async () => {
     setError("");
-    stopPreview();
+    const fence = previewFence.current;
+    const request = fence.begin();
+    try {
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    } catch {
+      // A superseded preview may already have lost its video element.
+    }
+    let media: MediaStream;
 
     try {
-      const media = await navigator.mediaDevices.getUserMedia({
+      media = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: true,
       });
-      stream.current = media;
-      media.getTracks().forEach((track) => {
-        track.addEventListener(
-          "ended",
-          () => {
-            setError("Camera or microphone access ended. Preview again before joining.");
-          },
-          { once: true },
+    } catch {
+      if (fence.settle(request)) {
+        setError(
+          "Camera or microphone access is blocked. Allow access in your browser, then try again.",
         );
-      });
-      media.addEventListener(
-        "inactive",
+      }
+      return;
+    }
+
+    if (!fence.adopt(request, media)) {
+      return;
+    }
+
+    const settleOwnedPreview = (message: string) => {
+      if (fence.owns(request, media) && fence.settle(request)) {
+        setError(message);
+      }
+    };
+    media.getTracks().forEach((track) => {
+      track.addEventListener(
+        "ended",
         () => {
-          setError("Camera and microphone preview stopped. Preview again before joining.");
+          settleOwnedPreview("Camera or microphone access ended. Preview again before joining.");
         },
         { once: true },
       );
-      if (videoRef.current) {
-        videoRef.current.srcObject = media;
+    });
+    media.addEventListener(
+      "inactive",
+      () => {
+        settleOwnedPreview("Camera and microphone preview stopped. Preview again before joining.");
+      },
+      { once: true },
+    );
+
+    try {
+      const video = videoRef.current;
+      if (!video || !fence.owns(request, media)) {
+        fence.settle(request);
+        return;
       }
-      setDevices(await navigator.mediaDevices.enumerateDevices());
+      video.srcObject = media;
     } catch {
-      setError(
-        "Camera or microphone access is blocked. Allow access in your browser, then try again.",
-      );
+      fence.settle(request);
+      return;
     }
-  }, [setError, stopPreview]);
+
+    try {
+      const nextDevices = await navigator.mediaDevices.enumerateDevices();
+      if (fence.owns(request, media)) {
+        setDevices(nextDevices);
+      }
+    } catch {
+      // Preview remains usable when device enumeration is unavailable.
+    }
+  }, [setError]);
 
   const unlockAudio = useCallback(async () => {
     audioUnlockRoom.current ??= new Room();
@@ -438,6 +501,7 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
     setBusy(true);
     setError("");
     pollGeneration.current += 1;
+    stopPreview();
 
     const values = new FormData(event.currentTarget);
     const microphoneValue = values.get("microphone");
@@ -458,7 +522,6 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
           cameraId,
         }),
       });
-      stopPreview();
       if (describeLobbyPhase(next.phase).contentKind !== phaseDescriptor.contentKind) {
         setFocusPhaseRequest((current) => current + 1);
       }
@@ -491,18 +554,37 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
           accepted: true,
         }),
       });
-      const result = await api<{ status: "ready" | "provisioning"; redirectTo?: string }>(
-        `/api/consultations/${consultationId}/join`,
-        {
+      let result: { status: "ready" | "provisioning"; redirectTo?: string } | undefined;
+      let recoveredLobby: LobbyState | undefined;
+      try {
+        result = await api(`/api/consultations/${consultationId}/join`, {
           method: "POST",
           body: JSON.stringify({ snapshotHash: data.snapshotHash }),
-        },
-      );
+        });
+      } catch (cause) {
+        if (
+          !(cause instanceof ApiError && cause.status === 409 && cause.code === "CONSENT_REQUIRED")
+        ) {
+          throw cause;
+        }
+        recoveredLobby = await api<LobbyState>(`/api/consultations/${consultationId}`);
+        if (
+          !recoveredLobby.redirectTo &&
+          recoveredLobby.phase === "ready" &&
+          recoveredLobby.snapshotHash
+        ) {
+          result = await api(`/api/consultations/${consultationId}/join`, {
+            method: "POST",
+            body: JSON.stringify({ snapshotHash: recoveredLobby.snapshotHash }),
+          });
+        }
+      }
 
-      if (result.redirectTo) {
+      if (result?.redirectTo) {
         window.location.replace(result.redirectTo);
       } else {
-        const next = await api<LobbyState>(`/api/consultations/${consultationId}`);
+        const next =
+          recoveredLobby ?? (await api<LobbyState>(`/api/consultations/${consultationId}`));
         if (next.redirectTo) {
           window.location.replace(next.redirectTo);
         } else {

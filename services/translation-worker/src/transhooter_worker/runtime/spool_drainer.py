@@ -215,7 +215,13 @@ def build_archive(root: Path) -> S3Archive:
 
 
 class RetryableRegistrationError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        failures: tuple[Exception, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.failures = failures
 
 
 class PermanentRegistrationError(RuntimeError):
@@ -372,6 +378,17 @@ async def _register_object_async(
         _finish_span(span, "ok")
 
 
+def _raise_registration_failures(failures: list[Exception]) -> None:
+    if not failures:
+        return
+    if len(failures) == 1:
+        raise failures[0]
+    raise RetryableRegistrationError(
+        f"{len(failures)} archive object registrations remain retryable",
+        tuple(failures),
+    )
+
+
 def upload_committed_objects(
     spool: EncryptedSpool,
     archive: ArchiveStore,
@@ -379,6 +396,7 @@ def upload_committed_objects(
     meeting_id: UUID | None = None,
 ) -> None:
     pcm_stages = {"stt-input", "tts-output", "livekit-output"}
+    retryable_failures: list[Exception] = []
     for spool_ref, _ in spool.committed():
         meeting, attempt, stage, ordinal, media_type = spool.context(spool_ref.object_id)
         if (
@@ -414,12 +432,17 @@ def upload_committed_objects(
                 bounded_error_kind(error),
             )
             continue
+        except Exception as error:
+            retryable_failures.append(error)
+            continue
         spool.mark_uploaded(
             spool_ref.object_id,
             archive_record.version_id,
             archive_record.s3_checksum,
         )
         _record_object("uploaded", object_class)
+    spool.compact_uploaded_envelopes()
+    _raise_registration_failures(retryable_failures)
 
 
 async def upload_committed_objects_async(
@@ -429,6 +452,7 @@ async def upload_committed_objects_async(
     meeting_id: UUID,
 ) -> None:
     pcm_stages = {"stt-input", "tts-output", "livekit-output"}
+    retryable_failures: list[Exception] = []
     for spool_ref, _ in spool.committed():
         meeting, attempt, stage, ordinal, media_type = spool.context(spool_ref.object_id)
         if meeting != meeting_id or stage in pcm_stages or stage == "checkpoint":
@@ -460,12 +484,17 @@ async def upload_committed_objects_async(
                 bounded_error_kind(error),
             )
             continue
+        except Exception as error:
+            retryable_failures.append(error)
+            continue
         spool.mark_uploaded(
             spool_ref.object_id,
             archive_record.version_id,
             archive_record.s3_checksum,
         )
         _record_object("uploaded", object_class)
+    spool.compact_uploaded_envelopes()
+    _raise_registration_failures(retryable_failures)
 
 
 def _drain_once(
@@ -498,7 +527,7 @@ def _drain_once(
 def main() -> None:
     telemetry = configure_telemetry(
         os.environ.get("OTEL_SERVICE_NAME", "").strip() or "transhooter-spool-drainer",
-        endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        endpoint=None,
         environment=os.environ.get("APP_ENV"),
         metric_export_interval_millis=_metric_export_interval(),
     )

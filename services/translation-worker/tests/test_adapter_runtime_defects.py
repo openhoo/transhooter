@@ -10,8 +10,10 @@ import httpx
 import pytest
 from websockets.frames import Frame, Opcode
 
+from transhooter_worker.adapters.deepgram import provider as deepgram_provider
 from transhooter_worker.adapters.deepgram.sansio import SansIoWebSocket
 from transhooter_worker.adapters.deepl.provider import DeepLConfig, DeepLProvider
+from transhooter_worker.adapters.google import provider as google_provider
 from transhooter_worker.adapters.google.provider import (
     GoogleConfig,
     GoogleSttSession,
@@ -91,6 +93,7 @@ class BlockingUnaryCall:
 class BlockingTranslationChannel:
     def __init__(self) -> None:
         self.calls = 0
+        self.closes = 0
         self.call: BlockingUnaryCall | None = None
 
         self.created = asyncio.Event()
@@ -109,6 +112,9 @@ class BlockingTranslationChannel:
             return self.call
 
         return invoke
+
+    async def close(self) -> None:
+        self.closes += 1
 
 
 @pytest.mark.asyncio
@@ -134,6 +140,43 @@ async def test_google_translation_caller_cancellation_does_not_restart_provider_
     assert channel.calls == 1
     assert outcome.terminal.outcome is Outcome.SUCCEEDED
     assert outcome.result is not None and outcome.result.text == "Guten Tag"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("owned", "expected_closes"), [(True, 1), (False, 0)])
+async def test_google_translation_closes_only_owned_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    owned: bool,
+    expected_closes: int,
+) -> None:
+    channel = BlockingTranslationChannel()
+    monkeypatch.setattr(google_provider, "authenticated_channel", lambda *_: channel)
+    request = TranslationRequest(
+        uuid4(),
+        uuid4(),
+        "final",
+        "en",
+        "de",
+        "hello",
+        SampleRange(0, 1),
+    )
+    provider = GoogleTranslationProvider(
+        google_config(),
+        MemoryJournal(),
+        None if owned else channel,
+    )
+    attempt = await provider.start(request)
+    result_waiter = asyncio.create_task(attempt.result())
+    await channel.created.wait()
+    call = channel.call
+    assert call is not None
+    await call.entered.wait()
+
+    call.release.set()
+    outcome = await result_waiter
+
+    assert outcome.terminal.outcome is Outcome.SUCCEEDED
+    assert channel.closes == expected_closes
 
 
 @pytest.mark.asyncio
@@ -338,6 +381,35 @@ async def test_deepgram_failed_upgrade_closes_tcp_writer(monkeypatch: pytest.Mon
     assert writer.closed and writer.waited
 
 
+@pytest.mark.asyncio
+async def test_deepgram_connect_timeout_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def open_stream(*_: Any) -> tuple[object, RecordingWriter]:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(SansIoWebSocket, "_CONNECT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(SansIoWebSocket, "_open_tls_stream", open_stream)
+
+    with pytest.raises(TimeoutError):
+        await SansIoWebSocket.connect(
+            "wss://api.eu.deepgram.com/v1/listen",
+            "Token secret",
+            lambda *_: None,
+        )
+
+    assert entered.is_set()
+    assert cancelled.is_set()
+
+
 class BlockingReader:
     async def read(self, _: int) -> bytes:
         await asyncio.Event().wait()
@@ -368,6 +440,81 @@ async def test_deepgram_inbound_queue_is_bounded_with_backpressure() -> None:
     socket._reader_task.cancel()
     await asyncio.gather(socket._reader_task, return_exceptions=True)
     assert writer.closed and writer.waited
+
+
+@pytest.mark.asyncio
+async def test_deepgram_read_timeout_closes_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = RecordingWriter()
+    monkeypatch.setattr(SansIoWebSocket, "_READ_TIMEOUT_SECONDS", 0.01)
+
+    socket = SansIoWebSocket(
+        BlockingReader(),
+        writer,
+        IdleProtocol(),
+        lambda *_: None,
+    )
+    with pytest.raises(TimeoutError):
+        await socket._reader_task
+
+    assert writer.closed and writer.waited
+
+
+class HangingFinalizeSocket:
+    close_code = 1000
+    close_reason = "closed"
+
+    def __init__(self) -> None:
+        self.closed = asyncio.Event()
+        self.finalize_started = asyncio.Event()
+        self.finalize_cancelled = asyncio.Event()
+
+    def __aiter__(self) -> AsyncIterator[str | bytes]:
+        async def stream() -> AsyncIterator[str | bytes]:
+            await self.closed.wait()
+            if False:
+                yield b""
+
+        return stream()
+
+    async def send(self, message: str | bytes) -> None:
+        if isinstance(message, str) and '"type":"Finalize"' in message:
+            self.finalize_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.finalize_cancelled.set()
+                raise
+
+    async def close(self, **_: object) -> None:
+        self.closed.set()
+
+
+@pytest.mark.asyncio
+async def test_deepgram_finalize_timeout_terminalizes_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = MemoryJournal()
+    socket = HangingFinalizeSocket()
+    config = deepgram_provider.DeepgramConfig(
+        "secret",
+        uuid4(),
+        "en-US",
+        "voice",
+        ("voice",),
+        credential_fingerprint="credential",
+    )
+    monkeypatch.setattr(deepgram_provider, "_COMPLETION_TIMEOUT_SECONDS", 0.01)
+    session = deepgram_provider.DeepgramSttSession(config, journal, uuid4(), socket, [])
+
+    terminal = await session.finish()
+
+    assert socket.finalize_started.is_set()
+    assert socket.finalize_cancelled.is_set()
+    assert terminal.outcome is Outcome.FAILED
+    assert terminal.error is not None
+    assert terminal.error.provider_code == "CompletionError"
 
 
 class OneReadReader:
@@ -475,6 +622,38 @@ class CancellationSettlingTransport(httpx.AsyncBaseTransport):
 
 
 @pytest.mark.asyncio
+async def test_deepl_cancel_waits_for_transport_settlement_before_terminal() -> None:
+    transport = CancellationSettlingTransport()
+    journal = MemoryJournal()
+    client = httpx.AsyncClient(transport=transport)
+    request = TranslationRequest(
+        uuid4(),
+        uuid4(),
+        "final",
+        "en",
+        "de",
+        "hello",
+        SampleRange(0, 1),
+    )
+    attempt = await DeepLProvider(DeepLConfig("secret", uuid4()), journal, client).start(request)
+    result_waiter = asyncio.create_task(attempt.result())
+    await transport.entered.wait()
+
+    cancel_waiter = asyncio.create_task(attempt.cancel())
+    await transport.cancelled.wait()
+    assert not cancel_waiter.done()
+
+    transport.release_after_cancel.set()
+    terminal = await cancel_waiter
+    settled = await result_waiter
+    await client.aclose()
+
+    assert terminal.outcome is Outcome.CANCELLED
+    assert settled.terminal.terminal_id == terminal.terminal_id
+    assert len(journal.terminals) == 1
+
+
+@pytest.mark.asyncio
 async def test_deepl_cancel_survives_cancelling_its_caller_and_terminalizes_once() -> None:
     transport = CancellationSettlingTransport()
     journal = MemoryJournal()
@@ -500,13 +679,18 @@ async def test_deepl_cancel_survives_cancelling_its_caller_and_terminalizes_once
 
 
 class RecordingQuotaGate(RedisQuotaGate):
-    def __init__(self, *, accepted: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        accepted: bool = True,
+        limits: dict[str, dict[str, int]] | None = None,
+    ) -> None:
         super().__init__(
             "redis://redis:6379",
             "provider",
             "account",
             "eu",
-            {"stt": {"streams": 10, "sessions": 10}},
+            limits if limits is not None else {"stt": {"streams": 10, "sessions": 10}},
         )
         self.evals: list[tuple[str, list[str], list[str]]] = []
         self.accepted = accepted
@@ -520,13 +704,18 @@ class RecordingQuotaGate(RedisQuotaGate):
 async def test_active_quota_dimensions_reserve_and_release_atomically() -> None:
     gate = RecordingQuotaGate()
     await gate.reserve_active("stt", "reservation")
+    await gate.reserve_active("stt", "reservation")
     await gate.release_active("stt", "reservation")
 
-    reserve, release = gate.evals
-    assert len(reserve[1]) == 2
-    assert reserve[2][-2:] == ["8", "8"]
+    first_reserve, renewal, release = gate.evals
+    assert len(first_reserve[1]) == 2
+    assert first_reserve[2][0] == "15000"
+    assert first_reserve[2][-2:] == ["8", "8"]
+    assert renewal[2][1] == first_reserve[2][1]
     assert len(release[1]) == 2
-    assert release[2] == ["reservation"]
+    assert release[2] == [first_reserve[2][1]]
+    assert release[2][0] != "reservation"
+    assert len(release[2][0]) >= 32
 
 
 @pytest.mark.asyncio
@@ -538,3 +727,53 @@ async def test_active_quota_rejection_cannot_leave_a_partial_dimension() -> None
 
     assert len(gate.evals) == 1
     assert len(gate.evals[0][1]) == 2
+
+
+@pytest.mark.asyncio
+async def test_audio_quota_accounts_exact_sample_counts_without_time_rounding() -> None:
+    gate = RecordingQuotaGate(limits={"stt": {"audio_seconds_minute": 1}})
+    sample_counts = (1, 3_999, 4_000, 8_001)
+
+    for sample_count in sample_counts:
+        await gate("stt", sample_count)
+
+    assert [call[2] for call in gate.evals] == [
+        [str(sample_count), "16000"] for sample_count in sample_counts
+    ]
+    assert {call[1][0] for call in gate.evals} == {
+        "quota:provider:account:eu:stt:audio_seconds_minute:window-v2"
+    }
+
+
+@pytest.mark.asyncio
+async def test_redis_time_drives_windows_and_active_expiry() -> None:
+    window_gate = RecordingQuotaGate(limits={"stt": {"audio_seconds_minute": 1}})
+    active_gate = RecordingQuotaGate()
+
+    await window_gate("stt", 4_000)
+    await active_gate.reserve_active("stt", "reservation", ttl_ms=3210)
+
+    window_script, _, window_arguments = window_gate.evals[0]
+    active_script, _, active_arguments = active_gate.evals[0]
+    assert "redis.call('TIME')" in window_script
+    assert "redis.call('TIME')" in active_script
+    assert window_arguments == ["4000", "16000"]
+    assert active_arguments[0] == "3210"
+    assert len(active_arguments) == 4
+
+
+@pytest.mark.asyncio
+async def test_stale_active_release_cannot_target_a_successor_owner() -> None:
+    previous = RecordingQuotaGate()
+    successor = RecordingQuotaGate()
+
+    await previous.reserve_active("stt", "same-reservation")
+    await successor.reserve_active("stt", "same-reservation")
+    previous_owner = previous.evals[0][2][1]
+    successor_owner = successor.evals[0][2][1]
+    await previous.release_active("stt", "same-reservation")
+
+    release_script, _, release_arguments = previous.evals[-1]
+    assert previous_owner != successor_owner
+    assert release_arguments == [previous_owner]
+    assert "redis.call('ZREM', KEYS[index], owner)" in release_script

@@ -39,6 +39,9 @@ resolve_profile() {
     fixture)
       overlay=deploy/compose/compose.test.yml
       APP_ENV=test
+      RTC_SUBNET=${RTC_SUBNET:-${TEST_RTC_SUBNET:-10.254.232.0/24}}
+      RTC_NODE_IP=${RTC_NODE_IP:-${TEST_RTC_NODE_IP:-10.254.232.250}}
+      export RTC_SUBNET RTC_NODE_IP
       ;;
     google-eu)
       overlay=deploy/compose/compose.google.yml
@@ -66,11 +69,43 @@ validate_project_name() {
   esac
 }
 
+volume_deletion_requested() {
+  for argument do
+    case "$argument" in
+      -v | -v=1 | -v=[tT] | -v=true | -v=True | -v=TRUE | \
+        --volumes | --volumes=1 | --volumes=[tT] | --volumes=true | --volumes=True | --volumes=TRUE)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+compose_help_requested() {
+  for argument do
+    case "$argument" in
+      -h | --help)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+confirm_volume_deletion() {
+  printf '%s\n' 'WARNING: this permanently removes Transhooter persistent volumes.' >&2
+  printf '%s' 'Type RESET to continue: ' >&2
+  IFS= read -r answer
+  test "$answer" = RESET || { echo "Volume deletion cancelled." >&2; exit 1; }
+}
+
 load_state() {
   if [ ! -s "$STATE_FILE" ]; then
     echo "No recorded transhooter stack. Run ./scripts/dev-up first." >&2
     exit 1
   fi
+  # A recorded stack must not be redirected by the caller's current shell.
+  PROJECT_NAME=transhooter
 
   profile=
   recorded_overlay=
@@ -110,6 +145,7 @@ load_state() {
   fi
 
   validate_project_name
+  export COMPOSE_PROJECT_NAME=$PROJECT_NAME
   resolve_profile "$profile"
   if $seen_overlay; then
     $seen_project || invalid_state
@@ -162,6 +198,31 @@ compose() {
   fi
 
   invoke_compose "$@"
+}
+
+failure_smoke_project_is_owned() {
+  candidate=$1
+  owner=$2
+  [ "$candidate" = "$owner" ] || return 1
+
+  case "$candidate" in
+    transhooter-failure-*-*) ;;
+    *) return 1 ;;
+  esac
+  identity=${candidate#transhooter-failure-}
+  process_id=${identity%%-*}
+  started_at=${identity#*-}
+  case "$process_id:$started_at" in
+    :* | *: | *[!0-9:]* | *:*:*) return 1 ;;
+  esac
+}
+
+failure_smoke_resource_is_owned() {
+  project=$1
+  owner=$2
+  resource_project_label=$3
+  failure_smoke_project_is_owned "$project" "$owner" &&
+    [ "$resource_project_label" = "$owner" ]
 }
 
 build_runtime_and_harness_images() {

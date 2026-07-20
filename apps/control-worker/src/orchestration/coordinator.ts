@@ -418,6 +418,7 @@ export class Coordinator {
           forceIncomplete: false,
           resourceGeneration: lifecycle.resourceGeneration ?? lifecycle.generation,
         },
+        "archive-reconcile",
       );
       return;
     }
@@ -431,6 +432,18 @@ export class Coordinator {
           outputPrefix: `v1/meetings/${lifecycle.consultationId}/media/composite/${String(lifecycle.generation)}`,
           layoutExpiresAtMs: this.clock.now().getTime() + 10 * 60_000,
         },
+      );
+      return;
+    }
+    if (lifecycle.kind === "ROOM_COMPOSITE_EGRESS") {
+      const roomCompositeEgressId = lifecycle.participantEgressId;
+      if (roomCompositeEgressId === undefined || roomCompositeEgressId === null) {
+        throw new Error("Room Composite effect is missing its Egress identity");
+      }
+      await this.planWorkerDispatch(
+        lifecycle.consultationId,
+        lifecycle.generation,
+        roomCompositeEgressId,
       );
       return;
     }
@@ -510,6 +523,7 @@ export class Coordinator {
       },
     );
   }
+
   private async planCaptureReady(
     lifecycle: z.infer<typeof lifecycleSchema>,
     occurrenceIdentity: string,
@@ -675,7 +689,6 @@ export class Coordinator {
       return "done";
     }
     if (event.kind === "EGRESS_ACTIVE" && event.participantId === null) {
-      await this.handleCompositeEgressActive(event, generation);
       return "done";
     }
     if (event.kind === "EGRESS_ACTIVE" && event.participantId !== null) {
@@ -707,18 +720,19 @@ export class Coordinator {
     });
   }
 
-  private async handleCompositeEgressActive(
-    event: VerifiedWebhook,
+  private async planWorkerDispatch(
+    consultationId: Uuid,
     generation: number,
+    egressId: string,
   ): Promise<void> {
-    await this.remote.notifyArchiveRecording(event.consultationId);
+    await this.remote.notifyArchiveRecording(consultationId);
     const metadata = WorkerJobMetadataSchema.parse(
-      await this.store.workerDispatchMetadata(event.consultationId, generation),
+      await this.store.workerDispatchMetadata(consultationId, generation),
     );
-    await this.plan(event.consultationId, generation, "WORKER_DISPATCH", metadata.workerIdentity, {
+    await this.plan(consultationId, generation, "WORKER_DISPATCH", metadata.workerIdentity, {
       agentName: "translation-worker",
       metadata,
-      roomCompositeEgressId: event.egressId,
+      roomCompositeEgressId: egressId,
     });
   }
 
@@ -733,12 +747,12 @@ export class Coordinator {
     if (!(await this.store.isStandardHuman(event.consultationId, participantId))) {
       return;
     }
-    await this.plan(event.consultationId, generation, "PARTICIPANT_GRANT", participantId, {
-      participantIdentity: participantId,
-      canPublish: true,
-      canPublishData: false,
-      trackSource: ["microphone", "camera"],
-      barrierEgressId: event.egressId,
+    await this.planParticipantGrant({
+      consultationId: event.consultationId,
+      generation,
+      subjectId: participantId,
+      kind: "PARTICIPANT_EGRESS",
+      participantEgressId: event.egressId,
     });
   }
 
@@ -779,6 +793,7 @@ export class Coordinator {
         "ARCHIVE_RECONCILE",
         deadline.consultationId,
         { forceIncomplete: true },
+        "archive-reconcile",
       );
     } else {
       complete = await this.handleRoomDeadline(deadline);
@@ -791,58 +806,99 @@ export class Coordinator {
   }
 
   private async handleRoomDeadline(deadline: Deadline): Promise<boolean> {
-    if (deadline.kind === "absence") {
-      const roomName = deterministicRoomName(deadline.consultationId, deadline.generation);
-      const identities = await this.store.humanIdentities(deadline.consultationId);
-      if (!(await this.remote.areHumansAbsent(roomName, identities))) {
-        return false;
+    let humanIdentities: readonly Uuid[];
+    if (deadline.kind === "ready") {
+      const observedState = await this.store.consultationState(deadline.consultationId);
+      if (observedState === "finalizing") {
+        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
+      } else {
+        if (observedState !== "ready") {
+          return true;
+        }
+        const presenceEpoch = await this.store.presenceEpoch(
+          deadline.consultationId,
+          deadline.generation,
+        );
+        if (presenceEpoch === null) {
+          return true;
+        }
+        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
+        const admission = await this.store.admitFinalization(
+          deadline.consultationId,
+          deadline.generation,
+          presenceEpoch,
+          this.clock.now(),
+        );
+        if (admission === "ready") {
+          return false;
+        }
+        if (admission !== "admitted" && admission !== "finalizing") {
+          return true;
+        }
       }
+    } else if (deadline.kind === "absence") {
+      const observedState = await this.store.consultationState(deadline.consultationId);
+      if (observedState === "finalizing") {
+        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
+      } else {
+        if (observedState !== "ready" && observedState !== "active") {
+          return true;
+        }
+        const presenceEpoch = await this.store.presenceEpoch(
+          deadline.consultationId,
+          deadline.generation,
+        );
+        if (presenceEpoch === null) {
+          return true;
+        }
+        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
+        const roomName = deterministicRoomName(deadline.consultationId, deadline.generation);
+        if (!(await this.remote.areHumansAbsent(roomName, humanIdentities))) {
+          return false;
+        }
+        const admission = await this.store.admitFinalization(
+          deadline.consultationId,
+          deadline.generation,
+          presenceEpoch,
+          this.clock.now(),
+        );
+        if (admission === "ready" || admission === "active") {
+          return false;
+        }
+        if (admission !== "admitted" && admission !== "finalizing") {
+          return true;
+        }
+      }
+    } else {
+      const state = await this.store.consultationState(deadline.consultationId);
+      if (state !== "finalizing") {
+        return true;
+      }
+      humanIdentities = await this.store.humanIdentities(deadline.consultationId);
     }
 
-    const humanIdentities = await this.store.humanIdentities(deadline.consultationId);
-    const state =
-      deadline.kind === "absence"
-        ? await this.store.admitFinalization(
-            deadline.consultationId,
-            deadline.generation,
-            this.clock.now(),
-          )
-        : await this.store.consultationState(deadline.consultationId);
-    if (
-      (deadline.kind === "ready" && state !== "ready") ||
-      (deadline.kind === "finalize" && state !== "finalizing") ||
-      (deadline.kind === "absence" && state !== "finalizing")
-    ) {
-      return true;
-    }
-    const nowMs = this.clock.now().getTime();
-    const notBeforeMs = state === "finalizing" ? nowMs + 5_000 : nowMs;
-    let statusId: Uuid | null = null;
-
-    if (state === "finalizing") {
-      const status = this.effectInput(
-        deadline.consultationId,
-        deadline.generation,
-        "STATUS_PACKET",
-        deadline.consultationId,
-        {
-          topic: "consultation.status.v1",
-          reasonCode: "SHUTDOWN",
-          state,
-          shutdownAtMs: notBeforeMs,
-          destinationIdentities: humanIdentities,
-        },
-        `${deadline.kind}:${deadline.dueAt.toISOString()}`,
-      );
-      statusId = status.id;
-      await this.store.scheduleEffect(status);
-    }
+    const notBeforeMs = this.clock.now().getTime() + 5_000;
+    const status = this.effectInput(
+      deadline.consultationId,
+      deadline.generation,
+      "STATUS_PACKET",
+      deadline.consultationId,
+      {
+        topic: "consultation.status.v1",
+        reasonCode: "SHUTDOWN",
+        state: "finalizing",
+        shutdownAtMs: notBeforeMs,
+        destinationIdentities: humanIdentities,
+      },
+      `${deadline.kind}:${deadline.dueAt.toISOString()}`,
+    );
+    await this.store.scheduleEffect(status);
     await this.scheduleDrainEffects(
       deadline.consultationId,
       deadline.generation,
       deadline.generation,
       deadline.consultationId,
-      statusId,
+      status.id,
       notBeforeMs,
     );
     return true;
@@ -995,7 +1051,10 @@ export class Coordinator {
   ): Promise<readonly PlannedEffect[]> {
     const drain = await this.store.roomDrainPlan(consultationId, resourceGeneration);
     const dependency = statusId === null ? {} : { dependsOnEffectId: statusId };
-    const resource = { resourceGeneration };
+    const resource = {
+      resourceGeneration,
+      ...(drain.resourceRoomName === null ? {} : { resourceRoomName: drain.resourceRoomName }),
+    };
     const egressStops = drain.egressIds.map((egressId) =>
       this.effectInput(
         consultationId,
@@ -1080,10 +1139,14 @@ export class Coordinator {
       consultationId,
       `${String(generation)}:${kind}:${subjectId}:${occurrenceKey}`,
     );
-    const roomName = deterministicRoomName(
-      consultationId,
-      typeof request.resourceGeneration === "number" ? request.resourceGeneration : generation,
-    );
+    const persistedResourceRoomName =
+      typeof request.resourceRoomName === "string" ? request.resourceRoomName : null;
+    const roomName =
+      persistedResourceRoomName ??
+      deterministicRoomName(
+        consultationId,
+        typeof request.resourceGeneration === "number" ? request.resourceGeneration : generation,
+      );
     const occurredAtMs =
       kind === "STATUS_PACKET" ? (request.occurredAtMs ?? this.clock.now().getTime()) : undefined;
     const timestamp = occurredAtMs === undefined ? {} : { occurredAtMs };

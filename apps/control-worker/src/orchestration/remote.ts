@@ -50,7 +50,7 @@ export interface RemoteEffects {
   verifyArchiveObject(input: ArchiveObjectVerification): Promise<boolean>;
   readArchiveObject(input: ArchiveObjectIdentity): Promise<Uint8Array>;
   notifyArchiveRecording(consultationId: Uuid): Promise<void>;
-  notifyDeleteDrain(consultationId: Uuid, writeEpoch: number): Promise<boolean>;
+  notifyDeleteDrain(consultationId: Uuid, writeEpoch: number, reason: string): Promise<boolean>;
   putArchiveObject(input: ArchiveObjectUpload): Promise<UploadedArchiveObject>;
   discoverArchiveObjects(prefix: string): Promise<readonly DiscoveredArchiveObject[]>;
   drainArchive(consultationId: Uuid): Promise<boolean>;

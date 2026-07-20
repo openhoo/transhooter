@@ -63,7 +63,10 @@ type ArchiveView = {
 
 type ArchivePageProps = {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ cursor?: string; previous?: string | string[] }>;
+  searchParams: Promise<{
+    cursor?: string | string[];
+    previous?: string | string[];
+  }>;
 };
 
 type GroupedArchiveObjects = Record<ArchiveObjectGroup, ArchiveObject[]>;
@@ -305,11 +308,16 @@ function ArchiveObjectGroups({
   ));
 }
 
+export function lastArchiveQueryValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value.at(-1) : value;
+}
+
 export default async function ArchivePage({ params, searchParams }: ArchivePageProps) {
   const { id } = await params;
   const { cursor, previous } = await searchParams;
-  const previousCursor = Array.isArray(previous) ? previous.at(-1) : previous;
-  const query = cursor ? { cursor } : {};
+  const currentCursor = lastArchiveQueryValue(cursor);
+  const previousCursor = lastArchiveQueryValue(previous);
+  const query = currentCursor ? { cursor: currentCursor } : {};
   const archive = await requirePageData<ArchiveView>("archives.get", { id }, query);
   const groupedObjects = groupArchiveObjects(archive.objects);
 
@@ -323,7 +331,7 @@ export default async function ArchivePage({ params, searchParams }: ArchivePageP
       <ArchiveObjectGroups archiveId={archive.id} groupedObjects={groupedObjects} />
       <ArchivePagination
         archiveId={id}
-        currentCursor={cursor}
+        currentCursor={currentCursor}
         nextCursor={archive.nextCursor}
         previousCursor={previousCursor}
       />

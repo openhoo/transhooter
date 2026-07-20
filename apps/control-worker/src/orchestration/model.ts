@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
+import type { ConsultationState, ExternalEffectState } from "@transhooter/contracts";
 import type { OrchestrationEffectKind } from "@transhooter/server-core/rooms";
 
+export type { ConsultationState };
+export type EffectState = ExternalEffectState;
 export type Uuid = string;
 export const EFFECT_KINDS = [
   "ROOM_CREATE",
@@ -22,15 +25,6 @@ export const EFFECT_KINDS = [
   | "PARTICIPANT_REMOVE"
 )[];
 export type EffectKind = (typeof EFFECT_KINDS)[number];
-export type EffectState = "planned" | "calling" | "applied" | "compensating" | "done" | "failed";
-export type ConsultationState =
-  | "invited"
-  | "ready"
-  | "active"
-  | "finalizing"
-  | "ended"
-  | "cancelled"
-  | "deleted";
 
 export interface Effect {
   readonly id: Uuid;
@@ -44,6 +38,8 @@ export interface Effect {
   readonly requestBytes: Uint8Array | null;
   readonly requestSha256: string | null;
   readonly remoteId: string | null;
+  /** Durable result recorded before an applied effect is terminally settled. */
+  readonly appliedResult?: unknown;
   readonly attempt: number;
   readonly leaseOwner: Uuid | null;
   readonly leaseExpiresAt: Date | null;
@@ -54,6 +50,7 @@ export type PlannedEffect = Omit<
   | "state"
   | "requestBytes"
   | "requestSha256"
+  | "appliedResult"
   | "remoteId"
   | "attempt"
   | "leaseOwner"
@@ -175,6 +172,7 @@ export interface RoomDrainPlan {
   readonly participantIds: readonly Uuid[];
   readonly dispatchIds: readonly string[];
   readonly roomCreated: boolean;
+  readonly resourceRoomName: string | null;
 }
 
 export interface CapacityDimension {
@@ -182,6 +180,8 @@ export interface CapacityDimension {
   readonly capacity: number;
   readonly units: number;
 }
+
+export type FinalizationAdmission = "admitted" | ConsultationState | null;
 
 export interface DurableStore {
   readiness(): Promise<void>;
@@ -218,11 +218,13 @@ export interface DurableStore {
     participantIdentity: Uuid,
     participantEgressId: string,
   ): Promise<"active" | null>;
+  presenceEpoch(consultationId: Uuid, generation: number): Promise<number | null>;
   admitFinalization(
     consultationId: Uuid,
     generation: number,
+    presenceEpoch: number,
     now: Date,
-  ): Promise<ConsultationState | null>;
+  ): Promise<FinalizationAdmission>;
   humanIdentities(consultationId: Uuid): Promise<readonly [Uuid, Uuid]>;
   seedDeadlines(consultationId: Uuid, generation: number): Promise<void>;
   roomDrainPlan(consultationId: Uuid, generation: number): Promise<RoomDrainPlan>;
@@ -260,7 +262,9 @@ export interface DurableStore {
     resourceGeneration: number,
   ): Promise<ReconciliationSnapshot | null>;
   completeReconciliation(
-    consultationId: Uuid,
+    effect: Effect,
+    owner: Uuid,
+    now: Date,
     snapshot: ReconciliationSnapshot,
     inventory: Readonly<Record<string, unknown>>,
     sha256: string,

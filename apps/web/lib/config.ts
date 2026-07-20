@@ -42,6 +42,18 @@ function hasTrustedClientIpBoundary(value: {
   return value.APP_ENV !== "production" || value.TRUSTED_CLIENT_IP_HEADER !== undefined;
 }
 
+const MagicLinkSealKeyringSchema = z
+  .object({
+    currentKeyId: z.string().min(1),
+    keys: z.record(z.string().min(1), z.string()),
+  })
+  .strict();
+
+export type MagicLinkSealKeyring = Readonly<{
+  currentKeyId: string;
+  keys: ReadonlyMap<string, Uint8Array>;
+}>;
+
 const EnvironmentSchema = z
   .object({
     APP_ENV: z.enum(["development", "test", "production"]),
@@ -57,6 +69,7 @@ const EnvironmentSchema = z
     LIVEKIT_CREDENTIALS_FILE: z.string().min(1),
     SESSION_SECRET_FILE: z.string().min(1),
     CSRF_SECRET_FILE: z.string().min(1),
+    MAGIC_LINK_SEAL_KEYS_FILE: z.string().min(1),
     INTERNAL_CONTROL_TOKEN_FILE: z.string().min(1).optional(),
     INTERNAL_TRANSLATION_TOKEN_FILE: z.string().min(1).optional(),
     INTERNAL_SPOOL_DRAINER_TOKEN_FILE: z.string().min(1).optional(),
@@ -112,6 +125,7 @@ export type WebConfig = {
   sessionSecret: string;
   csrfSecret: string;
   egressLayoutSigningKey: string;
+  magicLinkSealKeyring: MagicLinkSealKeyring;
   internalTokens: Readonly<{
     controlWorker: string | null;
     translationWorker: string | null;
@@ -138,6 +152,35 @@ function readSecret(path: string): string {
 
 function readOptionalSecret(path: string | undefined): string | null {
   return path ? readSecret(path) : null;
+}
+
+export function parseMagicLinkSealKeyring(serialized: string): MagicLinkSealKeyring {
+  let document: unknown;
+  try {
+    document = JSON.parse(serialized);
+  } catch {
+    throw new Error("Magic-link seal keyring is not valid JSON");
+  }
+  const parsed = MagicLinkSealKeyringSchema.parse(document);
+  const entries = Object.entries(parsed.keys);
+  if (entries.length === 0 || !Object.hasOwn(parsed.keys, parsed.currentKeyId)) {
+    throw new Error("Magic-link seal keyring must contain its current key");
+  }
+  const keys = new Map<string, Uint8Array>();
+  for (const [keyId, encoded] of entries) {
+    if (!/^[A-Za-z0-9+/]{43}=$/u.test(encoded)) {
+      throw new Error(`Magic-link seal key ${keyId} must be canonical base64`);
+    }
+    const key = Buffer.from(encoded, "base64");
+    if (key.length !== 32 || key.toString("base64") !== encoded) {
+      throw new Error(`Magic-link seal key ${keyId} must decode to 32 bytes`);
+    }
+    keys.set(keyId, new Uint8Array(key));
+  }
+  return Object.freeze({
+    currentKeyId: parsed.currentKeyId,
+    keys,
+  });
 }
 
 export function parseWebEnvironment(environment: NodeJS.ProcessEnv) {
@@ -180,6 +223,9 @@ export function webConfig(): WebConfig {
     liveKitCredentials: readSecret(environment.LIVEKIT_CREDENTIALS_FILE),
     sessionSecret: readSecret(environment.SESSION_SECRET_FILE),
     csrfSecret: readSecret(environment.CSRF_SECRET_FILE),
+    magicLinkSealKeyring: parseMagicLinkSealKeyring(
+      readSecret(environment.MAGIC_LINK_SEAL_KEYS_FILE),
+    ),
     internalTokens,
     egressLayoutSigningKey: readSecret(environment.EGRESS_LAYOUT_SIGNING_KEY_FILE),
     smtpUrl,

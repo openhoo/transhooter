@@ -60,7 +60,8 @@ type Surface = "api" | "page";
 type Outcome = "success" | "client_error" | "server_error" | "redirect" | "not_found" | "error";
 type StatusClass = "2xx" | "3xx" | "4xx" | "5xx" | "none";
 type ErrorKind = "aborted" | "timeout" | "validation" | "unavailable" | "other";
-type Attributes = Record<string, string>;
+type AttributeValue = string | number;
+type Attributes = Record<string, AttributeValue>;
 type Counter = { add(value: number, attributes?: Attributes): void };
 type Histogram = { record(value: number, attributes?: Attributes): void };
 type OperationSpan = {
@@ -74,7 +75,6 @@ type TelemetryState = {
   operationDuration: Histogram | undefined;
   operationTotal: Counter | undefined;
   frameworkErrorTotal: Counter | undefined;
-  shutdownPromise?: Promise<void>;
   operationErrors: WeakSet<object>;
 };
 
@@ -121,10 +121,7 @@ export function initializeWebTelemetry(): void {
 }
 
 export function shutdownWebTelemetry(): Promise<void> {
-  const current = telemetryGlobal[STATE_KEY];
-  if (!current) return Promise.resolve();
-  current.shutdownPromise ??= current.handle.shutdown();
-  return current.shutdownPromise;
+  return telemetryGlobal[STATE_KEY]?.handle.shutdown() ?? Promise.resolve();
 }
 
 function normalizedOperation(operation: string): string {
@@ -187,25 +184,34 @@ export async function withWebOperation<T>(
   const started = performance.now();
 
   let span: OperationSpan | undefined;
+  let workStarted = false;
+  let workPromise: Promise<T>;
   try {
-    span = current.handle.tracer.startSpan("web.operation", { attributes });
-  } catch {
-    // Application work must continue even if the telemetry API rejects a span.
+    workPromise = current.handle.tracer.startActiveSpan(
+      "web.operation",
+      { attributes },
+      (activeSpan) => {
+        span = activeSpan;
+        workStarted = true;
+        return work();
+      },
+    );
+  } catch (error) {
+    // Only fall back when span creation failed. A synchronous application error
+    // must be observed once rather than causing the operation to run again.
+    workPromise = workStarted ? Promise.reject(error) : work();
   }
 
   let outcome: Outcome = "error";
   let finalStatusClass: StatusClass = "none";
+  let responseStatus: number | undefined;
   let errorKind: ErrorKind | undefined;
   try {
-    const result = await work();
+    const result = await workPromise;
     if (result instanceof Response) {
-      if (operation === "auth.exchange.prepare") {
-        outcome = "redirect";
-        finalStatusClass = "3xx";
-      } else {
-        outcome = responseOutcome(result.status);
-        finalStatusClass = statusClass(result.status);
-      }
+      responseStatus = result.status;
+      outcome = responseOutcome(responseStatus);
+      finalStatusClass = statusClass(responseStatus);
     } else {
       outcome = "success";
       finalStatusClass = "2xx";
@@ -228,13 +234,16 @@ export async function withWebOperation<T>(
       ...attributes,
       outcome,
       status_class: finalStatusClass,
+      ...(responseStatus === undefined ? {} : { "http.response.status_code": responseStatus }),
       ...(errorKind ? { "error.kind": errorKind } : {}),
     };
     try {
       current.operationTotal.add(1, completedAttributes);
       current.operationDuration.record((performance.now() - started) / 1_000, completedAttributes);
       span?.setAttributes(completedAttributes);
-      span?.setStatus({ code: outcome === "error" || outcome === "server_error" ? 2 : 1 });
+      span?.setStatus({
+        code: outcome === "success" || outcome === "redirect" ? 1 : 2,
+      });
     } catch {
       // Telemetry failures must not replace the application result or error.
     } finally {

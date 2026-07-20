@@ -23,7 +23,7 @@ spec:
         app.kubernetes.io/component: control-worker
     spec:
       automountServiceAccountToken: false
-      serviceAccountName: control-worker
+      serviceAccountName: {{ include "transhooter.fullname" . }}-control-worker
       imagePullSecrets:
         {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
@@ -38,7 +38,7 @@ spec:
             - {name: INSTANCE_ID, valueFrom: {fieldRef: {fieldPath: metadata.uid}}}
             - {name: EGRESS_LAYOUT_SIGNING_KEY_FILE, value: /run/secrets/egress-layout-signing-key}
             {{- if .Values.telemetry.enabled }}
-            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ .Values.telemetry.endpoint | quote }}}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ default (printf "http://%s-otel-collector:%v" (include "transhooter.fullname" .) .Values.telemetry.collector.ports.otlpHttp) .Values.telemetry.endpoint | quote }}}
             - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
             - {name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio}
             - {name: OTEL_TRACES_SAMPLER_ARG, value: {{ .Values.telemetry.traceSampleRatio | quote }}}

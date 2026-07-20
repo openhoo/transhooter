@@ -101,6 +101,7 @@ async function run(
     egressIds: ["EG_1"],
     participantIds: [participantId],
     roomCreated: true,
+    resourceRoomName: null,
   },
   onCancellationFence: (
     cleanupGeneration: number,
@@ -120,6 +121,8 @@ async function run(
     applyVerifiedWebhook: async () => true,
     isStandardHuman: async () => standardHuman,
     consultationState: async () => "active" as const,
+    presenceEpoch: async () => 0,
+    admitFinalization: async () => "admitted" as const,
     markCaptureReady: async () => "active" as const,
     humanIdentities: async () => [participantId, "20000000-0000-4000-8000-000000000004"] as const,
     seedDeadlines: async () => undefined,
@@ -188,6 +191,8 @@ test("absence deadline remains claimable while humans are still present", async 
     claimStaleReservations: async () => [],
     preparePendingArchiveDeletes: async () => undefined,
     currentGeneration: async () => 7,
+    consultationState: async () => "active" as const,
+    presenceEpoch: async () => 3,
     humanIdentities: async () => [participantId, secondParticipantId],
     completeDeadline: async () => {
       completions += 1;
@@ -212,7 +217,7 @@ test("absence deadline remains claimable while humans are still present", async 
   assert.equal(completions, 0);
 });
 
-test("an active participant egress plans publication grant, not capture-ready", async () => {
+test("an active participant Egress converges on the publication grant", async () => {
   const planned = await run({
     id: "20000000-0000-4000-8000-000000000004",
     aggregateId: consultationId,
@@ -235,7 +240,7 @@ test("an active participant egress plans publication grant, not capture-ready", 
   assert.equal(planned[0]?.plan.barrierEgressId, "EG_1");
 });
 
-test("capture-ready is persisted only after the publication grant applied event", async () => {
+test("publication grant marks the accepted capture path ready", async () => {
   const planned = await run({
     id: "20000000-0000-4000-8000-000000000005",
     aggregateId: consultationId,
@@ -310,7 +315,7 @@ test("identical logical status occurrence has a stable dedupe identity", async (
   assert.equal(first[0]?.id, retried[0]?.id);
 });
 
-test("an accepted participant Egress request unlocks the publication bootstrap", async () => {
+test("an accepted participant Egress unlocks the publication grant", async () => {
   const planned = await run({
     id: "20000000-0000-4000-8000-000000000018",
     aggregateId: consultationId,
@@ -406,9 +411,21 @@ test("cancellation fences prior ownership and targets prior-generation resources
       resourceGeneration: 6,
     },
   };
-  const planned = await run(item, true, undefined, (cleanupGeneration, resourceGeneration) => {
-    fences.push({ cleanupGeneration, resourceGeneration });
-  });
+  const persistedResourceRoomName = "persisted-prior-generation-room";
+  const planned = await run(
+    item,
+    true,
+    {
+      dispatchIds: ["AD_1"],
+      egressIds: ["EG_1"],
+      participantIds: [participantId],
+      roomCreated: true,
+      resourceRoomName: persistedResourceRoomName,
+    },
+    (cleanupGeneration, resourceGeneration) => {
+      fences.push({ cleanupGeneration, resourceGeneration });
+    },
+  );
 
   assert.deepEqual(fences, [{ cleanupGeneration: 7, resourceGeneration: 6 }]);
   assert.deepEqual(
@@ -418,7 +435,8 @@ test("cancellation fences prior ownership and targets prior-generation resources
   for (const effect of planned) {
     assert.equal(effect.generation, 7);
     assert.equal(effect.plan.resourceGeneration, 6);
-    assert.equal(effect.plan.roomName, deterministicRoomName(consultationId, 6));
+    assert.equal(effect.plan.roomName, persistedResourceRoomName);
+    assert.equal(effect.plan.resourceRoomName, persistedResourceRoomName);
   }
   const dispatchDelete = planned[2];
   const roomDelete = planned[3];
@@ -429,7 +447,13 @@ test("cancellation fences prior ownership and targets prior-generation resources
     planned.slice(0, 2).map(({ id }) => id),
   );
 
-  const redelivered = await run(item);
+  const redelivered = await run(item, true, {
+    dispatchIds: ["AD_1"],
+    egressIds: ["EG_1"],
+    participantIds: [participantId],
+    roomCreated: true,
+    resourceRoomName: persistedResourceRoomName,
+  });
   assert.deepEqual(
     redelivered.map(({ id }) => id),
     planned.map(({ id }) => id),
@@ -439,6 +463,7 @@ test("cancellation fences prior ownership and targets prior-generation resources
     egressIds: [],
     participantIds: [participantId],
     roomCreated: true,
+    resourceRoomName: persistedResourceRoomName,
   });
   assert.equal(
     partiallySettledRedelivery.find(({ kind }) => kind === "ROOM_DELETE")?.id,
@@ -467,6 +492,7 @@ test("invited cancellation with no admitted resources is idempotent no-op cleanu
       egressIds: [],
       participantIds: [participantId, secondParticipantId],
       roomCreated: false,
+      resourceRoomName: null,
     },
     () => {
       fenceCalls += 1;
@@ -494,6 +520,61 @@ test("room deletion immediately starts archive reconciliation", async () => {
   assert.equal(planned[0]?.kind, "ARCHIVE_RECONCILE");
   assert.equal(planned[0]?.plan.forceIncomplete, false);
   assert.equal(planned[0]?.plan.resourceGeneration, 6);
+});
+
+test("archive deadline reuses the immediate reconciliation effect identity", async () => {
+  const immediate = await run({
+    id: "20000000-0000-4000-8000-000000000018",
+    aggregateId: consultationId,
+    type: "orchestration.effect.applied",
+    attempts: 0,
+    payload: {
+      consultationId,
+      generation: 7,
+      subjectId: consultationId,
+      kind: "ROOM_DELETE",
+      resourceGeneration: 6,
+    },
+  });
+  const deadline: Deadline = {
+    consultationId,
+    generation: 7,
+    kind: "archive-reconcile",
+    dueAt: new Date(4_000),
+  };
+  const planned: PlannedEffect[] = [];
+  const store = {
+    claimOutbox: async () => [],
+    claimDeadlines: async () => [deadline],
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+    currentGeneration: async () => 7,
+    scheduleEffect: async (effect: PlannedEffect) => {
+      planned.push(effect);
+    },
+    completeDeadline: async () => undefined,
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    {
+      areHumansAbsent: async () => true,
+      notifyArchiveRecording: async () => undefined,
+    },
+    {
+      reserve: async () => true,
+      renew: async () => true,
+      release: async () => undefined,
+    },
+  );
+
+  await coordinator.tick();
+
+  assert.equal(planned.length, 1);
+  assert.equal(planned[0]?.id, immediate[0]?.id);
+  assert.equal(planned[0]?.occurrenceKey, immediate[0]?.occurrenceKey);
+  assert.equal(planned[0]?.plan.forceIncomplete, true);
 });
 
 test("capture requests create generation-fenced participant Egress", async () => {
@@ -586,9 +667,33 @@ test("archive failure drains the fenced resource generation", async () => {
   assert.equal(roomDelete.plan.workerTerminalGeneration, 6);
 });
 
-test("Room Composite ACTIVE dispatches the full canonical worker metadata verbatim", async () => {
+test("accepted Room Composite dispatches the full canonical worker metadata verbatim", async () => {
   const planned = await run({
     id: "20000000-0000-4000-8000-000000000016",
+    aggregateId: consultationId,
+    generation: 7,
+    type: "orchestration.effect.applied",
+    attempts: 0,
+    payload: {
+      consultationId,
+      generation: 7,
+      subjectId: consultationId,
+      kind: "ROOM_COMPOSITE_EGRESS",
+      participantEgressId: "EG_COMPOSITE_STARTING",
+    },
+  });
+  assert.equal(planned.length, 1);
+  const workerDispatch = planned[0];
+  assert.ok(workerDispatch);
+  assert.equal(workerDispatch.kind, "WORKER_DISPATCH");
+  assert.equal(workerDispatch.subjectId, workerIdentity);
+  assert.equal(workerDispatch.plan.roomCompositeEgressId, "EG_COMPOSITE_STARTING");
+  assert.deepEqual(WorkerJobMetadataSchema.parse(workerDispatch.plan.metadata), metadata);
+});
+
+test("Room Composite ACTIVE is acknowledgement-only after accepted-effect dispatch", async () => {
+  const planned = await run({
+    id: "20000000-0000-4000-8000-000000000020",
     aggregateId: consultationId,
     generation: 7,
     type: "livekit.webhook.verified",
@@ -605,12 +710,7 @@ test("Room Composite ACTIVE dispatches the full canonical worker metadata verbat
       rawSha256: "e".repeat(64),
     },
   });
-  assert.equal(planned.length, 1);
-  const workerDispatch = planned[0];
-  assert.ok(workerDispatch);
-  assert.equal(workerDispatch.kind, "WORKER_DISPATCH");
-  assert.equal(workerDispatch.subjectId, workerIdentity);
-  assert.deepEqual(WorkerJobMetadataSchema.parse(workerDispatch.plan.metadata), metadata);
+  assert.equal(planned.length, 0);
 });
 
 test("capacity rollback releases only reservations acquired before exhaustion", async () => {

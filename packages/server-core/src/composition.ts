@@ -1,7 +1,7 @@
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { DrizzleApplicationOperations } from "./application-operations";
 import { ArchiveService, type InventoryHasher } from "./archives/service";
-import { type AuthSecrets, AuthService } from "./auth/service";
+import { type AuthSecrets, AuthService, type MagicLinkTokenSealer } from "./auth/service";
 import { type ConsultationHasher, ConsultationService } from "./consultations/service";
 import type { Clock, IdGenerator, TokenGenerator, TokenHasher } from "./domain/model";
 import { LanguageService } from "./languages/service";
@@ -48,6 +48,7 @@ export interface ConfiguredWebApplicationConfig {
   tokens: TokenGenerator;
   hashing: CoreHashing;
   authSecrets: AuthSecrets;
+  magicLinkTokenSealer: MagicLinkTokenSealer;
   publicBaseUrl: string;
   clientIp: (request: Request) => string;
   readiness: () => Promise<boolean>;
@@ -74,6 +75,7 @@ export function createConfiguredWebApplication(
     config.tokens,
     config.hashing,
     config.authSecrets,
+    config.magicLinkTokenSealer,
   );
   const consultations = new ConsultationService(
     consultationRepository,

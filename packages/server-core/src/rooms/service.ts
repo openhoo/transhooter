@@ -1,9 +1,7 @@
-import type { StatusPacket } from "@transhooter/contracts";
 import {
   beginFencedRoomFinalization,
   type Consultation,
   finishConsultation,
-  grantCapture,
   type ParticipantSlot,
 } from "../consultations/domain";
 import {
@@ -17,11 +15,17 @@ import type {
   AuditPort,
   ConsultationRepository,
   EffectRepository,
+  EgressEventEarlySource,
   EgressPort,
   LiveKitRoomPort,
   OutboxMessage,
   Transaction,
 } from "../ports/index";
+import {
+  deterministicUuid,
+  type EffectPlanRequested,
+  ORCHESTRATION_TOPICS,
+} from "./orchestration-contract";
 
 export interface VerifiedWebhook {
   id: string;
@@ -35,9 +39,10 @@ export interface VerifiedWebhook {
     | "egress_complete"
     | "egress_failed"
     | "ignored";
-  roomName: string;
+  roomName?: string;
   identity?: UUID;
   egressId?: string;
+  egressSource?: EgressEventEarlySource;
   payload: unknown;
 }
 
@@ -51,12 +56,14 @@ export interface WebhookVerifier {
 interface ResolvedWebhookTarget {
   consultationId: UUID;
   generation: number;
+  roomName: string;
+  earlySubject?: { participantId: UUID | null };
 }
 
-interface ParticipantRevocation {
+type ResolvedWebhook = VerifiedWebhook & {
   roomName: string;
-  identity: UUID;
-}
+  earlySubject?: { participantId: UUID | null };
+};
 
 interface AbsenceCandidate {
   roomName: string;
@@ -70,7 +77,7 @@ export class RoomService {
     private readonly consultations: ConsultationRepository,
     private readonly effects: EffectRepository,
     private readonly livekit: LiveKitRoomPort,
-    private readonly egress: EgressPort,
+    _egress: EgressPort,
     private readonly verifier: WebhookVerifier,
     _audit: AuditPort,
     private readonly clock: Clock,
@@ -87,16 +94,20 @@ export class RoomService {
     if (target === null) {
       return true;
     }
+    const resolvedEvent: ResolvedWebhook = {
+      ...event,
+      roomName: target.roomName,
+      ...(target.earlySubject ? { earlySubject: target.earlySubject } : {}),
+    };
 
-    const revocation: { value: ParticipantRevocation | null } = { value: null };
-    const accepted = await this.consultations.transaction(async (tx) => {
+    return this.consultations.transaction(async (tx) => {
       const rawSha256 = this.hasher.sha256(rawBody);
       const inboxAccepted = await this.effects.acceptInbox(
         "livekit",
-        event.id,
-        event.occurredAt,
+        resolvedEvent.id,
+        resolvedEvent.occurredAt,
         rawSha256,
-        webhookInboxPayload(event, target),
+        webhookInboxPayload(resolvedEvent, target),
         tx,
       );
       if (!inboxAccepted) {
@@ -105,92 +116,32 @@ export class RoomService {
 
       const current = await this.requiredLocked(target.consultationId, tx);
       const isAllowedIdentity =
-        event.identity !== undefined &&
-        current.participants.some((slot) => slot.livekitIdentity === event.identity);
+        resolvedEvent.identity !== undefined &&
+        current.participants.some((slot) => slot.livekitIdentity === resolvedEvent.identity);
 
-      if (current.roomName !== event.roomName || current.generation !== target.generation) {
-        if (event.kind === "participant_joined" && isAllowedIdentity && event.identity) {
-          revocation.value = {
-            roomName: event.roomName,
-            identity: event.identity,
-          };
+      if (current.roomName !== resolvedEvent.roomName || current.generation !== target.generation) {
+        if (
+          resolvedEvent.kind === "participant_joined" &&
+          isAllowedIdentity &&
+          resolvedEvent.identity
+        ) {
+          await this.enqueueParticipantRemoval(
+            tx,
+            current,
+            resolvedEvent.roomName,
+            resolvedEvent.identity,
+            target.generation,
+          );
         }
         return true;
       }
 
-      const next = await this.applyCurrentWebhook(current, event, rawSha256, tx, revocation);
+      const next = await this.applyCurrentWebhook(current, resolvedEvent, rawSha256, tx);
       if (next !== current) {
         await this.save(current, next, tx);
       }
       return true;
     });
-
-    if (revocation.value) {
-      await this.livekit.removeParticipant(revocation.value.roomName, revocation.value.identity);
-    }
-    return accepted;
-  }
-
-  async executeCaptureBarrier(consultationId: UUID, participantIdentity: UUID): Promise<void> {
-    const initial = await this.requireCaptureCandidate(consultationId, participantIdentity);
-    const slot = requiredParticipant(initial, participantIdentity);
-    const egressResult = await this.adoptOrStartParticipantEgress(
-      initial,
-      slot,
-      participantIdentity,
-    );
-
-    try {
-      await this.persistCaptureBinding(initial, slot, egressResult.egressId);
-    } catch (error) {
-      await this.egress.stop(egressResult.egressId);
-      throw error;
-    }
-
-    try {
-      await this.livekit.updateParticipant({
-        roomName: requiredRoomName(initial),
-        identity: participantIdentity,
-        canPublish: true,
-        canPublishData: false,
-      });
-    } catch (error) {
-      await this.egress.stop(egressResult.egressId);
-      await this.clearCaptureBinding(
-        consultationId,
-        initial.generation,
-        slot.id,
-        egressResult.egressId,
-      );
-      throw error;
-    }
-
-    let updated: Consultation;
-    try {
-      updated = await this.persistCaptureGrant(
-        consultationId,
-        initial.generation,
-        slot.id,
-        egressResult.egressId,
-      );
-    } catch (error) {
-      await this.livekit.updateParticipant({
-        roomName: requiredRoomName(initial),
-        identity: participantIdentity,
-        canPublish: false,
-        canPublishData: false,
-      });
-      await this.egress.stop(egressResult.egressId);
-      await this.clearCaptureBinding(
-        consultationId,
-        initial.generation,
-        slot.id,
-        egressResult.egressId,
-      );
-      throw error;
-    }
-
-    await this.sendCaptureReadyStatus(updated, slot, egressResult.egressId, participantIdentity);
   }
 
   async reconcileAbsence(consultationId: UUID): Promise<boolean> {
@@ -231,41 +182,56 @@ export class RoomService {
   private async resolveWebhookTarget(
     event: VerifiedWebhook,
   ): Promise<ResolvedWebhookTarget | null> {
-    if (event.consultationId !== undefined && event.generation !== undefined) {
-      return {
-        consultationId: event.consultationId,
-        generation: event.generation,
-      };
-    }
     if (event.kind === "ignored") {
       return null;
     }
-    if (!event.egressId) {
-      throw new DomainError("INVALID_WEBHOOK");
+    if (
+      event.kind === "egress_active" ||
+      event.kind === "egress_complete" ||
+      event.kind === "egress_failed"
+    ) {
+      if (!event.egressId) {
+        throw new DomainError("INVALID_WEBHOOK");
+      }
+      const binding = await this.consultations.resolveEgressEvent(
+        event.egressId,
+        event.egressSource,
+      );
+      if (!binding) {
+        throw new DomainError("EGRESS_NOT_BOUND");
+      }
+      if (event.roomName !== undefined && binding.roomName !== event.roomName) {
+        throw new DomainError("INVALID_WEBHOOK");
+      }
+      return {
+        consultationId: binding.consultationId,
+        generation: binding.generation,
+        roomName: binding.roomName,
+        ...(binding.earlySubject ? { earlySubject: binding.earlySubject } : {}),
+      };
     }
-
-    const binding = await this.consultations.resolveEgressEvent(event.egressId);
-    if (!binding) {
-      throw new DomainError("EGRESS_NOT_BOUND");
-    }
-    if (binding.roomName !== event.roomName) {
+    if (
+      event.consultationId === undefined ||
+      event.generation === undefined ||
+      event.roomName === undefined
+    ) {
       throw new DomainError("INVALID_WEBHOOK");
     }
     return {
-      consultationId: binding.consultationId,
-      generation: binding.generation,
+      consultationId: event.consultationId,
+      generation: event.generation,
+      roomName: event.roomName,
     };
   }
 
   private async applyCurrentWebhook(
     current: Consultation,
-    event: VerifiedWebhook,
+    event: ResolvedWebhook,
     rawSha256: string,
     tx: Transaction,
-    revocation: { value: ParticipantRevocation | null },
   ): Promise<Consultation> {
     if (event.kind === "participant_joined" || event.kind === "participant_left") {
-      return this.applyParticipantWebhook(current, event, tx, revocation);
+      return this.applyParticipantWebhook(current, event, tx);
     }
     if (
       event.kind === "egress_active" ||
@@ -279,18 +245,21 @@ export class RoomService {
 
   private async applyParticipantWebhook(
     current: Consultation,
-    event: VerifiedWebhook,
+    event: ResolvedWebhook,
     tx: Transaction,
-    revocation: { value: ParticipantRevocation | null },
   ): Promise<Consultation> {
     if (!event.identity) {
       throw new DomainError("INVALID_WEBHOOK");
     }
+    const participant = requiredParticipant(current, event.identity);
     if (event.kind === "participant_joined" && current.admissionFencedAt) {
-      revocation.value = {
-        roomName: event.roomName,
-        identity: event.identity,
-      };
+      await this.enqueueParticipantRemoval(
+        tx,
+        current,
+        event.roomName,
+        event.identity,
+        current.generation,
+      );
       return current;
     }
 
@@ -304,28 +273,66 @@ export class RoomService {
       this.clock.now(),
     );
     if (joined && next !== current) {
-      await this.enqueue(tx, current, "room.capture_requested", {
-        participantIdentity: event.identity,
-      });
+      await this.enqueue(tx, current, ORCHESTRATION_TOPICS.effectPlan, {
+        consultationId: current.id,
+        generation: current.generation,
+        subjectId: participant.id,
+        kind: "PARTICIPANT_EGRESS",
+        request: {
+          roomName: event.roomName,
+          resourceRoomName: event.roomName,
+          participantIdentity: event.identity,
+          outputPrefix: `v1/meetings/${current.id}/media/participants/${participant.id}/${String(current.generation)}`,
+          segmentedHls: true,
+          resourceGeneration: current.generation,
+          compensationIntent: "EGRESS_STOP",
+        },
+      } satisfies EffectPlanRequested);
     }
     return next;
   }
 
+  private async enqueueParticipantRemoval(
+    tx: Transaction,
+    consultation: Consultation,
+    roomName: string,
+    participantIdentity: UUID,
+    resourceGeneration: number,
+  ): Promise<void> {
+    await this.enqueue(tx, consultation, ORCHESTRATION_TOPICS.effectPlan, {
+      consultationId: consultation.id,
+      generation: consultation.generation,
+      subjectId: deterministicUuid(
+        consultation.id,
+        `participant-remove:${String(resourceGeneration)}:${roomName}:${participantIdentity}`,
+      ),
+      kind: "PARTICIPANT_REMOVE",
+      request: {
+        roomName,
+        resourceRoomName: roomName,
+        participantIdentity,
+        resourceGeneration,
+        compensationIntent: "REMOVE_PARTICIPANT",
+      },
+    } satisfies EffectPlanRequested);
+  }
+
   private async applyEgressWebhook(
     current: Consultation,
-    event: VerifiedWebhook,
+    event: ResolvedWebhook,
     rawSha256: string,
     tx: Transaction,
   ): Promise<Consultation> {
     if (!event.egressId) {
       throw new DomainError("INVALID_WEBHOOK");
     }
-    const binding = await this.consultations.resolveCurrentEgressSubject(
-      current.id,
-      current.generation,
-      event.egressId,
-      tx,
-    );
+    const binding =
+      (await this.consultations.resolveCurrentEgressSubject(
+        current.id,
+        current.generation,
+        event.egressId,
+        tx,
+      )) ?? event.earlySubject;
     if (!binding) {
       return current;
     }
@@ -358,108 +365,6 @@ export class RoomService {
       resourceGeneration: current.generation,
     });
     return next;
-  }
-
-  private async requireCaptureCandidate(
-    consultationId: UUID,
-    participantIdentity: UUID,
-  ): Promise<Consultation> {
-    const consultation = await this.consultations.get(consultationId);
-    if (
-      !consultation?.roomName ||
-      consultation.admissionFencedAt ||
-      (consultation.state !== "ready" && consultation.state !== "active")
-    ) {
-      throw new DomainError("INVALID_STATE");
-    }
-    requiredParticipant(consultation, participantIdentity);
-    return consultation;
-  }
-
-  private async adoptOrStartParticipantEgress(
-    consultation: Consultation,
-    slot: ParticipantSlot,
-    participantIdentity: UUID,
-  ) {
-    const adopted = slot.participantEgressId
-      ? await this.egress.get(slot.participantEgressId)
-      : null;
-    const result =
-      adopted?.state === "EGRESS_ACTIVE"
-        ? adopted
-        : await this.egress.startParticipant({
-            roomName: requiredRoomName(consultation),
-            identity: participantIdentity,
-            outputPrefix: `v1/meetings/${consultation.id}/media/participants/${slot.id}/`,
-            requestIdentity: `${consultation.id}:${String(consultation.generation)}:participant_capture:${slot.id}`,
-          });
-    if (result.state !== "EGRESS_ACTIVE") {
-      throw new DomainError("EGRESS_NOT_ACTIVE");
-    }
-    return result;
-  }
-
-  private async persistCaptureBinding(
-    initial: Consultation,
-    slot: ParticipantSlot,
-    egressId: string,
-  ): Promise<void> {
-    await this.consultations.transaction(async (tx) => {
-      const current = await this.requiredLocked(initial.id, tx);
-      if (current.generation !== initial.generation || current.admissionFencedAt) {
-        throw new DomainError("FENCED_GENERATION");
-      }
-      const participants = current.participants.map((candidate) =>
-        candidate.id === slot.id ? { ...candidate, participantEgressId: egressId } : candidate,
-      ) as [ParticipantSlot, ParticipantSlot];
-      const next = {
-        ...current,
-        participants,
-        updatedAt: this.clock.now(),
-      };
-      await this.save(current, next, tx);
-    });
-  }
-
-  private async persistCaptureGrant(
-    consultationId: UUID,
-    generation: number,
-    participantId: UUID,
-    egressId: string,
-  ): Promise<Consultation> {
-    return this.consultations.transaction(async (tx) => {
-      const current = await this.requiredLocked(consultationId, tx);
-      if (current.generation !== generation || current.admissionFencedAt) {
-        throw new DomainError("FENCED_GENERATION");
-      }
-      const next = grantCapture(current, participantId, egressId, this.clock.now());
-      await this.save(current, next, tx);
-      await this.enqueue(tx, next, "room.capture_ready", {
-        participantId,
-        participantEgressId: egressId,
-      });
-      return next;
-    });
-  }
-
-  private async sendCaptureReadyStatus(
-    consultation: Consultation,
-    slot: ParticipantSlot,
-    egressId: string,
-    participantIdentity: UUID,
-  ): Promise<void> {
-    const packet = {
-      schemaVersion: 1,
-      consultationId: consultation.id,
-      generation: consultation.generation,
-      occurredAtMs: this.clock.now().getTime(),
-      state: consultation.state === "active" ? "active" : "ready",
-      reasonCode: "CAPTURE_READY",
-      subjectParticipantId: slot.id,
-      participantEgressId: egressId,
-      shutdownAtMs: null,
-    } as StatusPacket;
-    await this.livekit.sendStatus(requiredRoomName(consultation), packet, [participantIdentity]);
   }
 
   private async claimAbsenceCandidate(consultationId: UUID): Promise<AbsenceCandidate | null> {
@@ -522,23 +427,6 @@ export class RoomService {
     });
   }
 
-  private async clearCaptureBinding(
-    consultationId: UUID,
-    generation: number,
-    participantId: UUID,
-    egressId: string,
-  ): Promise<void> {
-    await this.consultations.transaction((tx) =>
-      this.consultations.clearParticipantEgressBinding(
-        consultationId,
-        generation,
-        participantId,
-        egressId,
-        tx,
-      ),
-    );
-  }
-
   private async save(previous: Consultation, next: Consultation, tx: Transaction): Promise<void> {
     if (!(await this.consultations.save(next, previous.updatedAt, tx))) {
       throw new DomainError("CONCURRENT_MODIFICATION");
@@ -573,7 +461,7 @@ export class RoomService {
 }
 
 function webhookInboxPayload(
-  event: VerifiedWebhook,
+  event: ResolvedWebhook,
   target: ResolvedWebhookTarget,
 ): Record<string, unknown> {
   return {
@@ -595,13 +483,6 @@ function requiredParticipant(consultation: Consultation, identity: UUID): Partic
     throw new DomainError("FORBIDDEN");
   }
   return slot;
-}
-
-function requiredRoomName(consultation: Consultation): string {
-  if (!consultation.roomName) {
-    throw new DomainError("INVALID_STATE");
-  }
-  return consultation.roomName;
 }
 
 function matchesAbsenceCandidate(consultation: Consultation, candidate: AbsenceCandidate): boolean {

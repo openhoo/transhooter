@@ -5,6 +5,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
@@ -39,6 +40,25 @@ from transhooter_worker.domain.models import (
 )
 from transhooter_worker.ports.exchange_journal import ExchangeJournal
 from transhooter_worker.ports.providers import SttEvent, TtsEvent
+
+_COMPLETION_TIMEOUT_SECONDS = 10.0
+_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+class _SttCompletionState(Enum):
+    OPEN = auto()
+    FINALIZE_SENT = auto()
+    CLOSE_SENT = auto()
+    FINALIZE_ACKNOWLEDGED = auto()
+    COMPLETE = auto()
+
+
+class _TtsCompletionState(Enum):
+    OPEN = auto()
+    FLUSH_SENT = auto()
+    FLUSH_ACKNOWLEDGED = auto()
+    CLOSE_SENT = auto()
+    COMPLETE = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,11 +302,14 @@ class DeepgramSttSession:
         self._terminal: SessionTerminal | None = None
         self._accepted = resume_at_sample
         self._received = 0
-        self._boundary_ids: list[UUID] = []
+        self._boundaries: list[tuple[UUID, int]] = []
         self._base: int | None = resume_at_sample
         self._commit_watermark = commit_watermark
-        self._reader = asyncio.create_task(self._read())
+        self._emitted_watermark = commit_watermark
+        self._completion_state = _SttCompletionState.OPEN
         self._closing_outcome: Outcome | None = None
+        self._reader = asyncio.create_task(self._read())
+        self._completion = asyncio.create_task(self._publish_reader_completion())
 
     async def send_audio(self, chunk: AudioChunk) -> None:
         if len(chunk.pcm) > 8000:
@@ -318,11 +341,12 @@ class DeepgramSttSession:
         return stream()
 
     async def request_boundary(self, boundary_id: UUID) -> BoundaryReceipt:
-        self._boundary_ids.append(boundary_id)
+        boundary = (boundary_id, self._accepted)
+        self._boundaries.append(boundary)
         try:
             await self._send_json({"type": "Finalize"}, "finalize-out")
         except BaseException:
-            self._boundary_ids.remove(boundary_id)
+            self._boundaries.remove(boundary)
             raise
         return BoundaryReceipt(True, boundary_id)
 
@@ -330,50 +354,117 @@ class DeepgramSttSession:
         async with self._terminal_lock:
             if self._terminal:
                 return self._terminal
-            await self._send_json({"type": "Finalize"}, "finalize-out")
-            await self._send_json({"type": "CloseStream"}, "close-stream-out")
-        await self._reader
-        return await self._terminalize(Outcome.SUCCEEDED, None)
+            self._completion_state = _SttCompletionState.FINALIZE_SENT
+            try:
+                async with asyncio.timeout(_COMPLETION_TIMEOUT_SECONDS):
+                    await self._send_json({"type": "Finalize"}, "finalize-out")
+                    self._completion_state = _SttCompletionState.CLOSE_SENT
+                    await self._send_json({"type": "CloseStream"}, "close-stream-out")
+            except TimeoutError:
+                pass
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(self._completion),
+                _COMPLETION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            await self._settle_reader("Deepgram STT completion timed out")
+        if self._terminal is not None:
+            return self._terminal
+        return await self._terminalize(
+            Outcome.FAILED,
+            self._transport_error("Deepgram STT closed without completion acknowledgement"),
+        )
 
     async def cancel(self) -> SessionTerminal:
         async with self._terminal_lock:
             if self._terminal:
                 return self._terminal
             self._closing_outcome = Outcome.CANCELLED
-            await self._websocket.close(code=1000, reason="cancelled")
-        await self._reader
+        await self._settle_reader(None, code=1000, reason="cancelled")
         return await self._terminalize(Outcome.CANCELLED, None)
 
     async def _send_json(self, payload: dict[str, Any], kind: str) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode()
         ref = self._record_exchange(self._id, kind, "application/json", body, None)
-        await self._websocket.send(body.decode())
         self._refs.append(ref)
+        await self._websocket.send(body.decode())
 
-    async def _read(self) -> None:
+    async def _settle_reader(
+        self,
+        failure: str | None,
+        *,
+        code: int = 1011,
+        reason: str = "completion timeout",
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                self._websocket.close(code=code, reason=reason),
+                _CLOSE_TIMEOUT_SECONDS,
+            )
+        except (Exception, asyncio.CancelledError):
+            pass
+        if not self._reader.done():
+            self._reader.cancel()
+        await asyncio.gather(self._reader, return_exceptions=True)
+        await asyncio.gather(self._completion, return_exceptions=True)
+        if failure is not None and self._terminal is None:
+            await self._terminalize(Outcome.FAILED, self._transport_error(failure))
+
+    def _transport_error(self, detail: str) -> ProviderError:
+        return ProviderError(
+            ErrorKind.TRANSPORT,
+            "session",
+            RetryAdvice.UNSPECIFIED,
+            "CompletionError",
+            None,
+            None,
+            self._id,
+            tuple(self._refs),
+            detail,
+        )
+
+    async def _read(self) -> tuple[Outcome, ProviderError | None]:
         error: ProviderError | None = None
         try:
             async for message in self._websocket:
                 await self._handle_inbound_message(message)
         except Exception as exception:
-            error = ProviderError(
-                ErrorKind.TRANSPORT,
-                "session",
-                RetryAdvice.UNSPECIFIED,
-                type(exception).__name__,
-                None,
-                None,
-                self._id,
-                tuple(self._refs),
-                str(exception),
-            )
-        finally:
-            await self._drain_requested_boundaries()
-            self._record_close()
-            outcome = self._closing_outcome
-            if outcome is None:
-                outcome = Outcome.FAILED if error else Outcome.SUCCEEDED
-            await self._terminalize(outcome, error)
+            error = self._transport_error(f"{type(exception).__name__}: {exception}")
+        if (
+            self._completion_state is _SttCompletionState.FINALIZE_ACKNOWLEDGED
+            and self._websocket.close_code == 1000
+        ):
+            self._completion_state = _SttCompletionState.COMPLETE
+
+        outcome = self._closing_outcome
+        if outcome is None:
+            completed = self._completion_state is _SttCompletionState.COMPLETE
+            if not completed and error is None:
+                error = self._transport_error(
+                    "Deepgram STT transport ended before Finalize/CloseStream acknowledgement"
+                )
+            if not completed:
+                try:
+                    await asyncio.wait_for(
+                        self._websocket.close(
+                            code=1011,
+                            reason="completion acknowledgement missing",
+                        ),
+                        _CLOSE_TIMEOUT_SECONDS,
+                    )
+                except (Exception, asyncio.CancelledError):
+                    pass
+            outcome = Outcome.SUCCEEDED if completed else Outcome.FAILED
+        self._record_close()
+        return outcome, error
+
+    async def _publish_reader_completion(self) -> None:
+        try:
+            outcome, error = await self._reader
+        except asyncio.CancelledError:
+            return
+        await self._terminalize(outcome, error)
 
     async def _handle_inbound_message(self, message: str | bytes) -> None:
         if isinstance(message, bytes):
@@ -401,8 +492,21 @@ class DeepgramSttSession:
         message_type = data.get("type")
         if message_type == "Results":
             await self._handle_results(data, reference)
+            if data.get("from_finalize"):
+                if self._boundaries:
+                    await self._emit_requested_boundary(reference)
+                if self._completion_state in {
+                    _SttCompletionState.FINALIZE_SENT,
+                    _SttCompletionState.CLOSE_SENT,
+                }:
+                    self._completion_state = _SttCompletionState.FINALIZE_ACKNOWLEDGED
         elif message_type == "UtteranceEnd":
-            await self._emit_boundary(reference)
+            await self._emit_spontaneous_boundary(reference)
+        elif message_type == "CloseStream":
+            if self._completion_state is _SttCompletionState.FINALIZE_ACKNOWLEDGED:
+                while self._boundaries:
+                    await self._emit_requested_boundary(reference)
+                self._completion_state = _SttCompletionState.COMPLETE
         elif message_type not in {"Metadata", "SpeechStarted"}:
             raise ValueError(f"unsupported Deepgram STT message {message_type}")
 
@@ -417,21 +521,24 @@ class DeepgramSttSession:
         if text:
             span = self._result_sample_range(data)
             is_final = bool(data.get("is_final"))
-            is_duplicate_final = is_final and span.end <= self._commit_watermark
-            if not is_duplicate_final:
+            words = self._word_timings(alternative)
+            is_committed_final = is_final and span.end <= self._commit_watermark
+            if not is_committed_final:
+                if is_final and span.start < self._commit_watermark:
+                    words, text, span = self._trim_replayed_final(words, text, span)
                 await self._events.put(
                     TranscriptEvent(
                         span,
                         self._received,
                         Finality.SPAN_FINAL if is_final else Finality.PROVISIONAL,
                         text,
-                        self._word_timings(alternative),
+                        words,
                         (float(alternative["confidence"]) if "confidence" in alternative else None),
                         reference,
                     )
                 )
-        if data.get("speech_final"):
-            await self._emit_boundary(reference)
+        if data.get("speech_final") and not data.get("from_finalize"):
+            await self._emit_spontaneous_boundary(reference)
 
     def _result_sample_range(self, data: dict[str, Any]) -> SampleRange:
         base_sample = self._base or 0
@@ -461,13 +568,51 @@ class DeepgramSttSession:
             )
         return tuple(timings)
 
-    async def _emit_boundary(self, reference: RawRef) -> None:
-        boundary_id = self._boundary_ids.pop(0) if self._boundary_ids else uuid4()
-        await self._events.put(BoundaryEvent(boundary_id, self._accepted, reference))
+    def _trim_replayed_final(
+        self,
+        words: tuple[WordTiming, ...],
+        text: str,
+        span: SampleRange,
+    ) -> tuple[tuple[WordTiming, ...], str, SampleRange]:
+        retained = tuple(word for word in words if word.samples.end > self._commit_watermark)
+        if not retained:
+            raise ValueError(
+                "Deepgram replay final crossed the committed watermark without "
+                "sufficient word timing"
+            )
+        first = retained[0]
+        if first.samples.start < self._commit_watermark:
+            retained = (
+                WordTiming(
+                    first.text,
+                    SampleRange(self._commit_watermark, first.samples.end),
+                    first.confidence,
+                ),
+                *retained[1:],
+            )
+        suffix = " ".join(word.text.strip() for word in retained if word.text.strip())
+        if not suffix:
+            raise ValueError(
+                "Deepgram replay final crossed the committed watermark without timed suffix text"
+            )
+        return (
+            retained,
+            suffix,
+            SampleRange(retained[0].samples.start, retained[-1].samples.end),
+        )
 
-    async def _drain_requested_boundaries(self) -> None:
-        while self._boundary_ids and self._refs:
-            await self._emit_boundary(self._refs[-1])
+    async def _emit_requested_boundary(self, reference: RawRef) -> None:
+        boundary_id, requested_through = self._boundaries.pop(0)
+        committed_through = max(self._emitted_watermark, requested_through)
+        self._emitted_watermark = committed_through
+        self._commit_watermark = max(self._commit_watermark, committed_through)
+        await self._events.put(BoundaryEvent(boundary_id, committed_through, reference))
+
+    async def _emit_spontaneous_boundary(self, reference: RawRef) -> None:
+        committed_through = max(self._emitted_watermark, self._accepted)
+        self._emitted_watermark = committed_through
+        self._commit_watermark = max(self._commit_watermark, committed_through)
+        await self._events.put(BoundaryEvent(uuid4(), committed_through, reference))
 
     def _record_close(self) -> None:
         close_payload = json.dumps(
@@ -563,6 +708,7 @@ class DeepgramTtsProvider:
             "capabilities",
             references,
         )
+        websocket: SansIoWebSocket | None = None
         try:
             websocket = await SansIoWebSocket.connect(
                 _deepgram_tts_url(self._config.endpoint, self._config.voice),
@@ -586,6 +732,14 @@ class DeepgramTtsProvider:
                 evidence,
             )
         except Exception as error:
+            if websocket is not None:
+                try:
+                    await asyncio.wait_for(
+                        websocket.close(code=1011, reason="health probe failed"),
+                        _CLOSE_TIMEOUT_SECONDS,
+                    )
+                except (Exception, asyncio.CancelledError):
+                    pass
             evidence = _finish_probe(
                 self._config,
                 self._journal,
@@ -667,6 +821,7 @@ class DeepgramTtsSession:
         self._session_events: asyncio.Queue[SessionTerminalEvent] = asyncio.Queue()
         self._refs = references
         self._active: DeepgramSynthesisAttempt | None = None
+        self._completion_state = _TtsCompletionState.OPEN
 
     async def start(self, utterance: SynthesisUtterance) -> DeepgramSynthesisAttempt:
         if len(utterance.text) > 2000:
@@ -714,18 +869,37 @@ class DeepgramTtsSession:
                 media_type="application/json",
                 payload=body,
             )
-            await self._websocket.send(body.decode())
-            await self._websocket.close()
+            self._refs.append(ref)
+            error: ProviderError | None = None
+            try:
+                async with asyncio.timeout(_COMPLETION_TIMEOUT_SECONDS):
+                    await self._websocket.send(body.decode())
+                    self._completion_state = _TtsCompletionState.CLOSE_SENT
+                    await self._websocket.close()
+                    self._completion_state = _TtsCompletionState.COMPLETE
+            except Exception as exception:
+                outcome = Outcome.FAILED
+                error = ProviderError(
+                    ErrorKind.TRANSPORT,
+                    "session",
+                    RetryAdvice.UNSPECIFIED,
+                    type(exception).__name__,
+                    None,
+                    None,
+                    self._id,
+                    tuple(self._refs),
+                    str(exception),
+                )
             self._terminal = SessionTerminal(
                 uuid4(),
                 self._id,
                 outcome,
-                None,
+                error,
                 0,
                 0,
                 0,
                 Transport.WEBSOCKET,
-                (*tuple(self._refs), ref),
+                tuple(self._refs),
             )
             self._journal.terminal(self._id, terminal_bytes(self._terminal))
             await self._session_events.put(SessionTerminalEvent(self._terminal))
@@ -747,9 +921,10 @@ class DeepgramSynthesisAttempt:
         self._event_queue: asyncio.Queue[TtsEvent] = asyncio.Queue()
         self._terminal: OperationTerminal | None = None
         self._terminal_lock = asyncio.Lock()
-        self._task = asyncio.create_task(self._run())
         self._samples = 0
         self._refs: list[RawRef] = []
+        self._completion_state = _TtsCompletionState.OPEN
+        self._task = asyncio.create_task(self._run())
 
     @property
     def done(self) -> bool:
@@ -778,34 +953,64 @@ class DeepgramSynthesisAttempt:
         await asyncio.gather(self._task, return_exceptions=True)
         body = b'{"type":"Clear"}'
         ref = self._record("clear-out", "application/json", body)
-        await self._websocket.send(body.decode())
         self._refs.append(ref)
+        try:
+            await asyncio.wait_for(
+                self._websocket.send(body.decode()),
+                _COMPLETION_TIMEOUT_SECONDS,
+            )
+        except Exception as exception:
+            return await self._terminalize(
+                Outcome.FAILED,
+                self._operation_error(exception),
+            )
         return await self._terminalize(Outcome.CANCELLED, None)
 
     async def _run(self) -> None:
         try:
-            await self._send_command(
-                "text-out",
-                _json_command("Speak", text=self._utterance.text),
-            )
-            await self._send_command("flush-out", _json_command("Flush"))
-            async for message in self._websocket:
-                if await self._handle_inbound_message(message):
-                    break
+            async with asyncio.timeout(_COMPLETION_TIMEOUT_SECONDS):
+                await self._send_command(
+                    "text-out",
+                    _json_command("Speak", text=self._utterance.text),
+                )
+                await self._send_command("flush-out", _json_command("Flush"))
+                self._completion_state = _TtsCompletionState.FLUSH_SENT
+                async for message in self._websocket:
+                    if await self._handle_inbound_message(message):
+                        break
+                if self._completion_state is not _TtsCompletionState.FLUSH_ACKNOWLEDGED:
+                    raise ConnectionError(
+                        "Deepgram TTS transport ended before Flush acknowledgement"
+                    )
             await self._terminalize(Outcome.SUCCEEDED, None)
         except Exception as exception:
-            error = ProviderError(
-                ErrorKind.TRANSPORT,
-                "operation",
-                RetryAdvice.NEVER if self._samples else RetryAdvice.UNSPECIFIED,
-                type(exception).__name__,
-                None,
-                None,
-                self._utterance.attempt_id,
-                tuple(self._refs),
-                str(exception),
+            try:
+                await asyncio.wait_for(
+                    self._websocket.close(
+                        code=1011,
+                        reason="synthesis completion failed",
+                    ),
+                    _CLOSE_TIMEOUT_SECONDS,
+                )
+            except (Exception, asyncio.CancelledError):
+                pass
+            await self._terminalize(
+                Outcome.FAILED,
+                self._operation_error(exception),
             )
-            await self._terminalize(Outcome.FAILED, error)
+
+    def _operation_error(self, exception: BaseException) -> ProviderError:
+        return ProviderError(
+            ErrorKind.TRANSPORT,
+            "operation",
+            RetryAdvice.NEVER if self._samples else RetryAdvice.UNSPECIFIED,
+            type(exception).__name__,
+            None,
+            None,
+            self._utterance.attempt_id,
+            tuple(self._refs),
+            str(exception),
+        )
 
     async def _send_command(self, direction: str, body: bytes) -> None:
         reference = self._record(direction, "application/json", body)
@@ -858,6 +1063,7 @@ class DeepgramSynthesisAttempt:
     ) -> bool:
         message_type = json.loads(message).get("type")
         if message_type == "Flushed":
+            self._completion_state = _TtsCompletionState.FLUSH_ACKNOWLEDGED
             await self._event_queue.put(
                 SynthesisBoundary(
                     self._utterance.operation_id,

@@ -48,6 +48,28 @@ NormalizedSink = Callable[[object], Awaitable[None]]
 StageGate = Callable[[str, int], Awaitable[None]]
 
 
+def _audio_after_watermark(chunk: AudioChunk, watermark: int) -> AudioChunk | None:
+    if chunk.samples.end <= watermark:
+        return None
+    if chunk.samples.start >= watermark:
+        return chunk
+    if len(chunk.pcm) % chunk.samples.length:
+        raise ValueError("audio chunk PCM length does not match its sample range")
+    bytes_per_sample = len(chunk.pcm) // chunk.samples.length
+    if bytes_per_sample <= 0:
+        raise ValueError("audio chunk has no PCM sample data")
+    offset = (watermark - chunk.samples.start) * bytes_per_sample
+    return AudioChunk(
+        operation_id=chunk.operation_id,
+        sequence=chunk.sequence,
+        samples=SampleRange(watermark, chunk.samples.end),
+        pcm=chunk.pcm[offset:],
+        sample_rate=chunk.sample_rate,
+        channels=chunk.channels,
+        encoding=chunk.encoding,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class DirectionSpec:
     source_participant_id: UUID
@@ -663,9 +685,12 @@ class DirectionSession:
     async def _open_replacement_stt(self) -> SttSession:
         if self._stage_gate is not None:
             await self._stage_gate("stt_start", 1)
-        resume_at_sample = (
-            self._recent_audio[0].samples.start if self._recent_audio else self._committed_input
+        replay_audio = tuple(
+            clipped
+            for chunk in self._recent_audio
+            if (clipped := _audio_after_watermark(chunk, self._committed_input)) is not None
         )
+        resume_at_sample = replay_audio[0].samples.start if replay_audio else self._committed_input
         session_id = uuid4()
         self._stt_session_ids.add(session_id)
         self._session_started_at_ms[session_id] = int(time.time() * 1000)
@@ -685,7 +710,13 @@ class DirectionSession:
                 if self._state is Lifecycle.OPEN and not self._stop_requested.is_set():
                     self._stt = replacement
                     try:
-                        for chunk in self._recent_audio:
+                        replay_audio = tuple(
+                            clipped
+                            for chunk in self._recent_audio
+                            if (clipped := _audio_after_watermark(chunk, self._committed_input))
+                            is not None
+                        )
+                        for chunk in replay_audio:
                             if self._stage_gate is not None:
                                 await self._stage_gate("stt", chunk.samples.length)
                             await replacement.send_audio(chunk)

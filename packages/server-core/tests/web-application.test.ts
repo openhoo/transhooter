@@ -108,6 +108,7 @@ describe("WebApplication authentication boundary", () => {
       {
         kind: "archive.delete",
         consultationId: CONSULTATION,
+        reason: "retention elapsed",
       },
       {
         sessionToken: "opaque",
@@ -115,7 +116,7 @@ describe("WebApplication authentication boundary", () => {
       },
     );
 
-    expect(beginDelete).toHaveBeenCalledWith(CONSULTATION, SESSION);
+    expect(beginDelete).toHaveBeenCalledWith(CONSULTATION, SESSION, "retention elapsed");
   });
 
   it("derives internal principal exclusively from verified headers", async () => {
@@ -127,6 +128,7 @@ describe("WebApplication authentication boundary", () => {
         kind: "internal.deleteDrain",
         consultationId: CONSULTATION,
         writeEpoch: 4,
+        reason: "retention elapsed",
       },
       { internalHeaders },
     );

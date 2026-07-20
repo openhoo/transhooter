@@ -61,7 +61,14 @@ export class LanguageService {
     );
   }
 
-  async setEnabled(id: UUID, enabled: boolean): Promise<void> {
-    await this.repository.transaction((tx) => this.repository.setEnabled(id, enabled, tx));
+  async setEnabled(
+    id: UUID,
+    profileId: UUID,
+    profileRevision: number,
+    enabled: boolean,
+  ): Promise<void> {
+    await this.repository.transaction((tx) =>
+      this.repository.setEnabled(id, profileId, profileRevision, enabled, tx),
+    );
   }
 }

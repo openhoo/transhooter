@@ -508,11 +508,22 @@ def _validate_frozen_stage(
         raise RuntimeError("frozen provider credential version differs from admitted profile")
 
 
+async def _settled_fanout(*operations: Awaitable[Any]) -> tuple[Any, ...]:
+    tasks = tuple(asyncio.ensure_future(operation) for operation in operations)
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 async def _provider_preflight(
     metadata: JobMetadata,
     providers: Any,
 ) -> tuple[StageCapabilities, StageCapabilities, StageCapabilities, tuple[ProviderHealth, ...]]:
-    stt_capabilities, translation_capabilities, tts_capabilities = await asyncio.gather(
+    stt_capabilities, translation_capabilities, tts_capabilities = await _settled_fanout(
         providers.stt.capabilities(),
         providers.translation.capabilities(),
         providers.tts.capabilities(),
@@ -523,7 +534,7 @@ async def _provider_preflight(
         else (providers.stt, providers.translation, providers.tts)
     )
     provider_health = tuple(
-        await asyncio.gather(
+        await _settled_fanout(
             *(provider.health(metadata.selection.capability_hash) for provider in health_providers)
         )
     )
@@ -645,6 +656,7 @@ async def _supervise_runtime(
     publishers: dict[UUID, PreservedAudioPublisher],
     quota_leases: list[tuple[RedisQuotaGate, str, str]],
     stream_tasks: set[asyncio.Task[None]],
+    drain_runtime: Callable[[], Awaitable[None]],
     stream_failure: asyncio.Future[BaseException],
     disconnected: asyncio.Event,
     drain_requested: asyncio.Event,
@@ -673,7 +685,7 @@ async def _supervise_runtime(
         )
         if runtime_failure is not None:
             raise runtime_failure
-        await _drain_runtime(stream_tasks, sessions, publishers)
+        await drain_runtime()
     except BaseException as shutdown_error:
         await _cancel_stream_tasks(stream_tasks)
         await asyncio.gather(
@@ -1606,6 +1618,8 @@ def _install_room_handlers(
     disconnected: asyncio.Event,
     drain_requested: asyncio.Event,
 ) -> Callable[[rtc.RemoteTrackPublication, rtc.RemoteParticipant], None]:
+    active_stream_tasks: dict[UUID, asyncio.Task[None]] = {}
+
     async def consume_track(
         track: rtc.Track,
         participant: rtc.RemoteParticipant,
@@ -1626,39 +1640,44 @@ def _install_room_handlers(
             frame_size_ms=250,
         )
         timeline = timelines[source_identity]
-        async for event in stream:
-            claimed_frame = timeline.claim(generation, event.frame.samples_per_channel)
-            if claimed_frame is None:
-                return
-            sequence, sample_range = claimed_frame
-            pcm = bytes(event.frame.data)
-            spool.append(
-                meeting_id=metadata.consultation_id,
-                attempt_id=source_identity,
-                stage="stt-input",
-                transport="grpc",
-                direction=str(source_identity),
-                media_type="audio/L16",
-                payload=pcm,
-                sample_range=sample_range,
-                metadata=(("sequence", str(sequence)),),
-            )
-            await session.send_audio(
-                AudioChunk(
-                    source_identity,
-                    sequence,
-                    sample_range,
-                    pcm,
-                    16000,
-                    1,
-                    "LINEAR16",
+        try:
+            async for event in stream:
+                claimed_frame = timeline.claim(generation, event.frame.samples_per_channel)
+                if claimed_frame is None:
+                    return
+                sequence, sample_range = claimed_frame
+                pcm = bytes(event.frame.data)
+                spool.append(
+                    meeting_id=metadata.consultation_id,
+                    attempt_id=source_identity,
+                    stage="stt-input",
+                    transport="grpc",
+                    direction=str(source_identity),
+                    media_type="audio/L16",
+                    payload=pcm,
+                    sample_range=sample_range,
+                    metadata=(("sequence", str(sequence)),),
                 )
-            )
-        if timeline.generation == generation:
-            await session.boundary()
+                await session.send_audio(
+                    AudioChunk(
+                        source_identity,
+                        sequence,
+                        sample_range,
+                        pcm,
+                        16000,
+                        1,
+                        "LINEAR16",
+                    )
+                )
+            if timeline.generation == generation:
+                await session.boundary()
+        finally:
+            await stream.aclose()
 
-    def track_done(task: asyncio.Task[None]) -> None:
+    def track_done(source_identity: UUID, task: asyncio.Task[None]) -> None:
         stream_tasks.discard(task)
+        if active_stream_tasks.get(source_identity) is task:
+            del active_stream_tasks[source_identity]
         if (
             not task.cancelled()
             and (error := task.exception()) is not None
@@ -1699,9 +1718,13 @@ def _install_room_handlers(
         if source_identity not in timelines:
             return
         generation = timelines[source_identity].replace()
+        previous_task = active_stream_tasks.get(source_identity)
+        if previous_task is not None:
+            previous_task.cancel()
         stream_task = asyncio.create_task(consume_track(track, participant, generation))
+        active_stream_tasks[source_identity] = stream_task
         stream_tasks.add(stream_task)
-        stream_task.add_done_callback(track_done)
+        stream_task.add_done_callback(lambda task: track_done(source_identity, task))
 
     @ctx.room.on("data_received")
     def on_data_received(packet: rtc.DataPacket) -> None:
@@ -1750,6 +1773,27 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         metadata.worker_epoch,
         spool,
     )
+    sessions: dict[UUID, DirectionSession] = {}
+    sessions_by_identity: dict[UUID, DirectionSession] = {}
+    publishers: dict[UUID, PreservedAudioPublisher] = {}
+    quota_leases: list[tuple[RedisQuotaGate, str, str]] = []
+    stream_tasks: set[asyncio.Task[None]] = set()
+
+    drain_task: asyncio.Task[None] | None = None
+
+    async def drain_runtime_once() -> None:
+        nonlocal drain_task
+        if drain_task is None:
+            drain_task = asyncio.create_task(_drain_runtime(stream_tasks, sessions, publishers))
+        await asyncio.shield(drain_task)
+
+    async def shutdown_runtime() -> None:
+        try:
+            await drain_runtime_once()
+        finally:
+            await control.aclose()
+
+    ctx.add_shutdown_callback(shutdown_runtime)
 
     checkpoint_state = _restore_checkpoint_state(
         spool,
@@ -1769,6 +1813,7 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
     if completed_sources == {
         direction.source_participant_id for direction in metadata.selection.directions
     }:
+        await control.aclose()
         return
 
     stt_caps, translation_caps, tts_caps, provider_health = await _reported_preflight(
@@ -1776,11 +1821,6 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         control.report_failure,
         metadata.snapshot_hash,
     )
-    sessions: dict[UUID, DirectionSession] = {}
-    sessions_by_identity: dict[UUID, DirectionSession] = {}
-    publishers: dict[UUID, PreservedAudioPublisher] = {}
-    quota_leases: list[tuple[RedisQuotaGate, str, str]] = []
-    stream_tasks: set[asyncio.Task[None]] = set()
     sessions_ready = asyncio.Event()
     disconnected = asyncio.Event()
     drain_requested = asyncio.Event()
@@ -1953,11 +1993,6 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         sessions_by_identity[livekit_by_participant[direction.source_participant_id]] = session
     sessions_ready.set()
 
-    async def drain_on_shutdown() -> None:
-        await _drain_runtime(stream_tasks, sessions, publishers)
-
-    ctx.add_shutdown_callback(drain_on_shutdown)
-
     await _supervise_runtime(
         ctx,
         metadata,
@@ -1968,6 +2003,7 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         publishers,
         quota_leases,
         stream_tasks,
+        drain_runtime_once,
         failure,
         disconnected,
         drain_requested,

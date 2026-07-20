@@ -48,8 +48,26 @@ class ControlClient:
         self._worker_id = worker_id
         self._epoch = worker_epoch
         self._spool = spool
-        self._client = client or httpx.AsyncClient(timeout=10, follow_redirects=False)
+        self._owns_client = client is None
+        self._client = (
+            client if client is not None else httpx.AsyncClient(timeout=10, follow_redirects=False)
+        )
         self._retry_delays = retry_delays
+
+    async def __aenter__(self) -> ControlClient:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object | None,
+    ) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
 
     async def heartbeat(self, health: dict[str, Any], *, event_id: UUID | None = None) -> None:
         await self._post("heartbeat", health, event_id=event_id)

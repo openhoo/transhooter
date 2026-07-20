@@ -3134,26 +3134,106 @@
     "GrpcProviderAttemptTerminal": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
-      "else": {
-        "properties": {
-          "error": {
-            "type": "null"
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "allOf": [
+                  {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
+                  {
+                    "not": {
+                      "properties": {
+                        "kind": {
+                          "const": "cancelled"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
           }
         },
-        "required": [
-          "error"
-        ]
-      },
-      "if": {
-        "properties": {
-          "outcome": {
-            "const": "failed"
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "succeeded"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
           }
         },
-        "required": [
-          "outcome"
-        ]
-      },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "cancelled"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
+          }
+        }
+      ],
       "properties": {
         "attemptId": {
           "format": "uuid",
@@ -3733,23 +3813,13 @@
         "transport",
         "rawReference"
       ],
-      "then": {
-        "properties": {
-          "error": {
-            "not": {
-              "type": "null"
-            }
-          }
-        },
-        "required": [
-          "error"
-        ]
-      },
       "type": "object",
       "x-transhooter-runtime-refinements": [
         "error.attemptId must equal attemptId",
-        "retryDecision.previousAttemptId must be null or equal attemptId",
-        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+        "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+        "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+        "retries require a retryable failed provider error",
         "retryOfAttemptId must differ from attemptId"
       ]
     },
@@ -3995,26 +4065,106 @@
     "HttpProviderAttemptTerminal": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
-      "else": {
-        "properties": {
-          "error": {
-            "type": "null"
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "allOf": [
+                  {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
+                  {
+                    "not": {
+                      "properties": {
+                        "kind": {
+                          "const": "cancelled"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
           }
         },
-        "required": [
-          "error"
-        ]
-      },
-      "if": {
-        "properties": {
-          "outcome": {
-            "const": "failed"
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "succeeded"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
           }
         },
-        "required": [
-          "outcome"
-        ]
-      },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "cancelled"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
+          }
+        }
+      ],
       "properties": {
         "attemptId": {
           "format": "uuid",
@@ -4614,23 +4764,13 @@
         "transport",
         "rawReference"
       ],
-      "then": {
-        "properties": {
-          "error": {
-            "not": {
-              "type": "null"
-            }
-          }
-        },
-        "required": [
-          "error"
-        ]
-      },
       "type": "object",
       "x-transhooter-runtime-refinements": [
         "error.attemptId must equal attemptId",
-        "retryDecision.previousAttemptId must be null or equal attemptId",
-        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+        "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+        "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+        "retries require a retryable failed provider error",
         "retryOfAttemptId must differ from attemptId"
       ]
     },
@@ -5420,38 +5560,106 @@
       "additionalProperties": false,
       "allOf": [
         {
-          "else": {
-            "properties": {
-              "error": {
-                "type": "null"
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "failed"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "allOf": [
+                      {
+                        "not": {
+                          "type": "null"
+                        }
+                      },
+                      {
+                        "not": {
+                          "properties": {
+                            "kind": {
+                              "const": "cancelled"
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
               }
             },
-            "required": [
-              "error"
-            ]
-          },
-          "if": {
-            "properties": {
-              "outcome": {
-                "const": "failed"
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "succeeded"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "error"
+                ]
               }
             },
-            "required": [
-              "outcome"
-            ]
-          },
-          "then": {
-            "properties": {
-              "error": {
-                "not": {
-                  "type": "null"
-                }
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "cancelled"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "properties": {
+                          "kind": {
+                            "const": "cancelled"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
               }
-            },
-            "required": [
-              "error"
-            ]
-          }
+            }
+          ]
         },
         {
           "else": {
@@ -5898,8 +6106,10 @@
       "type": "object",
       "x-transhooter-runtime-refinements": [
         "error.attemptId must equal attemptId",
-        "retryDecision.previousAttemptId must be null or equal attemptId",
-        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+        "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+        "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+        "retries require a retryable failed provider error",
         "retryOfAttemptId must differ from attemptId",
         "occurredAtMs must not precede startedAtMs",
         "rawReferences ordinals must be unique"
@@ -5907,19 +6117,8 @@
     },
     "ProviderAttemptTerminal": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "anyOf": [
+      "allOf": [
         {
-          "additionalProperties": false,
-          "else": {
-            "properties": {
-              "error": {
-                "type": "null"
-              }
-            },
-            "required": [
-              "error"
-            ]
-          },
           "if": {
             "properties": {
               "outcome": {
@@ -5930,6 +6129,197 @@
               "outcome"
             ]
           },
+          "then": {
+            "properties": {
+              "error": {
+                "allOf": [
+                  {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
+                  {
+                    "not": {
+                      "properties": {
+                        "kind": {
+                          "const": "cancelled"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "succeeded"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "cancelled"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
+          }
+        }
+      ],
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "failed"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "allOf": [
+                      {
+                        "not": {
+                          "type": "null"
+                        }
+                      },
+                      {
+                        "not": {
+                          "properties": {
+                            "kind": {
+                              "const": "cancelled"
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "succeeded"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "error"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "cancelled"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "properties": {
+                          "kind": {
+                            "const": "cancelled"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
+              }
+            }
+          ],
           "properties": {
             "attemptId": {
               "format": "uuid",
@@ -6529,48 +6919,118 @@
             "transport",
             "rawReference"
           ],
-          "then": {
-            "properties": {
-              "error": {
-                "not": {
-                  "type": "null"
-                }
-              }
-            },
-            "required": [
-              "error"
-            ]
-          },
           "type": "object",
           "x-transhooter-runtime-refinements": [
             "error.attemptId must equal attemptId",
-            "retryDecision.previousAttemptId must be null or equal attemptId",
-            "retry action requires retryDecision.previousAttemptId to equal attemptId",
+            "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+            "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+            "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+            "retries require a retryable failed provider error",
             "retryOfAttemptId must differ from attemptId"
           ]
         },
         {
           "additionalProperties": false,
-          "else": {
-            "properties": {
-              "error": {
-                "type": "null"
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "failed"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "allOf": [
+                      {
+                        "not": {
+                          "type": "null"
+                        }
+                      },
+                      {
+                        "not": {
+                          "properties": {
+                            "kind": {
+                              "const": "cancelled"
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
               }
             },
-            "required": [
-              "error"
-            ]
-          },
-          "if": {
-            "properties": {
-              "outcome": {
-                "const": "failed"
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "succeeded"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "error"
+                ]
               }
             },
-            "required": [
-              "outcome"
-            ]
-          },
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "cancelled"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "properties": {
+                          "kind": {
+                            "const": "cancelled"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
+              }
+            }
+          ],
           "properties": {
             "attemptId": {
               "format": "uuid",
@@ -7178,48 +7638,118 @@
             "transport",
             "rawReference"
           ],
-          "then": {
-            "properties": {
-              "error": {
-                "not": {
-                  "type": "null"
-                }
-              }
-            },
-            "required": [
-              "error"
-            ]
-          },
           "type": "object",
           "x-transhooter-runtime-refinements": [
             "error.attemptId must equal attemptId",
-            "retryDecision.previousAttemptId must be null or equal attemptId",
-            "retry action requires retryDecision.previousAttemptId to equal attemptId",
+            "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+            "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+            "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+            "retries require a retryable failed provider error",
             "retryOfAttemptId must differ from attemptId"
           ]
         },
         {
           "additionalProperties": false,
-          "else": {
-            "properties": {
-              "error": {
-                "type": "null"
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "failed"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "allOf": [
+                      {
+                        "not": {
+                          "type": "null"
+                        }
+                      },
+                      {
+                        "not": {
+                          "properties": {
+                            "kind": {
+                              "const": "cancelled"
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
               }
             },
-            "required": [
-              "error"
-            ]
-          },
-          "if": {
-            "properties": {
-              "outcome": {
-                "const": "failed"
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "succeeded"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "type": "null"
+                  }
+                },
+                "required": [
+                  "error"
+                ]
               }
             },
-            "required": [
-              "outcome"
-            ]
-          },
+            {
+              "if": {
+                "properties": {
+                  "outcome": {
+                    "const": "cancelled"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "error": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "properties": {
+                          "kind": {
+                            "const": "cancelled"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "error"
+                ]
+              }
+            }
+          ],
           "properties": {
             "attemptId": {
               "format": "uuid",
@@ -7799,63 +8329,23 @@
             "transport",
             "rawReference"
           ],
-          "then": {
-            "properties": {
-              "error": {
-                "not": {
-                  "type": "null"
-                }
-              }
-            },
-            "required": [
-              "error"
-            ]
-          },
           "type": "object",
           "x-transhooter-runtime-refinements": [
             "error.attemptId must equal attemptId",
-            "retryDecision.previousAttemptId must be null or equal attemptId",
-            "retry action requires retryDecision.previousAttemptId to equal attemptId",
+            "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+            "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+            "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+            "retries require a retryable failed provider error",
             "retryOfAttemptId must differ from attemptId"
           ]
         }
       ],
-      "else": {
-        "properties": {
-          "error": {
-            "type": "null"
-          }
-        },
-        "required": [
-          "error"
-        ]
-      },
-      "if": {
-        "properties": {
-          "outcome": {
-            "const": "failed"
-          }
-        },
-        "required": [
-          "outcome"
-        ]
-      },
-      "then": {
-        "properties": {
-          "error": {
-            "not": {
-              "type": "null"
-            }
-          }
-        },
-        "required": [
-          "error"
-        ]
-      },
       "x-transhooter-runtime-refinements": [
         "error.attemptId must equal attemptId",
-        "retryDecision.previousAttemptId must be null or equal attemptId",
-        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+        "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+        "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+        "retries require a retryable failed provider error",
         "retryOfAttemptId must differ from attemptId"
       ]
     },
@@ -10866,26 +11356,106 @@
     "WebSocketProviderAttemptTerminal": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
-      "else": {
-        "properties": {
-          "error": {
-            "type": "null"
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "allOf": [
+                  {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
+                  {
+                    "not": {
+                      "properties": {
+                        "kind": {
+                          "const": "cancelled"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
           }
         },
-        "required": [
-          "error"
-        ]
-      },
-      "if": {
-        "properties": {
-          "outcome": {
-            "const": "failed"
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "succeeded"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "error"
+            ]
           }
         },
-        "required": [
-          "outcome"
-        ]
-      },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "error": {
+                "anyOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "properties": {
+                      "kind": {
+                        "const": "cancelled"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "error"
+            ]
+          }
+        }
+      ],
       "properties": {
         "attemptId": {
           "format": "uuid",
@@ -11493,23 +12063,13 @@
         "transport",
         "rawReference"
       ],
-      "then": {
-        "properties": {
-          "error": {
-            "not": {
-              "type": "null"
-            }
-          }
-        },
-        "required": [
-          "error"
-        ]
-      },
       "type": "object",
       "x-transhooter-runtime-refinements": [
         "error.attemptId must equal attemptId",
-        "retryDecision.previousAttemptId must be null or equal attemptId",
-        "retry action requires retryDecision.previousAttemptId to equal attemptId",
+        "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+        "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+        "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+        "retries require a retryable failed provider error",
         "retryOfAttemptId must differ from attemptId"
       ]
     },

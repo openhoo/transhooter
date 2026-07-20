@@ -5,9 +5,7 @@ import {
   CreateRoomRequest,
   DeleteAgentDispatchRequest,
   DeleteRoomRequest,
-  ParticipantEgressRequest,
   ParticipantPermission,
-  RoomCompositeEgressRequest,
   RoomParticipantIdentity,
   SendDataRequest,
   StopEgressRequest,
@@ -252,6 +250,25 @@ export class LiveKitEffects implements RemoteEffects {
       return;
     }
 
+    if (effect.kind === "PARTICIPANT_GRANT") {
+      const roomName = requiredString(effect.plan, "roomName");
+      const participantIdentity = requiredString(effect.plan, "participantIdentity");
+      const participant = await this.rooms
+        .getParticipant(roomName, participantIdentity)
+        .catch(() => undefined);
+      if (participant !== undefined) {
+        await this.rooms.updateParticipant(roomName, participantIdentity, {
+          permission: {
+            canSubscribe: false,
+            canPublish: false,
+            canPublishData: false,
+            canPublishSources: [],
+          },
+        });
+      }
+      return;
+    }
+
     if (effect.kind === "ROOM_CREATE" || effect.kind === "ROOM_DELETE") {
       const roomName = roomNameFor(effect, effect.plan);
       if ((await this.rooms.listRooms([roomName])).length > 0) {
@@ -335,13 +352,18 @@ export class LiveKitEffects implements RemoteEffects {
     request: Readonly<Record<string, unknown>>,
   ): Promise<Adoption | null> {
     if (effect.kind === "ROOM_COMPOSITE_EGRESS" || effect.kind === "PARTICIPANT_EGRESS") {
-      const roomName = requiredString(request, "roomName");
+      const roomName = roomNameFor(effect, request);
       const found = (await this.egress.listEgress({ roomName })).find((candidate) =>
-        egressMatches(candidate, request),
+        egressMatches(candidate, effect, request),
       );
       return found === undefined
         ? null
-        : { remoteId: found.egressId, matchesRequest: true, terminal: false };
+        : {
+            remoteId: found.egressId,
+            matchesRequest: true,
+            terminal: false,
+            result: { egressId: found.egressId, status: egressStatusName(found.status) },
+          };
     }
 
     const egressId = requiredString(request, "egressId");
@@ -377,7 +399,7 @@ export class LiveKitEffects implements RemoteEffects {
       };
     }
     const participantIdentity = requiredString(request, "participantIdentity");
-    const roomName = requiredString(request, "roomName");
+    const roomName = roomNameFor(effect, request);
 
     const participant = (await this.rooms.listParticipants(roomName)).find(
       ({ identity }) => identity === participantIdentity,
@@ -452,28 +474,30 @@ export class LiveKitEffects implements RemoteEffects {
       );
     }
 
-    const output = this.egressOutput(effect, request);
-    if (effect.kind === "ROOM_COMPOSITE_EGRESS") {
-      return twirpBytes(
-        new RoomCompositeEgressRequest({
-          roomName,
-          layout: "speaker",
-          audioOnly: false,
-          videoOnly: false,
-          customBaseUrl: this.signedLayoutUrl(effect, request),
-          output: { case: "segments", value: output },
-          segmentOutputs: [output],
-        }),
-      );
-    }
-    return twirpBytes(
-      new ParticipantEgressRequest({
-        roomName,
-        identity: requiredString(request, "participantIdentity"),
-        screenShare: false,
-        segmentOutputs: [output],
-      }),
-    );
+    const intent = {
+      kind: effect.kind,
+      roomName,
+      egressIdentity: effect.id,
+      consultationId: effect.consultationId,
+      generation: effect.generation,
+      output: {
+        format: "segmented_hls",
+        segmentDurationSeconds: 2,
+      },
+      ...(effect.kind === "ROOM_COMPOSITE_EGRESS"
+        ? {
+            render: {
+              layout: "speaker",
+              audioOnly: false,
+              videoOnly: false,
+            },
+          }
+        : {
+            participantIdentity: requiredString(request, "participantIdentity"),
+            screenShare: false,
+          }),
+    };
+    return encodeCanonicalRequest(intent).bytes;
   }
 
   private canonicalParticipantRequest(
@@ -631,11 +655,11 @@ export class LiveKitEffects implements RemoteEffects {
     }
 
     const output = this.egressOutput(effect, request);
-    const info =
+    const started =
       effect.kind === "ROOM_COMPOSITE_EGRESS"
         ? await this.egress.startRoomCompositeEgress(roomName, output, {
             layout: "speaker",
-            customBaseUrl: this.signedLayoutUrl(effect, request),
+            customBaseUrl: this.signedLayoutUrl(effect),
           })
         : await this.egress.startParticipantEgress(
             roomName,
@@ -644,8 +668,8 @@ export class LiveKitEffects implements RemoteEffects {
             { screenShare: false },
           );
     return {
-      remoteId: info.egressId,
-      result: { egressId: info.egressId, status: egressStatusName(info.status) },
+      remoteId: started.egressId,
+      result: { egressId: started.egressId, status: egressStatusName(started.status) },
     };
   }
 
@@ -711,8 +735,17 @@ export class LiveKitEffects implements RemoteEffects {
     await this.callInternal("archive-recording", consultationId);
   }
 
-  async notifyDeleteDrain(consultationId: Uuid, writeEpoch: number): Promise<boolean> {
-    return (await this.callInternal("delete-drain", consultationId, { writeEpoch })) === true;
+  async notifyDeleteDrain(
+    consultationId: Uuid,
+    writeEpoch: number,
+    reason: string,
+  ): Promise<boolean> {
+    if (reason.trim().length === 0) {
+      throw new Error("delete drain reason must be nonblank");
+    }
+    return (
+      (await this.callInternal("delete-drain", consultationId, { writeEpoch, reason })) === true
+    );
   }
 
   private async callInternal(
@@ -734,8 +767,8 @@ export class LiveKitEffects implements RemoteEffects {
     }
     return response.status === 204 ? null : await response.json();
   }
-  private signedLayoutUrl(effect: Effect, request: Readonly<Record<string, unknown>>): string {
-    const expires = requiredNumber(request, "layoutExpiresAtMs");
+  private signedLayoutUrl(effect: Effect): string {
+    const expires = Date.now() + 10 * 60_000;
     const message = `${effect.consultationId}\n${String(effect.generation)}\n${String(expires)}`;
     const signature = createHmac("sha256", this.config.egressLayoutSigningKey)
       .update(message)
@@ -923,15 +956,15 @@ function metadataAdoptionId(metadata: string): string | null {
 }
 function egressMatches(
   info: { readonly roomName?: string; readonly request: unknown },
+  effect: Effect,
   request: Readonly<Record<string, unknown>>,
 ): boolean {
-  const roomName = requiredString(request, "roomName");
-  const outputPrefix = requiredString(request, "outputPrefix");
+  const roomName = roomNameFor(effect, request);
   const participantIdentity = requiredOptionalString(request, "participantIdentity");
   const encoded = JSON.stringify(info.request);
   return (
     info.roomName === roomName &&
-    encoded.includes(outputPrefix) &&
+    encoded.includes(effect.id) &&
     (participantIdentity === undefined || encoded.includes(participantIdentity))
   );
 }
@@ -954,6 +987,12 @@ function withStatusCommon(
 }
 
 function roomNameFor(effect: Effect, request: Readonly<Record<string, unknown>>): string {
+  if (
+    (effect.kind === "PARTICIPANT_EGRESS" || effect.kind === "PARTICIPANT_REMOVE") &&
+    typeof request.resourceRoomName === "string"
+  ) {
+    return request.resourceRoomName;
+  }
   return typeof request.roomName === "string"
     ? request.roomName
     : deterministicRoomName(effect.consultationId, effect.generation);

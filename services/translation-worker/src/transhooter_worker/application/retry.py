@@ -26,6 +26,8 @@ class FrozenRetryPolicy:
     ) -> RetryDecision:
         if not 0 <= jitter_unit <= 1:
             raise ValueError("jitter must be normalized")
+        if error.kind is ErrorKind.CANCELLED:
+            return RetryDecision(RetryAction.STOP, None, "cancelled", None)
         unsafe = received_output > 0 or emitted_output > 0
         if (
             error.provider_retry_advice is RetryAdvice.NEVER

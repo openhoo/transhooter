@@ -2,9 +2,13 @@ import "server-only";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   ArchiveObjectRecordSchema,
+  ArchiveStateSchema,
+  ConsultationStateSchema,
   FinalInventorySchema,
+  ParticipantRoleSchema,
   ProviderAttemptReportSchema,
   RoomProviderSelectionSchema,
+  StaffRoleSchema,
   WorkerCheckpointSchema,
 } from "@transhooter/contracts";
 import { DomainError, type UUID, type WebCommand } from "@transhooter/server-core";
@@ -82,22 +86,14 @@ const AuthResultSchema = z.object({
     id: UuidSchema,
     email: z.email(),
     displayName: z.string(),
-    staffRole: z.enum(["employee", "admin"]).nullable(),
+    staffRole: StaffRoleSchema.nullable(),
   }),
 });
 const ConsultationSchema = z
   .object({
     id: UuidSchema,
-    state: z.enum(["invited", "ready", "active", "finalizing", "ended", "cancelled", "deleted"]),
-    archiveState: z.enum([
-      "pending",
-      "recording",
-      "reconciling",
-      "complete",
-      "incomplete",
-      "deleting",
-      "deleted",
-    ]),
+    state: ConsultationStateSchema,
+    archiveState: ArchiveStateSchema,
     providerProfileId: z.string(),
     providerProfileRevision: z.number().int(),
     participants: z
@@ -105,7 +101,7 @@ const ConsultationSchema = z
         z
           .object({
             id: UuidSchema,
-            role: z.enum(["employee", "customer"]),
+            role: ParticipantRoleSchema,
             userId: UuidSchema,
             livekitIdentity: UuidSchema,
             displayName: z.string().nullable(),
@@ -221,6 +217,54 @@ export function workerFailureCommand(
   };
 }
 
+export function archiveDeleteCommand(
+  body: unknown,
+): Extract<WebCommand, { kind: "archive.delete" }> {
+  const parsed = z
+    .object({
+      consultationId: UuidSchema,
+      reason: z.string().trim().min(1).max(2_000),
+    })
+    .parse(body);
+  return {
+    kind: "archive.delete",
+    consultationId: parsed.consultationId,
+    reason: parsed.reason,
+  };
+}
+
+export function consultationCreateCommand(
+  body: unknown,
+): Extract<WebCommand, { kind: "consultation.createInvitation" }> {
+  const parsed = ObjectSchema.parse(body);
+  return {
+    kind: "consultation.createInvitation",
+    customerEmail: z.email().parse(parsed.customerEmail),
+    customerName: z.string().min(1).max(120).parse(parsed.customerName),
+    providerProfileId: requiredUuid(
+      z.string().parse(parsed.providerProfileId),
+      "providerProfileId",
+    ),
+    creationIdempotencyKey: requiredUuid(
+      z.string().parse(parsed.creationIdempotencyKey),
+      "creationIdempotencyKey",
+    ),
+  };
+}
+
+export function adminLanguageUpdateCommand(
+  body: unknown,
+): Extract<WebCommand, { kind: "language.enable" }> {
+  const parsed = ObjectSchema.parse(body);
+  return {
+    kind: "language.enable",
+    capabilityId: requiredUuid(z.string().parse(parsed.directionId), "directionId"),
+    profileId: requiredUuid(z.string().parse(parsed.profileId), "profileId"),
+    profileRevision: z.number().int().positive().parse(parsed.profileRevision),
+    enabled: z.boolean().parse(parsed.enabled),
+  };
+}
+
 function commandFor(operation: string, context: RequestContext): WebCommand {
   const body = ObjectSchema.parse(context.body ?? {});
   switch (operation) {
@@ -251,15 +295,7 @@ function commandFor(operation: string, context: RequestContext): WebCommand {
         providerProfileId: z.string().parse(body.providerProfileId ?? webConfig().providerProfile),
       };
     case "consultations.create":
-      return {
-        kind: "consultation.createInvitation",
-        customerEmail: z.email().parse(body.customerEmail),
-        customerName: z.string().min(1).max(120).parse(body.customerName),
-        providerProfileId: requiredUuid(
-          z.string().parse(body.providerProfileId),
-          "providerProfileId",
-        ),
-      };
+      return consultationCreateCommand(body);
     case "consultations.get":
       return {
         kind: "consultation.get",
@@ -347,10 +383,7 @@ function commandFor(operation: string, context: RequestContext): WebCommand {
       };
     }
     case "archives.delete":
-      return {
-        kind: "archive.delete",
-        consultationId: requiredUuid(z.string().parse(body.consultationId), "consultationId"),
-      };
+      return archiveDeleteCommand(body);
     case "languages.catalog":
       return {
         kind: "consultation.options",
@@ -363,12 +396,9 @@ function commandFor(operation: string, context: RequestContext): WebCommand {
         kind: "admin.languages",
         providerProfileId: context.query.providerProfileId ?? webConfig().providerProfile,
       };
+
     case "admin.languages.update":
-      return {
-        kind: "language.enable",
-        capabilityId: requiredUuid(z.string().parse(body.directionId), "directionId"),
-        enabled: z.boolean().parse(body.enabled),
-      };
+      return adminLanguageUpdateCommand(body);
     case "internal.capabilities.update":
       return {
         kind: "internal.capability",
@@ -434,6 +464,7 @@ function commandFor(operation: string, context: RequestContext): WebCommand {
         kind: "internal.deleteDrain",
         consultationId: requiredUuid(z.string().parse(body.consultationId), "consultationId"),
         writeEpoch: z.number().int().nonnegative().parse(body.writeEpoch),
+        reason: z.string().trim().min(1).max(2_000).parse(body.reason),
       };
     default:
       throw new DomainError("NOT_FOUND");
@@ -715,13 +746,14 @@ function presentFailures(result: unknown) {
   };
 }
 
-function presentLanguages(result: unknown) {
+export function presentLanguages(result: unknown) {
   const rows = z.array(ObjectSchema).parse(result);
   return {
     directions: rows.map((row) => {
       const snapshot = ObjectSchema.safeParse(row.snapshot);
       return {
         id: String(row.id),
+        profileId: String(row.profileId ?? row.profile_id),
         profile: String(row.profileName ?? row.profile_name),
         revision: Number(row.revision),
         source: String(row.sourceLocale ?? row.source_locale),
@@ -793,7 +825,7 @@ async function present(
         worker_identity: UuidSchema,
         participant_id: UuidSchema,
         participant_identity: UuidSchema,
-        role: z.enum(["employee", "customer"]),
+        role: ParticipantRoleSchema,
         display_name: z.string().nullable(),
         other_participant_id: UuidSchema,
         other_identity: UuidSchema,
@@ -882,12 +914,14 @@ export function statusFor(error: DomainError): number {
       "SNAPSHOT_CHANGED",
       "INVALID_STATE",
       "PREFERENCES_LOCKED",
+      "CONSULTATION_CREATION_CONFLICT",
       "PROVIDER_ATTEMPT_FENCED",
       "PROVIDER_ATTEMPT_CONFLICT",
       "PROVIDER_SELECTION_MISMATCH",
       "PROVIDER_DIRECTION_MISMATCH",
       "PROVIDER_STAGE_MISMATCH",
       "PROVIDER_CREDENTIAL_MISMATCH",
+      "CAPABILITY_REVISION_CONFLICT",
     ].includes(error.code)
   ) {
     return 409;
@@ -993,6 +1027,20 @@ function applicationResponse(payload: unknown): Response {
   });
 }
 
+export function normalizeAuthFlowError(operation: string, error: DomainError): DomainError {
+  const isExchangeOperation =
+    operation === "auth.exchange.prepare" || operation === "auth.exchange.verify";
+  if (
+    isExchangeOperation &&
+    (error.code === "INVALID_OR_EXPIRED_LINK" ||
+      error.code === "INVALID_EXCHANGE" ||
+      error.code === "INVALID_EXCHANGE_CONTEXT")
+  ) {
+    return new DomainError("INVALID_OR_EXPIRED_LINK", "This sign-in flow is unavailable");
+  }
+  return error;
+}
+
 function errorResponse(error: DomainError | z.ZodError): Response {
   if (error instanceof DomainError) {
     return Response.json(
@@ -1011,6 +1059,40 @@ function errorResponse(error: DomainError | z.ZodError): Response {
     },
     {
       status: 400,
+      headers: { "cache-control": "no-store" },
+    },
+  );
+}
+
+function applicationFailureResponse(operation: string, error: unknown): Response {
+  const summary: { operation: string; name: string; code?: string; status?: number } = {
+    operation,
+    name: error instanceof Error ? error.name : typeof error,
+  };
+  let current = error;
+  for (let depth = 0; depth < 4 && current !== null && typeof current === "object"; depth += 1) {
+    const record = current as Record<string, unknown>;
+    if (summary.code === undefined && ["string", "number"].includes(typeof record.code)) {
+      summary.code = String(record.code);
+    }
+    const status = record.statusCode ?? record.status;
+    if (summary.status === undefined && typeof status === "number") {
+      summary.status = status;
+    }
+    current = record.cause;
+  }
+  console.error("Unhandled API request failure", summary);
+
+  const invalidJson = error instanceof SyntaxError;
+  return Response.json(
+    {
+      code: "REQUEST_FAILED",
+      message: invalidJson
+        ? "Request body is not valid JSON"
+        : "The request could not be completed",
+    },
+    {
+      status: invalidJson ? 400 : 503,
       headers: { "cache-control": "no-store" },
     },
   );
@@ -1133,19 +1215,40 @@ async function executeApplication(
     }
     return applicationResponse(presented);
   } catch (error) {
-    if (error instanceof DomainError || error instanceof z.ZodError) {
+    if (error instanceof DomainError) {
+      return errorResponse(normalizeAuthFlowError(operation, error));
+    }
+    if (error instanceof z.ZodError) {
       return errorResponse(error);
     }
     throw error;
   }
 }
 
-export function execute(
+export async function execute(
   operation: string,
   request: Request,
   params: Record<string, string> = {},
 ): Promise<Response> {
-  return withWebOperation(operation, "api", () => executeApplication(operation, request, params));
+  const startedAt = Date.now();
+  try {
+    return await withWebOperation(operation, "api", async () => {
+      try {
+        return await executeApplication(operation, request, params);
+      } catch (error) {
+        return applicationFailureResponse(operation, error);
+      }
+    });
+  } finally {
+    if (operation.startsWith("auth.")) {
+      const remaining = 250 - (Date.now() - startedAt);
+      if (remaining > 0) {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, remaining);
+        await promise;
+      }
+    }
+  }
 }
 
 async function requirePageDataApplication<T>(

@@ -42,3 +42,14 @@ class FixtureScenario:
         if not isinstance(section, dict):
             raise RuntimeError(f"fixture scenario section {name} must be an object")
         return section
+
+    def optional_nonnegative_int(self, section: str, field: str) -> int | None:
+        config = self.section(section)
+        if field not in config:
+            return None
+        value = config[field]
+        if isinstance(value, bool):
+            raise RuntimeError(f"fixture scenario {section}.{field} must be a non-negative integer")
+        if not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"fixture scenario {section}.{field} must be a non-negative integer")
+        return value

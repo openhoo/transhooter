@@ -218,7 +218,7 @@ export class S3ArchiveVersionDeleter implements ArchiveVersionDeleter {
       head.ChecksumCRC64NVME === undefined ||
       head.Metadata?.sha256 !== input.sha256
     ) {
-      throw new Error("create-once object collision");
+      throw new Error(`create-once object collision: ${input.key}`);
     }
 
     return {
@@ -366,13 +366,10 @@ function objectChecksum(
 }
 
 function isMissingObjectVersion(error: unknown): boolean {
-  if (httpStatusCode(error) === 404) {
-    return true;
-  }
   if (typeof error !== "object" || error === null || !("name" in error)) {
     return false;
   }
-  return error.name === "NoSuchKey" || error.name === "NoSuchVersion" || error.name === "NotFound";
+  return error.name === "NoSuchKey" || error.name === "NoSuchVersion";
 }
 
 function httpStatusCode(error: unknown): number | undefined {

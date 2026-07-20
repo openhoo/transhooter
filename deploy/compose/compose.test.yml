@@ -1,3 +1,5 @@
+x-web-runtime-volumes: []
+
 x-provider-disabled-env: &provider-disabled-env
   GOOGLE_APPLICATION_CREDENTIALS: ""
   GOOGLE_CLOUD_PROJECT: ""
@@ -28,17 +30,80 @@ x-fixture-runtime-env: &fixture-runtime-env
   APP_ENV: test
   PROVIDER_PROFILE: fixture
   PROVIDER_NETWORK_DISABLED: "true"
-  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-true}
+  OTEL_SDK_DISABLED: "false"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_METRIC_EXPORT_INTERVAL: "5000"
+  OTEL_TRACES_SAMPLER: parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG: "1"
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=transhooter,deployment.environment.name=test
 
 services:
+  secrets-init:
+    volumes: !override
+      - test-secrets:/secrets
+      - ../scripts/init-secrets.sh:/usr/local/bin/init-secrets:ro
+
+  postgres:
+    volumes: !override
+      - postgres-data:/var/lib/postgresql/data
+      - test-secrets:/run/secrets:ro
+
+  redis:
+    volumes: !override
+      - redis-data:/data
+      - test-secrets:/run/secrets:ro
+
+  minio-bootstrap:
+    volumes: !override
+      - test-secrets:/run/secrets:ro
+
+  egress-ready:
+    volumes: !override
+      - test-secrets:/run/secrets:ro
+
   minio:
     ports: !override []
+    volumes: !override
+      - minio-data:/data
+      - test-secrets:/run/secrets:ro
 
   mailpit:
-    ports: !override []
+    image: axllent/mailpit:v1.27.8
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    healthcheck:
+      test: [CMD, /mailpit, readyz]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   livekit:
+    networks:
+      backend:
+        ipv4_address: ${RTC_NODE_IP:-10.254.232.250}
+      edge: {}
     ports: !override []
+    environment:
+      RTC_ADVERTISED_IP: ${RTC_NODE_IP:-10.254.232.250}
+    volumes: !override
+      - test-secrets:/secrets:ro
+      - runtime-config:/runtime
+      - ./livekit.yaml:/templates/livekit.yaml:ro
+      - ./egress.yaml:/templates/egress.yaml:ro
+      - ../scripts/render-config.sh:/usr/local/bin/render-config:ro
+
+  egress:
+    environment:
+      RTC_ADVERTISED_IP: ${RTC_NODE_IP:-10.254.232.250}
+    volumes: !override
+      - test-secrets:/secrets:ro
+      - ./livekit.yaml:/templates/livekit.yaml:ro
+      - ./egress.yaml:/templates/egress.yaml:ro
+      - ../scripts/render-config.sh:/usr/local/bin/render-config:ro
 
   profile-preflight:
     environment:
@@ -50,8 +115,13 @@ services:
     volumes: !override []
 
   capability-publisher:
+    depends_on:
+      otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
+      SMTP_URL: smtp://mailpit:1025
+    volumes: !override
+      - test-secrets:/run/secrets:ro
 
   language-refresh:
     environment:
@@ -59,36 +129,41 @@ services:
       APP_ENV: test
       PROVIDER_PROFILE: fixture
       DATABASE_URL_FILE: /run/secrets/database-url
+      INTERNAL_TOKEN_FILE: /run/secrets/internal-translation-token
     command: [python, -m, transhooter_worker.providers, sync, --profile, fixture]
     volumes: !override
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
-      - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
-      - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
+      - test-secrets:/run/secrets:ro
 
   translation-worker:
+    depends_on:
+      otel-collector: {condition: service_healthy}
     environment:
       <<: [*provider-disabled-env, *fixture-runtime-env]
       FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+      INTERNAL_TOKEN_FILE: /run/secrets/internal-translation-token
+      WORKER_INTERNAL_BEARER_FILE: /run/secrets/internal-translation-token
     volumes: !override
       - spool-data:/var/lib/transhooter/spool
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
-      - ../../.secrets/redis-url:/run/secrets/redis-url:ro
-      - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
-      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
-      - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
-      - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
+      - test-secrets:/run/secrets:ro
       - fault-control:/shared:ro
 
   spool-drainer:
+    depends_on:
+      otel-collector: {condition: service_healthy}
     environment:
       <<: [*provider-disabled-env, *fixture-runtime-env]
       FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
-    volumes:
+      INTERNAL_TOKEN_FILE: /run/secrets/internal-spool-drainer-token
+    volumes: !override
+      - spool-data:/var/lib/transhooter/spool
+      - test-secrets:/run/secrets:ro
       - fault-control:/shared:ro
 
   migrate:
     environment:
       APP_ENV: test
+    volumes: !override
+      - test-secrets:/run/secrets:ro
 
   bootstrap-admin:
     depends_on:
@@ -100,6 +175,8 @@ services:
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL}
       BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Test Administrator}
     command: [bun, run, admin:create-staff, --email, "${BOOTSTRAP_ADMIN_EMAIL}", --name, "${BOOTSTRAP_ADMIN_NAME:-Test Administrator}", --role, admin]
+    volumes: !override
+      - test-secrets:/run/secrets:ro
 
   fault-control-init:
     image: alpine:3.22.1
@@ -128,20 +205,26 @@ services:
     depends_on:
       bootstrap-admin: {condition: service_completed_successfully}
       fault-control-init: {condition: service_completed_successfully}
+      otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
       TEST_FAULT_CONTROL_FILE: /shared/faults.json
-    volumes:
+      SMTP_URL: smtp://mailpit:1025
+    volumes: !override
+      - test-secrets:/run/secrets:ro
       - fault-control:/shared:ro
 
   control-worker-2:
     depends_on:
       bootstrap-admin: {condition: service_completed_successfully}
       fault-control-init: {condition: service_completed_successfully}
+      otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
       TEST_FAULT_CONTROL_FILE: /shared/faults.json
-    volumes:
+      SMTP_URL: smtp://mailpit:1025
+    volumes: !override
+      - test-secrets:/run/secrets:ro
       - fault-control:/shared:ro
 
   web:
@@ -156,10 +239,33 @@ services:
       spool-drainer: {condition: service_started}
       control-worker-1: {condition: service_healthy}
       control-worker-2: {condition: service_healthy}
+      otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
       PUBLIC_BASE_URL: http://app.localhost:3000
       PUBLIC_LIVEKIT_URL: ws://rtc.localhost:7880
+      SMTP_URL: smtp://mailpit:1025
+    volumes: !override
+      - test-secrets:/run/secrets:ro
+
+  test-dependencies-ready:
+    image: alpine:3.22.1
+    restart: "no"
+    networks: [backend]
+    depends_on:
+      bootstrap-admin: {condition: service_completed_successfully}
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio-bootstrap: {condition: service_completed_successfully}
+      livekit: {condition: service_healthy}
+      mailpit: {condition: service_healthy}
+      otel-collector: {condition: service_healthy}
+    command: [tail, -f, /dev/null]
+    healthcheck:
+      test: [CMD, /bin/true]
+      interval: 1s
+      timeout: 1s
+      retries: 3
 
   test:
     depends_on:
@@ -173,11 +279,9 @@ services:
       <<: *fixture-runtime-env
       DATABASE_URL_FILE: /run/secrets/database-url
       REDIS_URL_FILE: /run/secrets/redis-url
-    volumes:
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
-      - ../../.secrets/redis-url:/run/secrets/redis-url:ro
-      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
-      - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
+      TEST_GATE_PHASE_DEADLINE_SECONDS: ${TEST_GATE_PHASE_DEADLINE_SECONDS:-600}
+    volumes: !override
+      - test-secrets:/run/secrets:ro
     tmpfs:
       - /tmp:size=536870912,mode=1777,uid=10001,gid=10001
 
@@ -186,12 +290,13 @@ services:
       <<: [*provider-disabled-env, *fixture-runtime-env]
     volumes: !override
       - ../../tests/fixtures:/workspace/tests/fixtures:ro
-      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+      - test-secrets:/run/secrets:ro
 
   e2e:
     environment:
       <<: *fixture-runtime-env
       EXPECTED_PROFILE: fixture
+      MAILPIT_URL: http://mailpit:8025
 
   failure-smoke:
     user: "0:0"
@@ -212,8 +317,8 @@ services:
       FAULT_CONTROL_FILE: /shared/faults.json
       WORKER_SCENARIO_FILE: /shared/worker-scenarios.json
       FAILURE_RELEASE_DIR: /shared/releases
-    volumes:
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
+    volumes: !override
+      - test-secrets:/run/secrets:ro
       - fault-control:/shared
       - spool-data:/var/lib/transhooter/spool
       - /var/run/docker.sock:/var/run/docker.sock
@@ -223,4 +328,5 @@ networks:
     internal: true
 
 volumes:
+  test-secrets:
   fault-control:

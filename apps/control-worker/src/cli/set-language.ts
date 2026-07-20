@@ -1,6 +1,6 @@
 import { z } from "zod";
+import { parseSetLanguageOptions } from "./admin-options";
 import { databaseUrlFromEnvironment, setLanguage } from "./admin-store";
-import { parseLongOptions } from "./long-options";
 
 const argumentSchema = z.object({
   profile: z.string().min(1),
@@ -10,7 +10,7 @@ const argumentSchema = z.object({
   enabled: z.enum(["true", "false"]).transform((value) => value === "true"),
 });
 
-const args = parseLongOptions(process.argv.slice(2));
+const args = parseSetLanguageOptions(process.argv.slice(2));
 const input = argumentSchema.parse(args);
 const databaseUrl = await databaseUrlFromEnvironment(process.env);
 await setLanguage(databaseUrl, {

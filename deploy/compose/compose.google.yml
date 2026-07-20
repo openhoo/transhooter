@@ -1,5 +1,14 @@
+x-production-env: &production-env
+  APP_ENV: ${APP_ENV:-production}
+  RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:?set RTC_ADVERTISED_IP to the externally reachable LiveKit RTC address}
+  S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?set S3_PUBLIC_ENDPOINT to the externally reachable S3 address}
+
+x-production-mail-env: &production-mail-env
+  <<: *production-env
+  SMTP_URL: ${SMTP_URL:?set SMTP_URL for production mail delivery}
+
 x-google-env: &google-env
-  APP_ENV: development
+  <<: *production-env
   PROVIDER_PROFILE: google-eu
   GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/google-adc.json
   GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:?set GOOGLE_CLOUD_PROJECT}
@@ -16,6 +25,18 @@ x-google-secret-volumes: &google-secret-volumes
   - ../../.secrets/google-adc.json:/run/secrets/google-adc.json:ro
 
 services:
+  migrate:
+    environment:
+      <<: *production-env
+
+  bootstrap-admin:
+    environment:
+      <<: *production-env
+
+  capability-publisher:
+    environment:
+      <<: *production-mail-env
+
   profile-preflight:
     environment:
       <<: *google-env
@@ -30,6 +51,22 @@ services:
     environment:
       <<: *google-env
     volumes: *google-secret-volumes
+
+  spool-drainer:
+    environment:
+      <<: *google-env
+
+  control-worker-1:
+    environment:
+      <<: *production-mail-env
+
+  control-worker-2:
+    environment:
+      <<: *production-mail-env
+
+  web:
+    environment:
+      <<: *production-mail-env
 
   provider-benchmark:
     environment:

@@ -4,10 +4,6 @@ metadata:
   name: {{ include "transhooter.fullname" . }}
   labels:
     {{- include "transhooter.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: pre-install,pre-upgrade
-    helm.sh/hook-weight: "-40"
-    helm.sh/hook-delete-policy: before-hook-creation
 data:
   APP_ENV: {{ .Values.config.appEnv | quote }}
   PROVIDER_PROFILE: {{ .Values.config.providerProfile | quote }}
@@ -52,6 +48,7 @@ data:
   LIVEKIT_URL: {{ .Values.config.livekitUrl | quote }}
   LIVEKIT_CREDENTIALS_FILE: "/run/secrets/livekit-credentials"
   S3_ENDPOINT: {{ .Values.config.s3Endpoint | quote }}
+  S3_PUBLIC_ENDPOINT: {{ required "config.s3PublicEndpoint must be a public HTTPS endpoint" .Values.config.s3PublicEndpoint | quote }}
   S3_REGION: {{ .Values.config.s3Region | quote }}
   S3_BUCKET: {{ .Values.config.s3Bucket | quote }}
   S3_CREDENTIALS_FILE: "/run/secrets/s3-credentials"
@@ -64,4 +61,5 @@ data:
   INTERNAL_JWT_ISSUER: {{ .Values.config.internalIssuer | quote }}
   INTERNAL_JWT_AUDIENCE: {{ .Values.config.internalAudience | quote }}
   SPOOL_KEYRING_FILE: "/run/secrets/spool-keyring"
+  MAGIC_LINK_SEAL_KEYS_FILE: {{ required "magicLinkSealKeys.mountPath must identify the mounted keyring file" .Values.magicLinkSealKeys.mountPath | quote }}
   CONTROL_INTERNAL_URL: {{ printf "http://%s-web:%v" (include "transhooter.fullname" .) .Values.service.port | quote }}

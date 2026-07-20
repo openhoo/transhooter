@@ -78,7 +78,9 @@ test("reconciliation verifies ledger objects before create-once final inventory"
       return snapshot;
     },
     completeReconciliation: async (
-      _id: string,
+      _effect: Effect,
+      _owner: string,
+      _now: Date,
       _snapshot: ReconciliationSnapshot,
       inventory: Readonly<Record<string, unknown>>,
     ) => {
@@ -122,7 +124,74 @@ test("reconciliation verifies ledger objects before create-once final inventory"
   await runner.tick();
 
   // Assert
-  assert.deepEqual(calls, ["snapshot:3:2", "verify", "put", "complete:complete", "done"]);
+  assert.deepEqual(calls, ["snapshot:3:2", "verify", "put", "complete:complete"]);
+});
+
+test("forced reconciliation finalizes missing evidence before the archive deadline", async () => {
+  const calls: string[] = [];
+  const expectation = snapshot.expectations[0];
+  assert(expectation);
+  const forcedSnapshot: ReconciliationSnapshot = {
+    ...snapshot,
+    expectations: [
+      {
+        ...expectation,
+        fulfilledObjectId: null,
+      },
+    ],
+    objects: [],
+  };
+  const store = {
+    claimEffects: async () => [effect],
+    currentGeneration: async () => effect.generation,
+    persistCalling: async () => ({
+      ...effect,
+      state: "calling" as const,
+      requestBytes: new Uint8Array(),
+      requestSha256: "a".repeat(64),
+    }),
+    renewEffectLease: async () => true,
+    reconciliationSnapshot: async () => forcedSnapshot,
+    completeReconciliation: async (
+      _effect: Effect,
+      _owner: string,
+      _now: Date,
+      _snapshot: ReconciliationSnapshot,
+      inventory: Readonly<Record<string, unknown>>,
+    ) => {
+      calls.push(`complete:${inventory.status}`);
+      return true;
+    },
+    markDone: async () => {
+      calls.push("done");
+    },
+    markFailed: async () => {
+      calls.push("failed");
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    discoverArchiveObjects: async () => [],
+    verifyArchiveObject: async () => true,
+    putArchiveObject: async () => ({
+      versionId: "forced-final-v1",
+      size: 100,
+      checksum: "final-crc",
+    }),
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "40000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["complete:incomplete"]);
 });
 
 test("reconciliation resolves planned Egress expectations from discovered immutable objects", async () => {
@@ -155,7 +224,9 @@ test("reconciliation resolves planned Egress expectations from discovered immuta
     renewEffectLease: async () => true,
     reconciliationSnapshot: async () => egressSnapshot,
     completeReconciliation: async (
-      _id: string,
+      _effect: Effect,
+      _owner: string,
+      _now: Date,
       _snapshot: ReconciliationSnapshot,
       inventory: Readonly<Record<string, unknown>>,
     ) => {
@@ -200,7 +271,51 @@ test("reconciliation resolves planned Egress expectations from discovered immuta
 
   await runner.tick();
 
-  assert.deepEqual(calls, ["complete:complete", "done"]);
+  assert.deepEqual(calls, ["complete:complete"]);
+});
+
+test("reconciliation rejected by the transactional fence cannot mark the effect done", async () => {
+  const calls: string[] = [];
+  const store = {
+    claimEffects: async () => [effect],
+    currentGeneration: async () => effect.generation,
+    persistCalling: async () => ({ ...effect, state: "calling" as const }),
+    renewEffectLease: async () => true,
+    reconciliationSnapshot: async () => snapshot,
+    completeReconciliation: async () => {
+      calls.push("fence-rejected");
+      return false;
+    },
+    markDone: async () => {
+      calls.push("done");
+    },
+    markFailed: async () => {
+      calls.push("failed");
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    discoverArchiveObjects: async () => [],
+    verifyArchiveObject: async () => true,
+    putArchiveObject: async () => ({
+      versionId: "uncommitted-final",
+      size: 100,
+      checksum: "final-crc",
+    }),
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "40000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["fence-rejected", "failed"]);
 });
 
 test("reconciliation records unresolved leaf provider attempts as explicit gaps", async () => {
@@ -237,7 +352,9 @@ test("reconciliation records unresolved leaf provider attempts as explicit gaps"
     renewEffectLease: async () => true,
     reconciliationSnapshot: async () => providerGapSnapshot,
     completeReconciliation: async (
-      _id: string,
+      _effect: Effect,
+      _owner: string,
+      _now: Date,
       _snapshot: ReconciliationSnapshot,
       inventory: Readonly<Record<string, unknown>>,
     ) => {
@@ -270,6 +387,7 @@ test("reconciliation records unresolved leaf provider attempts as explicit gaps"
   await runner.tick();
 
   assert.equal(inventories[0]?.status, "incomplete");
+  assert.equal(inventories[0]?.consultationId, consultationId);
   assert.deepEqual(inventories[0]?.missing, [
     {
       class: "provider_terminal",
@@ -277,6 +395,138 @@ test("reconciliation records unresolved leaf provider attempts as explicit gaps"
       ...providerGapSnapshot.providerGaps[0],
     },
   ]);
+});
+
+test("reconciliation retry reproduces the same inventory after discovering its derived VTT", async () => {
+  const sourceParticipantId = "40000000-0000-4000-8000-000000000013";
+  const destinationParticipantId = "40000000-0000-4000-8000-000000000014";
+  const captionBytes = new TextEncoder().encode(
+    JSON.stringify({
+      schemaVersion: 1,
+      consultationId,
+      destinationParticipantId,
+      sourceParticipantId,
+      utteranceId: "40000000-0000-4000-8000-000000000015",
+      revision: 1,
+      finality: "final",
+      sourceLanguage: "en-US",
+      targetLanguage: "de-DE",
+      sourceText: "hello",
+      translatedText: "hallo",
+      sourceSampleStart: 0,
+      sourceSampleEnd: 480,
+      occurredAtMs: 1_000,
+    }),
+  );
+  const captionObject = {
+    id: "40000000-0000-4000-8000-000000000016",
+    objectClass: "caption_packet",
+    key: `v1/meetings/${consultationId}/captions/packet.json`,
+    versionId: "caption-v1",
+    size: captionBytes.byteLength,
+    sha256: "b".repeat(64),
+    s3Checksum: "caption-crc",
+    contentType: "application/json",
+  };
+  const retrySnapshot: ReconciliationSnapshot = {
+    ...snapshot,
+    reconciliationDeadlineAt: new Date(0),
+    expectations: [],
+    objects: [captionObject],
+    egressResults: [],
+  };
+  const inventories: Readonly<Record<string, unknown>>[] = [];
+  const stored = new Map<
+    string,
+    {
+      body: Uint8Array;
+      versionId: string;
+      size: number;
+      checksum: string;
+      contentType: string;
+      sha256: string;
+    }
+  >();
+  const errors: string[] = [];
+  const store = {
+    claimEffects: async () => [effect],
+    currentGeneration: async () => effect.generation,
+    persistCalling: async () => ({
+      ...effect,
+      state: "calling" as const,
+      requestBytes: new Uint8Array(),
+      requestSha256: "a".repeat(64),
+    }),
+    renewEffectLease: async () => true,
+    reconciliationSnapshot: async () => retrySnapshot,
+    completeReconciliation: async (
+      _effect: Effect,
+      _owner: string,
+      _now: Date,
+      _snapshot: ReconciliationSnapshot,
+      inventory: Readonly<Record<string, unknown>>,
+    ) => {
+      inventories.push(inventory);
+      return inventories.length > 1;
+    },
+    markDone: async () => undefined,
+    markFailed: async (_effectId: string, _owner: string, error: string) => {
+      errors.push(error);
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    discoverArchiveObjects: async () =>
+      [...stored.entries()].map(([key, object]) => ({
+        key,
+        versionId: object.versionId,
+        size: object.size,
+        checksum: object.checksum,
+        contentType: object.contentType,
+        sha256: object.sha256,
+      })),
+    verifyArchiveObject: async () => true,
+    readArchiveObject: async () => captionBytes,
+    putArchiveObject: async (input: {
+      key: string;
+      body: Uint8Array;
+      contentType: string;
+      sha256: string;
+    }) => {
+      const existing = stored.get(input.key);
+      if (existing !== undefined) {
+        assert.equal(input.sha256, existing.sha256);
+        assert.deepEqual(input.body, existing.body);
+        return existing;
+      }
+      const uploaded = {
+        body: input.body,
+        versionId: input.key.endsWith("final.json") ? "inventory-v1" : "vtt-v1",
+        size: input.body.byteLength,
+        checksum: "stored-crc",
+        contentType: input.contentType,
+        sha256: input.sha256,
+      };
+      stored.set(input.key, uploaded);
+      return uploaded;
+    },
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "40000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+  await runner.tick();
+
+  assert.deepEqual(errors, ["final inventory create-once fence rejected"]);
+  assert.equal(inventories.length, 2);
+  assert.deepEqual(inventories[1], inventories[0]);
 });
 
 test("redundant reconciliation completes after the archive is already terminal", async () => {

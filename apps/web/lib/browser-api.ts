@@ -1,7 +1,13 @@
-export type ApiError = {
-  code: string;
-  message: string;
-};
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 function csrfToken(): string {
   const cookieParts = document.cookie.split("; ");
@@ -39,9 +45,16 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   if (!response.ok) {
-    const error = body as Partial<ApiError>;
-    const message = error.message ?? `Request failed (${String(response.status)})`;
-    throw new Error(message);
+    const payload =
+      body && typeof body === "object"
+        ? (body as { code?: unknown; message?: unknown })
+        : undefined;
+    const code = typeof payload?.code === "string" ? payload.code : undefined;
+    const message =
+      typeof payload?.message === "string"
+        ? payload.message
+        : `Request failed (${String(response.status)})`;
+    throw new ApiError(response.status, code, message);
   }
 
   return body as T;

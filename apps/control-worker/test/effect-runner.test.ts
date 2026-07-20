@@ -219,6 +219,54 @@ test("resumes a leased compensation without replaying the remote effect", async 
   assert.deepEqual(calls, ["compensate", "done"]);
 });
 
+test("resumes an applied effect from durable state without repeating the remote call", async () => {
+  const { calls, runner } = harness(4, null, "applied");
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["done"]);
+});
+
+test("compensates a recovered applied effect when its generation is stale", async () => {
+  const calls: string[] = [];
+  const applied = {
+    ...effect,
+    state: "applied" as const,
+    remoteId: "persisted-room",
+    appliedResult: { status: "created" },
+  };
+  const store = {
+    claimEffects: async () => [applied],
+    currentGeneration: async () => applied.generation + 1,
+    renewEffectLease: async () => true,
+    markCompensating: async () => {
+      calls.push("compensating");
+    },
+    markDone: async () => {
+      calls.push("done");
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    compensate: async (candidate: Effect) => {
+      calls.push(`compensate:${candidate.remoteId}`);
+    },
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "10000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["compensating", "compensate:persisted-room", "done"]);
+});
+
 test("passes the exact consultation ID to both fault decisions", async () => {
   const decisions: string[] = [];
   const faults: EffectFaultControl = {

@@ -16,6 +16,8 @@ export type OrchestrationEffectKind =
   | "PARTICIPANT_GRANT"
   | "STATUS_PACKET"
   | "ROOM_DRAIN"
+  | "DISPATCH_DELETE"
+  | "PARTICIPANT_REMOVE"
   | "EGRESS_STOP"
   | "ROOM_DELETE"
   | "ARCHIVE_RECONCILE"
@@ -27,10 +29,44 @@ export interface ProvisioningRequested {
   subjectId: UUID;
 }
 
-export interface EffectPlanRequested extends ProvisioningRequested {
-  kind: OrchestrationEffectKind;
-  request: Readonly<Record<string, unknown>>;
+export interface ParticipantEgressEffectRequest {
+  roomName: string;
+  resourceRoomName: string;
+  participantIdentity: UUID;
+  outputPrefix: string;
+  segmentedHls: true;
+  resourceGeneration: number;
+  compensationIntent: "EGRESS_STOP";
 }
+
+export interface ParticipantRemoveEffectRequest {
+  roomName: string;
+  resourceRoomName: string;
+  participantIdentity: UUID;
+  resourceGeneration: number;
+  compensationIntent: "REMOVE_PARTICIPANT";
+}
+
+type GenericEffectKind = Exclude<
+  OrchestrationEffectKind,
+  "PARTICIPANT_EGRESS" | "PARTICIPANT_REMOVE"
+>;
+
+export type EffectPlanRequested = ProvisioningRequested &
+  (
+    | {
+        kind: "PARTICIPANT_EGRESS";
+        request: ParticipantEgressEffectRequest;
+      }
+    | {
+        kind: "PARTICIPANT_REMOVE";
+        request: ParticipantRemoveEffectRequest;
+      }
+    | {
+        kind: GenericEffectKind;
+        request: Readonly<Record<string, unknown>>;
+      }
+  );
 
 export function deterministicUuid(namespace: UUID, name: string): UUID {
   const namespaceBytes = Buffer.from(namespace.replaceAll("-", ""), "hex");

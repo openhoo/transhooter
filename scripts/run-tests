@@ -4,8 +4,31 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/deploy/scripts/compose-lib.sh"
 
-PROJECT_NAME=${COMPOSE_PROJECT_NAME:-transhooter-test}
+LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
+LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
+BUILD_DEADLINE_SECONDS=${COMPOSE_BUILD_DEADLINE_SECONDS:-1800}
+START_DEADLINE_SECONDS=${COMPOSE_START_DEADLINE_SECONDS:-900}
+TEST_DEADLINE_SECONDS=${COMPOSE_TEST_DEADLINE_SECONDS:-1800}
+CLEANUP_DEADLINE_SECONDS=${COMPOSE_CLEANUP_DEADLINE_SECONDS:-300}
+
+RUN_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/transhooter-test.XXXXXXXX") || {
+  printf 'Unable to create an isolated test directory.\n' >&2
+  exit 1
+}
+chmod 0700 "$RUN_DIRECTORY" || {
+  rm -rf -- "$RUN_DIRECTORY"
+  exit 1
+}
+COMPOSE_ENV_FILE="$RUN_DIRECTORY/compose.env"
+if ! (umask 077 && : > "$COMPOSE_ENV_FILE"); then
+  printf 'Unable to create an isolated Compose environment file.\n' >&2
+  rm -rf -- "$RUN_DIRECTORY"
+  exit 1
+fi
+RUN_ID=$(printf '%s' "${RUN_DIRECTORY##*.}" | tr '[:upper:]' '[:lower:]')
+PROJECT_NAME="transhooter-test-$RUN_ID"
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+
 OVERLAY_FILE="$ROOT/deploy/compose/compose.test.yml"
 export APP_ENV=test
 export PROVIDER_PROFILE=fixture
@@ -14,35 +37,94 @@ export BOOTSTRAP_ADMIN_NAME="${BOOTSTRAP_ADMIN_NAME:-Test Administrator}"
 export RTC_SUBNET="${TEST_RTC_SUBNET:-10.254.232.0/24}"
 export RTC_NODE_IP="${TEST_RTC_NODE_IP:-10.254.232.250}"
 
-LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
-LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
+require_deadline() {
+  name=$1
+  value=$2
+  case "$value" in
+    "" | *[!0-9]* | 0)
+      printf '%s must be a positive integer, got %s.\n' "$name" "$value" >&2
+      rm -rf -- "$RUN_DIRECTORY"
+      exit 2
+      ;;
+  esac
+}
+
+require_deadline COMPOSE_HARNESS_LOCK_WAIT_SECONDS "$LOCK_WAIT_SECONDS"
+require_deadline COMPOSE_BUILD_DEADLINE_SECONDS "$BUILD_DEADLINE_SECONDS"
+require_deadline COMPOSE_START_DEADLINE_SECONDS "$START_DEADLINE_SECONDS"
+require_deadline COMPOSE_TEST_DEADLINE_SECONDS "$TEST_DEADLINE_SECONDS"
+require_deadline COMPOSE_CLEANUP_DEADLINE_SECONDS "$CLEANUP_DEADLINE_SECONDS"
+select_compose_command_bounded() {
+  detection_deadline=15
+  announce_phase "Selecting Docker Compose (deadline: ${detection_deadline}s per implementation)"
+  if timeout --signal=TERM --kill-after=5s "${detection_deadline}s" docker compose version >/dev/null 2>&1; then
+    compose_implementation=plugin
+  elif timeout --signal=TERM --kill-after=5s "${detection_deadline}s" docker-compose version >/dev/null 2>&1; then
+    compose_implementation=legacy
+  else
+    printf 'Phase "Selecting Docker Compose" failed or exceeded its deadline.\n' >&2
+    rm -rf -- "$RUN_DIRECTORY"
+    exit 127
+  fi
+}
+
+select_compose_command_bounded
+
+
+compose_with_deadline() {
+  phase=$1
+  deadline=$2
+  shift 2
+  announce_phase "$phase (deadline: ${deadline}s)"
+
+  set -- --env-file "$COMPOSE_ENV_FILE" -p "$PROJECT_NAME" -f "$BASE_FILE" -f "$OVERLAY_FILE" "$@"
+
+  if [ "$compose_implementation" = plugin ]; then
+    set -- docker compose "$@"
+  else
+    set -- docker-compose "$@"
+  fi
+
+  if timeout --signal=TERM --kill-after=15s "${deadline}s" "$@"; then
+    return 0
+  else
+    phase_status=$?
+  fi
+  if [ "$phase_status" -eq 124 ] || [ "$phase_status" -eq 137 ]; then
+    printf 'Phase "%s" exceeded its absolute %ss deadline; its process tree was terminated.\n' "$phase" "$deadline" >&2
+  else
+    printf 'Phase "%s" failed with status %s.\n' "$phase" "$phase_status" >&2
+  fi
+  return "$phase_status"
+}
+
 exec 9>"$LOCK_FILE"
+announce_phase "Waiting for the compose harness lock (deadline: ${LOCK_WAIT_SECONDS}s)"
 if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
-  printf 'Timed out after %s seconds waiting for the compose harness lock.\n' "$LOCK_WAIT_SECONDS" >&2
+  printf 'Phase "Waiting for the compose harness lock" exceeded its absolute %ss deadline.\n' "$LOCK_WAIT_SECONDS" >&2
+  rm -rf -- "$RUN_DIRECTORY"
   exit 1
 fi
 
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
-  announce_phase "Cleaning hermetic test stack"
-  if ! compose down --volumes --remove-orphans; then
+  compose_with_deadline "Cleaning hermetic test stack" "$CLEANUP_DEADLINE_SECONDS" down --rmi local --volumes --remove-orphans || {
+    cleanup_status=$?
     if [ "$status" -eq 0 ]; then
-      status=1
+      status=$cleanup_status
     fi
-    printf 'Hermetic test stack cleanup failed.\n' >&2
-  fi
+  }
+  rm -rf -- "$RUN_DIRECTORY"
   flock -u 9
   exit "$status"
 }
 
 trap cleanup 0
 trap 'exit 130' HUP INT TERM
-announce_phase "Removing stale hermetic containers and volumes"
-compose down --volumes --remove-orphans
-announce_phase "Initializing hermetic runtime secrets"
-compose run --rm --no-deps secrets-init
-announce_phase "Building application and harness images from the current source tree"
-build_runtime_and_harness_images e2e failure-smoke test
-announce_phase "Running hermetic type, boundary, and test gates"
-compose run --rm test
+
+compose_with_deadline "Removing stale hermetic containers and volumes" "$CLEANUP_DEADLINE_SECONDS" down --volumes --remove-orphans
+compose_with_deadline "Initializing isolated hermetic runtime secrets" "$START_DEADLINE_SECONDS" run --rm --no-deps secrets-init
+compose_with_deadline "Building application and harness images from the current source tree" "$BUILD_DEADLINE_SECONDS" build egress-ready translation-worker web e2e failure-smoke test
+compose_with_deadline "Starting hermetic test dependencies" "$START_DEADLINE_SECONDS" up --wait --no-build test-dependencies-ready
+compose_with_deadline "Running hermetic type, boundary, and test gates" "$TEST_DEADLINE_SECONDS" run --rm --no-deps test

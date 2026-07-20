@@ -37,9 +37,16 @@ test("missing S3 object versions verify as reconciliation gaps", async () => {
   }
 });
 
-test("S3 authorization and transient verification errors remain failures", async () => {
-  for (const status of [403, 503]) {
-    const error = { name: "S3ServiceException", $metadata: { httpStatusCode: status } };
+test("S3 lookup failures other than missing objects remain operational failures", async () => {
+  for (const error of [
+    { name: "S3ServiceException", $metadata: { httpStatusCode: 404 } },
+    { name: "NotFound", $metadata: { httpStatusCode: 404 } },
+    { name: "NoSuchBucket", $metadata: { httpStatusCode: 404 } },
+    { name: "AuthorizationHeaderMalformed", $metadata: { httpStatusCode: 400 } },
+    { name: "AccessDenied", $metadata: { httpStatusCode: 403 } },
+    { name: "InternalError", $metadata: { httpStatusCode: 500 } },
+    { name: "ServiceUnavailable", $metadata: { httpStatusCode: 503 } },
+  ]) {
     const adapter = archive();
     Object.assign(adapter, {
       client: {

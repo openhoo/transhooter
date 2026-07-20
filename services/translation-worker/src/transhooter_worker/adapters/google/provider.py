@@ -4,7 +4,7 @@ import asyncio
 import json
 import struct
 import time
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
@@ -68,6 +68,17 @@ def _duration_samples(duration: duration_pb2.Duration | timedelta, sample_rate: 
     return -((-scaled_nanoseconds) // _NANOSECONDS_PER_SECOND)
 
 
+@dataclass(frozen=True, slots=True)
+class _CapabilityRpcResult:
+    payload: bytes
+    attempt_id: UUID
+    raw_refs: tuple[RawRef, ...]
+
+    @property
+    def evidence(self) -> RawRef:
+        return self.raw_refs[-1]
+
+
 async def _capability_rpc(
     config: GoogleConfig,
     journal: ExchangeJournal,
@@ -75,7 +86,7 @@ async def _capability_rpc(
     stage: str,
     path: str,
     payload: bytes,
-) -> tuple[bytes, RawRef]:
+) -> _CapabilityRpcResult:
     attempt_id = uuid4()
     request_ref = _append_capability_evidence(
         config=config,
@@ -85,6 +96,7 @@ async def _capability_rpc(
         media_type="application/protobuf",
         payload=payload,
     )
+    response_ref: RawRef | None = None
     try:
         callable_ = channel.unary_unary(
             path,
@@ -113,14 +125,11 @@ async def _capability_rpc(
             request_ref=request_ref,
             response_ref=response_ref,
         )
-        _record_capability_terminal(
-            journal=journal,
+        return _CapabilityRpcResult(
+            payload=response,
             attempt_id=attempt_id,
-            stage=stage,
-            outcome="succeeded",
             raw_refs=(request_ref, response_ref, status_ref),
         )
-        return response, status_ref
     except BaseException as error:
         status_ref = _append_capability_evidence(
             config=config,
@@ -137,12 +146,17 @@ async def _capability_rpc(
                 separators=(",", ":"),
             ).encode(),
         )
+        raw_refs = (
+            (request_ref, status_ref)
+            if response_ref is None
+            else (request_ref, response_ref, status_ref)
+        )
         _record_capability_terminal(
             journal=journal,
             attempt_id=attempt_id,
             stage=stage,
             outcome="failed",
-            raw_refs=(request_ref, status_ref),
+            raw_refs=raw_refs,
         )
         raise
 
@@ -363,51 +377,76 @@ class GoogleSttProvider:
         self._channel = channel
 
     async def capabilities(self) -> StageCapabilities:
+        owned_channel = self._channel is None
         channel = self._channel or authenticated_channel(
             self._config.speech_endpoint, self._config.quota_project
         )
-        request = locations_pb2.GetLocationRequest(
-            name=f"projects/{self._config.project}/locations/eu"
-        )
-        raw, evidence = await _capability_rpc(
-            self._config,
-            self._journal,
-            channel,
-            "stt",
-            "/google.cloud.location.Locations/GetLocation",
-            request.SerializeToString(),
-        )
-        location = locations_pb2.Location.FromString(raw)
-        metadata = locations_metadata.LocationsMetadata()
-        if not location.metadata.Unpack(locations_metadata.LocationsMetadata.pb(metadata)):
-            raise RuntimeError("Google Speech EU location omitted LocationsMetadata")
-        languages = tuple(sorted(metadata.languages.models.keys()))
-        models = tuple(
-            sorted(
-                {
-                    model
-                    for language in metadata.languages.models.values()
-                    for model in language.model_features.keys()
-                }
+        rpc: _CapabilityRpcResult | None = None
+        try:
+            request = locations_pb2.GetLocationRequest(
+                name=f"projects/{self._config.project}/locations/eu"
             )
-        )
-        if not languages or "long" not in models:
-            raise RuntimeError("Google Speech EU location capability is incomplete")
-        return StageCapabilities(
-            "google",
-            "stt",
-            self._config.speech_endpoint,
-            ("eu",),
-            languages,
-            models,
-            (
-                ("chunk_bytes", 8000),
-                ("session_seconds", 270),
-                ("messages_minute", 500),
-                ("streams", 2),
-            ),
-            evidence,
-        )
+            rpc = await _capability_rpc(
+                self._config,
+                self._journal,
+                channel,
+                "stt",
+                "/google.cloud.location.Locations/GetLocation",
+                request.SerializeToString(),
+            )
+            location = locations_pb2.Location.FromString(rpc.payload)
+            metadata = locations_metadata.LocationsMetadata()
+            if not location.metadata.Unpack(locations_metadata.LocationsMetadata.pb(metadata)):
+                raise RuntimeError("Google Speech EU location omitted LocationsMetadata")
+            languages = tuple(sorted(metadata.languages.models.keys()))
+            models = tuple(
+                sorted(
+                    {
+                        model
+                        for language in metadata.languages.models.values()
+                        for model in language.model_features.keys()
+                    }
+                )
+            )
+            if not languages or "long" not in models:
+                raise RuntimeError("Google Speech EU location capability is incomplete")
+            capability = StageCapabilities(
+                "google",
+                "stt",
+                self._config.speech_endpoint,
+                ("eu",),
+                languages,
+                models,
+                (
+                    ("chunk_bytes", 8000),
+                    ("session_seconds", 270),
+                    ("messages_minute", 500),
+                    ("streams", 2),
+                ),
+                rpc.evidence,
+            )
+        except BaseException:
+            if rpc is not None:
+                _record_capability_terminal(
+                    journal=self._journal,
+                    attempt_id=rpc.attempt_id,
+                    stage="stt",
+                    outcome="failed",
+                    raw_refs=rpc.raw_refs,
+                )
+            raise
+        else:
+            _record_capability_terminal(
+                journal=self._journal,
+                attempt_id=rpc.attempt_id,
+                stage="stt",
+                outcome="succeeded",
+                raw_refs=rpc.raw_refs,
+            )
+            return capability
+        finally:
+            if owned_channel:
+                await channel.close()
 
     async def health(self, snapshot: str) -> ProviderHealth:
         try:
@@ -424,6 +463,7 @@ class GoogleSttProvider:
         resume_at_sample: int = 0,
         commit_watermark: int = 0,
     ) -> GoogleSttSession:
+        owned_channel = self._channel is None
         channel = self._channel or authenticated_channel(
             self._config.speech_endpoint, self._config.quota_project
         )
@@ -435,6 +475,7 @@ class GoogleSttProvider:
             language,
             resume_at_sample,
             commit_watermark,
+            owned_channel=owned_channel,
         )
 
 
@@ -452,10 +493,13 @@ class GoogleSttSession:
         language: str,
         resume_at_sample: int = 0,
         commit_watermark: int = 0,
+        *,
+        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
+        self._owned_channel = owned_channel
         self._id = sid
         self._language = language
         self._input: asyncio.Queue[AudioChunk | object | None] = asyncio.Queue(
@@ -466,7 +510,9 @@ class GoogleSttSession:
         self._terminal: SessionTerminal | None = None
         self._lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        self._cancel_lock = asyncio.Lock()
         self._input_closed = asyncio.Event()
+        self._terminal_ready = asyncio.Event()
         self._refs: list[RawRef] = []
         self._accepted = 0
         self._received = 0
@@ -561,30 +607,48 @@ class GoogleSttSession:
                 self._finishing = True
             await self._put_input(None)
         await self._task
+        await self._terminal_ready.wait()
         assert self._terminal
         return self._terminal
 
     async def cancel(self) -> SessionTerminal:
-        async with self._lock:
-            if self._terminal:
-                return self._terminal
-            self._finishing = True
-            self._input_closed.set()
-            self._task.cancel()
-        return await self._terminalize(
-            Outcome.CANCELLED,
-            ProviderError(
-                ErrorKind.CANCELLED,
-                "session",
-                RetryAdvice.NEVER,
-                "cancelled",
-                None,
-                None,
-                self._id,
-                tuple(self._refs),
-                "cancelled",
-            ),
-        )
+        async with self._cancel_lock:
+            async with self._lock:
+                if self._terminal:
+                    return self._terminal
+                self._finishing = True
+                self._input_closed.set()
+                self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            async with self._lock:
+                if self._terminal:
+                    return self._terminal
+            self._refs.append(
+                self._journal.append(
+                    meeting_id=self._config.meeting_id,
+                    attempt_id=self._id,
+                    stage="stt",
+                    transport="grpc",
+                    direction="status-in",
+                    media_type="application/json",
+                    payload=b'{"code":"CANCELLED"}',
+                )
+            )
+            refs = tuple(self._refs)
+            return await self._terminalize(
+                Outcome.CANCELLED,
+                ProviderError(
+                    ErrorKind.CANCELLED,
+                    "session",
+                    RetryAdvice.NEVER,
+                    "cancelled",
+                    None,
+                    None,
+                    self._id,
+                    refs,
+                    "cancelled",
+                ),
+            )
 
     async def _requests(self) -> AsyncIterable[cloud_speech.StreamingRecognizeRequest]:
         config = cloud_speech.StreamingRecognitionConfig(
@@ -667,6 +731,9 @@ class GoogleSttSession:
                 str(exc),
             )
             await self._terminalize(Outcome.FAILED, error)
+        finally:
+            if self._owned_channel:
+                await self._channel.close()
 
     async def _emit_transcript_results(
         self,
@@ -696,22 +763,31 @@ class GoogleSttSession:
             reported_end = base_sample + _duration_samples(result.result_end_offset, 16000)
             if result.is_final and reported_end <= self._commit_watermark:
                 continue
+            transcript = alternative.transcript
+            if result.is_final and words and words[0].samples.start < self._commit_watermark:
+                words = tuple(word for word in words if word.samples.end > self._commit_watermark)
+                if words:
+                    trimmed_transcript = " ".join(word.text for word in words).strip()
+                    if trimmed_transcript:
+                        transcript = trimmed_transcript
             start = words[0].samples.start if words else max(base_sample, self._last_result_end)
-            end = max(start + 1, reported_end)
+            if result.is_final:
+                start = max(start, self._commit_watermark)
+            end = max(start + 1, reported_end, words[-1].samples.end if words else reported_end)
             self._last_result_end = max(self._last_result_end, end)
             await self._emit_event(
                 TranscriptEvent(
                     samples=SampleRange(start=start, end=end),
                     revision=self._received,
                     finality=(Finality.SPAN_FINAL if result.is_final else Finality.PROVISIONAL),
-                    text=alternative.transcript,
+                    text=transcript,
                     words=words,
                     confidence=(float(alternative.confidence) if alternative.confidence else None),
                     raw_ref=raw_ref,
                 )
             )
             if result.is_final and self._boundaries:
-                self._commit_watermark = end
+                self._commit_watermark = max(self._commit_watermark, end)
                 await self._emit_event(
                     BoundaryEvent(
                         boundary_id=self._boundaries.pop(0),
@@ -822,6 +898,7 @@ class GoogleSttSession:
         )
         self._journal.terminal(self._id, terminal_bytes(self._terminal))
         await self._events.put(SessionTerminalEvent(self._terminal))
+        self._terminal_ready.set()
         return self._terminal
 
 
@@ -837,35 +914,63 @@ class GoogleTranslationProvider:
         self._channel = channel
 
     async def capabilities(self) -> StageCapabilities:
+        owned_channel = self._channel is None
         channel = self._channel or authenticated_channel(
             self._config.translation_endpoint, self._config.quota_project
         )
-        request = translation_service.GetSupportedLanguagesRequest(
-            parent=f"projects/{self._config.project}/locations/eu", display_language_code="en"
-        )
-        payload = translation_service.GetSupportedLanguagesRequest.pb(request).SerializeToString()
-        raw, evidence = await _capability_rpc(
-            self._config,
-            self._journal,
-            channel,
-            "translation",
-            "/google.cloud.translation.v3.TranslationService/GetSupportedLanguages",
-            payload,
-        )
-        response = translation_service.SupportedLanguages.deserialize(raw)
-        languages = tuple(sorted(item.language_code for item in response.languages))
-        if not languages:
-            raise RuntimeError("Google Translation EU returned no supported languages")
-        return StageCapabilities(
-            "google",
-            "translation",
-            self._config.translation_endpoint,
-            ("eu",),
-            languages,
-            ("general/nmt",),
-            (("requests_minute", 100), ("characters_minute", 100000)),
-            evidence,
-        )
+        rpc: _CapabilityRpcResult | None = None
+        try:
+            request = translation_service.GetSupportedLanguagesRequest(
+                parent=f"projects/{self._config.project}/locations/eu",
+                display_language_code="en",
+            )
+            payload = translation_service.GetSupportedLanguagesRequest.pb(
+                request
+            ).SerializeToString()
+            rpc = await _capability_rpc(
+                self._config,
+                self._journal,
+                channel,
+                "translation",
+                "/google.cloud.translation.v3.TranslationService/GetSupportedLanguages",
+                payload,
+            )
+            response = translation_service.SupportedLanguages.deserialize(rpc.payload)
+            languages = tuple(sorted(item.language_code for item in response.languages))
+            if not languages:
+                raise RuntimeError("Google Translation EU returned no supported languages")
+            capability = StageCapabilities(
+                "google",
+                "translation",
+                self._config.translation_endpoint,
+                ("eu",),
+                languages,
+                ("general/nmt",),
+                (("requests_minute", 100), ("characters_minute", 100000)),
+                rpc.evidence,
+            )
+        except BaseException:
+            if rpc is not None:
+                _record_capability_terminal(
+                    journal=self._journal,
+                    attempt_id=rpc.attempt_id,
+                    stage="translation",
+                    outcome="failed",
+                    raw_refs=rpc.raw_refs,
+                )
+            raise
+        else:
+            _record_capability_terminal(
+                journal=self._journal,
+                attempt_id=rpc.attempt_id,
+                stage="translation",
+                outcome="succeeded",
+                raw_refs=rpc.raw_refs,
+            )
+            return capability
+        finally:
+            if owned_channel:
+                await channel.close()
 
     async def health(self, snapshot: str) -> ProviderHealth:
         try:
@@ -875,12 +980,16 @@ class GoogleTranslationProvider:
             return ProviderHealth(False, int(time.time() * 1000), type(exc).__name__, None)
 
     async def start(self, request: TranslationRequest) -> GoogleTranslationAttempt:
+        owned_channel = self._channel is None
+        channel = self._channel or authenticated_channel(
+            self._config.translation_endpoint, self._config.quota_project
+        )
         return GoogleTranslationAttempt(
             self._config,
             self._journal,
-            self._channel
-            or authenticated_channel(self._config.translation_endpoint, self._config.quota_project),
+            channel,
             request,
+            owned_channel=owned_channel,
         )
 
 
@@ -891,10 +1000,13 @@ class GoogleTranslationAttempt:
         j: ExchangeJournal,
         channel: grpc.aio.Channel,
         r: TranslationRequest,
+        *,
+        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
+        self._owned_channel = owned_channel
         self._request = r
         self._task: asyncio.Task[TranslationOutcome] | None = None
         self._terminal: OperationTerminal | None = None
@@ -903,6 +1015,8 @@ class GoogleTranslationAttempt:
         self._cancel_task: asyncio.Task[OperationTerminal] | None = None
         self._cancelling = False
         self._cancelled_terminal_ready = asyncio.Event()
+        self._refs: list[RawRef] = []
+        self._received = 0
 
     async def result(self) -> TranslationOutcome:
         async with self._lock:
@@ -955,6 +1069,8 @@ class GoogleTranslationAttempt:
     ) -> OperationTerminal:
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
+        elif self._owned_channel:
+            await self._channel.close()
         async with self._lock:
             if self._terminal is not None:
                 terminal = self._terminal
@@ -965,23 +1081,31 @@ class GoogleTranslationAttempt:
         return terminal
 
     async def _run(self) -> TranslationOutcome:
-        request = self._build_request()
-        refs: list[RawRef] = []
-        call = self._channel.unary_unary(
-            "/google.cloud.translation.v3.TranslationService/TranslateText",
-            request_serializer=lambda value: self._serialize_request(value, refs),
-            response_deserializer=lambda raw: self._deserialize_response(raw, refs),
-        )(
-            request,
-            metadata=(("x-goog-user-project", self._config.quota_project),),
-            timeout=20,
-        )
         try:
-            response = await call
-            refs.append(await self._record_status(call, error=None))
+            return await self._run_rpc()
+        finally:
+            if self._owned_channel:
+                await self._channel.close()
+
+    async def _run_rpc(self) -> TranslationOutcome:
+        call: object | None = None
+        try:
+            request = self._build_request()
+            callable_ = self._channel.unary_unary(
+                "/google.cloud.translation.v3.TranslationService/TranslateText",
+                request_serializer=lambda value: self._serialize_request(value, self._refs),
+                response_deserializer=lambda raw: self._deserialize_response(raw, self._refs),
+            )
+            call = callable_(
+                request,
+                metadata=(("x-goog-user-project", self._config.quota_project),),
+                timeout=20,
+            )
+            response = await cast(Awaitable[translation_service.TranslateTextResponse], call)
+            self._refs.append(await self._record_status(call, error=None))
             if len(response.translations) != 1:
                 raise RuntimeError("Google translation response cardinality must be one")
-            terminal = self._make_terminal(Outcome.SUCCEEDED, tuple(refs), None)
+            terminal = self._make_terminal(Outcome.SUCCEEDED, tuple(self._refs), None)
             result = None
             if terminal.outcome is Outcome.SUCCEEDED:
                 result = TranslationResult(
@@ -989,11 +1113,15 @@ class GoogleTranslationAttempt:
                     attempt_id=self._request.attempt_id,
                     text=response.translations[0].translated_text,
                     source_range=self._request.source_range,
-                    raw_ref=refs[-2],
+                    raw_ref=self._refs[-2],
                 )
             return TranslationOutcome(result=result, terminal=terminal)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            refs.append(await self._record_status(call, error=exc))
+            self._refs.append(await self._record_status(call, error=exc))
+            if self._cancelling:
+                raise asyncio.CancelledError from exc
             error = ProviderError(
                 kind=ErrorKind.TRANSPORT,
                 scope="operation",
@@ -1002,10 +1130,10 @@ class GoogleTranslationAttempt:
                 provider_request_id=None,
                 retry_delay_ms=None,
                 attempt_id=self._request.attempt_id,
-                raw_refs=tuple(refs),
+                raw_refs=tuple(self._refs),
                 message=str(exc),
             )
-            terminal = self._make_terminal(Outcome.FAILED, tuple(refs), error)
+            terminal = self._make_terminal(Outcome.FAILED, tuple(self._refs), error)
             return TranslationOutcome(result=None, terminal=terminal)
 
     def _build_request(self) -> translation_service.TranslateTextRequest:
@@ -1056,13 +1184,24 @@ class GoogleTranslationAttempt:
                 sample_range=self._request.source_range,
             )
         )
+        self._received += 1
         return cast(
             translation_service.TranslateTextResponse,
             translation_service.TranslateTextResponse.deserialize(raw),
         )
 
-    async def _record_status(self, call: object, error: Exception | None) -> RawRef:
-        if error is None:
+    async def _record_status(self, call: object | None, error: Exception | None) -> RawRef:
+        if call is None:
+            assert error is not None
+            payload = json.dumps(
+                {
+                    "code": "LOCAL_SETUP_ERROR",
+                    "errorType": type(error).__name__,
+                    "message": str(error)[:256],
+                },
+                separators=(",", ":"),
+            ).encode()
+        elif error is None:
             status = {
                 "initial": list(
                     await call.initial_metadata()  # type: ignore[attr-defined]
@@ -1099,17 +1238,19 @@ class GoogleTranslationAttempt:
         )
 
     def _cancellation_details(self) -> tuple[tuple[RawRef, ...], ProviderError]:
-        ref = self._journal.append(
-            meeting_id=self._config.meeting_id,
-            attempt_id=self._request.attempt_id,
-            stage="translation",
-            transport="grpc",
-            direction="status-in",
-            media_type="application/json",
-            payload=b'{"code":"CANCELLED"}',
-            sample_range=self._request.source_range,
+        self._refs.append(
+            self._journal.append(
+                meeting_id=self._config.meeting_id,
+                attempt_id=self._request.attempt_id,
+                stage="translation",
+                transport="grpc",
+                direction="status-in",
+                media_type="application/json",
+                payload=b'{"code":"CANCELLED"}',
+                sample_range=self._request.source_range,
+            )
         )
-        refs = (ref,)
+        refs = tuple(self._refs)
         return refs, ProviderError(
             ErrorKind.CANCELLED,
             "operation",
@@ -1145,7 +1286,7 @@ class GoogleTranslationAttempt:
                 previous_attempt_id=None,
             ),
             accepted_input=1,
-            received_output=max(0, len(refs) - 2),
+            received_output=self._received,
             emitted_output=0,
             transport=Transport.GRPC,
             raw_refs=refs,
@@ -1167,51 +1308,80 @@ class GoogleTtsProvider:
         self._channel = channel
 
     async def capabilities(self) -> StageCapabilities:
+        owned_channel = self._channel is None
         channel = self._channel or authenticated_channel(
             self._config.tts_endpoint, self._config.quota_project
         )
-        request = cloud_tts.ListVoicesRequest()
-        payload = cloud_tts.ListVoicesRequest.pb(request).SerializeToString()
-        raw, evidence = await _capability_rpc(
-            self._config,
-            self._journal,
-            channel,
-            "tts",
-            "/google.cloud.texttospeech.v1.TextToSpeech/ListVoices",
-            payload,
-        )
-        response = cloud_tts.ListVoicesResponse.deserialize(raw)
-        voices = tuple(sorted(voice.name for voice in response.voices if "Chirp3-HD" in voice.name))
-        languages = tuple(
-            sorted(
-                {
-                    code
-                    for voice in response.voices
-                    if voice.name in voices
-                    for code in voice.language_codes
-                }
+        rpc: _CapabilityRpcResult | None = None
+        try:
+            request = cloud_tts.ListVoicesRequest()
+            payload = cloud_tts.ListVoicesRequest.pb(request).SerializeToString()
+            rpc = await _capability_rpc(
+                self._config,
+                self._journal,
+                channel,
+                "tts",
+                "/google.cloud.texttospeech.v1.TextToSpeech/ListVoices",
+                payload,
             )
-        )
-        if not voices or not languages:
-            raise RuntimeError("Google EU TTS returned no Chirp 3 HD capabilities")
-        return StageCapabilities(
-            "google",
-            "tts",
-            self._config.tts_endpoint,
-            ("eu",),
-            languages,
-            ("Chirp3-HD",),
-            (("sample_rate", 48000), ("sessions", 2), ("starts_minute", 40)),
-            evidence,
-            voices,
-        )
+            response = cloud_tts.ListVoicesResponse.deserialize(rpc.payload)
+            voices = tuple(
+                sorted(voice.name for voice in response.voices if "Chirp3-HD" in voice.name)
+            )
+            languages = tuple(
+                sorted(
+                    {
+                        code
+                        for voice in response.voices
+                        if voice.name in voices
+                        for code in voice.language_codes
+                    }
+                )
+            )
+            if not voices or not languages:
+                raise RuntimeError("Google EU TTS returned no Chirp 3 HD capabilities")
+            capability = StageCapabilities(
+                "google",
+                "tts",
+                self._config.tts_endpoint,
+                ("eu",),
+                languages,
+                ("Chirp3-HD",),
+                (("sample_rate", 48000), ("sessions", 2), ("starts_minute", 40)),
+                rpc.evidence,
+                voices,
+            )
+        except BaseException:
+            if rpc is not None:
+                _record_capability_terminal(
+                    journal=self._journal,
+                    attempt_id=rpc.attempt_id,
+                    stage="tts",
+                    outcome="failed",
+                    raw_refs=rpc.raw_refs,
+                )
+            raise
+        else:
+            _record_capability_terminal(
+                journal=self._journal,
+                attempt_id=rpc.attempt_id,
+                stage="tts",
+                outcome="succeeded",
+                raw_refs=rpc.raw_refs,
+            )
+            return capability
+        finally:
+            if owned_channel:
+                await channel.close()
 
     async def health(self, snapshot: str) -> ProviderHealth:
         attempt_id = uuid4()
+        attempt: GoogleTtsAttempt | None = None
         try:
             channel = self._channel or authenticated_channel(
                 self._config.tts_endpoint, self._config.quota_project
             )
+            owned_channel = self._channel is None
             utterance = SynthesisUtterance(
                 uuid4(),
                 attempt_id,
@@ -1220,14 +1390,25 @@ class GoogleTtsProvider:
                 self._config.probe_voice,
                 SampleRange(0, 1),
             )
-            attempt = GoogleTtsAttempt(
-                self._config,
-                self._journal,
-                channel,
-                utterance,
-                self._config.probe_voice_locale,
-                self._config.probe_voice,
-            )
+            if owned_channel:
+                attempt = GoogleTtsAttempt(
+                    self._config,
+                    self._journal,
+                    channel,
+                    utterance,
+                    self._config.probe_voice_locale,
+                    self._config.probe_voice,
+                    owned_channel=True,
+                )
+            else:
+                attempt = GoogleTtsAttempt(
+                    self._config,
+                    self._journal,
+                    channel,
+                    utterance,
+                    self._config.probe_voice_locale,
+                    self._config.probe_voice,
+                )
             audio = False
             terminal = None
             async for event in attempt.events():
@@ -1249,6 +1430,12 @@ class GoogleTtsProvider:
             )
         except Exception as exc:
             return ProviderHealth(False, int(time.time() * 1000), type(exc).__name__, None)
+        finally:
+            if owned_channel and attempt is not None:
+                if attempt._terminal is None:
+                    await asyncio.shield(attempt.cancel())
+                else:
+                    await asyncio.shield(attempt.finish())
 
     async def open(self, session_id: UUID, language: str, voice: str) -> GoogleTtsSession:
         ref = self._journal.append(
@@ -1262,15 +1449,19 @@ class GoogleTtsProvider:
                 {"language": language, "voice": voice}, separators=(",", ":")
             ).encode(),
         )
+        owned_channel = self._channel is None
+        channel = self._channel or authenticated_channel(
+            self._config.tts_endpoint, self._config.quota_project
+        )
         return GoogleTtsSession(
             self._config,
             self._journal,
-            self._channel
-            or authenticated_channel(self._config.tts_endpoint, self._config.quota_project),
+            channel,
             session_id,
             language,
             voice,
             ref,
+            owned_channel=owned_channel,
         )
 
 
@@ -1284,26 +1475,36 @@ class GoogleTtsSession:
         language: str,
         voice: str,
         open_ref: RawRef,
+        *,
+        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
+        self._owned_channel = owned_channel
         self._id = sid
         self._language = language
         self._voice = voice
         self._terminal: SessionTerminal | None = None
         self._events: asyncio.Queue[SessionTerminalEvent] = asyncio.Queue()
         self._open_ref = open_ref
+        self._attempts: list[GoogleTtsAttempt] = []
+        self._end_lock = asyncio.Lock()
 
     async def start(self, u: SynthesisUtterance) -> GoogleTtsAttempt:
-        return GoogleTtsAttempt(
-            self._config,
-            self._journal,
-            self._channel,
-            u,
-            self._language,
-            self._voice,
-        )
+        async with self._end_lock:
+            if self._terminal is not None:
+                raise RuntimeError("session terminal")
+            attempt = GoogleTtsAttempt(
+                self._config,
+                self._journal,
+                self._channel,
+                u,
+                self._language,
+                self._voice,
+            )
+            self._attempts.append(attempt)
+            return attempt
 
     def session_events(self) -> AsyncIterator[SessionTerminalEvent]:
         async def stream() -> AsyncIterator[SessionTerminalEvent]:
@@ -1318,22 +1519,37 @@ class GoogleTtsSession:
         return await self._end(Outcome.CANCELLED)
 
     async def _end(self, outcome: Outcome) -> SessionTerminal:
-        if self._terminal:
+        async with self._end_lock:
+            if self._terminal:
+                return self._terminal
+            try:
+                if outcome is Outcome.CANCELLED:
+                    await asyncio.gather(
+                        *(attempt.cancel() for attempt in self._attempts),
+                        return_exceptions=True,
+                    )
+                else:
+                    await asyncio.gather(
+                        *(attempt.finish() for attempt in self._attempts),
+                        return_exceptions=True,
+                    )
+            finally:
+                if self._owned_channel:
+                    await self._channel.close()
+            self._terminal = SessionTerminal(
+                terminal_id=uuid4(),
+                session_id=self._id,
+                outcome=outcome,
+                error=None,
+                accepted_input=len(self._attempts),
+                received_output=sum(attempt.received_output for attempt in self._attempts),
+                emitted_output=sum(attempt.emitted_output for attempt in self._attempts),
+                transport=Transport.GRPC,
+                raw_refs=(self._open_ref,),
+            )
+            self._journal.terminal(self._id, terminal_bytes(self._terminal))
+            await self._events.put(SessionTerminalEvent(self._terminal))
             return self._terminal
-        self._terminal = SessionTerminal(
-            terminal_id=uuid4(),
-            session_id=self._id,
-            outcome=outcome,
-            error=None,
-            accepted_input=0,
-            received_output=0,
-            emitted_output=0,
-            transport=Transport.GRPC,
-            raw_refs=(self._open_ref,),
-        )
-        self._journal.terminal(self._id, terminal_bytes(self._terminal))
-        await self._events.put(SessionTerminalEvent(self._terminal))
-        return self._terminal
 
 
 class GoogleTtsAttempt:
@@ -1345,15 +1561,24 @@ class GoogleTtsAttempt:
         u: SynthesisUtterance,
         language: str,
         voice: str,
+        *,
+        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
+        self._owned_channel = owned_channel
         self._utterance = u
         self._language = language
         self._voice = voice
         self._events: asyncio.Queue[TtsEvent] = asyncio.Queue()
         self._terminal: OperationTerminal | None = None
+        self._refs: list[RawRef] = []
+        self._received = 0
+        self._emitted = 0
+        self._cancelling = False
+        self._cancel_lock = asyncio.Lock()
+        self._end_lock = asyncio.Lock()
         self._task = asyncio.create_task(self._run())
 
     def events(self) -> AsyncIterator[TtsEvent]:
@@ -1366,79 +1591,121 @@ class GoogleTtsAttempt:
 
         return stream()
 
+    @property
+    def received_output(self) -> int:
+        return self._received
+
+    @property
+    def emitted_output(self) -> int:
+        return self._emitted
+
     async def finish(self) -> OperationTerminal:
         await self._task
         assert self._terminal
         return self._terminal
 
     async def cancel(self) -> OperationTerminal:
-        self._task.cancel()
-        error = ProviderError(
-            ErrorKind.CANCELLED,
-            "operation",
-            RetryAdvice.NEVER,
-            "cancelled",
-            None,
-            None,
-            self._utterance.attempt_id,
-            (),
-            "cancelled",
-        )
-        return await self._end(Outcome.CANCELLED, (), 0, error)
+        async with self._cancel_lock:
+            if self._terminal is not None:
+                return self._terminal
+            self._cancelling = True
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            if self._terminal is not None:
+                return self._terminal
+            self._refs.append(
+                self._journal.append(
+                    meeting_id=self._config.meeting_id,
+                    attempt_id=self._utterance.attempt_id,
+                    stage="tts",
+                    transport="grpc",
+                    direction="status-in",
+                    media_type="application/json",
+                    payload=b'{"code":"CANCELLED"}',
+                    sample_range=self._utterance.source_range,
+                )
+            )
+            refs = tuple(self._refs)
+            error = ProviderError(
+                ErrorKind.CANCELLED,
+                "operation",
+                RetryAdvice.NEVER,
+                "cancelled",
+                None,
+                None,
+                self._utterance.attempt_id,
+                refs,
+                "cancelled",
+            )
+            return await self._end(Outcome.CANCELLED, refs, self._emitted, error)
 
     async def _run(self) -> None:
-        refs: list[RawRef] = []
-        call = self._channel.stream_stream(
-            "/google.cloud.texttospeech.v1.TextToSpeech/StreamingSynthesize",
-            request_serializer=lambda value: self._serialize_request(value, refs),
-            response_deserializer=lambda raw: self._deserialize_response(raw, refs),
-        )(
-            self._requests(),
-            metadata=(("x-goog-user-project", self._config.quota_project),),
-            timeout=20,
-        )
-        emitted = 0
+        try:
+            await self._run_rpc()
+        finally:
+            if self._owned_channel:
+                await self._channel.close()
+
+    async def _run_rpc(self) -> None:
+        call: object | None = None
         sequence = 0
         decoder = Linear16StreamDecoder(48000)
         try:
-            async for response in call:
+            callable_ = self._channel.stream_stream(
+                "/google.cloud.texttospeech.v1.TextToSpeech/StreamingSynthesize",
+                request_serializer=lambda value: self._serialize_request(value, self._refs),
+                response_deserializer=lambda raw: self._deserialize_response(raw, self._refs),
+            )
+            call = callable_(
+                self._requests(),
+                metadata=(("x-goog-user-project", self._config.quota_project),),
+                timeout=20,
+            )
+            async for response in cast(AsyncIterable[cloud_tts.StreamingSynthesizeResponse], call):
                 pcm = decoder.feed(response.audio_content)
                 if not pcm:
                     continue
-                emitted = await self._emit_audio(
+                self._received += len(pcm) // 2
+                self._emitted = await self._emit_audio(
                     pcm=pcm,
-                    emitted=emitted,
+                    emitted=self._emitted,
                     sequence=sequence,
-                    raw_ref=refs[-1],
+                    raw_ref=self._refs[-1],
                 )
                 sequence += 1
             decoder.finish()
-            refs.append(await self._record_status(call, error=None))
-            if emitted <= 0:
+            self._refs.append(await self._record_status(call, error=None))
+            if self._emitted <= 0:
                 raise RuntimeError("Google streaming TTS returned no audio")
-            boundary = SampleRange(start=0, end=emitted)
+            boundary = SampleRange(start=0, end=self._emitted)
             await self._events.put(
                 SynthesisBoundary(
                     operation_id=self._utterance.operation_id,
                     samples=boundary,
-                    raw_ref=refs[-1],
+                    raw_ref=self._refs[-1],
                 )
             )
-            await self._end(Outcome.SUCCEEDED, tuple(refs), emitted, None)
+            await self._end(Outcome.SUCCEEDED, tuple(self._refs), self._emitted, None)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            refs.append(await self._record_status(call, error=exc))
+            self._refs.append(await self._record_status(call, error=exc))
+            if self._cancelling:
+                raise asyncio.CancelledError from exc
             error = ProviderError(
                 kind=ErrorKind.TRANSPORT,
                 scope="operation",
-                provider_retry_advice=(RetryAdvice.NEVER if emitted else RetryAdvice.UNSPECIFIED),
+                provider_retry_advice=(
+                    RetryAdvice.NEVER if self._emitted else RetryAdvice.UNSPECIFIED
+                ),
                 provider_code=type(exc).__name__,
                 provider_request_id=None,
                 retry_delay_ms=None,
                 attempt_id=self._utterance.attempt_id,
-                raw_refs=tuple(refs),
+                raw_refs=tuple(self._refs),
                 message=str(exc),
             )
-            await self._end(Outcome.FAILED, tuple(refs), emitted, error)
+            await self._end(Outcome.FAILED, tuple(self._refs), self._emitted, error)
 
     async def _requests(
         self,
@@ -1524,8 +1791,18 @@ class GoogleTtsAttempt:
         )
         return samples.end
 
-    async def _record_status(self, call: object, error: Exception | None) -> RawRef:
-        if error is None:
+    async def _record_status(self, call: object | None, error: Exception | None) -> RawRef:
+        if call is None:
+            assert error is not None
+            payload = json.dumps(
+                {
+                    "code": "LOCAL_SETUP_ERROR",
+                    "errorType": type(error).__name__,
+                    "message": str(error)[:256],
+                },
+                separators=(",", ":"),
+            ).encode()
+        elif error is None:
             status = {
                 "initial": list(
                     await call.initial_metadata()  # type: ignore[attr-defined]
@@ -1568,39 +1845,28 @@ class GoogleTtsAttempt:
         emitted: int,
         error: ProviderError | None,
     ) -> OperationTerminal:
-        if self._terminal:
-            return self._terminal
-        if not refs:
-            ref = self._journal.append(
-                meeting_id=self._config.meeting_id,
+        async with self._end_lock:
+            if self._terminal:
+                return self._terminal
+            self._terminal = OperationTerminal(
+                terminal_id=uuid4(),
+                operation_id=self._utterance.operation_id,
                 attempt_id=self._utterance.attempt_id,
-                stage="tts",
-                transport="grpc",
-                direction="status-in",
-                media_type="application/json",
-                payload=b'{"code":"CANCELLED"}',
-                sample_range=self._utterance.source_range,
+                outcome=outcome,
+                error=error,
+                retry=RetryDecision(
+                    action=RetryAction.STOP,
+                    delay_ms=None,
+                    reason="application decides replay",
+                    previous_attempt_id=None,
+                ),
+                accepted_input=1,
+                received_output=self._received,
+                emitted_output=emitted,
+                transport=Transport.GRPC,
+                raw_refs=refs,
+                credential_fingerprint=self._config.credential_fingerprint,
             )
-            refs = (ref,)
-        self._terminal = OperationTerminal(
-            terminal_id=uuid4(),
-            operation_id=self._utterance.operation_id,
-            attempt_id=self._utterance.attempt_id,
-            outcome=outcome,
-            error=error,
-            retry=RetryDecision(
-                action=RetryAction.STOP,
-                delay_ms=None,
-                reason="application decides replay",
-                previous_attempt_id=None,
-            ),
-            accepted_input=1,
-            received_output=max(0, len(refs) - 2),
-            emitted_output=emitted,
-            transport=Transport.GRPC,
-            raw_refs=refs,
-            credential_fingerprint=self._config.credential_fingerprint,
-        )
-        self._journal.terminal(self._utterance.attempt_id, terminal_bytes(self._terminal))
-        await self._events.put(OperationTerminalEvent(self._terminal))
-        return self._terminal
+            self._journal.terminal(self._utterance.attempt_id, terminal_bytes(self._terminal))
+            await self._events.put(OperationTerminalEvent(self._terminal))
+            return self._terminal

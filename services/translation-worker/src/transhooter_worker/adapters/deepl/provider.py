@@ -137,16 +137,18 @@ def _terminal_evidence(
 
 def _parse_capability_languages(payload: bytes) -> tuple[str, ...]:
     data: Any = json.loads(payload)
-    if not isinstance(data, list):
+    if not isinstance(data, list) or not data:
         raise RuntimeError("DeepL returned an incomplete language capability set")
-    languages = tuple(
-        sorted(
-            {str(row["language"]) for row in data if isinstance(row, dict) and "language" in row}
-        )
-    )
-    if not languages:
-        raise RuntimeError("DeepL returned an incomplete language capability set")
-    return languages
+
+    languages: set[str] = set()
+    for row in data:
+        if not isinstance(row, dict):
+            raise RuntimeError("DeepL returned an incomplete language capability row")
+        language = row.get("lang")
+        if not isinstance(language, str) or not language.strip():
+            raise RuntimeError("DeepL returned an incomplete language capability row")
+        languages.add(language)
+    return tuple(sorted(languages))
 
 
 def _translation_request_body(
@@ -465,12 +467,14 @@ class DeepLAttempt:
         status = response.status_code
         if status == 456:
             error_kind = ErrorKind.QUOTA
-        elif status == 429:
+        elif status in {429, 529}:
             error_kind = ErrorKind.RATE_LIMIT
+        elif status in {500, 504}:
+            error_kind = ErrorKind.TRANSPORT
         else:
             error_kind = ErrorKind.PROVIDER
 
-        if status in {429, 500, 504, 529}:
+        if error_kind in {ErrorKind.RATE_LIMIT, ErrorKind.TRANSPORT}:
             retry_advice = RetryAdvice.RETRY_AFTER
         else:
             retry_advice = RetryAdvice.NEVER

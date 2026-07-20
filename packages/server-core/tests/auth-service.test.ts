@@ -1,7 +1,10 @@
 import { describe, expect, it, mock } from "bun:test";
-import { AuthService } from "../src/auth/service";
+import { AuthService, type MagicLinkTokenSealer } from "../src/auth/service";
 import type {
+  ActiveMagicLink,
   AuthRepository,
+  MagicLinkCandidate,
+  MagicLinkIdentity,
   MagicLinkRecord,
   PendingExchangeRecord,
   SessionRecord,
@@ -18,6 +21,7 @@ const PUBLIC_BASE_URL = "https://app";
 type AuthState = {
   usersByEmail: Map<string, UserRecord>;
   magicLinksByTokenHash: Map<string, MagicLinkRecord>;
+  sealedLinksById: Map<string, Omit<MagicLinkCandidate, "record">>;
   exchangesByNonceHash: Map<string, PendingExchangeRecord>;
   sessionsById: Map<string, SessionRecord>;
   admissionCounts: Map<string, number>;
@@ -25,6 +29,61 @@ type AuthState = {
 
 function hash(value: Uint8Array | string): string {
   return Buffer.from(typeof value === "string" ? value : value).toString("hex");
+}
+
+function magicLinkIdentity(record: MagicLinkRecord): string {
+  return JSON.stringify([record.userId, record.purpose, record.consultationId, record.sessionId]);
+}
+
+function magicLinkAad(record: MagicLinkRecord): string {
+  return JSON.stringify([
+    record.id,
+    record.userId,
+    record.purpose,
+    record.consultationId,
+    record.sessionId,
+  ]);
+}
+
+class TestTokenSealer implements MagicLinkTokenSealer {
+  readonly sealedWith: string[] = [];
+
+  constructor(
+    readonly currentKeyId: string,
+    readonly keys: Readonly<Record<string, true>>,
+  ) {}
+
+  seal(rawToken: Uint8Array, record: MagicLinkRecord) {
+    if (!this.keys[this.currentKeyId]) {
+      throw new Error("missing current key");
+    }
+    this.sealedWith.push(this.currentKeyId);
+    return {
+      keyId: this.currentKeyId,
+      sealedRawToken: Buffer.from(
+        JSON.stringify({
+          keyId: this.currentKeyId,
+          aad: magicLinkAad(record),
+          token: Buffer.from(rawToken).toString("base64url"),
+        }),
+      ).toString("base64url"),
+    };
+  }
+
+  open(link: ActiveMagicLink): Uint8Array {
+    if (!this.keys[link.keyId]) {
+      throw new Error("missing retained key");
+    }
+    const value = JSON.parse(Buffer.from(link.sealedRawToken, "base64url").toString("utf8")) as {
+      keyId: string;
+      aad: string;
+      token: string;
+    };
+    if (value.keyId !== link.keyId || value.aad !== magicLinkAad(link.record)) {
+      throw new Error("authentication failed");
+    }
+    return new Uint8Array(Buffer.from(value.token, "base64url"));
+  }
 }
 
 function createRepository(state: AuthState): AuthRepository {
@@ -38,8 +97,37 @@ function createRepository(state: AuthState): AuthRepository {
     },
     findSessionByTokenHash: async (tokenHash: string) =>
       [...state.sessionsById.values()].find((session) => session.tokenHash === tokenHash) ?? null,
-    createMagicLink: async (link: MagicLinkRecord) => {
-      state.magicLinksByTokenHash.set(link.tokenHash, link);
+    getOrCreateActiveMagicLink: async (
+      identity: MagicLinkIdentity,
+      candidate: MagicLinkCandidate,
+      now: Date,
+    ) => {
+      const existing = [...state.magicLinksByTokenHash.values()].find(
+        (link) =>
+          magicLinkIdentity(link) ===
+            JSON.stringify([
+              identity.userId,
+              identity.purpose,
+              identity.consultationId,
+              identity.sessionId,
+            ]) &&
+          !link.consumedAt &&
+          !link.revokedAt &&
+          link.expiresAt > now,
+      );
+      if (existing) {
+        const sealed = state.sealedLinksById.get(existing.id);
+        if (!sealed) {
+          throw new Error("MAGIC_LINK_DELIVERY_UNRECOVERABLE");
+        }
+        return { record: existing, ...sealed, created: false };
+      }
+      state.magicLinksByTokenHash.set(candidate.record.tokenHash, candidate.record);
+      state.sealedLinksById.set(candidate.record.id, {
+        sealedRawToken: candidate.sealedRawToken,
+        keyId: candidate.keyId,
+      });
+      return { ...candidate, created: true };
     },
     lockMagicLinkByTokenHash: async (tokenHash: string) =>
       state.magicLinksByTokenHash.get(tokenHash) ?? null,
@@ -113,10 +201,12 @@ function makeSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-function createAuthFixture() {
+function createAuthFixture(
+  options: { state?: AuthState; sealer?: MagicLinkTokenSealer; sequenceStart?: number } = {},
+) {
   let now = new Date("2026-01-01T00:00:00Z");
-  let sequence = 10;
-  const state: AuthState = {
+  let sequence = options.sequenceStart ?? 10;
+  const state: AuthState = options.state ?? {
     usersByEmail: new Map([
       [
         "known@example.com",
@@ -129,6 +219,7 @@ function createAuthFixture() {
       ],
     ]),
     magicLinksByTokenHash: new Map(),
+    sealedLinksById: new Map(),
     exchangesByNonceHash: new Map(),
     sessionsById: new Map(),
     admissionCounts: new Map(),
@@ -154,12 +245,14 @@ function createAuthFixture() {
     { bytes: () => new Uint8Array(32).fill(sequence++) },
     { sha256: hash },
     { rateLimitKey: "rate" },
+    options.sealer ?? new TestTokenSealer("current", { current: true }),
   );
 
   return {
     service,
     mail,
     state,
+    repository,
     advance: (milliseconds: number) => {
       now = new Date(now.getTime() + milliseconds);
     },
@@ -246,6 +339,193 @@ describe("AuthService", () => {
     expect(fixture.mail.sendMagicLink).toHaveBeenCalledTimes(5);
   });
 
+  it("reuses one usable token after ambiguous delivery and duplicate submissions", async () => {
+    const fixture = createAuthFixture();
+    fixture.mail.sendMagicLink.mockImplementationOnce(async () => {
+      throw new Error("provider response lost after acceptance");
+    });
+
+    await requestKnownSignIn(fixture, {
+      ip: "1",
+      publicBaseUrl: PUBLIC_BASE_URL,
+    });
+    await requestKnownSignIn(fixture, {
+      ip: "1",
+      publicBaseUrl: PUBLIC_BASE_URL,
+    });
+
+    expect(fixture.state.magicLinksByTokenHash.size).toBe(1);
+    expect(fixture.mail.sendMagicLink).toHaveBeenCalledTimes(2);
+    const firstUrl = fixture.mail.sendMagicLink.mock.calls[0]?.[0].url;
+    const retryUrl = fixture.mail.sendMagicLink.mock.calls[1]?.[0].url;
+    if (!firstUrl || !retryUrl) {
+      throw new Error("Expected both delivery attempts");
+    }
+    expect(retryUrl).toBe(firstUrl);
+
+    const pending = await fixture.service.beginExchange(tokenFromMagicLinkUrl(retryUrl));
+    await fixture.service.verifyExchange(pending.exchangeNonce, {
+      csrfToken: pending.verificationCsrfToken,
+      origin: PUBLIC_BASE_URL,
+      publicBaseUrl: PUBLIC_BASE_URL,
+      requestIp: "1",
+    });
+    expect(requireFirstMagicLink(fixture.state).consumedAt).not.toBeNull();
+  });
+
+  it("converges concurrent issuers on one durable URL and expiry", async () => {
+    const fixture = createAuthFixture();
+
+    await Promise.all(
+      Array.from({ length: 5 }, () =>
+        requestKnownSignIn(fixture, {
+          ip: "concurrent",
+          publicBaseUrl: PUBLIC_BASE_URL,
+        }),
+      ),
+    );
+
+    expect(fixture.state.magicLinksByTokenHash.size).toBe(1);
+    expect(
+      new Set(fixture.mail.sendMagicLink.mock.calls.map(([message]) => message.url)).size,
+    ).toBe(1);
+    expect(
+      new Set(
+        fixture.mail.sendMagicLink.mock.calls.map(([message]) => message.expiresAt.toISOString()),
+      ).size,
+    ).toBe(1);
+  });
+
+  it("reuses the sealed durable token after restart and ambiguous SMTP acceptance", async () => {
+    const first = createAuthFixture();
+    first.mail.sendMagicLink.mockImplementationOnce(async () => {
+      throw new Error("provider response lost after acceptance");
+    });
+    await requestKnownSignIn(first, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+    const acceptedUrl = first.mail.sendMagicLink.mock.calls[0]?.[0].url;
+    const acceptedExpiry = first.mail.sendMagicLink.mock.calls[0]?.[0].expiresAt;
+
+    const restarted = createAuthFixture({ state: first.state, sequenceStart: 100 });
+    await requestKnownSignIn(restarted, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+
+    expect(restarted.state.magicLinksByTokenHash.size).toBe(1);
+    expect(restarted.mail.sendMagicLink.mock.calls[0]?.[0].url).toBe(acceptedUrl);
+    expect(restarted.mail.sendMagicLink.mock.calls[0]?.[0].expiresAt).toEqual(acceptedExpiry);
+  });
+
+  it("opens retained-key links across rotation and seals the next link with the current key", async () => {
+    const oldSealer = new TestTokenSealer("old", { old: true });
+    const first = createAuthFixture({ sealer: oldSealer });
+    await requestKnownSignIn(first, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+    const oldUrl = requireLastMagicLinkUrl(first.mail.sendMagicLink.mock.calls);
+
+    const rotatedSealer = new TestTokenSealer("new", { old: true, new: true });
+    const restarted = createAuthFixture({
+      state: first.state,
+      sealer: rotatedSealer,
+      sequenceStart: 100,
+    });
+    await requestKnownSignIn(restarted, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+    expect(requireLastMagicLinkUrl(restarted.mail.sendMagicLink.mock.calls)).toBe(oldUrl);
+    expect(rotatedSealer.sealedWith).toEqual(["new"]);
+
+    const pending = await restarted.service.beginExchange(tokenFromMagicLinkUrl(oldUrl));
+    await restarted.service.verifyExchange(pending.exchangeNonce, {
+      csrfToken: pending.verificationCsrfToken,
+      origin: PUBLIC_BASE_URL,
+      publicBaseUrl: PUBLIC_BASE_URL,
+      requestIp: "1",
+    });
+    await requestKnownSignIn(restarted, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+
+    const current = [...restarted.state.magicLinksByTokenHash.values()].find(
+      (record) => !record.consumedAt,
+    );
+    expect(current).toBeDefined();
+    expect(current && restarted.state.sealedLinksById.get(current.id)?.keyId).toBe("new");
+  });
+
+  it("fails closed for missing retained keys, legacy rows, and corrupt ciphertext", async () => {
+    const first = createAuthFixture({
+      sealer: new TestTokenSealer("old", { old: true }),
+    });
+    await requestKnownSignIn(first, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+    const link = requireFirstMagicLink(first.state);
+
+    const missingKey = createAuthFixture({
+      state: first.state,
+      sealer: new TestTokenSealer("new", { new: true }),
+      sequenceStart: 100,
+    });
+    await expect(
+      requestKnownSignIn(missingKey, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL }),
+    ).rejects.toThrow(/MAGIC_LINK_DELIVERY_UNRECOVERABLE/);
+    expect(missingKey.mail.sendMagicLink).not.toHaveBeenCalled();
+    expect(missingKey.state.magicLinksByTokenHash.size).toBe(1);
+
+    first.state.sealedLinksById.delete(link.id);
+    const legacy = createAuthFixture({ state: first.state, sequenceStart: 200 });
+    await expect(
+      requestKnownSignIn(legacy, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL }),
+    ).rejects.toThrow(/MAGIC_LINK_DELIVERY_UNRECOVERABLE/);
+    expect(legacy.mail.sendMagicLink).not.toHaveBeenCalled();
+    expect(legacy.state.magicLinksByTokenHash.size).toBe(1);
+
+    first.state.sealedLinksById.set(link.id, {
+      keyId: "old",
+      sealedRawToken: "corrupt",
+    });
+    const corrupt = createAuthFixture({
+      state: first.state,
+      sealer: new TestTokenSealer("new", { old: true, new: true }),
+      sequenceStart: 300,
+    });
+    await expect(
+      requestKnownSignIn(corrupt, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL }),
+    ).rejects.toThrow(/MAGIC_LINK_DELIVERY_UNRECOVERABLE/);
+    expect(corrupt.mail.sendMagicLink).not.toHaveBeenCalled();
+    expect(corrupt.state.magicLinksByTokenHash.size).toBe(1);
+  });
+
+  it("never persists plaintext tokens and rejects ciphertext swapped between record identities", async () => {
+    const fixture = createAuthFixture();
+    await requestKnownSignIn(fixture, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+    await fixture.service.requestMagicLink({
+      email: "known@example.com",
+      ip: "2",
+      purpose: "consultation_invite",
+      consultationId: CONSULTATION_ID,
+      publicBaseUrl: PUBLIC_BASE_URL,
+    });
+    const [firstRecord, secondRecord] = [...fixture.state.magicLinksByTokenHash.values()];
+    if (!firstRecord || !secondRecord) {
+      throw new Error("Expected two stored link identities");
+    }
+    const firstUrl = fixture.mail.sendMagicLink.mock.calls[0]?.[0].url;
+    if (!firstUrl) {
+      throw new Error("Expected plaintext delivery URL");
+    }
+    const plaintextToken = tokenFromMagicLinkUrl(firstUrl);
+    for (const persisted of fixture.state.sealedLinksById.values()) {
+      expect(persisted.sealedRawToken).not.toBe(plaintextToken);
+      expect(persisted.sealedRawToken).not.toContain(plaintextToken);
+    }
+
+    const firstSealed = fixture.state.sealedLinksById.get(firstRecord.id);
+    const secondSealed = fixture.state.sealedLinksById.get(secondRecord.id);
+    if (!firstSealed || !secondSealed) {
+      throw new Error("Expected sealed link material");
+    }
+    fixture.state.sealedLinksById.set(firstRecord.id, secondSealed);
+    fixture.state.sealedLinksById.set(secondRecord.id, firstSealed);
+    const restarted = createAuthFixture({ state: fixture.state, sequenceStart: 100 });
+    await expect(
+      requestKnownSignIn(restarted, { ip: "3", publicBaseUrl: PUBLIC_BASE_URL }),
+    ).rejects.toThrow(/MAGIC_LINK_DELIVERY_UNRECOVERABLE/);
+    expect(restarted.mail.sendMagicLink).not.toHaveBeenCalled();
+    expect(restarted.state.magicLinksByTokenHash.size).toBe(2);
+  });
+
   it("rejects expired links and returns no observable mail for unknown users", async () => {
     const fixture = createAuthFixture();
     await fixture.service.requestMagicLink({
@@ -290,10 +570,48 @@ describe("AuthService", () => {
       origin: PUBLIC_BASE_URL,
       publicBaseUrl: PUBLIC_BASE_URL,
       requestIp: "1",
+      sessionToken: encodedSessionToken,
     });
 
     expect(verified.session.reauthConsultationId).toBe(CONSULTATION_ID);
     expect(fixture.state.sessionsById.has(SESSION_ID)).toBe(false);
+  });
+
+  it("does not let another authenticated session claim a reauthentication exchange", async () => {
+    const fixture = createAuthFixture();
+    const requestingRawToken = new Uint8Array(32).fill(7);
+    const requestingToken = Buffer.from(requestingRawToken).toString("base64url");
+    fixture.state.sessionsById.set(
+      SESSION_ID,
+      makeSession({ tokenHash: hash(requestingRawToken) }),
+    );
+    await fixture.service.requestArchiveDeleteReauth(
+      requestingToken,
+      CONSULTATION_ID,
+      "1",
+      PUBLIC_BASE_URL,
+    );
+    const token = tokenFromMagicLinkUrl(
+      requireLastMagicLinkUrl(fixture.mail.sendMagicLink.mock.calls),
+    );
+    const pending = await fixture.service.beginExchange(token);
+
+    const otherSessionId = "00000000-0000-4000-8000-000000000099";
+    const otherRawToken = new Uint8Array(32).fill(8);
+    fixture.state.sessionsById.set(
+      otherSessionId,
+      makeSession({ id: otherSessionId, tokenHash: hash(otherRawToken) }),
+    );
+    await expect(
+      fixture.service.verifyExchange(pending.exchangeNonce, {
+        csrfToken: pending.verificationCsrfToken,
+        origin: PUBLIC_BASE_URL,
+        publicBaseUrl: PUBLIC_BASE_URL,
+        requestIp: "1",
+        sessionToken: Buffer.from(otherRawToken).toString("base64url"),
+      }),
+    ).rejects.toThrow(/INVALID_EXCHANGE/);
+    expect(requireFirstMagicLink(fixture.state).consumedAt).toBeNull();
   });
 
   it("rejects cross-origin or missing-CSRF verification without consuming the exchange", async () => {

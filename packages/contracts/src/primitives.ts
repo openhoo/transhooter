@@ -13,23 +13,14 @@ export const OpaqueKeySchema = z
   );
 export const NullableUuidSchema = UuidSchema.nullable();
 
-export const StaffRoleSchema = z.enum(["employee", "admin"]);
-export type StaffRole = z.infer<typeof StaffRoleSchema>;
-
-export const NullableStaffRoleSchema = StaffRoleSchema.nullable();
-export type NullableStaffRole = z.infer<typeof NullableStaffRoleSchema>;
-
-export const MagicLinkPurposeSchema = z.enum([
+export const STAFF_ROLE_VALUES = ["employee", "admin"] as const;
+export const MAGIC_LINK_PURPOSE_VALUES = [
   "sign_in",
   "consultation_invite",
   "archive_delete_reauth",
-]);
-export type MagicLinkPurpose = z.infer<typeof MagicLinkPurposeSchema>;
-
-export const ParticipantRoleSchema = z.enum(["employee", "customer"]);
-export type ParticipantRole = z.infer<typeof ParticipantRoleSchema>;
-
-export const ConsultationStateSchema = z.enum([
+] as const;
+export const PARTICIPANT_ROLE_VALUES = ["employee", "customer"] as const;
+export const CONSULTATION_STATE_VALUES = [
   "invited",
   "ready",
   "active",
@@ -37,10 +28,8 @@ export const ConsultationStateSchema = z.enum([
   "ended",
   "cancelled",
   "deleted",
-]);
-export type ConsultationState = z.infer<typeof ConsultationStateSchema>;
-
-export const ArchiveStateSchema = z.enum([
+] as const;
+export const ARCHIVE_STATE_VALUES = [
   "pending",
   "recording",
   "reconciling",
@@ -48,18 +37,36 @@ export const ArchiveStateSchema = z.enum([
   "incomplete",
   "deleting",
   "deleted",
-]);
-export type ArchiveState = z.infer<typeof ArchiveStateSchema>;
-
-export const ExternalEffectStateSchema = z.enum([
+] as const;
+export const EXTERNAL_EFFECT_STATE_VALUES = [
   "planned",
   "calling",
   "applied",
   "compensating",
   "done",
   "failed",
-]);
-export type ExternalEffectState = z.infer<typeof ExternalEffectStateSchema>;
+] as const;
+
+export const StaffRoleSchema = z.enum(STAFF_ROLE_VALUES);
+export type StaffRole = (typeof STAFF_ROLE_VALUES)[number];
+
+export const NullableStaffRoleSchema = StaffRoleSchema.nullable();
+export type NullableStaffRole = z.infer<typeof NullableStaffRoleSchema>;
+
+export const MagicLinkPurposeSchema = z.enum(MAGIC_LINK_PURPOSE_VALUES);
+export type MagicLinkPurpose = (typeof MAGIC_LINK_PURPOSE_VALUES)[number];
+
+export const ParticipantRoleSchema = z.enum(PARTICIPANT_ROLE_VALUES);
+export type ParticipantRole = (typeof PARTICIPANT_ROLE_VALUES)[number];
+
+export const ConsultationStateSchema = z.enum(CONSULTATION_STATE_VALUES);
+export type ConsultationState = (typeof CONSULTATION_STATE_VALUES)[number];
+
+export const ArchiveStateSchema = z.enum(ARCHIVE_STATE_VALUES);
+export type ArchiveState = (typeof ARCHIVE_STATE_VALUES)[number];
+
+export const ExternalEffectStateSchema = z.enum(EXTERNAL_EFFECT_STATE_VALUES);
+export type ExternalEffectState = (typeof EXTERNAL_EFFECT_STATE_VALUES)[number];
 
 export const ParticipantAttributesSchema = z
   .object({

@@ -9,6 +9,7 @@ import {
   type UUID,
 } from "../domain/model";
 import type {
+  ActiveMagicLink,
   AuthRepository,
   MagicLinkRecord,
   MailPort,
@@ -34,11 +35,22 @@ export interface AuthSecrets {
   rateLimitKey: string;
 }
 
+export interface SealedMagicLinkToken {
+  sealedRawToken: string;
+  keyId: string;
+}
+
+export interface MagicLinkTokenSealer {
+  seal(rawToken: Uint8Array, record: MagicLinkRecord): SealedMagicLinkToken;
+  open(link: ActiveMagicLink): Uint8Array;
+}
+
 interface VerifyExchangeContext {
   csrfToken: string;
   origin: string;
   publicBaseUrl: string;
   requestIp: string;
+  sessionToken?: string | null;
 }
 
 interface AuthenticatedSession {
@@ -72,6 +84,7 @@ export class AuthService {
     private readonly tokens: TokenGenerator,
     private readonly hasher: TokenHasher,
     private readonly secrets: AuthSecrets,
+    private readonly tokenSealer: MagicLinkTokenSealer,
   ) {}
 
   async requestMagicLink(input: MagicLinkRequest): Promise<void> {
@@ -198,6 +211,14 @@ export class AuthService {
     const csrfToken = this.tokens.bytes(32);
     let created!: SessionRecord;
     let purpose!: MagicLinkPurpose;
+    let requestingSessionId: UUID | null = null;
+    if (context.sessionToken) {
+      try {
+        requestingSessionId = (await this.authenticate(context.sessionToken)).session.id;
+      } catch {
+        requestingSessionId = null;
+      }
+    }
 
     await this.repository.transaction(async (tx) => {
       const nonceHash = this.hasher.sha256(nonce);
@@ -216,28 +237,40 @@ export class AuthService {
         throw new DomainError("INVALID_EXCHANGE");
       }
 
+      let archiveBinding: { sessionId: UUID; consultationId: UUID } | null = null;
+      if (link.purpose === "archive_delete_reauth") {
+        if (
+          !link.sessionId ||
+          !link.consultationId ||
+          !requestingSessionId ||
+          requestingSessionId !== link.sessionId
+        ) {
+          throw new DomainError("INVALID_EXCHANGE");
+        }
+        archiveBinding = {
+          sessionId: link.sessionId,
+          consultationId: link.consultationId,
+        };
+      }
+
       const consumed = await this.repository.consumeExchangeAndLink(exchange.id, link.id, now, tx);
       if (!consumed) {
         throw new DomainError("INVALID_EXCHANGE");
       }
 
       purpose = link.purpose;
-      const isArchiveDeleteReauth = link.purpose === "archive_delete_reauth";
       created = {
         id: this.ids.uuid(),
         userId: link.userId,
         tokenHash: this.hasher.sha256(sessionToken),
         csrfHash: this.hasher.sha256(csrfToken),
         expiresAt: addMilliseconds(now, SESSION_TTL_MS),
-        reauthenticatedAt: isArchiveDeleteReauth ? now : null,
-        reauthConsultationId: isArchiveDeleteReauth ? link.consultationId : null,
+        reauthenticatedAt: archiveBinding ? now : null,
+        reauthConsultationId: archiveBinding?.consultationId ?? null,
       };
 
-      if (isArchiveDeleteReauth) {
-        if (!link.sessionId || !link.consultationId) {
-          throw new DomainError("INVALID_REAUTH_BINDING");
-        }
-        await this.repository.rotateSession(created, link.sessionId, tx);
+      if (archiveBinding) {
+        await this.repository.rotateSession(created, archiveBinding.sessionId, tx);
         return;
       }
 
@@ -302,25 +335,65 @@ export class AuthService {
 
   private async issueMagicLink(input: AdmittedMagicLink): Promise<void> {
     const rawToken = this.tokens.bytes(32);
-    const expiresAt = addMilliseconds(input.now, LINK_TTL_MS);
-    const link: MagicLinkRecord = {
+    const record: MagicLinkRecord = {
       id: this.ids.uuid(),
       userId: input.userId,
       consultationId: input.consultationId,
       sessionId: input.sessionId,
       purpose: input.purpose,
       tokenHash: this.hasher.sha256(rawToken),
-      expiresAt,
+      expiresAt: addMilliseconds(input.now, LINK_TTL_MS),
       consumedAt: null,
       revokedAt: null,
     };
-    await this.repository.createMagicLink(link);
-    await this.mail.sendMagicLink({
-      to: input.email,
-      purpose: input.purpose,
-      url: `${input.publicBaseUrl}/auth/exchange?token=${encodeURIComponent(base64url(rawToken))}`,
-      expiresAt,
-    });
+
+    let sealed: SealedMagicLinkToken;
+    try {
+      sealed = this.tokenSealer.seal(rawToken, record);
+    } catch {
+      throw new DomainError("MAGIC_LINK_DELIVERY_UNRECOVERABLE");
+    }
+
+    const active = await this.repository.getOrCreateActiveMagicLink(
+      {
+        userId: record.userId,
+        purpose: record.purpose,
+        consultationId: record.consultationId,
+        sessionId: record.sessionId,
+      },
+      { record, ...sealed },
+      input.now,
+    );
+    let issuedToken: Uint8Array;
+    try {
+      issuedToken = this.tokenSealer.open(active);
+    } catch {
+      throw new DomainError("MAGIC_LINK_DELIVERY_UNRECOVERABLE");
+    }
+    if (
+      issuedToken.length !== 32 ||
+      this.hasher.sha256(issuedToken) !== active.record.tokenHash ||
+      active.record.userId !== input.userId ||
+      active.record.purpose !== input.purpose ||
+      active.record.consultationId !== input.consultationId ||
+      active.record.sessionId !== input.sessionId ||
+      !Number.isFinite(active.record.expiresAt.getTime()) ||
+      active.record.expiresAt <= input.now
+    ) {
+      throw new DomainError("MAGIC_LINK_DELIVERY_UNRECOVERABLE");
+    }
+
+    try {
+      await this.mail.sendMagicLink({
+        to: input.email,
+        purpose: input.purpose,
+        url: `${input.publicBaseUrl}/auth/exchange?token=${encodeURIComponent(base64url(issuedToken))}`,
+        expiresAt: active.record.expiresAt,
+      });
+    } catch {
+      // Delivery errors are ambiguous: the provider may have accepted the message.
+      // The durable sealed token lets every retry resend the same usable flow.
+    }
   }
 
   private admitMagicLinkRequest(email: string | null, ip: string, now: Date): Promise<boolean> {

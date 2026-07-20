@@ -37,6 +37,7 @@ interface CreateConsultationInput {
   employeeUserId: UUID;
   customerUserId: UUID;
   providerProfileId: string;
+  creationIdempotencyKey: UUID;
 }
 
 type SnapshotParticipant = {
@@ -76,8 +77,18 @@ export class ConsultationService {
 
   async create(input: CreateConsultationInput): Promise<Consultation> {
     return this.consultations.transaction(async (tx) => {
-      const now = this.clock.now();
+      const existing = await this.consultations.findByCreationIdempotencyKey(
+        input.employeeUserId,
+        input.creationIdempotencyKey,
+        tx,
+      );
+      if (existing) {
+        this.assertCreationPayload(existing, input.customerUserId, input.providerProfileId);
+        return existing;
+      }
       const profile = await this.snapshots.currentEnabledRevision(input.providerProfileId, tx);
+
+      const now = this.clock.now();
       const id = this.ids.uuid();
       const employee = this.newParticipant("employee", input.employeeUserId);
       const customer = this.newParticipant("customer", input.customerUserId);
@@ -104,7 +115,25 @@ export class ConsultationService {
         updatedAt: now,
       };
 
-      await this.consultations.create(value, tx);
+      const created = await this.consultations.create(
+        value,
+        input.employeeUserId,
+        input.creationIdempotencyKey,
+        tx,
+      );
+      if (!created) {
+        const concurrent = await this.consultations.findByCreationIdempotencyKey(
+          input.employeeUserId,
+          input.creationIdempotencyKey,
+          tx,
+        );
+        if (!concurrent) {
+          throw new DomainError("CONSULTATION_CREATION_CONFLICT");
+        }
+        this.assertCreationPayload(concurrent, input.customerUserId, profile.profileId);
+        return concurrent;
+      }
+
       await this.audit.append(
         {
           id: this.ids.uuid(),
@@ -285,7 +314,7 @@ export class ConsultationService {
       ) {
         throw new DomainError("CONSENT_REQUIRED");
       }
-      if (!current.roomSid || !current.compositeEgressId || !current.dispatchId) {
+      if (!current.roomSid) {
         throw new DomainError("PROVISIONING");
       }
 
@@ -362,6 +391,22 @@ export class ConsultationService {
       });
       return next;
     });
+  }
+
+  private assertCreationPayload(
+    consultation: Consultation,
+    customerUserId: UUID,
+    providerProfileId: string,
+  ): void {
+    const customer = consultation.participants.find(
+      (participant) => participant.role === "customer",
+    );
+    if (
+      customer?.userId !== customerUserId ||
+      consultation.providerProfileId !== providerProfileId
+    ) {
+      throw new DomainError("CONSULTATION_CREATION_CONFLICT");
+    }
   }
 
   private newParticipant(role: ParticipantSlot["role"], userId: UUID): ParticipantSlot {

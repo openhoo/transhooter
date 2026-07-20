@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: transhooter-otel-collector
+  name: {{ include "transhooter.fullname" . }}-otel-collector
   labels:
     {{- include "transhooter.labels" . | nindent 4 }}
     app.kubernetes.io/component: otel-collector

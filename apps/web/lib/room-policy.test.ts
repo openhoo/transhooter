@@ -103,18 +103,18 @@ void test("audio modes fall back atomically to original audio", () => {
   });
 });
 
-void test("ready consultations remain in the lobby until every remote media barrier exists", () => {
+void test("ready consultations enter the room before capture and worker barriers settle", () => {
   const pending = {
     id: consultationId,
     state: "ready" as const,
     roomName: "room-id",
-    roomSid: "room-sid",
+    roomSid: null,
     dispatchId: null,
-    compositeEgressId: "egress-id",
+    compositeEgressId: null,
   };
   assert.equal(durableConsultationDestination(pending), null);
   assert.equal(
-    durableConsultationDestination({ ...pending, dispatchId: "dispatch-id" }),
+    durableConsultationDestination({ ...pending, roomSid: "room-sid" }),
     `/consultations/${consultationId}/room`,
   );
   assert.equal(

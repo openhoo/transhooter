@@ -8,6 +8,13 @@ import {
   Sha256Schema,
   UuidSchema,
 } from "./primitives";
+import {
+  ProviderOutcomeSchema,
+  ProviderRetryActionSchema,
+  ProviderRetryAdviceSchema,
+} from "./wire";
+
+export const TRANSPORT_KIND_VALUES = ["http", "websocket", "grpc"] as const;
 
 export const CredentialReferenceSchema = z
   .object({
@@ -282,7 +289,7 @@ export const ProviderErrorSchema = z
       "cancelled",
     ]),
     scope: z.enum(["operation", "session"]),
-    providerRetryAdvice: z.enum(["never", "retry_after", "unspecified"]),
+    providerRetryAdvice: ProviderRetryAdviceSchema,
     providerCode: z.string().nullable(),
     providerRequestId: z.string().nullable(),
     retryDelayMs: NonNegativeIntegerSchema.nullable(),
@@ -292,9 +299,18 @@ export const ProviderErrorSchema = z
   .strict();
 export type ProviderError = z.infer<typeof ProviderErrorSchema>;
 
+const RETRYABLE_PROVIDER_ERROR_KINDS: Partial<Record<ProviderError["kind"], true>> = {
+  quota: true,
+  rate_limit: true,
+  transport: true,
+  provider: true,
+  invalid_response: true,
+  internal: true,
+};
+
 export const RetryDecisionSchema = z
   .object({
-    action: z.enum(["retry", "do_not_retry", "degrade"]),
+    action: ProviderRetryActionSchema,
     reason: z.string().min(1),
     retryAtMs: NonNegativeIntegerSchema.nullable(),
     previousAttemptId: NullableUuidSchema,
@@ -330,7 +346,7 @@ const ProviderAttemptTerminalCommonShape = {
   operationId: UuidSchema,
   attemptId: UuidSchema,
   stage: z.enum(["stt", "translation", "tts"]),
-  outcome: z.enum(["succeeded", "failed", "cancelled"]),
+  outcome: ProviderOutcomeSchema,
   error: ProviderErrorSchema.nullable(),
   retryDecision: RetryDecisionSchema,
   retryOfAttemptId: NullableUuidSchema,
@@ -343,16 +359,22 @@ const ProviderAttemptTerminalCommonShape = {
 const ProviderAttemptTerminalCommonSchema = z.object(ProviderAttemptTerminalCommonShape);
 type ProviderAttemptTerminalCommon = z.infer<typeof ProviderAttemptTerminalCommonSchema>;
 
-function validateProviderAttemptTerminal(
-  terminal: ProviderAttemptTerminalCommon,
+function validateProviderOutcome(
+  terminal: Pick<
+    ProviderAttemptTerminalCommon,
+    "attemptId" | "outcome" | "error" | "retryDecision"
+  >,
   context: z.RefinementCtx,
 ): void {
-  const didFail = terminal.outcome === "failed";
-  const hasError = terminal.error !== null;
-  if (didFail !== hasError) {
+  const errorKind = terminal.error?.kind;
+  const invalidError =
+    (terminal.outcome === "succeeded" && terminal.error !== null) ||
+    (terminal.outcome === "failed" && (terminal.error === null || errorKind === "cancelled")) ||
+    (terminal.outcome === "cancelled" && terminal.error !== null && errorKind !== "cancelled");
+  if (invalidError) {
     context.addIssue({
       code: "custom",
-      message: "only failed terminals carry an error",
+      message: "error must match the succeeded, failed, or cancelled outcome",
       path: ["error"],
     });
   }
@@ -363,8 +385,24 @@ function validateProviderAttemptTerminal(
       path: ["error", "attemptId"],
     });
   }
+
+  const retries = terminal.retryDecision.action === "retry";
+  if (terminal.outcome !== "failed" && terminal.retryDecision.action !== "do_not_retry") {
+    context.addIssue({
+      code: "custom",
+      message: "successful and cancelled terminals cannot carry retry advice",
+      path: ["retryDecision", "action"],
+    });
+  }
+  if (terminal.outcome !== "failed" && terminal.retryDecision.previousAttemptId !== null) {
+    context.addIssue({
+      code: "custom",
+      message: "successful and cancelled terminals cannot link a retry decision",
+      path: ["retryDecision", "previousAttemptId"],
+    });
+  }
   if (
-    terminal.retryDecision.previousAttemptId !== null &&
+    (terminal.retryDecision.previousAttemptId !== null || retries) &&
     terminal.retryDecision.previousAttemptId !== terminal.attemptId
   ) {
     context.addIssue({
@@ -374,15 +412,24 @@ function validateProviderAttemptTerminal(
     });
   }
   if (
-    terminal.retryDecision.action === "retry" &&
-    terminal.retryDecision.previousAttemptId !== terminal.attemptId
+    retries &&
+    (terminal.error === null ||
+      terminal.error.providerRetryAdvice === "never" ||
+      RETRYABLE_PROVIDER_ERROR_KINDS[terminal.error.kind] !== true)
   ) {
     context.addIssue({
       code: "custom",
-      message: "retry decisions require the terminal attempt link",
-      path: ["retryDecision", "previousAttemptId"],
+      message: "retries require a retryable failed provider error",
+      path: ["retryDecision", "action"],
     });
   }
+}
+
+function validateProviderAttemptTerminal(
+  terminal: ProviderAttemptTerminalCommon,
+  context: z.RefinementCtx,
+): void {
+  validateProviderOutcome(terminal, context);
   if (terminal.retryOfAttemptId === terminal.attemptId) {
     context.addIssue({
       code: "custom",
@@ -444,13 +491,13 @@ export const ProviderAttemptReportSchema = z
     attemptId: UuidSchema,
     attemptNumber: PositiveIntegerSchema,
     retryOfAttemptId: NullableUuidSchema,
-    outcome: z.enum(["succeeded", "failed", "cancelled"]),
+    outcome: ProviderOutcomeSchema,
     error: ProviderErrorSchema.nullable(),
     retryDecision: RetryDecisionSchema,
     watermarks: ProviderWatermarksSchema,
     credentialVersion: z.string().min(1),
     credentialFingerprint: z.string().min(1),
-    transport: z.enum(["http", "websocket", "grpc"]),
+    transport: z.enum(TRANSPORT_KIND_VALUES),
     rawReferences: z.array(ProviderAttemptRawReferenceSchema),
     terminalHash: Sha256Schema,
     startedAtMs: NonNegativeIntegerSchema,
@@ -458,40 +505,7 @@ export const ProviderAttemptReportSchema = z
   })
   .strict()
   .superRefine((report, context) => {
-    if ((report.outcome === "failed") !== (report.error !== null)) {
-      context.addIssue({
-        code: "custom",
-        message: "only failed attempts carry an error",
-        path: ["error"],
-      });
-    }
-    if (report.error !== null && report.error.attemptId !== report.attemptId) {
-      context.addIssue({
-        code: "custom",
-        message: "error attemptId must match the reported attempt",
-        path: ["error", "attemptId"],
-      });
-    }
-    if (
-      report.retryDecision.previousAttemptId !== null &&
-      report.retryDecision.previousAttemptId !== report.attemptId
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "retry decision must link to the reported attempt",
-        path: ["retryDecision", "previousAttemptId"],
-      });
-    }
-    if (
-      report.retryDecision.action === "retry" &&
-      report.retryDecision.previousAttemptId !== report.attemptId
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "retry decisions require the reported attempt link",
-        path: ["retryDecision", "previousAttemptId"],
-      });
-    }
+    validateProviderOutcome(report, context);
     if (report.retryOfAttemptId === report.attemptId) {
       context.addIssue({
         code: "custom",

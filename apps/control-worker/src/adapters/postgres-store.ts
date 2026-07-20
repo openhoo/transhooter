@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { type RoomProviderSelection, RoomProviderSelectionSchema } from "@transhooter/contracts";
+import {
+  ArchiveStateSchema,
+  ExternalEffectStateSchema,
+  PARTICIPANT_ROLE_VALUES,
+  type RoomProviderSelection,
+  RoomProviderSelectionSchema,
+} from "@transhooter/contracts";
 import {
   consultationParticipants,
   consultations,
@@ -33,7 +39,7 @@ interface ExternalEffectRow extends PostgresRow {
   readonly effect_kind: string;
   readonly subject_id: string;
   readonly occurrence_key: string;
-  readonly state: Effect["state"];
+  readonly state: unknown;
   readonly request_bytes: Uint8Array | null;
   readonly request_hash: string | null;
   readonly lease_owner: string | null;
@@ -72,6 +78,37 @@ interface IdRow extends PostgresRow {
   readonly id: string;
 }
 
+interface RoomResourceRow extends PostgresRow {
+  readonly resource_room_name: string | null;
+}
+
+interface ReserveConsultationRow extends PostgresRow {
+  readonly worker_identity: string | null;
+  readonly snapshot_hash: string | null;
+}
+
+interface CancellationConsultationRow extends PostgresRow {
+  readonly generation: number;
+  readonly state: ConsultationState;
+}
+
+interface WorkerEpochTerminalRow extends PostgresRow {
+  readonly terminal_at: Date | string | null;
+}
+
+interface ArchiveStateRow extends PostgresRow {
+  readonly id: string;
+  readonly state: unknown;
+}
+
+interface ReconciliationArchiveRow extends ArchiveStateRow {
+  readonly reconciliation_deadline_at: Date | string | null;
+}
+
+interface ConsultationIdRow extends PostgresRow {
+  readonly consultation_id: string;
+}
+
 interface WorkerDispatchRow extends PostgresRow {
   readonly room_name: string;
   readonly worker_identity: string;
@@ -89,12 +126,6 @@ interface WorkerDirectionRow extends PostgresRow {
 interface ParticipantIdentityRow extends PostgresRow {
   readonly id: string;
   readonly livekit_identity: string;
-}
-
-interface ArchiveClaimRow extends PostgresRow {
-  readonly id: string;
-  readonly state: "reconciling";
-  readonly reconciliation_deadline_at: Date | string;
 }
 
 interface ExpectationRow extends PostgresRow {
@@ -178,7 +209,7 @@ type ReconciliationEgressResult = {
 export class PostgresStore implements DurableStore {
   private readonly db: PostgresJsDatabase;
   private constructor(private readonly client: Sql) {
-    this.db = drizzle(client);
+    this.db = drizzle({ client });
   }
 
   static connect(url: string): PostgresStore {
@@ -221,7 +252,7 @@ export class PostgresStore implements DurableStore {
 
   async claimEffects(options: ClaimOptions): Promise<readonly Effect[]> {
     const rows = await this.db.execute<ExternalEffectRow>(sql`WITH picked AS (
-      SELECT candidate.id FROM external_effects candidate WHERE candidate.state IN ('planned','calling','compensating')
+      SELECT candidate.id FROM external_effects candidate WHERE candidate.state IN ('planned','calling','applied','compensating')
         AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < ${options.now.toISOString()})
         AND (
           candidate.result->'plan'->>'dependsOnEffectId' IS NULL
@@ -276,7 +307,10 @@ export class PostgresStore implements DurableStore {
 
   async markDone(effectId: Uuid, owner: Uuid): Promise<void> {
     await this.db.execute(
-      sql`UPDATE external_effects SET state='done',updated_at=now(),lease_owner=NULL,lease_expires_at=NULL WHERE id=${effectId} AND lease_owner=${owner} AND state IN ('calling','applied','compensating')`,
+      sql`UPDATE external_effects SET state='done',updated_at=now(),lease_owner=NULL,lease_expires_at=NULL
+        WHERE id=${effectId} AND lease_owner=${owner}
+          AND lease_expires_at > now()
+          AND state IN ('calling','applied','compensating')`,
     );
   }
 
@@ -294,13 +328,15 @@ export class PostgresStore implements DurableStore {
   async renewEffectLease(effectId: Uuid, owner: Uuid, leaseExpiresAt: Date): Promise<boolean> {
     const rows =
       await this.db.execute<IdRow>(sql`UPDATE external_effects SET lease_expires_at=${leaseExpiresAt.toISOString()},updated_at=now()
-      WHERE id=${effectId} AND lease_owner=${owner} AND state IN ('calling','compensating') RETURNING id`);
+      WHERE id=${effectId} AND lease_owner=${owner} AND state IN ('calling','applied','compensating') RETURNING id`);
     return rows.length === 1;
   }
 
   async markCompensating(effectId: Uuid, owner: Uuid, reason: string): Promise<void> {
     await this.db.execute(
-      sql`UPDATE external_effects SET state='compensating',result=${JSON.stringify({ reason })}::jsonb,updated_at=now() WHERE id=${effectId} AND lease_owner=${owner}`,
+      sql`UPDATE external_effects SET state='compensating',
+        result=COALESCE(result,'{}'::jsonb) || ${JSON.stringify({ reason })}::jsonb,updated_at=now()
+        WHERE id=${effectId} AND lease_owner=${owner} AND lease_expires_at > now()`,
     );
   }
 
@@ -321,10 +357,38 @@ export class PostgresStore implements DurableStore {
 
   async claimDeadlines(options: ClaimOptions): Promise<readonly Deadline[]> {
     const rows = await this.db.execute<DeadlineRow>(sql`WITH picked AS (
-      SELECT consultation_id,generation,kind FROM orchestration_deadlines WHERE completed_at IS NULL AND due_at <= ${options.now.toISOString()}
-        AND (lease_expires_at IS NULL OR lease_expires_at < ${options.now.toISOString()}) ORDER BY due_at FOR UPDATE SKIP LOCKED LIMIT ${options.limit}
-    ) UPDATE orchestration_deadlines d SET lease_owner=${options.owner},lease_expires_at=${new Date(options.now.getTime() + options.leaseMs).toISOString()}
-      FROM picked WHERE d.consultation_id=picked.consultation_id AND d.generation=picked.generation AND d.kind=picked.kind RETURNING d.*`);
+      SELECT deadline.consultation_id,deadline.generation,deadline.kind
+      FROM orchestration_deadlines deadline
+      WHERE deadline.completed_at IS NULL
+        AND (
+          deadline.due_at <= ${options.now.toISOString()}
+          OR EXISTS (
+            SELECT 1 FROM consultations consultation
+            WHERE consultation.id=deadline.consultation_id
+              AND (
+                consultation.generation <> deadline.generation
+                OR (
+                  deadline.kind <> 'archive-reconcile'
+                  AND consultation.state IN ('ended','cancelled','deleted')
+                )
+              )
+          )
+        )
+        AND (
+          deadline.lease_expires_at IS NULL
+          OR deadline.lease_expires_at < ${options.now.toISOString()}
+        )
+      ORDER BY deadline.due_at
+      FOR UPDATE OF deadline SKIP LOCKED
+      LIMIT ${options.limit}
+    ) UPDATE orchestration_deadlines d
+      SET lease_owner=${options.owner},
+        lease_expires_at=${new Date(options.now.getTime() + options.leaseMs).toISOString()}
+      FROM picked
+      WHERE d.consultation_id=picked.consultation_id
+        AND d.generation=picked.generation
+        AND d.kind=picked.kind
+      RETURNING d.*`);
     return rows.map(mapDeadline);
   }
 
@@ -366,19 +430,27 @@ export class PostgresStore implements DurableStore {
 
   async reserveWorker(consultationId: Uuid, generation: number): Promise<WorkerReservation> {
     return this.client.begin(async (transaction) => {
-      const consultations = await transaction<
-        { readonly worker_identity: string; readonly snapshot_hash: string }[]
-      >`SELECT worker_identity,snapshot_hash FROM consultations
-        WHERE id=${consultationId} AND generation=${generation} AND state='ready' FOR UPDATE`;
-      const consultation = consultations[0];
+      const [consultationRow] = await transaction<
+        ReserveConsultationRow[]
+      >`SELECT worker_identity,snapshot_hash
+        FROM consultations
+        WHERE id=${consultationId} AND generation=${generation} AND state='ready'
+        FOR UPDATE`;
+      const consultation =
+        consultationRow === undefined
+          ? undefined
+          : {
+              workerIdentity: consultationRow.worker_identity,
+              snapshotHash: consultationRow.snapshot_hash,
+            };
       if (
         consultation === undefined ||
-        typeof consultation.worker_identity !== "string" ||
-        typeof consultation.snapshot_hash !== "string"
+        typeof consultation.workerIdentity !== "string" ||
+        typeof consultation.snapshotHash !== "string"
       ) {
         throw new Error("ready consultation has no worker reservation identity");
       }
-      const workerId = consultation.worker_identity;
+      const workerId = consultation.workerIdentity;
       const epoch = generation;
       await transaction`INSERT INTO worker_leases(worker_id,accepting_load,capacity,reserved,encrypted_spool_percent,providers_ok,archive_ok,heartbeat_at,expires_at,epoch,status)
         VALUES (${workerId},true,1,1,0,true,true,now(),now()+interval '20 minutes',${epoch},'{}'::jsonb)
@@ -386,7 +458,7 @@ export class PostgresStore implements DurableStore {
           providers_ok=true,archive_ok=true,heartbeat_at=now(),expires_at=now()+interval '20 minutes',epoch=${epoch},status='{}'::jsonb`;
       const rows = await transaction<ReservationRow[]>`INSERT INTO worker_reservations(
           consultation_id,generation,worker_id,epoch,selection_hash,reserved_at,heartbeat_at,lease_expires_at,accepting_load
-        ) VALUES (${consultationId},${generation},${workerId},${epoch},${consultation.snapshot_hash},now(),now(),now()+interval '5 minutes',true)
+        ) VALUES (${consultationId},${generation},${workerId},${epoch},${consultation.snapshotHash},now(),now(),now()+interval '5 minutes',true)
         ON CONFLICT(consultation_id,generation) DO UPDATE SET accepting_load=true
         RETURNING *`;
       await transaction`INSERT INTO worker_job_epochs(
@@ -424,7 +496,10 @@ export class PostgresStore implements DurableStore {
         }
       }
 
-      if (event.participantId === null) {
+      if (
+        event.participantId === null ||
+        (event.kind !== "PARTICIPANT_JOINED" && event.kind !== "PARTICIPANT_LEFT")
+      ) {
         return true;
       }
 
@@ -437,25 +512,36 @@ export class PostgresStore implements DurableStore {
     });
   }
 
+  async presenceEpoch(consultationId: Uuid, generation: number): Promise<number | null> {
+    const rows = await this.db
+      .select({ presenceEpoch: consultations.presenceEpoch })
+      .from(consultations)
+      .where(and(eq(consultations.id, consultationId), eq(consultations.generation, generation)))
+      .limit(1);
+    return rows[0]?.presenceEpoch ?? null;
+  }
+
   async admitFinalization(
     consultationId: Uuid,
     generation: number,
+    presenceEpoch: number,
     now: Date,
-  ): Promise<ConsultationState | null> {
+  ): Promise<"admitted" | ConsultationState | null> {
     return this.client.begin(async (transaction) => {
       const rows = await transaction<
         { readonly state: ConsultationState }[]
       >`UPDATE consultations SET state='finalizing',finalize_deadline_at=COALESCE(finalize_deadline_at,${new Date(now.getTime() + 15 * 60_000).toISOString()}),updated_at=${now.toISOString()}
-        WHERE id=${consultationId} AND generation=${generation} AND state='active' RETURNING state`;
+        WHERE id=${consultationId} AND generation=${generation} AND presence_epoch=${presenceEpoch}
+          AND state IN ('ready','active') RETURNING state`;
       if (rows.length === 1) {
         await transaction`UPDATE archives SET state='reconciling',reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,${new Date(now.getTime() + 30 * 60_000).toISOString()}),updated_at=${now.toISOString()}
           WHERE consultation_id=${consultationId} AND state IN ('pending','recording')`;
-        return "finalizing" as const;
+        return "admitted" as const;
       }
       const current = await transaction<
         { readonly state: ConsultationState }[]
       >`SELECT state FROM consultations WHERE id=${consultationId} AND generation=${generation}`;
-      return current[0] === undefined ? null : (current[0].state as ConsultationState);
+      return current[0]?.state ?? null;
     });
   }
 
@@ -467,7 +553,7 @@ export class PostgresStore implements DurableStore {
         and(
           eq(consultationParticipants.consultationId, consultationId),
           eq(consultationParticipants.livekitIdentity, participantId),
-          inArray(consultationParticipants.role, ["employee", "customer"]),
+          inArray(consultationParticipants.role, PARTICIPANT_ROLE_VALUES),
         ),
       )
       .limit(1);
@@ -636,31 +722,38 @@ export class PostgresStore implements DurableStore {
     effects: readonly PlannedEffect[],
   ): Promise<void> {
     await this.client.begin(async (transaction) => {
-      const consultations = await transaction<
-        { readonly generation: number; readonly state: string }[]
-      >`SELECT generation,state FROM consultations WHERE id=${consultationId} FOR UPDATE`;
-      const consultation = consultations[0];
+      const [consultationRow] = await transaction<
+        CancellationConsultationRow[]
+      >`SELECT generation,state
+        FROM consultations
+        WHERE id=${consultationId}
+        FOR UPDATE`;
+      const consultation =
+        consultationRow === undefined
+          ? undefined
+          : { generation: Number(consultationRow.generation), state: consultationRow.state };
       if (
         consultation === undefined ||
         consultation.state !== "cancelled" ||
-        Number(consultation.generation) !== cleanupGeneration ||
+        consultation.generation !== cleanupGeneration ||
         cleanupGeneration <= resourceGeneration
       ) {
         throw new Error("cancellation cleanup generation is not current");
       }
-      const reservations = await transaction<
-        ReservationRow[]
-      >`SELECT * FROM worker_reservations WHERE consultation_id=${consultationId}
-        AND generation=${resourceGeneration} FOR UPDATE`;
-      const row = reservations[0];
-      if (row !== undefined) {
-        const reservation = mapReservation(row);
-        const epochs = await transaction<
-          { readonly terminal_at: Date | string | null }[]
-        >`SELECT terminal_at FROM worker_job_epochs WHERE consultation_id=${consultationId}
-          AND generation=${resourceGeneration} AND worker_id=${reservation.workerId}
-          AND epoch=${reservation.epoch} FOR UPDATE`;
-        if (epochs[0]?.terminal_at === null) {
+      const [reservationRow] = await transaction<ReservationRow[]>`SELECT *
+        FROM worker_reservations
+        WHERE consultation_id=${consultationId} AND generation=${resourceGeneration}
+        FOR UPDATE`;
+      if (reservationRow !== undefined) {
+        const reservation = mapReservation(reservationRow);
+        const [epoch] = await transaction<WorkerEpochTerminalRow[]>`SELECT terminal_at
+          FROM worker_job_epochs
+          WHERE consultation_id=${consultationId}
+            AND generation=${resourceGeneration}
+            AND worker_id=${reservation.workerId}
+            AND epoch=${reservation.epoch}
+          FOR UPDATE`;
+        if (epoch?.terminal_at === null) {
           const terminalCheckpointId = await persistSupervisorTerminalCheckpoints(
             transaction,
             reservation,
@@ -689,6 +782,10 @@ export class PostgresStore implements DurableStore {
           WHERE consultation_id=${consultationId} AND generation=${resourceGeneration}
             AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}`;
       }
+      await transaction`UPDATE orchestration_deadlines
+        SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL
+        WHERE consultation_id=${consultationId} AND generation < ${cleanupGeneration}
+          AND completed_at IS NULL`;
       await insertPlannedEffects(transaction, effects);
     });
   }
@@ -709,9 +806,11 @@ export class PostgresStore implements DurableStore {
   async seedDeadlines(consultationId: Uuid, generation: number): Promise<void> {
     await this.db.execute(sql`INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
       SELECT id,generation,'ready',ready_deadline_at FROM consultations
-        WHERE id=${consultationId} AND generation=${generation} AND ready_deadline_at IS NOT NULL
+        WHERE id=${consultationId} AND generation=${generation}
+          AND state IN ('ready','active') AND ready_deadline_at IS NOT NULL
       UNION ALL SELECT id,generation,'finalize',finalize_deadline_at FROM consultations
-        WHERE id=${consultationId} AND generation=${generation} AND finalize_deadline_at IS NOT NULL
+        WHERE id=${consultationId} AND generation=${generation}
+          AND state='finalizing' AND finalize_deadline_at IS NOT NULL
       UNION ALL SELECT c.id,c.generation,'archive-reconcile',a.reconciliation_deadline_at FROM consultations c
         JOIN archives a ON a.consultation_id=c.id WHERE c.id=${consultationId} AND c.generation=${generation} AND a.reconciliation_deadline_at IS NOT NULL
       ON CONFLICT (consultation_id,generation,kind) DO UPDATE SET due_at=EXCLUDED.due_at`);
@@ -724,6 +823,7 @@ export class PostgresStore implements DurableStore {
     readonly participantIds: readonly Uuid[];
     readonly dispatchIds: readonly string[];
     readonly roomCreated: boolean;
+    readonly resourceRoomName: string | null;
   }> {
     const [egress, participants, dispatches, rooms] = await Promise.all([
       this.db.execute<EgressIdRow>(
@@ -735,21 +835,26 @@ export class PostgresStore implements DurableStore {
       this.db.execute<DispatchIdRow>(sql`SELECT result->>'remoteId' AS dispatch_id FROM external_effects
         WHERE consultation_id=${consultationId} AND generation=${generation} AND effect_kind='WORKER_DISPATCH'
           AND result->>'remoteId' IS NOT NULL ORDER BY created_at`),
-      this.db.execute<IdRow>(sql`SELECT id FROM external_effects
+      this.db.execute<RoomResourceRow>(sql`SELECT result->'plan'->>'roomName' AS resource_room_name FROM external_effects
         WHERE consultation_id=${consultationId} AND generation=${generation} AND effect_kind='ROOM_CREATE'
-          AND state IN ('applied','done') AND result->>'remoteId' IS NOT NULL LIMIT 1`),
+          AND state IN ('applied','done') AND result->'plan'->>'roomName' IS NOT NULL LIMIT 1`),
     ]);
     return {
       egressIds: egress.map((row) => String(row.egress_id)),
       participantIds: participants.map((row) => String(row.livekit_identity)),
       dispatchIds: dispatches.map((row) => String(row.dispatch_id)),
-      roomCreated: rooms.length > 0,
+      roomCreated: rooms.length === 1,
+      resourceRoomName: rooms[0]?.resource_room_name ?? null,
     };
   }
 
   async completeRoomDrain(consultationId: Uuid, generation: number): Promise<void> {
     await this.client.begin(async (transaction) => {
       await transaction`UPDATE consultations SET state='ended',updated_at=now() WHERE id=${consultationId} AND generation=${generation} AND state='finalizing'`;
+      await transaction`UPDATE orchestration_deadlines SET completed_at=COALESCE(completed_at,now()),
+        lease_owner=NULL,lease_expires_at=NULL
+        WHERE consultation_id=${consultationId} AND generation=${generation}
+          AND kind <> 'archive-reconcile' AND completed_at IS NULL`;
       await transaction`UPDATE worker_reservations reservation SET accepting_load=false,released_at=COALESCE(reservation.released_at,epoch.terminal_at)
         FROM worker_job_epochs epoch
         WHERE reservation.consultation_id=${consultationId} AND reservation.generation=${generation}
@@ -786,25 +891,46 @@ export class PostgresStore implements DurableStore {
     resourceGeneration: number,
   ): Promise<ReconciliationSnapshot | null> {
     return this.client.begin(async (transaction) => {
-      const archiveStates = await transaction<
-        { readonly id: string; readonly state: string }[]
-      >`SELECT id,state FROM archives WHERE consultation_id=${consultationId}`;
-      const archiveState = archiveStates[0];
-      if (archiveState === undefined) {
+      const [archiveStateRow] = await transaction<ArchiveStateRow[]>`SELECT id,state
+        FROM archives
+        WHERE consultation_id=${consultationId}`;
+      if (archiveStateRow === undefined) {
         throw new Error("consultation archive is unavailable");
       }
-      if (["complete", "incomplete", "deleting", "deleted"].includes(archiveState.state)) {
+      const archiveState = ArchiveStateSchema.parse(archiveStateRow.state);
+      if (
+        archiveState === "complete" ||
+        archiveState === "incomplete" ||
+        archiveState === "deleting" ||
+        archiveState === "deleted"
+      ) {
         return null;
       }
-      if (archiveState.state !== "reconciling") {
-        throw new Error(`archive is not reconciling: ${archiveState.state}`);
+      if (archiveState !== "reconciling") {
+        throw new Error(`archive is not reconciling: ${archiveState}`);
       }
-      const archives = await transaction<
-        ArchiveClaimRow[]
-      >`SELECT id,state,reconciliation_deadline_at FROM archives WHERE consultation_id=${consultationId} AND state='reconciling' FOR UPDATE SKIP LOCKED`;
-      const archive = archives[0];
+      const [archiveRow] = await transaction<
+        ReconciliationArchiveRow[]
+      >`SELECT id,state,reconciliation_deadline_at
+        FROM archives
+        WHERE consultation_id=${consultationId} AND state='reconciling'
+        FOR UPDATE SKIP LOCKED`;
+      const archive =
+        archiveRow === undefined
+          ? undefined
+          : {
+              id: archiveRow.id,
+              state: ArchiveStateSchema.parse(archiveRow.state),
+              reconciliationDeadlineAt:
+                archiveRow.reconciliation_deadline_at === null
+                  ? null
+                  : new Date(String(archiveRow.reconciliation_deadline_at)),
+            };
       if (archive === undefined) {
         throw new Error("reconciling archive is unavailable");
+      }
+      if (archive.reconciliationDeadlineAt === null) {
+        throw new Error("reconciling archive has no deadline");
       }
       await transaction`UPDATE worker_reservations reservation SET accepting_load=false,released_at=COALESCE(reservation.released_at,epoch.terminal_at)
         FROM worker_job_epochs epoch
@@ -814,12 +940,12 @@ export class PostgresStore implements DurableStore {
           AND EXISTS (SELECT 1 FROM worker_checkpoints checkpoint WHERE checkpoint.consultation_id=reservation.consultation_id
             AND checkpoint.generation=${resourceGeneration} AND checkpoint.worker_id=reservation.worker_id
             AND checkpoint.worker_epoch=reservation.epoch AND checkpoint.terminal=true)`;
-      const archiveId = String(archive.id);
+      const archiveId = archive.id;
       const [expectations, objects, checkpoints, egress, drains, providerGaps] = await Promise.all([
         transaction<
           ExpectationRow[]
         >`SELECT id,object_class,causal_key,sample_start,sample_end,fulfilled_object_id
-          FROM expected_archive_artifacts WHERE archive_id=${archiveId} ORDER BY object_class,causal_key FOR UPDATE SKIP LOCKED`,
+          FROM expected_archive_artifacts WHERE archive_id=${archiveId} ORDER BY object_class,causal_key`,
         transaction<
           ArchiveObjectRow[]
         >`SELECT id,object_class,key,version_id,size,sha256,s3_checksum,content_type
@@ -845,12 +971,16 @@ export class PostgresStore implements DurableStore {
           FROM provider_attempts attempt
           WHERE attempt.consultation_id=${consultationId} AND attempt.terminal_at IS NOT NULL
           AND attempt.outcome <> 'succeeded'
+          AND NOT (attempt.outcome='cancelled' AND attempt.id=attempt.operation_id
+            AND COALESCE(attempt.accepted_input_watermark,0)=0
+            AND COALESCE(attempt.received_output_watermark,0)=0
+            AND COALESCE(attempt.emitted_output_watermark,0)=0)
           AND NOT EXISTS (SELECT 1 FROM provider_attempts retry WHERE retry.retry_of=attempt.id)
           ORDER BY attempt.stage,attempt.direction_id,attempt.operation_id,attempt.attempt_number`,
       ]);
       return mapReconciliationSnapshot(
         archiveId,
-        new Date(String(archive.reconciliation_deadline_at)),
+        archive.reconciliationDeadlineAt,
         expectations,
         objects,
         checkpoints,
@@ -862,7 +992,9 @@ export class PostgresStore implements DurableStore {
   }
 
   async completeReconciliation(
-    consultationId: Uuid,
+    effect: Effect,
+    owner: Uuid,
+    now: Date,
     snapshot: ReconciliationSnapshot,
     inventory: Readonly<Record<string, unknown>>,
     sha256: string,
@@ -870,10 +1002,29 @@ export class PostgresStore implements DurableStore {
     derivedObjects: readonly DerivedArchiveObject[],
   ): Promise<boolean> {
     return this.client.begin(async (transaction) => {
+      const fenced = await transaction<IdRow[]>`SELECT effect.id
+        FROM external_effects effect
+        JOIN consultations consultation ON consultation.id=effect.consultation_id
+          AND effect.effect_kind='ARCHIVE_RECONCILE'
+        JOIN archives archive ON archive.consultation_id=consultation.id
+        WHERE effect.id=${effect.id}
+          AND effect.consultation_id=${effect.consultationId}
+          AND effect.generation=${effect.generation}
+          AND effect.state='calling'
+          AND date_trunc('milliseconds',archive.reconciliation_deadline_at)=${snapshot.reconciliationDeadlineAt.toISOString()}
+          AND effect.lease_owner=${owner}
+          AND effect.lease_expires_at > ${now.toISOString()}
+          AND consultation.generation=effect.generation
+          AND archive.id=${snapshot.archiveId}
+          AND archive.state='reconciling'
+        FOR UPDATE OF effect,consultation,archive`;
+      if (fenced.length !== 1) {
+        return false;
+      }
       const status = inventory.status === "complete" ? "complete" : "incomplete";
       await insertReconciliationObjects(
         transaction,
-        consultationId,
+        effect.consultationId,
         snapshot.archiveId,
         sha256,
         finalObject,
@@ -890,10 +1041,28 @@ export class PostgresStore implements DurableStore {
         const existing = await transaction<
           { readonly sha256: string }[]
         >`SELECT sha256 FROM final_inventories WHERE archive_id=${snapshot.archiveId}`;
-        return existing[0]?.sha256 === sha256;
+        if (existing[0]?.sha256 !== sha256) {
+          return false;
+        }
       }
-      await transaction`UPDATE archives SET state=${status},final_inventory_hash=${sha256},updated_at=now()
-        WHERE id=${snapshot.archiveId} AND consultation_id=${consultationId} AND state='reconciling'`;
+      const completed = await transaction<IdRow[]>`WITH archive_done AS (
+          UPDATE archives SET state=${status},final_inventory_hash=${sha256},updated_at=now()
+          WHERE id=${snapshot.archiveId} AND consultation_id=${effect.consultationId}
+            AND state='reconciling'
+          RETURNING id
+        )
+        UPDATE external_effects SET state='done',updated_at=now(),
+          lease_owner=NULL,lease_expires_at=NULL
+        WHERE id=${effect.id} AND lease_owner=${owner} AND state='calling'
+          AND EXISTS (SELECT 1 FROM archive_done)
+        RETURNING id`;
+      if (completed.length !== 1) {
+        return false;
+      }
+      await transaction`UPDATE orchestration_deadlines
+        SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL
+        WHERE consultation_id=${effect.consultationId} AND generation=${effect.generation}
+          AND kind='archive-reconcile'`;
       return true;
     });
   }
@@ -928,6 +1097,13 @@ export async function persistSupervisorTerminalCheckpoints(
     throw new Error("worker supervisor settlement requires two frozen directions");
   }
 
+  await transaction<ConsultationIdRow[]>`select consultation_id
+    from "worker_job_epochs"
+    where consultation_id=${reservation.consultationId}
+      and generation=${reservation.generation}
+      and worker_id=${reservation.workerId}
+      and epoch=${reservation.epoch}
+    for update`;
   for (const direction of directions) {
     const { id, hash, objectKey } = supervisorTerminalIdentity(
       reservation,
@@ -946,6 +1122,7 @@ export async function persistSupervisorTerminalCheckpoints(
           AND source_participant_id=${direction.source_participant_id}
           AND destination_participant_id=${direction.destination_participant_id}
         ORDER BY accepted_input_sequence DESC,high_watermark DESC LIMIT 1
+        FOR UPDATE
       )
       INSERT INTO worker_checkpoints(
         id,consultation_id,generation,worker_id,worker_epoch,write_epoch,
@@ -1007,6 +1184,18 @@ async function insertPlannedEffects(
   effects: readonly PlannedEffect[],
 ): Promise<void> {
   for (const effect of effects) {
+    const authoritative = await transaction<
+      IdRow[]
+    >`INSERT INTO external_effects(id,consultation_id,generation,effect_kind,subject_id,occurrence_key,state,result,attempts,created_at,updated_at)
+      VALUES (${effect.id},${effect.consultationId},${effect.generation},${effect.kind},${effect.subjectId},${effect.occurrenceKey},'planned',
+        ${JSON.stringify({ plan: effect.plan })}::jsonb,0,now(),now())
+      ON CONFLICT (consultation_id,generation,effect_kind,subject_id,occurrence_key)
+      DO UPDATE SET updated_at=external_effects.updated_at
+      RETURNING id`;
+    const effectId = authoritative[0]?.id;
+    if (effectId === undefined) {
+      throw new Error("authoritative effect was not persisted");
+    }
     if (effect.kind === "ROOM_COMPOSITE_EGRESS" || effect.kind === "PARTICIPANT_EGRESS") {
       const outputPrefix = effect.plan.outputPrefix;
       if (typeof outputPrefix !== "string" || outputPrefix.length === 0) {
@@ -1015,10 +1204,10 @@ async function insertPlannedEffects(
       const objectClass =
         effect.kind === "ROOM_COMPOSITE_EGRESS" ? "room_composite" : "participant_original";
       await transaction`INSERT INTO expected_archive_artifacts(
-          id,archive_id,profile_id,profile_revision,object_class,causal_key,
+          id,archive_id,effect_id,profile_id,profile_revision,object_class,causal_key,
           sample_start,sample_end,owner_epoch,disposition,created_at
         )
-        SELECT ${effect.id},archive.id,consultation.provider_profile_id,
+        SELECT ${effectId},archive.id,${effectId},consultation.provider_profile_id,
           consultation.provider_profile_revision,${objectClass},${outputPrefix},
           NULL,NULL,archive.write_epoch,'expected',now()
         FROM consultations consultation
@@ -1026,12 +1215,11 @@ async function insertPlannedEffects(
         WHERE consultation.id=${effect.consultationId}
           AND consultation.generation=${effect.generation}
           AND archive.state NOT IN ('deleting','deleted')
-        ON CONFLICT (archive_id,object_class,causal_key) DO NOTHING`;
+        ON CONFLICT (archive_id,object_class,causal_key) DO UPDATE
+        SET effect_id=COALESCE(expected_archive_artifacts.effect_id,EXCLUDED.effect_id)
+        WHERE expected_archive_artifacts.effect_id IS NULL
+          OR expected_archive_artifacts.effect_id=EXCLUDED.effect_id`;
     }
-    await transaction`INSERT INTO external_effects(id,consultation_id,generation,effect_kind,subject_id,occurrence_key,state,result,attempts,created_at,updated_at)
-          VALUES (${effect.id},${effect.consultationId},${effect.generation},${effect.kind},${effect.subjectId},${effect.occurrenceKey},'planned',
-            ${JSON.stringify({ plan: effect.plan })}::jsonb,0,now(),now())
-          ON CONFLICT (consultation_id,generation,effect_kind,subject_id,occurrence_key) DO NOTHING`;
   }
 }
 
@@ -1082,7 +1270,8 @@ function markAppliedStatement(
   return sql`WITH changed AS (
       UPDATE external_effects SET state='applied',
         result=COALESCE(result,'{}'::jsonb) || ${JSON.stringify({ remoteId, value: result })}::jsonb,updated_at=now()
-      WHERE id=${effectId} AND lease_owner=${owner} AND state='calling' RETURNING *
+      WHERE id=${effectId} AND lease_owner=${owner} AND lease_expires_at > now()
+        AND state='calling' RETURNING *
     ), egress_inserted AS (
       INSERT INTO egress_jobs(id,consultation_id,generation,kind,subject_id,egress_id,request_hash,state,output_prefix,expected_artifact_id,created_at)
       SELECT id,consultation_id,generation,CASE effect_kind WHEN 'ROOM_COMPOSITE_EGRESS' THEN 'room_composite' ELSE 'participant' END,subject_id,result->>'remoteId',request_hash,
@@ -1113,7 +1302,7 @@ function markAppliedStatement(
       SELECT gen_random_uuid(),'orchestration.effect.applied',consultation_id,generation,
         jsonb_build_object('consultationId',consultation_id,'generation',generation,'subjectId',subject_id,'kind',effect_kind,
           'resourceGeneration',COALESCE((result->'plan'->>'resourceGeneration')::integer,generation),
-          'participantEgressId',CASE WHEN effect_kind='PARTICIPANT_EGRESS' THEN result->>'remoteId' ELSE result->'plan'->>'barrierEgressId' END),now(),0 FROM changed
+          'participantEgressId',CASE WHEN effect_kind IN ('ROOM_COMPOSITE_EGRESS','PARTICIPANT_EGRESS') THEN result->>'remoteId' ELSE result->'plan'->>'barrierEgressId' END),now(),0 FROM changed
       ON CONFLICT (id) DO NOTHING`;
 }
 
@@ -1144,23 +1333,26 @@ function participantWatermark(event: VerifiedWebhook): string {
 }
 
 function participantPresenceUpdate(event: VerifiedWebhook, watermark: string): SQL {
-  return sql`UPDATE consultation_participants SET presence_event_id=${watermark},
-      present=${event.kind === "PARTICIPANT_JOINED"} WHERE consultation_id=${event.consultationId} AND livekit_identity=${event.participantId}
-      AND (presence_event_id IS NULL OR presence_event_id < ${watermark}) RETURNING id`;
+  return sql`UPDATE consultation_participants participant SET presence_event_id=${watermark},
+      present=${event.kind === "PARTICIPANT_JOINED"} FROM consultations consultation
+      WHERE participant.consultation_id=consultation.id AND consultation.id=${event.consultationId}
+        AND consultation.generation=${event.generation} AND participant.livekit_identity=${event.participantId}
+        AND (participant.presence_event_id IS NULL OR participant.presence_event_id < ${watermark}) RETURNING participant.id`;
 }
 
 function participantPresenceTransition(event: VerifiedWebhook): SQL {
   if (event.kind === "PARTICIPANT_JOINED") {
-    return sql`WITH joined AS (
-              UPDATE consultations SET both_absent_since=NULL,updated_at=now() WHERE id=${event.consultationId} RETURNING id,generation
-            ) UPDATE orchestration_deadlines deadline SET completed_at=now(),lease_owner=NULL,lease_expires_at=NULL
-              FROM joined WHERE deadline.consultation_id=joined.id AND deadline.generation=joined.generation AND deadline.kind='absence'`;
+    return sql`UPDATE consultations SET both_absent_since=NULL,presence_epoch=presence_epoch+1,updated_at=now()
+      WHERE id=${event.consultationId} AND generation=${event.generation}`;
   }
-  return sql`WITH absent AS (
-              UPDATE consultations SET both_absent_since=COALESCE(both_absent_since,now()),updated_at=now()
-              WHERE id=${event.consultationId} AND generation=${event.generation} AND NOT EXISTS (
+  return sql`WITH changed AS (
+              UPDATE consultations SET presence_epoch=presence_epoch+1,updated_at=now()
+                WHERE id=${event.consultationId} AND generation=${event.generation} RETURNING id,generation
+            ), absent AS (
+              UPDATE consultations consultation SET both_absent_since=COALESCE(consultation.both_absent_since,now()),updated_at=now()
+              FROM changed WHERE consultation.id=changed.id AND NOT EXISTS (
                 SELECT 1 FROM consultation_participants WHERE consultation_id=${event.consultationId} AND present=true
-              ) RETURNING id,generation,both_absent_since
+              ) RETURNING consultation.id,consultation.generation,consultation.both_absent_since
             ) INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
               SELECT id,generation,'absence',both_absent_since+interval '30 seconds' FROM absent
               ON CONFLICT (consultation_id,generation,kind) DO UPDATE SET due_at=EXCLUDED.due_at,completed_at=NULL,lease_owner=NULL,lease_expires_at=NULL`;
@@ -1234,7 +1426,7 @@ function claimPendingArchiveDeletesStatement(): SQL {
     ) INSERT INTO external_effects(id,consultation_id,generation,effect_kind,subject_id,occurrence_key,state,result,attempts,created_at,updated_at)
       SELECT gen_random_uuid(),c.id,c.generation,'ARCHIVE_DELETE',a.id,
         'archive-write-epoch:' || a.write_epoch::text,'planned',
-        jsonb_build_object('plan',jsonb_build_object('archiveId',a.id,'writeEpoch',a.write_epoch)),0,now(),now()
+        jsonb_build_object('plan',jsonb_build_object('archiveId',a.id,'writeEpoch',a.write_epoch,'reason','retention_delete')),0,now(),now()
       FROM archives a JOIN consultations c ON c.id=a.consultation_id
       WHERE a.state='deleting' AND c.state='ended'
         AND NOT EXISTS (SELECT 1 FROM egress_jobs job WHERE job.consultation_id=c.id AND job.terminal_at IS NULL)
@@ -1460,10 +1652,11 @@ function mapEffect(row: ExternalEffectRow): Effect {
     subjectId: String(row.subject_id),
     occurrenceKey: String(row.occurrence_key),
     plan,
-    state: row.state,
+    state: ExternalEffectStateSchema.parse(row.state),
     requestBytes: row.request_bytes instanceof Uint8Array ? row.request_bytes : null,
     requestSha256: nullableString(row.request_hash),
     remoteId: typeof result.remoteId === "string" ? result.remoteId : null,
+    appliedResult: "value" in result ? result.value : null,
     attempt: Number(row.attempts),
     leaseOwner: nullableString(row.lease_owner),
     leaseExpiresAt: nullableDate(row.lease_expires_at),

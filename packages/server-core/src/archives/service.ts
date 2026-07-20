@@ -21,6 +21,8 @@ import type {
   Transaction,
 } from "../ports/index";
 
+const MAX_VERSION_LIST_PAGES = 10_000;
+
 export interface InventoryHasher {
   sha256Canonical(value: unknown): string;
 }
@@ -503,8 +505,12 @@ export class ArchiveService {
     }
   }
 
-  async beginDelete(consultationId: UUID, session: SessionRecord): Promise<void> {
+  async beginDelete(consultationId: UUID, session: SessionRecord, reason: string): Promise<void> {
     this.assertFreshReauth(consultationId, session);
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) {
+      throw new DomainError("DELETION_REASON_REQUIRED");
+    }
     await this.recoverStaleHold(consultationId);
     await this.archives.transaction(async (tx) => {
       const archive = await this.required(consultationId, tx);
@@ -539,8 +545,8 @@ export class ArchiveService {
           aggregateId: archive.id,
           actorId: session.userId,
           kind: "archive.deletion_admitted",
-          occurredAt: this.clock.now(),
-          details: { writeEpoch },
+          occurredAt: now,
+          details: { writeEpoch, reason: trimmedReason },
         },
         tx,
       );
@@ -554,6 +560,8 @@ export class ArchiveService {
             consultationId,
             archiveId: archive.id,
             writeEpoch,
+            actorId: session.userId,
+            reason: trimmedReason,
           },
           availableAt: this.clock.now(),
           attempts: 0,
@@ -563,7 +571,11 @@ export class ArchiveService {
     });
   }
 
-  async drainDeletion(consultationId: UUID, writeEpoch: number): Promise<boolean> {
+  async drainDeletion(consultationId: UUID, writeEpoch: number, reason: string): Promise<boolean> {
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) {
+      throw new DomainError("DELETION_REASON_REQUIRED");
+    }
     const archive = await this.archives.transaction(async (tx) => {
       const value = await this.required(consultationId, tx);
       if (value.state === "deleted" && value.completedDeletionEpoch === writeEpoch) {
@@ -596,6 +608,7 @@ export class ArchiveService {
           archive.writeEpoch,
           scan,
           consecutiveEmpty,
+          trimmedReason,
         );
         if (!writersStillDrained) {
           return false;
@@ -810,9 +823,12 @@ export class ArchiveService {
         contentType: "application/json",
         checksum: sha256,
       });
-    } catch {
+    } catch (error) {
       const existing = await this.storage.head(key);
-      if (!existing || existing.sha256 !== sha256) {
+      if (!existing) {
+        throw error;
+      }
+      if (existing.sha256 !== sha256) {
         throw new DomainError(conflictCode);
       }
       return existing;
@@ -1363,6 +1379,7 @@ export class ArchiveService {
       remainingVersions: readonly ObjectVersion[];
     },
     consecutiveEmpty: number,
+    reason: string,
   ): Promise<boolean> {
     return this.archives.transaction(async (tx) => {
       const locked = await this.required(consultationId, tx);
@@ -1386,6 +1403,12 @@ export class ArchiveService {
             deletedVersions: scan.versions.length,
             abortedUploads: scan.uploads.length,
             writersDrained: drained,
+            reason,
+            versions: scan.versions.map((version) => ({
+              ...version,
+              outcome: "deleted",
+              reason,
+            })),
           },
           at: this.clock.now(),
         },
@@ -1447,20 +1470,43 @@ export class ArchiveService {
 
   private async allVersions(consultationId: UUID): Promise<ObjectVersion[]> {
     const versions: ObjectVersion[] = [];
+    const seenCursors = new Set<string>();
     let cursor: string | undefined;
+    let pageCount = 0;
     do {
+      if (pageCount >= MAX_VERSION_LIST_PAGES) {
+        throw new DomainError(
+          "ARCHIVE_STORAGE_PROTOCOL_ERROR",
+          `version listing exceeded ${MAX_VERSION_LIST_PAGES} pages`,
+        );
+      }
+      pageCount += 1;
       const page = await this.storage.listMeetingVersions(consultationId, cursor);
       versions.push(...page.versions);
-      cursor = page.cursor ?? undefined;
+      const nextCursor = page.cursor ?? undefined;
+      if (nextCursor !== undefined) {
+        if (seenCursors.has(nextCursor)) {
+          throw new DomainError(
+            "ARCHIVE_STORAGE_PROTOCOL_ERROR",
+            `version listing repeated continuation cursor: ${nextCursor}`,
+          );
+        }
+        seenCursors.add(nextCursor);
+      }
+      cursor = nextCursor;
     } while (cursor !== undefined);
     return versions;
   }
 
   private assertFreshReauth(consultationId: UUID, session: SessionRecord): void {
+    const now = this.clock.now().getTime();
+    const reauthenticatedAt = session.reauthenticatedAt?.getTime() ?? null;
     const isFresh =
-      session.reauthenticatedAt !== null &&
+      session.expiresAt.getTime() > now &&
+      reauthenticatedAt !== null &&
+      reauthenticatedAt <= now &&
       session.reauthConsultationId === consultationId &&
-      this.clock.now().getTime() - session.reauthenticatedAt.getTime() <= 300_000;
+      now - reauthenticatedAt <= 300_000;
     if (!isFresh) {
       throw new DomainError("REAUTH_REQUIRED");
     }
@@ -1544,6 +1590,7 @@ export class ArchiveService {
         stored.size !== object.size ||
         stored.sha256 !== object.sha256 ||
         stored.s3Checksum !== object.s3Checksum ||
+        stored.contentType !== object.contentType ||
         stored.sampleStart !== (object.sampleRange?.start ?? null) ||
         stored.sampleEnd !== (object.sampleRange?.end ?? null) ||
         stored.attempt !== object.attempt ||

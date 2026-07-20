@@ -1,4 +1,5 @@
-import { EgressStatus } from "@livekit/protocol";
+import { type EgressInfo, EgressStatus } from "@livekit/protocol";
+import type { EgressEventEarlySource } from "@transhooter/server-core";
 
 export type NormalizedEgressWebhookKind =
   | "egress_active"
@@ -6,6 +7,23 @@ export type NormalizedEgressWebhookKind =
   | "egress_failed"
   | "ignored"
   | null;
+
+export function normalizeEgressRequestSource(
+  egressInfo: Pick<EgressInfo, "request"> | undefined,
+): EgressEventEarlySource | null {
+  const request = egressInfo?.request;
+  if (request?.case === "roomComposite" && request.value.roomName) {
+    return { kind: "room_composite", roomName: request.value.roomName };
+  }
+  if (request?.case === "participant" && request.value.roomName && request.value.identity) {
+    return {
+      kind: "participant",
+      roomName: request.value.roomName,
+      identity: request.value.identity,
+    };
+  }
+  return null;
+}
 
 export function normalizedEgressWebhookKind(
   eventName: string | undefined,

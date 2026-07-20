@@ -51,12 +51,14 @@ type ConsultationCommand =
       kind: "consultation.create";
       customerUserId: UUID;
       providerProfileId: string;
+      creationIdempotencyKey: UUID;
     }
   | {
       kind: "consultation.createInvitation";
       customerEmail: string;
       customerName: string;
       providerProfileId: string;
+      creationIdempotencyKey: UUID;
     }
   | {
       kind: "consultation.get";
@@ -137,6 +139,7 @@ type ArchiveCommand =
   | {
       kind: "archive.delete";
       consultationId: UUID;
+      reason: string;
     };
 
 type AdminCommand =
@@ -150,6 +153,8 @@ type AdminCommand =
   | {
       kind: "language.enable";
       capabilityId: UUID;
+      profileId: UUID;
+      profileRevision: number;
       enabled: boolean;
     };
 
@@ -223,6 +228,7 @@ type InternalCommand =
   | {
       kind: "internal.deleteDrain";
       consultationId: UUID;
+      reason: string;
       writeEpoch: number;
     };
 
@@ -345,6 +351,7 @@ async function executeUnauthenticatedAuth(
         origin: context.request.headers.get("origin") ?? "",
         publicBaseUrl: config.publicBaseUrl,
         requestIp: ip,
+        sessionToken: context.sessionToken ?? null,
       });
     }
     default:
@@ -430,6 +437,7 @@ async function executeConsultation(
         employeeUserId: userId,
         customerUserId: command.customerUserId,
         providerProfileId: command.providerProfileId,
+        creationIdempotencyKey: command.creationIdempotencyKey,
       });
     case "consultation.createInvitation":
       assertStaff(authenticated.user);
@@ -478,6 +486,7 @@ async function createConsultationInvitation(
     employeeUserId,
     customerUserId: customer.id,
     providerProfileId: command.providerProfileId,
+    creationIdempotencyKey: command.creationIdempotencyKey,
   });
   await config.auth.requestMagicLink({
     email: customer.email,
@@ -543,7 +552,11 @@ async function executeArchive(
       );
     case "archive.delete":
       assertAdmin(authenticated.user);
-      return config.archives.beginDelete(command.consultationId, authenticated.session);
+      return config.archives.beginDelete(
+        command.consultationId,
+        authenticated.session,
+        command.reason,
+      );
     default:
       return assertNever(command);
   }
@@ -564,7 +577,12 @@ async function executeAdmin(
       );
     case "language.enable":
       assertAdmin(authenticated.user);
-      return config.languages.setEnabled(command.capabilityId, command.enabled);
+      return config.languages.setEnabled(
+        command.capabilityId,
+        command.profileId,
+        command.profileRevision,
+        command.enabled,
+      );
     default:
       return assertNever(command);
   }
@@ -664,7 +682,11 @@ async function executeInternal(
       return config.archives.adoptCompositeRecording(command.consultationId);
     case "internal.deleteDrain":
       authorizeInternal(principal, "delete:drain", ["control-worker"]);
-      return config.archives.drainDeletion(command.consultationId, command.writeEpoch);
+      return config.archives.drainDeletion(
+        command.consultationId,
+        command.writeEpoch,
+        command.reason,
+      );
     default:
       return assertNever(command);
   }

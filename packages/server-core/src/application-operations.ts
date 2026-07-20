@@ -3,10 +3,11 @@ import {
   RoomProviderSelectionSchema,
   type WorkerCheckpoint,
 } from "@transhooter/contracts";
-import { sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { type Clock, DomainError, type StaffRole, type UUID } from "./domain/model";
 import type { DrizzleSchema } from "./persistence/repositories";
+import { consultations, workerJobEpochs } from "./persistence/schema";
 import type { ObjectStoragePort } from "./ports/index";
 
 export interface StaffPrincipal {
@@ -21,6 +22,7 @@ export interface ArchiveObjectPage {
 
 export interface AdminLanguageRow {
   id: UUID;
+  profileId: UUID;
   sourceLocale: string;
   targetLocale: string;
   mode: "translated" | "same_language";
@@ -140,6 +142,7 @@ function mapArchiveDetail(row: Record<string, unknown>): ArchiveDetail {
 function mapAdminLanguage(row: Record<string, unknown>): AdminLanguageRow {
   return {
     id: row.id as UUID,
+    profileId: row.profile_id as UUID,
     sourceLocale: String(row.source_locale),
     targetLocale: String(row.target_locale),
     mode: row.mode as AdminLanguageRow["mode"],
@@ -246,7 +249,7 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
     if (!row) {
       throw new DomainError("NOT_FOUND");
     }
-    if (!row.worker_identity || !row.room_sid || !row.dispatch_id || !row.composite_egress_id) {
+    if (!row.worker_identity || !row.room_sid) {
       throw new DomainError("PROVISIONING");
     }
     return row;
@@ -319,7 +322,7 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
   ): Promise<readonly AdminLanguageRow[]> {
     this.assertAdmin(principal);
     const result = await this.database.execute(
-      sql`SELECT l.id,l.source_locale,l.target_locale,l.mode,l.snapshot,p.name AS profile_name,l.revision,l.fresh_until,l.enabled FROM language_capabilities l JOIN provider_profiles p ON p.id=l.profile_id WHERE p.name=${profileId} AND l.revision=p.current_revision ORDER BY l.source_locale,l.target_locale,l.mode`,
+      sql`SELECT l.id,l.profile_id,l.source_locale,l.target_locale,l.mode,l.snapshot,p.name AS profile_name,l.revision,l.fresh_until,l.enabled FROM language_capabilities l JOIN provider_profiles p ON p.id=l.profile_id WHERE p.name=${profileId} AND l.revision=p.current_revision ORDER BY l.source_locale,l.target_locale,l.mode`,
     );
     return result.rows.map(mapAdminLanguage);
   }
@@ -369,123 +372,166 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
     const checkpoint = input.checkpoint;
     const { expected, observed, gaps } = serializeCheckpointObjectIds(checkpoint);
     const persisted = checkpointPersistenceValues(checkpoint);
-    const result = await retryPostgresContention(() =>
-      this.database.execute(
-        sql`INSERT INTO worker_checkpoints(id,consultation_id,generation,worker_id,worker_epoch,write_epoch,source_participant_id,destination_participant_id,accepted_input_sequence,high_watermark,received_output,emitted_output,previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,object_key,created_at)
-        SELECT ${checkpoint.checkpointId},${input.consultationId},${input.generation},${input.workerId},${checkpoint.workerEpoch},${input.writeEpoch},${persisted.sourceParticipantId},${persisted.destinationParticipantId},${persisted.acceptedInputSequence},${persisted.acceptedInput},${persisted.receivedOutput},${persisted.emittedOutput},${checkpoint.previousCheckpointSha256},${checkpoint.highWatermarkSha256},${expected}::jsonb,${observed}::jsonb,${gaps}::jsonb,${checkpoint.terminal},${input.objectKey},${persisted.createdAt}
-        FROM consultations consultation
-        JOIN worker_reservations reservation ON reservation.consultation_id=consultation.id
-          AND reservation.generation=consultation.generation
-        JOIN worker_job_epochs job ON job.consultation_id=reservation.consultation_id
-          AND job.generation=reservation.generation AND job.worker_id=reservation.worker_id
-          AND job.epoch=reservation.epoch
-        JOIN archives archive ON archive.consultation_id=consultation.id
-        WHERE consultation.id=${input.consultationId} AND consultation.generation=${input.generation}
-          AND reservation.worker_id=${input.workerId} AND reservation.epoch=${checkpoint.workerEpoch}
-          AND reservation.fenced_at IS NULL AND reservation.released_at IS NULL
-          AND job.fenced_at IS NULL AND job.terminal_at IS NULL
-          AND archive.write_epoch=${input.writeEpoch}
-          AND NOT EXISTS (
-            SELECT 1 FROM worker_checkpoints prior
-            WHERE prior.consultation_id=${input.consultationId}
-              AND prior.generation=${input.generation}
-              AND prior.worker_id=${input.workerId}
-              AND prior.worker_epoch=${checkpoint.workerEpoch}
-              AND prior.source_participant_id=${persisted.sourceParticipantId}
-              AND prior.destination_participant_id=${persisted.destinationParticipantId}
-              AND prior.terminal
+    return retryPostgresContention(() =>
+      this.database.transaction(async (transaction) => {
+        const consultation = await transaction
+          .select({ id: consultations.id })
+          .from(consultations)
+          .where(
+            and(
+              eq(consultations.id, input.consultationId),
+              eq(consultations.generation, input.generation),
+            ),
           )
-        ON CONFLICT (id) DO NOTHING RETURNING id`,
-      ),
-    );
+          .for("update");
+        if (consultation.length !== 1) {
+          throw new DomainError("CHECKPOINT_CONFLICT");
+        }
 
-    if (result.rowCount !== 1) {
-      const replay = await this.database.execute(
-        sql`SELECT 1 FROM worker_checkpoints checkpoint
-          JOIN consultations consultation ON consultation.id=checkpoint.consultation_id
-            AND consultation.generation=checkpoint.generation
-          JOIN worker_reservations reservation ON reservation.consultation_id=checkpoint.consultation_id
-            AND reservation.generation=checkpoint.generation
-            AND reservation.worker_id=checkpoint.worker_id AND reservation.epoch=checkpoint.worker_epoch
-          JOIN worker_job_epochs job ON job.consultation_id=checkpoint.consultation_id
-            AND job.generation=checkpoint.generation AND job.worker_id=checkpoint.worker_id
-            AND job.epoch=checkpoint.worker_epoch
-          WHERE checkpoint.id=${checkpoint.checkpointId}
-            AND checkpoint.consultation_id=${input.consultationId}
-            AND checkpoint.generation=${input.generation}
-            AND checkpoint.worker_id=${input.workerId}
-            AND checkpoint.worker_epoch=${checkpoint.workerEpoch}
-            AND checkpoint.write_epoch=${input.writeEpoch}
-            AND checkpoint.source_participant_id=${persisted.sourceParticipantId}
-            AND checkpoint.destination_participant_id=${persisted.destinationParticipantId}
-            AND checkpoint.high_watermark=${persisted.acceptedInput}
-            AND checkpoint.accepted_input_sequence=${persisted.acceptedInputSequence}
-            AND checkpoint.received_output=${persisted.receivedOutput}
-            AND checkpoint.emitted_output=${persisted.emittedOutput}
-            AND checkpoint.previous_hash IS NOT DISTINCT FROM ${checkpoint.previousCheckpointSha256}
-            AND checkpoint.checkpoint_hash=${checkpoint.highWatermarkSha256}
-            AND checkpoint.expected_ids=${expected}::jsonb AND checkpoint.observed_ids=${observed}::jsonb
-            AND checkpoint.gaps=${gaps}::jsonb AND checkpoint.terminal=${checkpoint.terminal}
-            AND checkpoint.object_key=${input.objectKey} AND checkpoint.created_at=${persisted.createdAt}
-            AND reservation.fenced_at IS NULL AND job.fenced_at IS NULL
-            AND (
-              (reservation.released_at IS NULL AND job.terminal_at IS NULL)
-              OR (
-                checkpoint.terminal
-                AND reservation.released_at IS NOT NULL
-                AND job.terminal_at IS NOT NULL
-                AND job.terminal_outcome='clean'
-              )
-            )`,
-      );
-      if (replay.rowCount !== 1) {
-        throw new DomainError("CHECKPOINT_CONFLICT");
-      }
-    }
+        const parents = await transaction
+          .select({ consultationId: workerJobEpochs.consultationId })
+          .from(workerJobEpochs)
+          .where(
+            and(
+              eq(workerJobEpochs.consultationId, input.consultationId),
+              eq(workerJobEpochs.generation, input.generation),
+              eq(workerJobEpochs.workerId, input.workerId),
+              eq(workerJobEpochs.epoch, checkpoint.workerEpoch),
+            ),
+          )
+          .for("update");
+        if (parents.length !== 1) {
+          throw new DomainError("CHECKPOINT_CONFLICT");
+        }
 
-    if (checkpoint.terminal) {
-      await this.database.execute(
-        sql`WITH frozen_directions AS (
-          SELECT direction->>'sourceParticipantId' AS source_participant_id,
-            direction->>'destinationParticipantId' AS destination_participant_id
-          FROM room_provider_selections selection
-          CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
-          WHERE selection.consultation_id=${input.consultationId}
-        ), complete AS (
-          SELECT count(*)=2 AND bool_and(EXISTS (
-            SELECT 1 FROM worker_checkpoints terminal
-            WHERE terminal.consultation_id=${input.consultationId}
-              AND terminal.generation=${input.generation}
-              AND terminal.worker_id=${input.workerId}
-              AND terminal.worker_epoch=${checkpoint.workerEpoch}
-              AND terminal.source_participant_id=frozen_directions.source_participant_id::uuid
-              AND terminal.destination_participant_id=frozen_directions.destination_participant_id::uuid
-              AND terminal.terminal
-          )) AS settled
-          FROM frozen_directions
-        ), terminal_epoch AS (
-          UPDATE worker_job_epochs job
-          SET terminal_checkpoint_id=${checkpoint.checkpointId},
-            terminal_outcome=COALESCE(job.terminal_outcome,'clean'),
-            terminal_at=COALESCE(job.terminal_at,to_timestamp(${checkpoint.occurredAtMs}/1000.0))
-          FROM complete,consultations consultation
-          WHERE complete.settled AND consultation.id=${input.consultationId}
-            AND consultation.generation=${input.generation}
-            AND job.consultation_id=consultation.id AND job.generation=consultation.generation
-            AND job.worker_id=${input.workerId} AND job.epoch=${checkpoint.workerEpoch}
+        const result = await transaction.execute(
+          sql`INSERT INTO worker_checkpoints(id,consultation_id,generation,worker_id,worker_epoch,write_epoch,source_participant_id,destination_participant_id,accepted_input_sequence,high_watermark,received_output,emitted_output,previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,object_key,created_at)
+          SELECT ${checkpoint.checkpointId},${input.consultationId},${input.generation},${input.workerId},${checkpoint.workerEpoch},${input.writeEpoch},${persisted.sourceParticipantId},${persisted.destinationParticipantId},${persisted.acceptedInputSequence},${persisted.acceptedInput},${persisted.receivedOutput},${persisted.emittedOutput},${checkpoint.previousCheckpointSha256},${checkpoint.highWatermarkSha256},${expected}::jsonb,${observed}::jsonb,${gaps}::jsonb,${checkpoint.terminal},${input.objectKey},${persisted.createdAt}
+          FROM consultations consultation
+          JOIN worker_reservations reservation ON reservation.consultation_id=consultation.id
+            AND reservation.generation=consultation.generation
+          JOIN worker_job_epochs job ON job.consultation_id=reservation.consultation_id
+            AND job.generation=reservation.generation AND job.worker_id=reservation.worker_id
+            AND job.epoch=reservation.epoch
+          JOIN archives archive ON archive.consultation_id=consultation.id
+          WHERE consultation.id=${input.consultationId} AND consultation.generation=${input.generation}
+            AND reservation.worker_id=${input.workerId} AND reservation.epoch=${checkpoint.workerEpoch}
+            AND reservation.fenced_at IS NULL AND reservation.released_at IS NULL
             AND job.fenced_at IS NULL AND job.terminal_at IS NULL
-          RETURNING job.consultation_id,job.generation,job.worker_id,job.epoch,job.terminal_at
-        )
-        UPDATE worker_reservations reservation
-        SET accepting_load=false,released_at=COALESCE(reservation.released_at,terminal_epoch.terminal_at)
-        FROM terminal_epoch
-        WHERE reservation.consultation_id=terminal_epoch.consultation_id
-          AND reservation.generation=terminal_epoch.generation
-          AND reservation.worker_id=terminal_epoch.worker_id
-          AND reservation.epoch=terminal_epoch.epoch`,
-      );
-    }
-    return true;
+            AND archive.write_epoch=${input.writeEpoch}
+            AND ${checkpoint.previousCheckpointSha256} IS NOT DISTINCT FROM (
+              SELECT head.checkpoint_hash FROM worker_checkpoints head
+              WHERE head.consultation_id=${input.consultationId}
+                AND head.generation=${input.generation}
+                AND head.worker_id=${input.workerId}
+                AND head.worker_epoch=${checkpoint.workerEpoch}
+                AND head.source_participant_id=${persisted.sourceParticipantId}
+                AND head.destination_participant_id=${persisted.destinationParticipantId}
+              ORDER BY head.accepted_input_sequence DESC,head.high_watermark DESC,head.created_at DESC
+              LIMIT 1
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM worker_checkpoints prior
+              WHERE prior.consultation_id=${input.consultationId}
+                AND prior.generation=${input.generation}
+                AND prior.worker_id=${input.workerId}
+                AND prior.worker_epoch=${checkpoint.workerEpoch}
+                AND prior.source_participant_id=${persisted.sourceParticipantId}
+                AND prior.destination_participant_id=${persisted.destinationParticipantId}
+                AND prior.terminal
+            )
+          ON CONFLICT DO NOTHING RETURNING id`,
+        );
+
+        if (result.rowCount !== 1) {
+          const replay = await transaction.execute(
+            sql`SELECT 1 FROM worker_checkpoints checkpoint
+              JOIN consultations consultation ON consultation.id=checkpoint.consultation_id
+                AND consultation.generation=checkpoint.generation
+              JOIN worker_reservations reservation ON reservation.consultation_id=checkpoint.consultation_id
+                AND reservation.generation=checkpoint.generation
+                AND reservation.worker_id=checkpoint.worker_id AND reservation.epoch=checkpoint.worker_epoch
+              JOIN worker_job_epochs job ON job.consultation_id=checkpoint.consultation_id
+                AND job.generation=checkpoint.generation AND job.worker_id=checkpoint.worker_id
+                AND job.epoch=checkpoint.worker_epoch
+              WHERE checkpoint.id=${checkpoint.checkpointId}
+                AND checkpoint.consultation_id=${input.consultationId}
+                AND checkpoint.generation=${input.generation}
+                AND checkpoint.worker_id=${input.workerId}
+                AND checkpoint.worker_epoch=${checkpoint.workerEpoch}
+                AND checkpoint.write_epoch=${input.writeEpoch}
+                AND checkpoint.source_participant_id=${persisted.sourceParticipantId}
+                AND checkpoint.destination_participant_id=${persisted.destinationParticipantId}
+                AND checkpoint.high_watermark=${persisted.acceptedInput}
+                AND checkpoint.accepted_input_sequence=${persisted.acceptedInputSequence}
+                AND checkpoint.received_output=${persisted.receivedOutput}
+                AND checkpoint.emitted_output=${persisted.emittedOutput}
+                AND checkpoint.previous_hash IS NOT DISTINCT FROM ${checkpoint.previousCheckpointSha256}
+                AND checkpoint.checkpoint_hash=${checkpoint.highWatermarkSha256}
+                AND checkpoint.expected_ids=${expected}::jsonb AND checkpoint.observed_ids=${observed}::jsonb
+                AND checkpoint.gaps=${gaps}::jsonb AND checkpoint.terminal=${checkpoint.terminal}
+                AND checkpoint.object_key=${input.objectKey} AND checkpoint.created_at=${persisted.createdAt}
+                AND reservation.fenced_at IS NULL AND job.fenced_at IS NULL
+                AND (
+                  (reservation.released_at IS NULL AND job.terminal_at IS NULL)
+                  OR (
+                    checkpoint.terminal
+                    AND reservation.released_at IS NOT NULL
+                    AND job.terminal_at IS NOT NULL
+                    AND job.terminal_outcome='clean'
+                  )
+                )`,
+          );
+          if (replay.rowCount !== 1) {
+            throw new DomainError("CHECKPOINT_CONFLICT");
+          }
+        }
+
+        if (checkpoint.terminal) {
+          await transaction.execute(
+            sql`WITH frozen_directions AS (
+              SELECT direction->>'sourceParticipantId' AS source_participant_id,
+                direction->>'destinationParticipantId' AS destination_participant_id
+              FROM room_provider_selections selection
+              CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
+              WHERE selection.consultation_id=${input.consultationId}
+            ), complete AS (
+              SELECT count(*)=2 AND bool_and(EXISTS (
+                SELECT 1 FROM worker_checkpoints terminal
+                WHERE terminal.consultation_id=${input.consultationId}
+                  AND terminal.generation=${input.generation}
+                  AND terminal.worker_id=${input.workerId}
+                  AND terminal.worker_epoch=${checkpoint.workerEpoch}
+                  AND terminal.source_participant_id=frozen_directions.source_participant_id::uuid
+                  AND terminal.destination_participant_id=frozen_directions.destination_participant_id::uuid
+                  AND terminal.terminal
+              )) AS settled
+              FROM frozen_directions
+            ), terminal_epoch AS (
+              UPDATE worker_job_epochs job
+              SET terminal_checkpoint_id=${checkpoint.checkpointId},
+                terminal_outcome=COALESCE(job.terminal_outcome,'clean'),
+                terminal_at=COALESCE(job.terminal_at,to_timestamp(${checkpoint.occurredAtMs}/1000.0))
+              FROM complete,consultations consultation
+              WHERE complete.settled AND consultation.id=${input.consultationId}
+                AND consultation.generation=${input.generation}
+                AND job.consultation_id=consultation.id AND job.generation=consultation.generation
+                AND job.worker_id=${input.workerId} AND job.epoch=${checkpoint.workerEpoch}
+                AND job.fenced_at IS NULL AND job.terminal_at IS NULL
+              RETURNING job.consultation_id,job.generation,job.worker_id,job.epoch,job.terminal_at
+            )
+            UPDATE worker_reservations reservation
+            SET accepting_load=false,released_at=COALESCE(reservation.released_at,terminal_epoch.terminal_at)
+            FROM terminal_epoch
+            WHERE reservation.consultation_id=terminal_epoch.consultation_id
+              AND reservation.generation=terminal_epoch.generation
+              AND reservation.worker_id=terminal_epoch.worker_id
+              AND reservation.epoch=terminal_epoch.epoch`,
+          );
+        }
+        return true;
+      }),
+    );
   }
 
   async providerAttempt(input: ProviderAttemptInput): Promise<boolean> {

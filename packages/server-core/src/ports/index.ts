@@ -46,6 +46,23 @@ export interface MagicLinkRecord {
   revokedAt: Instant | null;
 }
 
+export interface MagicLinkIdentity {
+  userId: UUID | null;
+  purpose: MagicLinkPurpose;
+  consultationId: UUID | null;
+  sessionId: UUID | null;
+}
+
+export interface MagicLinkCandidate {
+  record: MagicLinkRecord;
+  sealedRawToken: string;
+  keyId: string;
+}
+
+export interface ActiveMagicLink extends MagicLinkCandidate {
+  created: boolean;
+}
+
 export interface PendingExchangeRecord {
   id: UUID;
   magicLinkId: UUID;
@@ -65,7 +82,11 @@ export interface AuthRepository extends TransactionManager {
     createdAt: Instant,
   ): Promise<UserRecord>;
   findSessionByTokenHash(hash: string): Promise<SessionRecord | null>;
-  createMagicLink(link: MagicLinkRecord, tx?: Transaction): Promise<void>;
+  getOrCreateActiveMagicLink(
+    identity: MagicLinkIdentity,
+    candidate: MagicLinkCandidate,
+    now: Instant,
+  ): Promise<ActiveMagicLink>;
   lockMagicLinkByTokenHash(hash: string, tx: Transaction): Promise<MagicLinkRecord | null>;
   lockMagicLinkById(id: UUID, tx: Transaction): Promise<MagicLinkRecord | null>;
   createPendingExchange(exchange: PendingExchangeRecord, tx: Transaction): Promise<void>;
@@ -101,12 +122,33 @@ export interface MailPort {
   }): Promise<void>;
 }
 
+export type EgressEventEarlySource =
+  | { kind: "room_composite"; roomName: string }
+  | { kind: "participant"; roomName: string; identity: UUID };
+
+export interface ResolvedEgressEvent {
+  consultationId: UUID;
+  generation: number;
+  roomName: string;
+  earlySubject?: { participantId: UUID | null };
+}
+
 export interface ConsultationRepository extends TransactionManager {
   lock(id: UUID, tx: Transaction): Promise<Consultation | null>;
   get(id: UUID): Promise<Consultation | null>;
+  findByCreationIdempotencyKey(
+    employeeUserId: UUID,
+    creationIdempotencyKey: UUID,
+    tx: Transaction,
+  ): Promise<Consultation | null>;
   listForUser(userId: UUID): Promise<readonly Consultation[]>;
   save(value: Consultation, expectedUpdatedAt: Instant, tx: Transaction): Promise<boolean>;
-  create(value: Consultation, tx: Transaction): Promise<void>;
+  create(
+    value: Consultation,
+    employeeUserId: UUID,
+    creationIdempotencyKey: UUID,
+    tx: Transaction,
+  ): Promise<boolean>;
   isCurrentEgress(
     consultationId: UUID,
     generation: number,
@@ -119,11 +161,10 @@ export interface ConsultationRepository extends TransactionManager {
     egressId: string,
     tx: Transaction,
   ): Promise<{ participantId: UUID | null } | null>;
-  resolveEgressEvent(egressId: string): Promise<{
-    consultationId: UUID;
-    generation: number;
-    roomName: string;
-  } | null>;
+  resolveEgressEvent(
+    egressId: string,
+    earlySource?: EgressEventEarlySource,
+  ): Promise<ResolvedEgressEvent | null>;
   persistProvisioningIds(
     consultationId: UUID,
     generation: number,
@@ -190,7 +231,13 @@ export interface LanguageRepository extends TransactionManager {
     tx: Transaction,
   ): Promise<void>;
   list(profileId: UUID, revision?: number): Promise<readonly LanguageCapability[]>;
-  setEnabled(id: UUID, enabled: boolean, tx: Transaction): Promise<void>;
+  setEnabled(
+    id: UUID,
+    profileId: UUID,
+    profileRevision: number,
+    enabled: boolean,
+    tx: Transaction,
+  ): Promise<void>;
 }
 
 export interface ExternalEffect {

@@ -7,7 +7,7 @@ export async function register(): Promise<void> {
 
 export async function onRequestError(error: unknown): Promise<void> {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
-  // Keep the Node SDK out of the Edge instrumentation bundle.
-  const { recordFrameworkRequestError } = await import("./lib/telemetry");
-  recordFrameworkRequestError(error);
+  // Route framework hooks through the same Node-only module as registration.
+  const { recordNodeRequestError } = await import("./instrumentation.node");
+  recordNodeRequestError(error);
 }

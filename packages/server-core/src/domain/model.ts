@@ -1,3 +1,11 @@
+export type {
+  ArchiveState,
+  ConsultationState,
+  ExternalEffectState as EffectState,
+  MagicLinkPurpose,
+  ParticipantRole,
+  StaffRole,
+} from "@transhooter/contracts";
 export type UUID = string;
 export type Instant = Date;
 
@@ -13,27 +21,6 @@ export interface TokenGenerator {
 export interface TokenHasher {
   sha256(value: Uint8Array | string): string;
 }
-
-export type StaffRole = "employee" | "admin";
-export type ParticipantRole = "employee" | "customer";
-export type ConsultationState =
-  | "invited"
-  | "ready"
-  | "active"
-  | "finalizing"
-  | "ended"
-  | "cancelled"
-  | "deleted";
-export type ArchiveState =
-  | "pending"
-  | "recording"
-  | "reconciling"
-  | "complete"
-  | "incomplete"
-  | "deleting"
-  | "deleted";
-export type EffectState = "planned" | "calling" | "applied" | "compensating" | "done" | "failed";
-export type MagicLinkPurpose = "sign_in" | "consultation_invite" | "archive_delete_reauth";
 
 export class DomainError extends Error {
   constructor(

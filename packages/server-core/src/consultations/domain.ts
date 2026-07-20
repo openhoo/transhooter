@@ -78,7 +78,7 @@ export function assertTwoSlots(value: Consultation): void {
 export function slotForUser(value: Consultation, userId: UUID): ParticipantSlot {
   const slot = value.participants.find((candidate) => candidate.userId === userId);
   if (!slot) {
-    throw new DomainError("FORBIDDEN");
+    throw new DomainError("NOT_FOUND");
   }
   return slot;
 }
@@ -300,6 +300,7 @@ export function cancelBeforeStart(value: Consultation, now: Instant): Consultati
     ...value,
     state: "cancelled",
     generation: value.generation + 1,
+    admissionFencedAt: value.admissionFencedAt ?? now,
     updatedAt: now,
   };
 }

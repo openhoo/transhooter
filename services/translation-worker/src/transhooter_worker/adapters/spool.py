@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS checkpoint_deliveries (
 );
 CREATE INDEX IF NOT EXISTS checkpoint_deliveries_scope_order
 ON checkpoint_deliveries(meeting_id, worker_epoch, source_id, checkpoint_id);
+CREATE TABLE IF NOT EXISTS compacted_envelopes (
+    object_id TEXT PRIMARY KEY REFERENCES records(object_id),
+    compacted_at INTEGER NOT NULL
+);
 """
 
 
@@ -1031,6 +1035,49 @@ class EncryptedSpool:
                 (version_id, checksum, str(object_id)),
             )
 
+    @_locked
+    def compact_uploaded_envelopes(self, limit: int = 128) -> int:
+        """Durably discard bounded, replay-independent uploaded payloads."""
+        if limit < 1:
+            return 0
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._db.execute(
+                """
+                SELECT records.object_id, records.opaque_path
+                FROM records
+                LEFT JOIN compacted_envelopes
+                  ON compacted_envelopes.object_id = records.object_id
+                WHERE records.state = 'uploaded'
+                  AND records.stage != 'checkpoint'
+                  AND records.stage != 'terminal'
+                  AND records.stage NOT LIKE '%-terminal'
+                  AND records.sample_start IS NULL
+                  AND compacted_envelopes.object_id IS NULL
+                ORDER BY records.ordinal
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            compacted_at = time.time_ns()
+            for object_id, _ in rows:
+                self._db.execute(
+                    """
+                    INSERT INTO compacted_envelopes(object_id, compacted_at)
+                    VALUES (?, ?)
+                    """,
+                    (object_id, compacted_at),
+                )
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        for _, opaque_path in rows:
+            Path(opaque_path).unlink(missing_ok=True)
+        if rows:
+            self._fsync_directory()
+        return len(rows)
+
     def quarantine(self, object_id: UUID) -> None:
         with self._exclusive():
             self._quarantine(object_id)
@@ -1040,15 +1087,41 @@ class EncryptedSpool:
             self._recover_unlocked()
 
     def _recover_unlocked(self) -> None:
+        self._recover_compacted_envelopes()
         referenced = {
             Path(row[0]) for row in self._db.execute("SELECT opaque_path FROM records").fetchall()
         }
         self._remove_stale_temps()
         self._import_orphan_finals(referenced)
         self._recover_checkpoint_deliveries()
-        missing = [path for path in referenced if not path.exists()]
+        missing = [
+            Path(row[0])
+            for row in self._db.execute(
+                """
+                SELECT records.opaque_path
+                FROM records
+                LEFT JOIN compacted_envelopes
+                  ON compacted_envelopes.object_id = records.object_id
+                WHERE compacted_envelopes.object_id IS NULL
+                """
+            ).fetchall()
+            if not Path(row[0]).exists()
+        ]
         if missing:
             raise SpoolUnavailable(f"{len(missing)} indexed spool payloads are missing")
+
+    def _recover_compacted_envelopes(self) -> None:
+        rows = self._db.execute(
+            """
+            SELECT records.opaque_path
+            FROM compacted_envelopes
+            JOIN records ON records.object_id = compacted_envelopes.object_id
+            """
+        ).fetchall()
+        for (opaque_path,) in rows:
+            Path(opaque_path).unlink(missing_ok=True)
+        if rows:
+            self._fsync_directory()
 
     def _recover_checkpoint_deliveries(self) -> None:
         rows = self._db.execute(

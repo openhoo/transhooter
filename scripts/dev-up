@@ -11,6 +11,11 @@ elif [ "$#" -ne 0 ]; then
   exit 2
 fi
 
+if [ "$profile" = fixture ] && [ -z "${COMPOSE_PROJECT_NAME:-}" ]; then
+  PROJECT_NAME=transhooter-fixture
+  export COMPOSE_PROJECT_NAME=$PROJECT_NAME
+fi
+
 mkdir -p "$ROOT/.secrets"
 
 resolve_profile "$profile"
@@ -24,14 +29,15 @@ case "$profile" in
     ;;
 esac
 
+# These defaults only apply to the developer lifecycle wrapper. Direct provider
+# overlay use remains fail-closed and defaults to production.
+export RTC_ADVERTISED_IP="${RTC_ADVERTISED_IP:-${RTC_BRIDGE_IP:-10.254.231.10}}"
+export S3_PUBLIC_ENDPOINT="${S3_PUBLIC_ENDPOINT:-http://localhost:9000}"
+
 export OTEL_SDK_DISABLED=false
 
 announce_phase "Validating ${profile} Compose configuration"
 compose config --quiet
-announce_phase "Building the current secret initializer"
-compose build secrets-init
-announce_phase "Initializing missing runtime secrets"
-compose run --rm --no-deps secrets-init
 write_compose_state
 announce_phase "Recorded recoverable Compose state"
 announce_phase "Building current sources and waiting for semantic readiness"

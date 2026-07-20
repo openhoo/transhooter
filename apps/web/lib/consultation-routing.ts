@@ -10,15 +10,10 @@ export type RoutedConsultation = {
 export function durableConsultationDestination(
   consultation: RoutedConsultation,
 ): `/consultations/${string}/room` | `/archives/${string}` | null {
-  const mediaReady = Boolean(
-    consultation.roomName &&
-      consultation.roomSid &&
-      consultation.dispatchId &&
-      consultation.compositeEgressId,
-  );
+  const roomReady = Boolean(consultation.roomName && consultation.roomSid);
   const isRoomState = consultation.state === "ready" || consultation.state === "active";
 
-  if (isRoomState && mediaReady) {
+  if (isRoomState && roomReady) {
     return `/consultations/${consultation.id}/room`;
   }
 

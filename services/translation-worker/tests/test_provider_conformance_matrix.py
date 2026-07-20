@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
+import transhooter_worker.adapters.google.provider as google_provider
 from transhooter_worker.adapters.deepgram.provider import (
     DeepgramConfig,
     DeepgramSttSession,
@@ -97,18 +98,27 @@ class ScriptSocket:
     close_code = 1000
     close_reason = "complete"
 
-    def __init__(self, messages: list[str | bytes], *, wait_for_close: bool = False) -> None:
+    def __init__(
+        self,
+        messages: list[str | bytes],
+        *,
+        wait_for_close: bool = False,
+        messages_after_close: list[str | bytes] | None = None,
+    ) -> None:
         self.messages = messages
         self.sent: list[str | bytes] = []
         self.closed = asyncio.Event()
         self.wait_for_close = wait_for_close
+        self.messages_after_close = messages_after_close or []
 
     def __aiter__(self) -> AsyncIterator[str | bytes]:
         async def stream() -> AsyncIterator[str | bytes]:
             for message in self.messages:
                 yield message
-            if self.wait_for_close:
+            if self.wait_for_close or self.messages_after_close:
                 await self.closed.wait()
+            for message in self.messages_after_close:
+                yield message
 
         return stream()
 
@@ -191,6 +201,20 @@ class GoogleChannel:
             return GrpcCall(None, request_serializer, response_deserializer, [raw])
 
         return invoke
+
+
+class TrackingGoogleChannel:
+    def __init__(self) -> None:
+        self.closes = 0
+
+    def unary_unary(self, *_: Any, **__: Any):
+        def invoke(*_: Any, **__: Any) -> Any:
+            raise RuntimeError("capability unavailable")
+
+        return invoke
+
+    async def close(self) -> None:
+        self.closes += 1
 
 
 @dataclass
@@ -281,7 +305,16 @@ def make_deepgram_deepl_composition() -> Composition:
                 }
             )
         ],
-        wait_for_close=True,
+        messages_after_close=[
+            json.dumps(
+                {
+                    "type": "Results",
+                    "from_finalize": True,
+                    "channel": {"alternatives": []},
+                }
+            ),
+            json.dumps({"type": "CloseStream"}),
+        ],
     )
     tts_socket = ScriptSocket([b"\x01\x00" * 480, b"\x02\x00" * 480, '{"type":"Flushed"}'])
     stt = _DirectDeepgramSttProvider(config, journal, stt_socket)
@@ -337,12 +370,64 @@ class _DirectDeepgramTtsProvider:
         return DeepgramTtsSession(self.config, self.journal, session_id, self.socket, [])
 
 
+COMPOSITION_FACTORIES = [
+    pytest.param(make_fixture_composition, id="fixture"),
+    pytest.param(make_google_composition, id="google-eu"),
+    pytest.param(make_deepgram_deepl_composition, id="deepgram-deepl-eu"),
+]
+
+
+async def make_google_empty_final_stt() -> Any:
+    result = cloud_speech.StreamingRecognitionResult(
+        alternatives=[],
+        is_final=True,
+        result_end_offset=timedelta(seconds=0.25),
+    )
+    response = cloud_speech.StreamingRecognizeResponse(results=[result])
+    raw = bytes(cloud_speech.StreamingRecognizeResponse.pb(response).SerializeToString())
+    return await GoogleSttProvider(
+        google_config(uuid4()),
+        MemoryJournal(),
+        GoogleChannel([[raw]], []),
+    ).open(uuid4(), "en-US")
+
+
+async def make_deepgram_empty_final_stt() -> DeepgramSttSession:
+    config = DeepgramConfig(
+        "secret",
+        uuid4(),
+        "en-US",
+        "voice",
+        ("voice",),
+        credential_fingerprint="fingerprint",
+    )
+    socket = ScriptSocket(
+        [
+            json.dumps(
+                {
+                    "type": "Results",
+                    "is_final": True,
+                    "speech_final": False,
+                    "channel": {"alternatives": []},
+                }
+            )
+        ],
+        messages_after_close=[
+            json.dumps(
+                {
+                    "type": "Results",
+                    "from_finalize": True,
+                    "channel": {"alternatives": []},
+                }
+            ),
+            json.dumps({"type": "CloseStream"}),
+        ],
+    )
+    return DeepgramSttSession(config, MemoryJournal(), uuid4(), socket, [])
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "factory",
-    [make_fixture_composition, make_google_composition, make_deepgram_deepl_composition],
-    ids=["fixture", "google-eu", "deepgram-deepl-eu"],
-)
+@pytest.mark.parametrize("factory", COMPOSITION_FACTORIES)
 async def test_compositions_obey_one_neutral_port_contract(factory: Any) -> None:
     composition = factory()
     source_range = SampleRange(32_000, 36_000)
@@ -405,10 +490,7 @@ async def test_compositions_obey_one_neutral_port_contract(factory: Any) -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "factory",
-    [make_fixture_composition, make_google_composition, make_deepgram_deepl_composition],
-)
+@pytest.mark.parametrize("factory", COMPOSITION_FACTORIES)
 async def test_same_language_direction_is_explicit_bypass(factory: Any) -> None:
     composition = factory()
     direction = {"mode": "same_language", "translation": None, "tts": None}
@@ -420,10 +502,7 @@ async def test_same_language_direction_is_explicit_bypass(factory: Any) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "factory",
-    [make_fixture_composition, make_google_composition, make_deepgram_deepl_composition],
-)
+@pytest.mark.parametrize("factory", COMPOSITION_FACTORIES)
 async def test_finish_cancel_race_has_one_authoritative_terminal(factory: Any) -> None:
     composition = factory()
     stt = await composition.stt.open(uuid4(), "en-US")
@@ -438,10 +517,7 @@ async def test_finish_cancel_race_has_one_authoritative_terminal(factory: Any) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "factory",
-    [make_fixture_composition, make_google_composition, make_deepgram_deepl_composition],
-)
+@pytest.mark.parametrize("factory", COMPOSITION_FACTORIES)
 async def test_cancelled_translation_rejects_late_provider_result(factory: Any) -> None:
     composition = factory()
     assert composition.translation is not None
@@ -454,6 +530,73 @@ async def test_cancelled_translation_rejects_late_provider_result(factory: Any) 
     assert terminal.outcome is Outcome.CANCELLED
     assert late.result is None
     assert late.terminal.terminal_id == terminal.terminal_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("factory", COMPOSITION_FACTORIES)
+async def test_provider_terminal_methods_are_bounded_and_idempotent(factory: Any) -> None:
+    composition = factory()
+
+    stt = await composition.stt.open(uuid4(), "en-US")
+    stt_first = await asyncio.wait_for(stt.cancel(), 1)
+    stt_second = await asyncio.wait_for(stt.cancel(), 1)
+    assert stt_first.outcome is Outcome.CANCELLED
+    assert stt_second.terminal_id == stt_first.terminal_id
+    stt_events = [event async for event in stt.events()]
+    assert [event.terminal for event in stt_events if isinstance(event, SessionTerminalEvent)] == [
+        stt_first
+    ]
+
+    assert composition.translation is not None
+    request = TranslationRequest(
+        uuid4(), uuid4(), "final", "en", "de", "cancel me", SampleRange(0, 1)
+    )
+    translation = await composition.translation.start(request)
+    translation_first = await asyncio.wait_for(translation.cancel(), 1)
+    translation_second = await asyncio.wait_for(translation.cancel(), 1)
+    translation_result = await asyncio.wait_for(translation.result(), 1)
+    assert translation_first.outcome is Outcome.CANCELLED
+    assert translation_second.terminal_id == translation_first.terminal_id
+    assert translation_result.result is None
+    assert translation_result.terminal.terminal_id == translation_first.terminal_id
+
+    assert composition.tts is not None
+    tts = await composition.tts.open(uuid4(), "de-DE", composition.tts_voice or "")
+    utterance = SynthesisUtterance(
+        uuid4(),
+        uuid4(),
+        "cancel me",
+        "de-DE",
+        composition.tts_voice or "",
+        SampleRange(0, 1),
+    )
+    synthesis = await tts.start(utterance)
+    synthesis_first = await asyncio.wait_for(synthesis.cancel(), 1)
+    synthesis_second = await asyncio.wait_for(synthesis.cancel(), 1)
+    assert synthesis_first.outcome is Outcome.CANCELLED
+    assert synthesis_second.terminal_id == synthesis_first.terminal_id
+    tts_first = await asyncio.wait_for(tts.cancel(), 1)
+    tts_second = await asyncio.wait_for(tts.cancel(), 1)
+    assert tts_first.outcome is Outcome.CANCELLED
+    assert tts_second.terminal_id == tts_first.terminal_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(make_google_empty_final_stt, id="google"),
+        pytest.param(make_deepgram_empty_final_stt, id="deepgram"),
+    ],
+)
+async def test_empty_final_provider_chunks_complete_without_empty_transcripts(factory: Any) -> None:
+    session = await factory()
+    terminal = await asyncio.wait_for(session.finish(), 1)
+    events = [event async for event in session.events()]
+
+    assert terminal.outcome is Outcome.SUCCEEDED
+    assert not any(isinstance(event, TranscriptEvent) for event in events)
+    assert events[-1] == SessionTerminalEvent(terminal)
 
 
 @pytest.mark.asyncio
@@ -509,6 +652,102 @@ async def test_google_rollover_suppresses_duplicate_final_and_records_each_grpc_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("acknowledgements", "expected"),
+    [
+        ([], Outcome.FAILED),
+        (
+            [
+                json.dumps(
+                    {
+                        "type": "Results",
+                        "from_finalize": True,
+                        "channel": {"alternatives": []},
+                    }
+                ),
+                json.dumps({"type": "CloseStream"}),
+            ],
+            Outcome.SUCCEEDED,
+        ),
+    ],
+)
+async def test_deepgram_stt_requires_provider_completion_acknowledgements(
+    acknowledgements: list[str],
+    expected: Outcome,
+) -> None:
+    journal = MemoryJournal()
+    config = DeepgramConfig(
+        "secret",
+        uuid4(),
+        "en-US",
+        "voice",
+        ("voice",),
+        credential_fingerprint="fingerprint",
+    )
+    socket = ScriptSocket([], messages_after_close=acknowledgements)
+    session = DeepgramSttSession(config, journal, uuid4(), socket, [])
+
+    terminal = await session.finish()
+    events = [event async for event in session.events()]
+
+    assert terminal.outcome is expected
+    assert events[-1] == SessionTerminalEvent(terminal)
+    if expected is Outcome.FAILED:
+        assert terminal.error is not None
+        assert terminal.error.provider_code == "CompletionError"
+    journal.assert_exact_refs(terminal.raw_refs)
+
+
+@pytest.mark.asyncio
+async def test_deepl_v3_capabilities_decode_lang_rows() -> None:
+    journal = MemoryJournal()
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=[{"lang": "DE"}, {"lang": "EN"}])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        capabilities = await DeepLProvider(
+            DeepLConfig("secret", uuid4()),
+            journal,
+            client,
+        ).capabilities()
+        assert not client.is_closed
+
+    assert requests[0].url.params["resource"] == "translate_text"
+    assert requests[0].url.path == "/v3/languages"
+    assert capabilities.languages == ("DE", "EN")
+    assert capabilities.evidence is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider_type",
+    [GoogleSttProvider, GoogleTranslationProvider, GoogleTtsProvider],
+    ids=["stt", "translation", "tts"],
+)
+@pytest.mark.parametrize("supplied", [False, True], ids=["owned", "supplied"])
+async def test_google_capability_channel_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_type: Any,
+    supplied: bool,
+) -> None:
+    channel = TrackingGoogleChannel()
+    monkeypatch.setattr(google_provider, "authenticated_channel", lambda *_: channel)
+    provider = provider_type(
+        google_config(uuid4()),
+        MemoryJournal(),
+        channel if supplied else None,
+    )
+
+    with pytest.raises(RuntimeError, match="capability unavailable"):
+        await asyncio.wait_for(provider.capabilities(), 1)
+
+    assert channel.closes == (0 if supplied else 1)
+
+
+@pytest.mark.asyncio
 async def test_deepgram_partial_audio_flush_clear_and_close_are_evidenced() -> None:
     journal = MemoryJournal()
     config = DeepgramConfig(
@@ -545,8 +784,32 @@ async def test_deepgram_partial_audio_flush_clear_and_close_are_evidenced() -> N
 @pytest.mark.parametrize(
     ("status", "headers", "expected_kind", "expected_advice", "delay"),
     [
-        (456, {}, ErrorKind.QUOTA, RetryAdvice.NEVER, None),
-        (429, {"Retry-After": "2"}, ErrorKind.RATE_LIMIT, RetryAdvice.RETRY_AFTER, 2_000),
+        pytest.param(400, {}, ErrorKind.PROVIDER, RetryAdvice.NEVER, None, id="bad-request"),
+        pytest.param(456, {}, ErrorKind.QUOTA, RetryAdvice.NEVER, None, id="quota"),
+        pytest.param(
+            429,
+            {"Retry-After": "2"},
+            ErrorKind.RATE_LIMIT,
+            RetryAdvice.RETRY_AFTER,
+            2_000,
+            id="rate-limit",
+        ),
+        pytest.param(
+            500,
+            {},
+            ErrorKind.TRANSPORT,
+            RetryAdvice.RETRY_AFTER,
+            None,
+            id="server-error",
+        ),
+        pytest.param(
+            529,
+            {"Retry-After": "0.25"},
+            ErrorKind.RATE_LIMIT,
+            RetryAdvice.RETRY_AFTER,
+            250,
+            id="overloaded",
+        ),
     ],
 )
 async def test_deepl_failure_statuses_have_typed_normalization_and_exact_refs(

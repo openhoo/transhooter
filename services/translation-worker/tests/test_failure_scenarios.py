@@ -178,9 +178,16 @@ async def test_stt_transport_failure_after_first_chunk(
         samples=SampleRange(0, 1),
         pcm=b"\0\0",
     )
+    await stt_session.send_audio(audio_chunk)
+    second_chunk = AudioChunk(
+        operation_id=uuid4(),
+        sequence=1,
+        samples=SampleRange(1, 2),
+        pcm=b"\0\0",
+    )
 
     with pytest.raises(RuntimeError, match="STT transport"):
-        await stt_session.send_audio(audio_chunk)
+        await stt_session.send_audio(second_chunk)
 
 
 @pytest.mark.asyncio

@@ -166,6 +166,9 @@ export class DurableEffectExecutor {
     } catch (error) {
       const discovered = await input.adopt(input.request).catch(() => null);
       if (discovered) {
+        if (input.resultGeneration(discovered) === input.generation) {
+          return discovered;
+        }
         await this.persistDiscoveredEffectAndCompensate(input, discovered, owner, requestHash);
       } else {
         await this.effects.transaction((tx) =>

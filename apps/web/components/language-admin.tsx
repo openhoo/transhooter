@@ -6,6 +6,7 @@ import { createExclusiveActionGate } from "./interface-state";
 
 type Direction = {
   id: string;
+  profileId: string;
   profile: string;
   revision: number;
   source: string;
@@ -43,6 +44,7 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
         method: "POST",
         body: JSON.stringify({
           directionId: item.id,
+          profileId: item.profileId,
           enabled: !item.enabled,
           profileRevision: item.revision,
         }),

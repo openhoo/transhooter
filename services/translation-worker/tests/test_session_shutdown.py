@@ -1,5 +1,7 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
@@ -42,7 +44,6 @@ async def ignore_sink(*_: object) -> None:
 
 
 def failed_terminal(session_id: UUID) -> SessionTerminal:
-    attempt_id = uuid4()
     error = ProviderError(
         kind=ErrorKind.TRANSPORT,
         scope="session",
@@ -50,7 +51,7 @@ def failed_terminal(session_id: UUID) -> SessionTerminal:
         provider_code="closed",
         provider_request_id=None,
         retry_delay_ms=None,
-        attempt_id=attempt_id,
+        attempt_id=session_id,
         raw_refs=(REF,),
         message="closed",
     )
@@ -279,7 +280,6 @@ async def test_terminal_stt_failure_is_exposed_to_job_supervisor(
 ) -> None:
     monkeypatch.setenv("APP_ENV", "test")
     session_id = uuid4()
-    attempt_id = uuid4()
     error = ProviderError(
         kind=ErrorKind.INVALID_REQUEST,
         scope="session",
@@ -287,7 +287,7 @@ async def test_terminal_stt_failure_is_exposed_to_job_supervisor(
         provider_code="invalid",
         provider_request_id=None,
         retry_delay_ms=None,
-        attempt_id=attempt_id,
+        attempt_id=session_id,
         raw_refs=(REF,),
         message="invalid",
     )
@@ -456,6 +456,43 @@ def fixture_direction(
         ignore_sink,
         checkpoint_sink,
     )
+
+
+@pytest.mark.asyncio
+async def test_fixture_stt_fails_after_exact_configured_chunk_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "test")
+    meeting_id = uuid4()
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {
+                "consultations": {
+                    str(meeting_id): {
+                        "stt": {"failAfterChunks": 1},
+                    }
+                }
+            }
+        ),
+        "utf-8",
+    )
+    session = await FixtureSttProvider(FixtureScenario(meeting_id, scenario_path)).open(
+        uuid4(), "en-US"
+    )
+    first = AudioChunk(uuid4(), 0, SampleRange(0, 4_000), b"\0\0" * 4_000)
+    second = AudioChunk(uuid4(), 1, SampleRange(4_000, 8_000), b"\0\0" * 4_000)
+
+    await session.send_audio(first)
+    with pytest.raises(RuntimeError, match="injected fixture STT transport failure"):
+        await session.send_audio(second)
+    events = [event async for event in session.events()]
+    terminal = events[-1].terminal
+
+    assert terminal.outcome is Outcome.FAILED
+    assert terminal.accepted_input == first.samples.end
+    assert sum(isinstance(event, SessionTerminalEvent) for event in events) == 1
 
 
 @pytest.mark.asyncio

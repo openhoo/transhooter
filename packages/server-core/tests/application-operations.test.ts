@@ -4,6 +4,8 @@ import {
   checkpointPersistenceValues,
   DrizzleApplicationOperations,
 } from "../src/application-operations";
+import { DrizzleLanguageRepository } from "../src/persistence/application-repositories";
+import { TransactionHandle } from "../src/persistence/repositories";
 
 const ADMIN = {
   userId: "00000000-0000-4000-8000-000000000001",
@@ -13,6 +15,7 @@ const PROFILE_FRESH_UNTIL = new Date("2026-02-01T00:00:00Z");
 
 const ENABLED_DIRECTION_ROW = {
   id: "00000000-0000-4000-8000-000000000002",
+  profile_id: "00000000-0000-4000-8000-000000000010",
   source_locale: "en-US",
   target_locale: "de-DE",
   mode: "translated",
@@ -25,6 +28,7 @@ const ENABLED_DIRECTION_ROW = {
 
 const DISABLED_DIRECTION_ROW = {
   id: "00000000-0000-4000-8000-000000000003",
+  profile_id: "00000000-0000-4000-8000-000000000010",
   source_locale: "de-DE",
   target_locale: "en-US",
   mode: "translated",
@@ -171,7 +175,7 @@ const ARCHIVE_DETAIL_ROW = {
       reason: "litigation",
     },
   ],
-  egress_ids: ["EG_room"],
+  egress_ids: ["EG_room_g1", "EG_participant_g1", "EG_room_g2"],
   provider_attempt_ids: ["00000000-0000-4000-8000-000000000007"],
   provider_attempt_groups: [
     {
@@ -195,10 +199,25 @@ function createSequentialOperations(
   results: Array<{ rows: Record<string, unknown>[]; rowCount?: number }>,
 ) {
   const execute = mock(async (_statement: unknown) => results.shift() ?? { rows: [], rowCount: 0 });
-  const operations = new DrizzleApplicationOperations({ execute } as never, {} as never, {
-    now: () => new Date(),
+  const forUpdate = mock(async () => [{ consultationId: "00000000-0000-4000-8000-000000000021" }]);
+  const select = () => ({
+    from: () => ({
+      where: () => ({
+        for: forUpdate,
+      }),
+    }),
   });
-  return { execute, operations };
+  const transaction = async <T>(
+    callback: (transaction: { execute: typeof execute; select: typeof select }) => Promise<T>,
+  ) => callback({ execute, select });
+  const operations = new DrizzleApplicationOperations(
+    { execute, transaction } as never,
+    {} as never,
+    {
+      now: () => new Date(),
+    },
+  );
+  return { execute, forUpdate, operations };
 }
 
 describe("ApplicationOperations typed views", () => {
@@ -210,6 +229,9 @@ describe("ApplicationOperations typed views", () => {
     expect(rows.map((row) => row.enabled)).toEqual([true, false]);
     expect(rows.every((row) => row.revision === 4)).toBe(true);
     expect(rows.every((row) => row.profileName === "google-eu")).toBe(true);
+    expect(rows.every((row) => row.profileId === "00000000-0000-4000-8000-000000000010")).toBe(
+      true,
+    );
   });
 
   it("returns non-null proof arrays and scoped active hold details", async () => {
@@ -224,7 +246,7 @@ describe("ApplicationOperations typed views", () => {
       },
     ]);
     expect(detail.inventoryVersionId).toBe("version-1");
-    expect(detail.egressIds).toEqual(["EG_room"]);
+    expect(detail.egressIds).toEqual(["EG_room_g1", "EG_participant_g1", "EG_room_g2"]);
     expect(detail.providerAttemptGroups[0]?.attemptIds).toEqual(detail.providerAttemptIds);
   });
 
@@ -401,6 +423,116 @@ describe("ApplicationOperations typed views", () => {
     expect(reverseDirection.execute).toHaveBeenCalledTimes(2);
   });
 
+  it("serializes concurrent directional appends and rejects a stale committed head", async () => {
+    let tail = Promise.resolve();
+    let insertAttempt = 0;
+    let activeLocks = 0;
+    let maximumActiveLocks = 0;
+    const database = {
+      transaction: async <T>(
+        callback: (transaction: {
+          execute: () => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
+          select: () => {
+            from: () => {
+              where: () => { for: () => Promise<{ consultationId: string }[]> };
+            };
+          };
+        }) => Promise<T>,
+      ) => {
+        let release: (() => void) | undefined;
+        let transactionLocked = false;
+        const transaction = {
+          select: () => ({
+            from: () => ({
+              where: () => ({
+                for: async () => {
+                  if (!transactionLocked) {
+                    const predecessor = tail;
+                    tail = new Promise<void>((resolve) => {
+                      release = resolve;
+                    });
+                    await predecessor;
+                    activeLocks += 1;
+                    maximumActiveLocks = Math.max(maximumActiveLocks, activeLocks);
+                    transactionLocked = true;
+                  }
+                  return [{ consultationId: "00000000-0000-4000-8000-000000000021" }];
+                },
+              }),
+            }),
+          }),
+          execute: async () => {
+            insertAttempt += 1;
+            if (insertAttempt === 1) {
+              await Promise.resolve();
+              return {
+                rows: [{ id: "00000000-0000-4000-8000-000000000031" }],
+                rowCount: 1,
+              };
+            }
+            return { rows: [], rowCount: 0 };
+          },
+        };
+        try {
+          return await callback(transaction);
+        } finally {
+          if (release !== undefined) {
+            activeLocks -= 1;
+            release();
+          }
+        }
+      },
+    };
+    const operations = new DrizzleApplicationOperations(database as never, {} as never, {
+      now: () => new Date(),
+    });
+    const base = {
+      workerId: "00000000-0000-4000-8000-000000000022",
+      consultationId: "00000000-0000-4000-8000-000000000021",
+      generation: 3,
+      writeEpoch: 1,
+      objectKey: "v1/checkpoint.json",
+      checkpoint: {
+        checkpointId: "00000000-0000-4000-8000-000000000031",
+        workerEpoch: 2,
+        sourceParticipantId: "00000000-0000-4000-8000-000000000011",
+        destinationParticipantId: "00000000-0000-4000-8000-000000000012",
+        acceptedInputSequence: 8,
+        acceptedInput: 32_000,
+        receivedOutput: 24_000,
+        emittedOutput: 20_000,
+        previousCheckpointSha256: null,
+        highWatermarkSha256: "d".repeat(64),
+        expectedObjectIds: [],
+        observedObjectIds: [],
+        gaps: [],
+        terminal: false,
+        occurredAtMs: 1_700_000_000_000,
+      },
+    };
+
+    const settled = await Promise.allSettled([
+      operations.checkpoint(base),
+      operations.checkpoint({
+        ...base,
+        checkpoint: {
+          ...base.checkpoint,
+          checkpointId: "00000000-0000-4000-8000-000000000032",
+          highWatermarkSha256: "e".repeat(64),
+        },
+      }),
+    ]);
+
+    expect(maximumActiveLocks).toBe(1);
+    expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const rejected = settled.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(rejected?.reason).toBeInstanceOf(Error);
+    expect(String(rejected?.reason)).toContain("CHECKPOINT_CONFLICT");
+  });
+
   it("accepts an exact terminal replay after clean two-direction settlement", async () => {
     const replayed = createSequentialOperations([
       { rows: [], rowCount: 0 },
@@ -516,5 +648,44 @@ describe("ApplicationOperations typed views", () => {
     expect(admissionSql).not.toContain("released_at=");
     expect(admissionSql).not.toContain("archive_state");
     expect(admissionSql).not.toContain("terminal_at=");
+  });
+});
+
+describe("Language capability revision fencing", () => {
+  const CAPABILITY_ID = "00000000-0000-4000-8000-000000000041";
+  const PROFILE_ID = "00000000-0000-4000-8000-000000000042";
+
+  function repositoryFixture(updated: readonly { id: string }[]) {
+    const returning = mock(async () => updated);
+    const where = mock((_predicate: unknown) => ({ returning }));
+    const set = mock((_values: unknown) => ({ where }));
+    const update = mock((_table: unknown) => ({ set }));
+    const repository = new DrizzleLanguageRepository({} as never);
+    const transaction = new TransactionHandle({ update } as never);
+    return { repository, transaction, set, where };
+  }
+
+  it("updates an exact current profile revision once", async () => {
+    const fixture = repositoryFixture([{ id: CAPABILITY_ID }]);
+
+    await fixture.repository.setEnabled(CAPABILITY_ID, PROFILE_ID, 7, true, fixture.transaction);
+
+    expect(fixture.set).toHaveBeenCalledTimes(1);
+    expect(fixture.set).toHaveBeenCalledWith({ enabled: true });
+    const predicate = fixture.where.mock.calls[0]?.[0];
+    const predicateSql = new PgDialect().sqlToQuery(predicate as never).sql;
+    expect(predicateSql).toContain("language_capabilities");
+    expect(predicateSql).toContain("profile_id");
+    expect(predicateSql).toContain("revision");
+    expect(predicateSql).toContain("provider_profiles");
+    expect(predicateSql).toContain("current_revision");
+  });
+
+  it("returns a conflict when the capability revision is stale or absent", async () => {
+    const fixture = repositoryFixture([]);
+
+    await expect(
+      fixture.repository.setEnabled(CAPABILITY_ID, PROFILE_ID, 6, false, fixture.transaction),
+    ).rejects.toMatchObject({ code: "CAPABILITY_REVISION_CONFLICT" });
   });
 });

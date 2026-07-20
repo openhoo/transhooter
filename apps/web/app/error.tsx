@@ -5,7 +5,7 @@ type ErrorPageProps = {
   reset: () => void;
 };
 
-export default function ErrorPage({ reset }: ErrorPageProps) {
+export function ErrorRecovery({ reset }: ErrorPageProps) {
   return (
     <section className="empty flat">
       <p className="eyebrow">Data unavailable</p>
@@ -20,3 +20,5 @@ export default function ErrorPage({ reset }: ErrorPageProps) {
     </section>
   );
 }
+
+export default ErrorRecovery;

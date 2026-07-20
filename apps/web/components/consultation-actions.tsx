@@ -28,6 +28,7 @@ export function NewConsultationForm({ profiles }: NewConsultationFormProps) {
   const router = useRouter();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const pendingSubmission = useRef<{ fingerprint: string; key: string } | null>(null);
 
   if (profiles.length === 0) {
     return (
@@ -48,16 +49,27 @@ export function NewConsultationForm({ profiles }: NewConsultationFormProps) {
     setError("");
 
     const values = new FormData(event.currentTarget);
+    const payload = {
+      customerEmail: String(values.get("email") ?? ""),
+      customerName: String(values.get("name") ?? ""),
+      providerProfileId: String(values.get("profile") ?? ""),
+    };
+    const fingerprint = JSON.stringify(payload);
+    let pending = pendingSubmission.current;
+    if (pending?.fingerprint !== fingerprint) {
+      pending = { fingerprint, key: crypto.randomUUID() };
+      pendingSubmission.current = pending;
+    }
 
     try {
       const result = await api<{ id: string }>("/api/consultations", {
         method: "POST",
         body: JSON.stringify({
-          customerEmail: values.get("email"),
-          customerName: values.get("name"),
-          providerProfileId: values.get("profile"),
+          ...payload,
+          creationIdempotencyKey: pending.key,
         }),
       });
+      pendingSubmission.current = null;
       router.push(`/consultations/${result.id}/lobby`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Consultation could not be created");

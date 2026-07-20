@@ -1,11 +1,15 @@
-import { initializeWebTelemetry, shutdownWebTelemetry } from "./lib/telemetry";
+import {
+  initializeWebTelemetry,
+  recordFrameworkRequestError,
+  shutdownWebTelemetry,
+} from "./lib/telemetry";
 
-const SHUTDOWN_LISTENERS_KEY = Symbol.for("@transhooter/web.telemetry.shutdown-listeners");
+const REGISTRATION_KEY = Symbol.for("@transhooter/web.telemetry.shutdown-listeners");
 const SHUTDOWN_STARTED_KEY = Symbol.for("@transhooter/web.telemetry.shutdown-started");
 const SHUTDOWN_GRACE_MILLIS = 5_000;
 
 const instrumentationGlobal = globalThis as typeof globalThis & {
-  [SHUTDOWN_LISTENERS_KEY]?: true;
+  [REGISTRATION_KEY]?: true;
   [SHUTDOWN_STARTED_KEY]?: true;
 };
 
@@ -51,13 +55,16 @@ function shutdownBeforeProcessExit(signal: "SIGINT" | "SIGTERM"): void {
 }
 
 export function registerNodeTelemetry(): void {
+  if (process.env.NEXT_RUNTIME !== "nodejs" || instrumentationGlobal[REGISTRATION_KEY]) return;
+  instrumentationGlobal[REGISTRATION_KEY] = true;
   initializeWebTelemetry();
-
-  if (instrumentationGlobal[SHUTDOWN_LISTENERS_KEY]) return;
-  instrumentationGlobal[SHUTDOWN_LISTENERS_KEY] = true;
 
   // Next.js closes its server asynchronously, then calls process.exit. Run first
   // and defer that final exit until the telemetry SDK has shut down or timed out.
   process.prependOnceListener("SIGINT", () => shutdownBeforeProcessExit("SIGINT"));
   process.prependOnceListener("SIGTERM", () => shutdownBeforeProcessExit("SIGTERM"));
+}
+
+export function recordNodeRequestError(error: unknown): void {
+  recordFrameworkRequestError(error);
 }

@@ -1,4 +1,4 @@
-from transhooter_worker.runtime.job import run_worker
+from transhooter_worker.__main__ import main
 
 if __name__ == "__main__":
-    run_worker()
+    main()

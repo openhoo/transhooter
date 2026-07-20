@@ -4,6 +4,7 @@ import {
   beginFinalization,
   beginProvisioning,
   type Consultation,
+  cancelBeforeStart,
   grantCapture,
   joinEligibility,
   type ParticipantSlot,
@@ -105,6 +106,14 @@ describe("consultation domain", () => {
     expect(value.archiveState).toBe("reconciling");
     expect(value.generation).toBe(1);
     expect(value.finalizeDeadlineAt?.toISOString()).toBe("2026-01-01T00:15:00.000Z");
+  });
+
+  it("fences admission when cancellation increments the generation", () => {
+    const cancelled = cancelBeforeStart(consultation(), NOW);
+
+    expect(cancelled.state).toBe("cancelled");
+    expect(cancelled.generation).toBe(1);
+    expect(cancelled.admissionFencedAt).toEqual(NOW);
   });
 
   it("invalidates both consents when an invited preference changes", () => {

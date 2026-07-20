@@ -35,7 +35,6 @@ x-control-worker-env: &control-worker-env
   S3_CREDENTIALS_FILE: /run/secrets/minio-credentials
   INTERNAL_TOKEN_FILE: /run/secrets/internal-control-token
   EGRESS_LAYOUT_SIGNING_KEY_FILE: /run/secrets/egress-layout-signing-key
-  SMTP_URL: smtp://mailpit:1025
 
 x-web-runtime-env: &web-runtime-env
   <<: *otel-env
@@ -50,7 +49,7 @@ x-web-runtime-env: &web-runtime-env
   INTERNAL_TRANSLATION_TOKEN_FILE: /run/secrets/internal-translation-token
   INTERNAL_SPOOL_DRAINER_TOKEN_FILE: /run/secrets/internal-spool-drainer-token
   EGRESS_LAYOUT_SIGNING_KEY_FILE: /run/secrets/egress-layout-signing-key
-  SMTP_URL: smtp://mailpit:1025
+  MAGIC_LINK_SEAL_KEYS_FILE: /run/secrets/magic-link-seal-keys
   NEXT_TELEMETRY_DISABLED: "1"
 
 x-web-runtime-volumes: &web-runtime-volumes
@@ -64,6 +63,7 @@ x-web-runtime-volumes: &web-runtime-volumes
   - ../../.secrets/internal-translation-token:/run/secrets/internal-translation-token:ro
   - ../../.secrets/internal-spool-drainer-token:/run/secrets/internal-spool-drainer-token:ro
   - ../../.secrets/egress-layout-signing-key:/run/secrets/egress-layout-signing-key:ro
+  - ../../.secrets/magic-link-seal-keys:/run/secrets/magic-link-seal-keys:ro
 
 services:
   secrets-init:
@@ -87,35 +87,6 @@ services:
       - spool-data:/var/lib/transhooter/spool
     command: [/bin/sh, -ec, "mkdir -p /var/lib/transhooter/spool && chown 10001:10001 /var/lib/transhooter/spool && chmod 0700 /var/lib/transhooter/spool"]
 
-  rtc-host:
-    image: alpine:3.22.1
-    restart: "no"
-    networks: [backend]
-    environment:
-      RTC_NODE_IP: ${RTC_NODE_IP:-10.254.231.10}
-    volumes: [runtime-config:/runtime]
-    command: [/bin/sh, -ec, "printf '%s\n' \"$$RTC_NODE_IP\" > /runtime/rtc-host.tmp; chmod 0444 /runtime/rtc-host.tmp; mv /runtime/rtc-host.tmp /runtime/rtc-host"]
-
-  config-render:
-    image: alpine:3.22.1
-    user: "0:10001"
-    restart: "no"
-    networks: [backend]
-    depends_on:
-      secrets-init: {condition: service_completed_successfully}
-      rtc-host: {condition: service_completed_successfully}
-    environment:
-      RTC_UDP_PORT_START: ${RTC_UDP_PORT_START:-50000}
-      RTC_UDP_PORT_END: ${RTC_UDP_PORT_END:-60000}
-    volumes:
-      - ../../.secrets/livekit-api-key:/secrets/livekit-api-key:ro
-      - ../../.secrets/livekit-api-secret:/secrets/livekit-api-secret:ro
-      - ../../.secrets/redis-password:/secrets/redis-password:ro
-      - runtime-config:/runtime
-      - ./livekit.yaml:/templates/livekit.yaml:ro
-      - ./egress.yaml:/templates/egress.yaml:ro
-      - ../scripts/render-config.sh:/usr/local/bin/render-config:ro
-    command: [/bin/sh, /usr/local/bin/render-config]
 
   postgres:
     image: postgres:17.5-bookworm
@@ -171,19 +142,6 @@ services:
       timeout: 5s
       retries: 30
 
-  mailpit:
-    image: axllent/mailpit:v1.27.8
-    restart: unless-stopped
-    networks: [backend, edge]
-    ports: ["127.0.0.1:8025:8025"]
-    environment:
-      MP_SMTP_AUTH_ACCEPT_ANY: "1"
-      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
-    healthcheck:
-      test: [CMD, /mailpit, readyz]
-      interval: 5s
-      timeout: 5s
-      retries: 20
 
   minio-bootstrap:
     image: *bootstrap-runtime-image
@@ -211,19 +169,39 @@ services:
   livekit:
     image: livekit/livekit-server:v1.9.2
     restart: unless-stopped
+    user: "0:10001"
     networks:
       backend:
-        ipv4_address: ${RTC_NODE_IP:-10.254.231.10}
+        ipv4_address: ${RTC_BRIDGE_IP:-10.254.231.10}
       edge: {}
     depends_on:
-      config-render: {condition: service_completed_successfully}
+      secrets-init: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
+    environment:
+      RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:-}
+      RTC_UDP_PORT_START: ${RTC_UDP_PORT_START:-50000}
+      RTC_UDP_PORT_END: ${RTC_UDP_PORT_END:-60000}
     ports:
       - "7880:7880"
       - "7881:7881"
       - "${RTC_UDP_PORT_START:-50000}-${RTC_UDP_PORT_END:-60000}:${RTC_UDP_PORT_START:-50000}-${RTC_UDP_PORT_END:-60000}/udp"
-    volumes: [runtime-config:/runtime:ro]
-    command: [--config, /runtime/livekit.yaml]
+    volumes:
+      - ../../.secrets/livekit-api-key:/secrets/livekit-api-key:ro
+      - ../../.secrets/livekit-api-secret:/secrets/livekit-api-secret:ro
+      - ../../.secrets/redis-password:/secrets/redis-password:ro
+      - runtime-config:/runtime
+      - ./livekit.yaml:/templates/livekit.yaml:ro
+      - ./egress.yaml:/templates/egress.yaml:ro
+      - ../scripts/render-config.sh:/usr/local/bin/render-config:ro
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        : "$${RTC_ADVERTISED_IP:?set RTC_ADVERTISED_IP to the externally reachable LiveKit RTC address}"
+        printf '%s\n' "$$RTC_ADVERTISED_IP" > /runtime/rtc-host.tmp
+        chmod 0444 /runtime/rtc-host.tmp
+        mv -f /runtime/rtc-host.tmp /runtime/rtc-host
+        /usr/local/bin/render-config
+        exec /livekit-server --config /runtime/livekit.yaml
     healthcheck:
       test: [CMD, wget, -qO-, http://127.0.0.1:7880/]
       interval: 5s
@@ -241,8 +219,28 @@ services:
       minio-bootstrap: {condition: service_completed_successfully}
     environment:
       EGRESS_CONFIG_FILE: /runtime/egress.yaml
+      RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:-}
+      RTC_UDP_PORT_START: ${RTC_UDP_PORT_START:-50000}
+      RTC_UDP_PORT_END: ${RTC_UDP_PORT_END:-60000}
     group_add: ["10001"]
-    volumes: [runtime-config:/runtime:ro]
+    volumes:
+      - ../../.secrets/livekit-api-key:/secrets/livekit-api-key:ro
+      - ../../.secrets/livekit-api-secret:/secrets/livekit-api-secret:ro
+      - ../../.secrets/redis-password:/secrets/redis-password:ro
+      - ./livekit.yaml:/templates/livekit.yaml:ro
+      - ./egress.yaml:/templates/egress.yaml:ro
+      - ../scripts/render-config.sh:/usr/local/bin/render-config:ro
+    tmpfs:
+      - /runtime:size=1048576,mode=0770,uid=0,gid=0
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        : "$${RTC_ADVERTISED_IP:?set RTC_ADVERTISED_IP to the externally reachable LiveKit RTC address}"
+        printf '%s\n' "$$RTC_ADVERTISED_IP" > /runtime/rtc-host.tmp
+        chmod 0444 /runtime/rtc-host.tmp
+        mv -f /runtime/rtc-host.tmp /runtime/rtc-host
+        /usr/local/bin/render-config
+        exec /entrypoint.sh
     shm_size: 1gb
     cap_drop: [ALL]
     security_opt:
@@ -328,7 +326,7 @@ services:
       DATABASE_URL_FILE: /run/secrets/database-url
       REDIS_URL_FILE: /run/secrets/redis-url
       S3_ENDPOINT: http://minio:9000
-      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
       S3_REGION: eu-central-1
       S3_BUCKET: transhooter
     volumes:
@@ -456,7 +454,7 @@ services:
       - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
-    command: [python, -m, transhooter_worker.runtime, start]
+    command: [python, -m, transhooter_worker, start]
     healthcheck:
       test: [CMD, python, -m, transhooter_worker.runtime.healthcheck]
       interval: 10s
@@ -522,7 +520,6 @@ services:
     depends_on:
       bootstrap-admin: {condition: service_completed_successfully}
       migrate: {condition: service_completed_successfully}
-      mailpit: {condition: service_healthy}
       livekit: {condition: service_healthy}
       language-refresh: {condition: service_completed_successfully}
       egress-ready: {condition: service_completed_successfully}
@@ -578,7 +575,6 @@ services:
     environment:
       BASE_URL: http://app.localhost:3000
       LIVEKIT_URL: ws://livekit:7880
-      MAILPIT_URL: http://mailpit:8025
       E2E_EMPLOYEE_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL}
       EXPECTED_PROFILE: ${PROVIDER_PROFILE:?set PROVIDER_PROFILE}
       EMIT_PROOF_JSON: "true"

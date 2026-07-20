@@ -1,6 +1,7 @@
 FROM oven/bun:1.3.14-debian
 COPY --from=ghcr.io/astral-sh/uv:0.8.3 /uv /uvx /bin/
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_PYTHON=3.13.5 \
     PATH=/workspace/services/translation-worker/.venv/bin:$PATH \
     APP_ENV=test \
     PROVIDER_NETWORK_DISABLED=true \

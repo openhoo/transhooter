@@ -1,6 +1,7 @@
 import { describe, expect, it, mock } from "bun:test";
 import type { Consultation, ParticipantSlot } from "../src/consultations/domain";
 import type { ConsultationRepository, EffectRepository, Transaction } from "../src/ports/index";
+import { deterministicUuid } from "../src/rooms/orchestration-contract";
 import { RoomService, type VerifiedWebhook } from "../src/rooms/service";
 
 const ID = "00000000-0000-4000-8000-000000000001";
@@ -65,18 +66,36 @@ function consultation(overrides: Partial<Consultation> = {}): Consultation {
   };
 }
 
-function webhookFixture(event: VerifiedWebhook) {
+function webhookFixture(
+  event: VerifiedWebhook,
+  options: {
+    resolveEgressEvent?: ConsultationRepository["resolveEgressEvent"];
+    resolveCurrentEgressSubject?: ConsultationRepository["resolveCurrentEgressSubject"];
+  } = {},
+) {
   const value = consultation();
   const save = mock(async () => true);
   const enqueue = mock(async () => undefined);
+  const resolveEgressEvent = mock(
+    options.resolveEgressEvent ??
+      (async () => ({
+        consultationId: ID,
+        generation: 2,
+        roomName: ROOM_NAME,
+      })),
+  );
+  const resolveCurrentEgressSubject =
+    options.resolveCurrentEgressSubject ?? (async () => ({ participantId: ID }));
   const consultations = {
     transaction: async <T>(work: (value: Transaction) => Promise<T>) => work(transaction),
     lock: async () => value,
     save,
-    resolveCurrentEgressSubject: async () => ({ participantId: ID }),
+    resolveCurrentEgressSubject,
+    resolveEgressEvent,
   } as unknown as ConsultationRepository;
+  const acceptInbox = mock(async () => true);
   const effects = {
-    acceptInbox: async () => true,
+    acceptInbox,
     enqueue,
   } as unknown as EffectRepository;
   const service = new RoomService(
@@ -91,7 +110,7 @@ function webhookFixture(event: VerifiedWebhook) {
     { sha256: () => "a".repeat(64) },
   );
 
-  return { service, save, enqueue };
+  return { service, save, enqueue, acceptInbox, resolveEgressEvent };
 }
 
 describe("RoomService webhook fences", () => {
@@ -113,15 +132,15 @@ describe("RoomService webhook fences", () => {
     expect(fixture.save).not.toHaveBeenCalled();
   });
 
-  it("derives the Egress participant from persisted binding", async () => {
+  it("journals participant capture with immutable resource and compensation identities", async () => {
     const fixture = webhookFixture({
-      id: "e",
+      id: "joined-customer",
       consultationId: ID,
       generation: 2,
       occurredAt: NOW,
-      kind: "egress_active",
+      kind: "participant_joined",
       roomName: ROOM_NAME,
-      egressId: "egress-p",
+      identity: OTHER,
       payload: {},
     });
 
@@ -129,63 +148,190 @@ describe("RoomService webhook fences", () => {
 
     expect(fixture.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
-        payload: expect.objectContaining({ participantId: ID }),
+        topic: "orchestration.effect.plan",
+        aggregateId: ID,
+        generation: 2,
+        payload: {
+          consultationId: ID,
+          generation: 2,
+          subjectId: OTHER,
+          kind: "PARTICIPANT_EGRESS",
+          request: {
+            roomName: ROOM_NAME,
+            resourceRoomName: ROOM_NAME,
+            participantIdentity: OTHER,
+            outputPrefix: `v1/meetings/${ID}/media/participants/${OTHER}/2`,
+            segmentedHls: true,
+            resourceGeneration: 2,
+            compensationIntent: "EGRESS_STOP",
+          },
+        },
+      }),
+      transaction,
+    );
+    expect(fixture.save).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves a roomless Egress event from its persisted binding before applying it", async () => {
+    const fixture = webhookFixture({
+      id: "e",
+      occurredAt: NOW,
+      kind: "egress_active",
+      egressId: "egress-p",
+      payload: {},
+    });
+
+    await fixture.service.acceptWebhook(new Uint8Array(), {});
+
+    expect(fixture.resolveEgressEvent).toHaveBeenCalledWith("egress-p", undefined);
+    expect(fixture.acceptInbox).toHaveBeenCalledWith(
+      "livekit",
+      "e",
+      NOW,
+      "a".repeat(64),
+      expect.objectContaining({
+        consultationId: ID,
+        generation: 2,
+        roomName: ROOM_NAME,
+      }),
+      transaction,
+    );
+    expect(fixture.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        aggregateId: ID,
+        generation: 2,
+        payload: expect.objectContaining({ consultationId: ID, participantId: ID }),
       }),
       transaction,
     );
   });
 
-  it("clears a stopped participant Egress binding when publication permission fails", async () => {
-    const value = consultation();
-    const clearParticipantEgressBinding = mock(async () => true);
-    const stop = mock(async () => undefined);
-    const consultations = {
-      get: async () => value,
-      transaction: async <T>(work: (entry: Transaction) => Promise<T>) => work(transaction),
-      lock: async () => value,
-      save: async () => true,
-      clearParticipantEgressBinding,
-    } as unknown as ConsultationRepository;
-    const effects = {
-      enqueue: async () => undefined,
-    } as unknown as EffectRepository;
-    const service = new RoomService(
-      consultations,
-      effects,
+  it("accepts an early composite Egress event and enqueues its null participant subject", async () => {
+    const egressSource = { kind: "room_composite", roomName: ROOM_NAME } as const;
+    const fixture = webhookFixture(
       {
-        updateParticipant: async () => {
-          throw new Error("grant denied");
-        },
-      } as never,
-      {
-        get: async () => null,
-        startParticipant: async () => ({
-          egressId: "egress-new",
-          state: "EGRESS_ACTIVE",
-        }),
-        stop,
-      } as never,
-      {
-        verify: async () => {
-          throw new Error("unused");
-        },
+        id: "early-composite",
+        occurredAt: NOW,
+        kind: "egress_active",
+        roomName: ROOM_NAME,
+        egressId: "early-room-egress",
+        egressSource,
+        payload: {},
       },
-      {} as never,
-      { now: () => NOW },
-      { uuid: () => OTHER },
-      { sha256: () => "a".repeat(64) },
+      {
+        resolveEgressEvent: async () => ({
+          consultationId: ID,
+          generation: 2,
+          roomName: ROOM_NAME,
+          earlySubject: { participantId: null },
+        }),
+        resolveCurrentEgressSubject: async () => null,
+      },
     );
 
-    await expect(service.executeCaptureBarrier(ID, OTHER)).rejects.toThrowError(/grant denied/);
+    await expect(fixture.service.acceptWebhook(new Uint8Array(), {})).resolves.toBe(true);
 
-    expect(stop).toHaveBeenCalledWith("egress-new");
-    expect(clearParticipantEgressBinding).toHaveBeenCalledWith(
-      ID,
-      2,
-      OTHER,
-      "egress-new",
+    expect(fixture.resolveEgressEvent).toHaveBeenCalledWith("early-room-egress", egressSource);
+    expect(fixture.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        topic: "livekit.webhook.verified",
+        payload: expect.objectContaining({
+          kind: "EGRESS_ACTIVE",
+          egressId: "early-room-egress",
+          participantId: null,
+        }),
+      }),
       transaction,
     );
+  });
+
+  it("uses only the early participant identity fenced by repository resolution", async () => {
+    const egressSource = {
+      kind: "participant",
+      roomName: ROOM_NAME,
+      identity: OTHER,
+    } as const;
+    const fixture = webhookFixture(
+      {
+        id: "early-participant",
+        occurredAt: NOW,
+        kind: "egress_active",
+        roomName: ROOM_NAME,
+        egressId: "early-participant-egress",
+        egressSource,
+        payload: {},
+      },
+      {
+        resolveEgressEvent: async () => ({
+          consultationId: ID,
+          generation: 2,
+          roomName: ROOM_NAME,
+          earlySubject: { participantId: OTHER },
+        }),
+        resolveCurrentEgressSubject: async () => null,
+      },
+    );
+
+    await expect(fixture.service.acceptWebhook(new Uint8Array(), {})).resolves.toBe(true);
+    expect(fixture.resolveEgressEvent).toHaveBeenCalledWith(
+      "early-participant-egress",
+      egressSource,
+    );
+    expect(fixture.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        topic: "livekit.webhook.verified",
+        payload: expect.objectContaining({ participantId: OTHER }),
+      }),
+      transaction,
+    );
+  });
+
+  it.each(["no pending match", "ambiguous pending matches"])(
+    "rejects an early Egress event with %s",
+    async () => {
+      const egressSource = { kind: "room_composite", roomName: ROOM_NAME } as const;
+      const fixture = webhookFixture(
+        {
+          id: "unbound-early",
+          occurredAt: NOW,
+          kind: "egress_active",
+          roomName: ROOM_NAME,
+          egressId: "unbound-egress",
+          egressSource,
+          payload: {},
+        },
+        { resolveEgressEvent: async () => null },
+      );
+
+      await expect(fixture.service.acceptWebhook(new Uint8Array(), {})).rejects.toMatchObject({
+        code: "EGRESS_NOT_BOUND",
+      });
+      expect(fixture.resolveEgressEvent).toHaveBeenCalledWith("unbound-egress", egressSource);
+      expect(fixture.acceptInbox).not.toHaveBeenCalled();
+      expect(fixture.enqueue).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a supplied Egress room that conflicts with its nested source binding", async () => {
+    const fixture = webhookFixture({
+      id: "e-mismatch",
+      occurredAt: NOW,
+      kind: "egress_active",
+      roomName: "different-room",
+      egressId: "egress-p",
+      egressSource: { kind: "room_composite", roomName: ROOM_NAME },
+      payload: {},
+    });
+
+    await expect(fixture.service.acceptWebhook(new Uint8Array(), {})).rejects.toMatchObject({
+      code: "INVALID_WEBHOOK",
+    });
+    expect(fixture.resolveEgressEvent).toHaveBeenCalledWith("egress-p", {
+      kind: "room_composite",
+      roomName: ROOM_NAME,
+    });
+    expect(fixture.acceptInbox).not.toHaveBeenCalled();
+    expect(fixture.enqueue).not.toHaveBeenCalled();
   });
 
   it("persists an admission fence and waits for old ten-minute tokens before absence finalization", async () => {
@@ -278,9 +424,8 @@ describe("RoomService webhook fences", () => {
     expect(value.state).toBe("active");
   });
 
-  it("revokes a join made with a pre-fence token without granting capture", async () => {
+  it("journals a pre-fence participant removal in the webhook transaction", async () => {
     const current = consultation({ admissionFencedAt: NOW });
-    const removeParticipant = mock(async () => undefined);
     const enqueue = mock(async () => undefined);
     const repository = {
       transaction: async <T>(work: (entry: Transaction) => Promise<T>) => work(transaction),
@@ -293,7 +438,7 @@ describe("RoomService webhook fences", () => {
         acceptInbox: async () => true,
         enqueue,
       } as unknown as EffectRepository,
-      { removeParticipant } as never,
+      {} as never,
       {} as never,
       {
         verify: async () => ({
@@ -315,20 +460,39 @@ describe("RoomService webhook fences", () => {
 
     await service.acceptWebhook(new Uint8Array(), {});
 
-    expect(removeParticipant).toHaveBeenCalledWith(ROOM_NAME, ID);
-    expect(enqueue).not.toHaveBeenCalled();
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        topic: "orchestration.effect.plan",
+        generation: 2,
+        payload: expect.objectContaining({
+          consultationId: ID,
+          generation: 2,
+          subjectId: deterministicUuid(ID, `participant-remove:2:${ROOM_NAME}:${ID}`),
+          kind: "PARTICIPANT_REMOVE",
+          request: {
+            roomName: ROOM_NAME,
+            resourceRoomName: ROOM_NAME,
+            participantIdentity: ID,
+            resourceGeneration: 2,
+            compensationIntent: "REMOVE_PARTICIPANT",
+          },
+        }),
+      }),
+      transaction,
+    );
   });
-  it("revokes a stale-generation join from the room named by the event", async () => {
+
+  it("journals stale-generation removal against the event room as current-generation cleanup", async () => {
     const staleRoom = "00000000-0000-4000-8000-000000000099";
-    const removeParticipant = mock(async () => undefined);
+    const enqueue = mock(async () => undefined);
     const current = consultation();
     const service = new RoomService(
       {
         transaction: async <T>(work: (entry: Transaction) => Promise<T>) => work(transaction),
         lock: async () => current,
       } as unknown as ConsultationRepository,
-      { acceptInbox: async () => true } as unknown as EffectRepository,
-      { removeParticipant } as never,
+      { acceptInbox: async () => true, enqueue } as unknown as EffectRepository,
+      {} as never,
       {} as never,
       {
         verify: async () => ({
@@ -350,64 +514,21 @@ describe("RoomService webhook fences", () => {
 
     await service.acceptWebhook(new Uint8Array(), {});
 
-    expect(removeParticipant).toHaveBeenCalledWith(staleRoom, ID);
-  });
-
-  it("rechecks the admission fence before persisting a capture grant", async () => {
-    let value = consultation();
-    const clearParticipantEgressBinding = mock(async () => true);
-    const stop = mock(async () => undefined);
-    const updateParticipant = mock(async (input: { canPublish: boolean }) => {
-      if (input.canPublish) {
-        value = { ...value, admissionFencedAt: NOW };
-      }
-    });
-    const service = new RoomService(
-      {
-        get: async () => value,
-        transaction: async <T>(work: (entry: Transaction) => Promise<T>) => work(transaction),
-        lock: async () => value,
-        save: async (next: Consultation) => {
-          value = next;
-          return true;
-        },
-        clearParticipantEgressBinding,
-      } as unknown as ConsultationRepository,
-      { enqueue: async () => undefined } as unknown as EffectRepository,
-      { updateParticipant } as never,
-      {
-        get: async () => null,
-        startParticipant: async () => ({
-          egressId: "egress-new",
-          state: "EGRESS_ACTIVE",
+    expect(enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        topic: "orchestration.effect.plan",
+        generation: 2,
+        payload: expect.objectContaining({
+          generation: 2,
+          kind: "PARTICIPANT_REMOVE",
+          request: expect.objectContaining({
+            roomName: staleRoom,
+            resourceRoomName: staleRoom,
+            participantIdentity: ID,
+            resourceGeneration: 1,
+          }),
         }),
-        stop,
-      } as never,
-      {
-        verify: async () => {
-          throw new Error("unused");
-        },
-      },
-      {} as never,
-      { now: () => NOW },
-      { uuid: () => OTHER },
-      { sha256: () => "a".repeat(64) },
-    );
-
-    await expect(service.executeCaptureBarrier(ID, OTHER)).rejects.toThrowError(
-      /FENCED_GENERATION/,
-    );
-
-    expect(updateParticipant).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({ identity: OTHER, canPublish: false }),
-    );
-    expect(stop).toHaveBeenCalledWith("egress-new");
-    expect(clearParticipantEgressBinding).toHaveBeenCalledWith(
-      ID,
-      2,
-      OTHER,
-      "egress-new",
+      }),
       transaction,
     );
   });

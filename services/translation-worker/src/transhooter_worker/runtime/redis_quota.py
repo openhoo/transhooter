@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import math
-import time
+import secrets
 from urllib.parse import unquote, urlparse
 
-_MINUTE_MS = 60_000
+_AUDIO_SAMPLES_PER_SECOND = 16_000
 _QUOTA_HEADROOM = 0.8
 _ACTIVE_DIMENSIONS = {"streams", "sessions"}
 
@@ -33,11 +32,16 @@ def _minute_dimensions(
 
 
 def _reserved_units(dimension: str, amount: int) -> int:
-    if dimension == "characters_minute":
+    if dimension in {"characters_minute", "audio_seconds_minute"}:
         return amount
-    if dimension == "audio_seconds_minute":
-        return max(1, math.ceil(amount / 16_000))
     return 1
+
+
+def _capacity_units(dimension: str, capacity: int) -> int:
+    limit = _headroom_limit(capacity)
+    if dimension == "audio_seconds_minute":
+        return limit * _AUDIO_SAMPLES_PER_SECOND
+    return limit
 
 
 def _quota_key(
@@ -53,49 +57,64 @@ def _quota_key(
 
 class RedisQuotaGate:
     _ACTIVE_RESERVATION_SCRIPT = """
-local now = tonumber(ARGV[1])
-local expiry = tonumber(ARGV[2])
-local member = ARGV[3]
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local ttl = tonumber(ARGV[1])
+local expiry = now + ttl
+local owner = ARGV[2]
 
 for index = 1, #KEYS do
     redis.call('ZREMRANGEBYSCORE', KEYS[index], '-inf', now)
-    if not redis.call('ZSCORE', KEYS[index], member)
-        and redis.call('ZCARD', KEYS[index]) >= tonumber(ARGV[index + 3]) then
+    if not redis.call('ZSCORE', KEYS[index], owner)
+        and redis.call('ZCARD', KEYS[index]) >= tonumber(ARGV[index + 2]) then
         return 0
     end
 end
 
 for index = 1, #KEYS do
-    redis.call('ZADD', KEYS[index], expiry, member)
-    redis.call('PEXPIRE', KEYS[index], expiry - now)
+    redis.call('ZADD', KEYS[index], expiry, owner)
+    local latest = redis.call('ZRANGE', KEYS[index], -1, -1, 'WITHSCORES')
+    redis.call('PEXPIRE', KEYS[index], math.ceil(tonumber(latest[2]) - now))
 end
 return 1
 """
     _ACTIVE_RELEASE_SCRIPT = """
+local owner = ARGV[1]
 for index = 1, #KEYS do
-    redis.call('ZREM', KEYS[index], ARGV[1])
+    redis.call('ZREM', KEYS[index], owner)
 end
 return 1
 """
     _WINDOW_RESERVATION_SCRIPT = """
+local redis_time = redis.call('TIME')
+local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local bucket = tostring(math.floor(now / 60000))
+local expires_in = 60000 - (now % 60000)
+
 for index = 1, #KEYS do
-    local argument_offset = (index - 1) * 3
+    local argument_offset = (index - 1) * 2
     local amount = tonumber(ARGV[argument_offset + 1])
-    local limit = tonumber(ARGV[argument_offset + 3])
-    local current = tonumber(redis.call('GET', KEYS[index]) or '0')
+    local limit = tonumber(ARGV[argument_offset + 2])
+    local stored_bucket = redis.call('HGET', KEYS[index], 'bucket')
+    local current = 0
+    if stored_bucket == bucket then
+        current = tonumber(redis.call('HGET', KEYS[index], 'amount') or '0')
+    end
     if current + amount > limit then
         return 0
     end
 end
 
 for index = 1, #KEYS do
-    local argument_offset = (index - 1) * 3
-    local amount = ARGV[argument_offset + 1]
-    local expiry_ms = ARGV[argument_offset + 2]
-    local total = redis.call('INCRBY', KEYS[index], amount)
-    if total == tonumber(amount) then
-        redis.call('PEXPIRE', KEYS[index], expiry_ms)
+    local argument_offset = (index - 1) * 2
+    local amount = tonumber(ARGV[argument_offset + 1])
+    local stored_bucket = redis.call('HGET', KEYS[index], 'bucket')
+    if stored_bucket == bucket then
+        redis.call('HINCRBY', KEYS[index], 'amount', amount)
+    else
+        redis.call('HSET', KEYS[index], 'bucket', bucket, 'amount', amount)
     end
+    redis.call('PEXPIRE', KEYS[index], expires_in)
 end
 
 return 1
@@ -117,6 +136,7 @@ return 1
         self._account = account
         self._region = region
         self._limits = limits
+        self._active_owner_tokens: dict[tuple[str, str], str] = {}
 
     async def __call__(self, stage: str, amount: int) -> None:
         is_start_reservation = stage.endswith("_start")
@@ -129,7 +149,6 @@ return 1
         if not dimensions:
             return
 
-        minute_bucket = str(int(time.time() * 1000) // _MINUTE_MS)
         keys = [
             _quota_key(
                 self._provider,
@@ -137,7 +156,7 @@ return 1
                 self._region,
                 base_stage,
                 dimension,
-                minute_bucket,
+                "window-v2",
             )
             for dimension, _ in dimensions
         ]
@@ -146,8 +165,7 @@ return 1
             arguments.extend(
                 (
                     str(_reserved_units(dimension, amount)),
-                    str(_MINUTE_MS),
-                    str(_headroom_limit(capacity)),
+                    str(_capacity_units(dimension, capacity)),
                 )
             )
         if not await self._reserve(keys, arguments):
@@ -166,7 +184,12 @@ return 1
         ]
         if not dimensions:
             return
-        now_ms = int(time.time() * 1000)
+        lease_key = (stage, reservation_id)
+        owner = self._active_owner_tokens.get(lease_key)
+        created_owner = owner is None
+        if owner is None:
+            owner = secrets.token_urlsafe(32)
+            self._active_owner_tokens[lease_key] = owner
         keys = [
             _quota_key(
                 self._provider,
@@ -182,16 +205,21 @@ return 1
             self._ACTIVE_RESERVATION_SCRIPT,
             keys,
             [
-                str(now_ms),
-                str(now_ms + ttl_ms),
-                reservation_id,
+                str(ttl_ms),
+                owner,
                 *(str(_headroom_limit(capacity)) for _, capacity in dimensions),
             ],
         )
+        if not accepted and created_owner:
+            self._active_owner_tokens.pop(lease_key, None)
         if not accepted:
             raise RuntimeError(f"provider active quota rejected: {stage}")
 
     async def release_active(self, stage: str, reservation_id: str) -> None:
+        lease_key = (stage, reservation_id)
+        owner = self._active_owner_tokens.get(lease_key)
+        if owner is None:
+            return
         keys = [
             _quota_key(
                 self._provider,
@@ -204,8 +232,8 @@ return 1
             for dimension in self._limits.get(stage, {})
             if dimension in _ACTIVE_DIMENSIONS
         ]
-        if keys:
-            await self._eval(self._ACTIVE_RELEASE_SCRIPT, keys, [reservation_id])
+        if keys and await self._eval(self._ACTIVE_RELEASE_SCRIPT, keys, [owner]):
+            self._active_owner_tokens.pop(lease_key, None)
 
     async def _eval(self, script: str, keys: list[str], arguments: list[str]) -> bool:
         return (

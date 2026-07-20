@@ -30,15 +30,58 @@ type RefinementOverride = {
 
 const nonNull = { not: { type: "null" } };
 const terminalErrorConstraints: JsonObject = {
-  if: { properties: { outcome: { const: "failed" } }, required: ["outcome"] },
-  // biome-ignore lint/suspicious/noThenProperty: Draft 2020-12 requires the `then` keyword.
-  then: { properties: { error: nonNull }, required: ["error"] },
-  else: { properties: { error: { type: "null" } }, required: ["error"] },
+  allOf: [
+    {
+      if: { properties: { outcome: { const: "failed" } }, required: ["outcome"] },
+      // biome-ignore lint/suspicious/noThenProperty: Draft 2020-12 requires the `then` keyword.
+      then: {
+        properties: {
+          error: {
+            allOf: [
+              nonNull,
+              {
+                not: {
+                  properties: { kind: { const: "cancelled" } },
+                  required: ["kind"],
+                },
+              },
+            ],
+          },
+        },
+        required: ["error"],
+      },
+    },
+    {
+      if: { properties: { outcome: { const: "succeeded" } }, required: ["outcome"] },
+      // biome-ignore lint/suspicious/noThenProperty: Draft 2020-12 requires the `then` keyword.
+      then: { properties: { error: { type: "null" } }, required: ["error"] },
+    },
+    {
+      if: { properties: { outcome: { const: "cancelled" } }, required: ["outcome"] },
+      // biome-ignore lint/suspicious/noThenProperty: Draft 2020-12 requires the `then` keyword.
+      then: {
+        properties: {
+          error: {
+            anyOf: [
+              { type: "null" },
+              {
+                properties: { kind: { const: "cancelled" } },
+                required: ["kind"],
+              },
+            ],
+          },
+        },
+        required: ["error"],
+      },
+    },
+  ],
 };
 const terminalRuntimeRefinements = [
   "error.attemptId must equal attemptId",
-  "retryDecision.previousAttemptId must be null or equal attemptId",
-  "retry action requires retryDecision.previousAttemptId to equal attemptId",
+  "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+  "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+  "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+  "retries require a retryable failed provider error",
   "retryOfAttemptId must differ from attemptId",
 ] as const;
 
@@ -142,8 +185,10 @@ export const REFINEMENT_OVERRIDES: Readonly<Record<string, RefinementOverride>> 
     },
     runtimeOnly: [
       "error.attemptId must equal attemptId",
-      "retryDecision.previousAttemptId must be null or equal attemptId",
-      "retry action requires retryDecision.previousAttemptId to equal attemptId",
+      "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+      "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+      "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+      "retries require a retryable failed provider error",
       "retryOfAttemptId must differ from attemptId",
       "occurredAtMs must not precede startedAtMs",
       "rawReferences ordinals must be unique",

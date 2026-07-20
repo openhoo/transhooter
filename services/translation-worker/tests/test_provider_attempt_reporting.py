@@ -18,9 +18,12 @@ from transhooter_worker.adapters.spool import EncryptedSpool, deterministic_room
 from transhooter_worker.application.session import DirectionSession, DirectionSpec
 from transhooter_worker.domain.models import (
     AudioChunk,
+    ErrorKind,
     OperationTerminal,
     Outcome,
+    ProviderError,
     RetryAction,
+    RetryAdvice,
     RetryDecision,
     SampleRange,
     SessionTerminal,
@@ -121,6 +124,137 @@ def spool(tmp_path: Path) -> EncryptedSpool:
         "v1",
         capacity_probe=deterministic_roomy_capacity,
     )
+
+
+def provider_error(
+    attempt_id: UUID,
+    *,
+    kind: ErrorKind = ErrorKind.RATE_LIMIT,
+    advice: RetryAdvice = RetryAdvice.RETRY_AFTER,
+) -> ProviderError:
+    return ProviderError(
+        kind,
+        "operation",
+        advice,
+        "fixture_error",
+        None,
+        250 if advice is RetryAdvice.RETRY_AFTER else None,
+        attempt_id,
+        (FIXTURE_REF,),
+        "fixture error",
+    )
+
+
+def test_provider_terminal_outcomes_reject_crossed_error_and_retry_states() -> None:
+    attempt_id = uuid4()
+    stop = RetryDecision(RetryAction.STOP, None, "terminal", None)
+    retry = RetryDecision(RetryAction.RETRY, 250, "retryable", attempt_id)
+
+    with pytest.raises(ValueError, match="cannot carry an error"):
+        OperationTerminal(
+            uuid4(),
+            uuid4(),
+            attempt_id,
+            Outcome.SUCCEEDED,
+            provider_error(attempt_id),
+            stop,
+            0,
+            0,
+            0,
+            Transport.HTTP,
+            (FIXTURE_REF,),
+            "fixture",
+        )
+    with pytest.raises(ValueError, match="require a non-cancellation error"):
+        OperationTerminal(
+            uuid4(),
+            uuid4(),
+            attempt_id,
+            Outcome.FAILED,
+            None,
+            stop,
+            0,
+            0,
+            0,
+            Transport.HTTP,
+            (FIXTURE_REF,),
+            "fixture",
+        )
+    with pytest.raises(ValueError, match="cannot carry retry advice"):
+        OperationTerminal(
+            uuid4(),
+            uuid4(),
+            attempt_id,
+            Outcome.SUCCEEDED,
+            None,
+            retry,
+            0,
+            0,
+            0,
+            Transport.HTTP,
+            (FIXTURE_REF,),
+            "fixture",
+        )
+    with pytest.raises(ValueError, match="retryable failed provider error"):
+        OperationTerminal(
+            uuid4(),
+            uuid4(),
+            attempt_id,
+            Outcome.FAILED,
+            provider_error(
+                attempt_id,
+                kind=ErrorKind.AUTHENTICATION,
+                advice=RetryAdvice.UNSPECIFIED,
+            ),
+            retry,
+            0,
+            0,
+            0,
+            Transport.HTTP,
+            (FIXTURE_REF,),
+            "fixture",
+        )
+
+    with pytest.raises(ValueError, match="only a cancellation error"):
+        OperationTerminal(
+            uuid4(),
+            uuid4(),
+            attempt_id,
+            Outcome.CANCELLED,
+            provider_error(attempt_id),
+            stop,
+            0,
+            0,
+            0,
+            Transport.HTTP,
+            (FIXTURE_REF,),
+            "fixture",
+        )
+    terminal = OperationTerminal(
+        uuid4(),
+        uuid4(),
+        attempt_id,
+        Outcome.FAILED,
+        provider_error(attempt_id),
+        retry,
+        0,
+        0,
+        0,
+        Transport.HTTP,
+        (FIXTURE_REF,),
+        "fixture",
+    )
+    assert terminal.retry is retry
+
+
+def test_retry_decision_requires_delay_and_attempt_link_only_for_retries() -> None:
+    with pytest.raises(ValueError, match="only retries have a delay"):
+        RetryDecision(RetryAction.RETRY, None, "missing delay", uuid4())
+    with pytest.raises(ValueError, match="terminal attempt link"):
+        RetryDecision(RetryAction.RETRY, 1, "missing link", None)
+    with pytest.raises(ValueError, match="only retries have a delay"):
+        RetryDecision(RetryAction.STOP, 1, "unexpected delay", None)
+    assert RetryAction.STOP.value == "do_not_retry"
 
 
 @pytest.mark.asyncio
@@ -261,8 +395,8 @@ async def test_retry_decision_maps_delay_to_absolute_time_and_preserves_links(
         uuid4(),
         uuid4(),
         current_attempt,
-        Outcome.SUCCEEDED,
-        None,
+        Outcome.FAILED,
+        provider_error(current_attempt),
         decision,
         0,
         0,

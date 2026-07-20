@@ -12,7 +12,7 @@ COPY --chown=transhooter:transhooter packages/telemetry/package.json packages/te
 COPY --chown=transhooter:transhooter packages/server-core/package.json packages/server-core/package.json
 COPY --chown=transhooter:transhooter tests/e2e/package.json tests/e2e/package.json
 COPY --chown=transhooter:transhooter tests/failure-smoke/package.json tests/failure-smoke/package.json
-RUN --mount=type=cache,id=bun-e2e-v1,target=/root/.bun/install/cache \
+RUN --mount=type=cache,id=bun-harness-v1,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --filter @transhooter/e2e
 COPY --chown=transhooter:transhooter tests/e2e/smoke-consultation.mjs tests/e2e/smoke-consultation.mjs
 COPY --chown=transhooter:transhooter tests/e2e/harness-contracts.mjs tests/e2e/harness-contracts.mjs

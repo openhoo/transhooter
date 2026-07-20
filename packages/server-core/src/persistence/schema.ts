@@ -1,16 +1,25 @@
+import {
+  ARCHIVE_STATE_VALUES,
+  CONSULTATION_STATE_VALUES,
+  EXTERNAL_EFFECT_STATE_VALUES,
+  MAGIC_LINK_PURPOSE_VALUES,
+  PARTICIPANT_ROLE_VALUES,
+  STAFF_ROLE_VALUES,
+  TRANSPORT_KIND_VALUES,
+} from "@transhooter/contracts";
 import { pgTable, unique, check, uuid, text, boolean, integer, timestamp, foreignKey, jsonb, bigint, index, bigserial, numeric, uniqueIndex, primaryKey, pgEnum, customType } from "drizzle-orm/pg-core"
 import { sql } from "drizzle-orm"
 
 const bytea = customType<{ data: Uint8Array; driverData: Buffer }>({ dataType: () => "bytea" })
 
-export const archiveState = pgEnum("archive_state", ['pending', 'recording', 'reconciling', 'complete', 'incomplete', 'deleting', 'deleted'])
-export const consultationState = pgEnum("consultation_state", ['invited', 'ready', 'active', 'finalizing', 'ended', 'cancelled', 'deleted'])
-export const externalEffectState = pgEnum("external_effect_state", ['planned', 'calling', 'applied', 'compensating', 'done', 'failed'])
-export const magicLinkPurpose = pgEnum("magic_link_purpose", ['sign_in', 'consultation_invite', 'archive_delete_reauth'])
-export const participantRole = pgEnum("participant_role", ['employee', 'customer'])
-export const staffRole = pgEnum("staff_role", ['employee', 'admin'])
+export const archiveState = pgEnum("archive_state", ARCHIVE_STATE_VALUES)
+export const consultationState = pgEnum("consultation_state", CONSULTATION_STATE_VALUES)
+export const externalEffectState = pgEnum("external_effect_state", EXTERNAL_EFFECT_STATE_VALUES)
+export const magicLinkPurpose = pgEnum("magic_link_purpose", MAGIC_LINK_PURPOSE_VALUES)
+export const participantRole = pgEnum("participant_role", PARTICIPANT_ROLE_VALUES)
+export const staffRole = pgEnum("staff_role", STAFF_ROLE_VALUES)
 export const terminalOutcome = pgEnum("terminal_outcome", ['succeeded', 'failed', 'cancelled', 'degraded', 'unknown'])
-export const transportKind = pgEnum("transport_kind", ['http', 'websocket', 'grpc'])
+export const transportKind = pgEnum("transport_kind", TRANSPORT_KIND_VALUES)
 
 
 export const providerProfiles = pgTable("provider_profiles", {
@@ -82,6 +91,10 @@ export const consultations = pgTable("consultations", {
 	bothAbsentSince: timestamp("both_absent_since", { withTimezone: true, mode: 'date' }),
 	admissionFencedAt: timestamp("admission_fenced_at", { withTimezone: true, mode: 'date' }),
 	effectGeneration: integer("effect_generation").default(0).notNull(),
+	employeeUserId: uuid("employee_user_id"),
+	creationIdempotencyKey: text("creation_idempotency_key"),
+	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
+	presenceEpoch: bigint("presence_epoch", { mode: "number" }).default(0).notNull(),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'date' }).notNull(),
 	updatedAt: timestamp("updated_at", { withTimezone: true, mode: 'date' }).notNull(),
 	deletedAt: timestamp("deleted_at", { withTimezone: true, mode: 'date' }),
@@ -91,10 +104,18 @@ export const consultations = pgTable("consultations", {
 			foreignColumns: [providerProfileRevisions.profileId, providerProfileRevisions.revision],
 			name: "consultations_provider_profile_id_provider_profile_revisio_fkey"
 		}),
+	foreignKey({
+			columns: [table.employeeUserId],
+			foreignColumns: [users.id],
+			name: "consultations_employee_user_id_fkey"
+		}),
 	unique("consultations_room_name_key").on(table.roomName),
 	unique("consultations_worker_identity_key").on(table.workerIdentity),
+	unique("consultations_employee_user_id_creation_idempotency_key_key").on(table.employeeUserId, table.creationIdempotencyKey),
 	check("consultations_generation_check", sql`generation >= 0`),
 	check("consultations_effect_generation_check", sql`effect_generation >= 0`),
+	check("consultations_presence_epoch_check", sql`presence_epoch >= 0`),
+	check("consultations_creation_idempotency_key_scope_check", sql`(employee_user_id IS NULL) = (creation_idempotency_key IS NULL)`),
 	check("consultations_check", sql`(provider_selection IS NULL) = (snapshot_hash IS NULL)`),
 	check("consultations_check1", sql`(state = 'invited'::consultation_state) OR (room_name IS NOT NULL) OR (state = ANY (ARRAY['cancelled'::consultation_state, 'deleted'::consultation_state]))`),
 ]);
@@ -197,6 +218,8 @@ export const magicLinks = pgTable("magic_links", {
 	consumedAt: timestamp("consumed_at", { withTimezone: true, mode: 'date' }),
 	revokedAt: timestamp("revoked_at", { withTimezone: true, mode: 'date' }),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'date' }).notNull(),
+	sealedRawToken: text("sealed_raw_token"),
+	sealedTokenKeyId: text("sealed_token_key_id"),
 }, (table) => [
 	foreignKey({
 			columns: [table.userId],
@@ -215,6 +238,7 @@ export const magicLinks = pgTable("magic_links", {
 		}),
 	unique("magic_links_token_hash_key").on(table.tokenHash),
 	check("magic_links_check", sql`(purpose <> 'archive_delete_reauth'::magic_link_purpose) OR ((user_id IS NOT NULL) AND (consultation_id IS NOT NULL) AND (session_id IS NOT NULL))`),
+	check("magic_links_sealed_token_pair_check", sql`(sealed_raw_token IS NULL) = (sealed_token_key_id IS NULL)`),
 ]);
 
 export const pendingExchanges = pgTable("pending_exchanges", {
@@ -344,6 +368,7 @@ export const workerCheckpoints = pgTable("worker_checkpoints", {
 		}),
 	unique("worker_checkpoints_direction_watermarks_key").on(table.consultationId, table.workerEpoch, table.sourceParticipantId, table.destinationParticipantId, table.acceptedInputSequence, table.acceptedInput, table.receivedOutput, table.emittedOutput),
 	unique("worker_checkpoints_checkpoint_hash_key").on(table.checkpointHash),
+	uniqueIndex("worker_checkpoints_terminal_direction_unique").using("btree", table.consultationId.asc().nullsLast().op("uuid_ops"), table.generation.asc().nullsLast().op("int4_ops"), table.workerId.asc().nullsLast().op("uuid_ops"), table.workerEpoch.asc().nullsLast().op("int8_ops"), table.sourceParticipantId.asc().nullsLast().op("uuid_ops"), table.destinationParticipantId.asc().nullsLast().op("uuid_ops")).where(sql`terminal`),
 	check("worker_checkpoints_accepted_input_sequence_check", sql`accepted_input_sequence >= 0`),
 	check("worker_checkpoints_accepted_input_check", sql`high_watermark >= 0`),
 	check("worker_checkpoints_received_output_check", sql`received_output >= 0`),
@@ -377,6 +402,7 @@ export const externalEffects = pgTable("external_effects", {
 	check("external_effects_attempts_check", sql`attempts >= 0`),
 	check("external_effects_check", sql`(request_bytes IS NULL) = (request_hash IS NULL)`),
 	check("external_effects_check1", sql`(state = 'planned'::external_effect_state) OR (request_hash IS NOT NULL)`),
+	check("external_effects_egress_intent_redacted_check", sql`effect_kind NOT IN ('ROOM_COMPOSITE_EGRESS', 'PARTICIPANT_EGRESS') OR request_bytes IS NULL OR lower(convert_from(request_bytes, 'UTF8')) !~ '"(accesskey|secret|custombaseurl|signature|authorization|token|filenameprefix|playlistname|liveplaylistname)"'`),
 ]);
 
 export const effectCompensationAttempts = pgTable("effect_compensation_attempts", {
@@ -476,6 +502,7 @@ export const archives = pgTable("archives", {
 export const expectedArchiveArtifacts = pgTable("expected_archive_artifacts", {
 	id: uuid().primaryKey().notNull(),
 	archiveId: uuid("archive_id").notNull(),
+	effectId: uuid("effect_id"),
 	profileId: uuid("profile_id").notNull(),
 	profileRevision: integer("profile_revision").notNull(),
 	objectClass: text("object_class").notNull(),
@@ -498,6 +525,11 @@ export const expectedArchiveArtifacts = pgTable("expected_archive_artifacts", {
 			name: "expected_archive_artifacts_archive_id_fkey"
 		}),
 	foreignKey({
+			columns: [table.effectId],
+			foreignColumns: [externalEffects.id],
+			name: "expected_archive_artifacts_effect_id_fkey"
+		}),
+	foreignKey({
 			columns: [table.profileId, table.profileRevision],
 			foreignColumns: [providerProfileRevisions.profileId, providerProfileRevisions.revision],
 			name: "expected_archive_artifacts_profile_id_profile_revision_fkey"
@@ -508,6 +540,7 @@ export const expectedArchiveArtifacts = pgTable("expected_archive_artifacts", {
 			name: "expected_fulfilled_object_fk"
 		}),
 	unique("expected_archive_artifacts_archive_id_object_class_causal_k_key").on(table.archiveId, table.objectClass, table.causalKey),
+	unique("expected_archive_artifacts_effect_id_key").on(table.effectId),
 	check("expected_archive_artifacts_check", sql`((sample_start IS NULL) AND (sample_end IS NULL)) OR ((sample_start >= 0) AND (sample_end > sample_start))`),
 	check("expected_archive_artifacts_check1", sql`((segment_start IS NULL) AND (segment_end IS NULL)) OR ((segment_start >= 0) AND (segment_end > segment_start))`),
 ]);

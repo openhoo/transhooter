@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "bun failure-smoke.mjs",
-    "test:contracts": "bun test harness-contracts.test.mjs"
+    "test:contracts": "bun test harness-contracts.test.mjs && ./wrapper-contracts.test.sh"
   },
   "dependencies": {
     "playwright": "1.55.0",

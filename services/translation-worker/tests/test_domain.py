@@ -49,6 +49,27 @@ def test_retry_never_replays_emitted_output() -> None:
     assert policy.decide(error, 1, 1, 0, 1, 0.5).action is RetryAction.DEGRADE
 
 
+def test_cancelled_provider_work_is_never_retried_or_degraded() -> None:
+    attempt = uuid4()
+    error = ProviderError(
+        ErrorKind.CANCELLED,
+        "operation",
+        RetryAdvice.NEVER,
+        None,
+        None,
+        None,
+        attempt,
+        (),
+        "cancelled",
+    )
+
+    decision = FrozenRetryPolicy(3, 100, 1000).decide(error, 1, 1, 1, 1, 0.5)
+
+    assert decision.action is RetryAction.STOP
+    assert decision.delay_ms is None
+    assert decision.previous_attempt_id is None
+
+
 def test_pathological_text_splits_on_sentence_boundaries() -> None:
     text = ("a" * 2000) + ". " + ("b" * 2500) + ". " + ("c" * 100)
     pieces = split_text(text, 4500)

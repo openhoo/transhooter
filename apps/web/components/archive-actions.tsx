@@ -251,6 +251,8 @@ export function ArchiveAdminActions({
   const keepHoldRef = useRef<HTMLButtonElement>(null);
   const releaseTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
   const restoreHoldTrigger = useRef<string | null>(null);
+  const feedbackRef = useRef<HTMLDivElement>(null);
+  const focusDestructiveSuccess = useRef(false);
 
   useEffect(() => {
     if (confirmingHoldId) {
@@ -263,6 +265,13 @@ export function ArchiveAdminActions({
       restoreHoldTrigger.current = null;
     }
   }, [confirmingHoldId]);
+  useEffect(() => {
+    if (feedback?.kind !== "status" || !focusDestructiveSuccess.current) {
+      return;
+    }
+    focusDestructiveSuccess.current = false;
+    feedbackRef.current?.focus();
+  }, [feedback]);
 
   async function requestReauth() {
     setBusyAction("reauth");
@@ -304,6 +313,7 @@ export function ArchiveAdminActions({
       if (action === "delete") {
         setDeleteAcknowledged(false);
         setDeleteReason("");
+        focusDestructiveSuccess.current = true;
       }
       router.refresh();
       setFeedback({
@@ -337,6 +347,7 @@ export function ArchiveAdminActions({
         }),
       });
       setConfirmingHoldId(null);
+      focusDestructiveSuccess.current = true;
       router.refresh();
       setFeedback({
         kind: "status",
@@ -515,6 +526,8 @@ export function ArchiveAdminActions({
 
       {feedback && (
         <div
+          ref={feedbackRef}
+          tabIndex={-1}
           className={feedback.kind === "error" ? "error" : "notice"}
           id="archive-action-feedback"
           role={feedback.kind === "error" ? "alert" : "status"}

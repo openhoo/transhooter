@@ -18,6 +18,10 @@ class RecordingS3Client:
         self.aborted: list[str] = []
         self.multipart: dict[str, Any] = {}
         self.completion_error: ClientError | None = None
+        self.active_uploads: dict[str, str] = {}
+        self.next_upload = 1
+        self.completion_calls = 0
+        self.upload_calls: list[tuple[str, int]] = []
 
     def put_object(self, **kwargs: Any) -> dict[str, str]:
         self.objects[(kwargs["Key"], "v1")] = (
@@ -45,7 +49,18 @@ class RecordingS3Client:
     def create_multipart_upload(self, **kwargs: Any) -> dict[str, str]:
         self.multipart = kwargs
         self.parts[kwargs["Key"]] = {}
-        return {"UploadId": "upload-1"}
+        upload_id = f"upload-{self.next_upload}"
+        self.next_upload += 1
+        self.active_uploads[upload_id] = kwargs["Key"]
+        return {"UploadId": upload_id}
+
+    def list_multipart_uploads(self, **_: Any) -> dict[str, Any]:
+        return {
+            "Uploads": [
+                {"Key": key, "UploadId": upload_id}
+                for upload_id, key in self.active_uploads.items()
+            ]
+        }
 
     def list_parts(self, **kwargs: Any) -> dict[str, list[dict[str, Any]]]:
         return {
@@ -62,15 +77,18 @@ class RecordingS3Client:
 
     def upload_part(self, **kwargs: Any) -> dict[str, str]:
         part_number = kwargs["PartNumber"]
+        self.upload_calls.append((str(kwargs["Key"]), int(part_number)))
         etag = f"etag-{part_number}"
+        checksum = str(kwargs["ChecksumCRC64NVME"])
         self.parts[kwargs["Key"]][part_number] = (
             bytes(kwargs["Body"]),
             etag,
-            "part-crc",
+            checksum,
         )
-        return {"ETag": etag, "ChecksumCRC64NVME": "part-crc"}
+        return {"ETag": etag, "ChecksumCRC64NVME": checksum}
 
     def complete_multipart_upload(self, **kwargs: Any) -> dict[str, str]:
+        self.completion_calls += 1
         key = kwargs["Key"]
         uploaded_parts = self.parts[key]
         body = b"".join(uploaded_parts[number][0] for number in sorted(uploaded_parts))
@@ -80,6 +98,7 @@ class RecordingS3Client:
             "crc-multi",
             self.multipart["ContentType"],
         )
+        self.active_uploads.pop(str(kwargs["UploadId"]), None)
         if self.completion_error is not None:
             raise self.completion_error
         return {"VersionId": "v2", "ChecksumCRC64NVME": "crc-multi"}
@@ -92,7 +111,9 @@ class RecordingS3Client:
         }
 
     def abort_multipart_upload(self, **kwargs: Any) -> None:
-        self.aborted.append(kwargs["UploadId"])
+        upload_id = str(kwargs["UploadId"])
+        self.aborted.append(upload_id)
+        self.active_uploads.pop(upload_id, None)
 
 
 def archive_client(
@@ -151,6 +172,157 @@ def test_archive_multipart_persists_parts_and_verifies(
     assert record.version_id == "v2"
     assert archive.verify(record)
     assert len(client.parts[key]) == 3
+    assert archive._db is not None
+    intended = archive._db.execute(
+        """
+        SELECT part_number, byte_start, byte_end, size, checksum
+        FROM multipart_parts
+        WHERE key = ?
+        ORDER BY part_number
+        """,
+        (key,),
+    ).fetchall()
+    assert [(row[0], row[1], row[2], row[3]) for row in intended] == [
+        (1, 0, 6, 6),
+        (2, 6, 12, 6),
+        (3, 12, 17, 5),
+    ]
+    assert [row[4] for row in intended] == [
+        S3Archive._crc64nvme(body[0:6]),
+        S3Archive._crc64nvme(body[6:12]),
+        S3Archive._crc64nvme(body[12:17]),
+    ]
+
+
+def test_crc64nvme_matches_standard_check_vector() -> None:
+    assert S3Archive._crc64nvme(b"123456789") == "rosUhgp5mIg="
+
+
+def test_archive_reuses_only_checksum_and_size_matched_remote_part(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    archive, client = archive_client(tmp_path)
+    assert archive._db is not None
+    body = b"abcdefghijklmnopq"
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/resume.pcm"
+    archive._db.execute(
+        """
+        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
+        VALUES (?, ?, 'resumed-upload', 'uploading', ?)
+        """,
+        (key, sha256_hex(body), archive._now_ms()),
+    )
+    client.multipart = {
+        "Metadata": {"sha256": sha256_hex(body)},
+        "ContentType": "audio/L16",
+    }
+    client.parts[key] = {
+        1: (
+            body[:6],
+            "durable-etag",
+            S3Archive._crc64nvme(body[:6]),
+        )
+    }
+
+    record = archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert record.version_id == "v2"
+    assert client.upload_calls == [(key, 2), (key, 3)]
+    assert client.parts[key][1][1] == "durable-etag"
+
+
+def test_archive_same_sha_multipart_replay_returns_durable_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    archive, client = archive_client(tmp_path)
+    body = b"one durable multipart identity"
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/replay.pcm"
+
+    first = archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+    assert archive._db is not None
+    archive._db.close()
+    reopened = S3Archive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
+    replayed = reopened.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert replayed == first
+    assert client.completion_calls == 1
+    assert reopened._db is not None
+    assert reopened._db.execute(
+        """
+        SELECT object_id, version_id, object_size, object_checksum, content_type
+        FROM multipart_uploads
+        WHERE key = ?
+        """,
+        (key,),
+    ).fetchone() == (
+        first.object_id,
+        first.version_id,
+        first.size,
+        first.s3_checksum,
+        first.content_type,
+    )
+
+
+@pytest.mark.parametrize(
+    ("remote_body", "reported_size"),
+    [
+        pytest.param(b"xxxxxx", 6, id="wrong-body"),
+        pytest.param(b"aaaaa", 5, id="wrong-size"),
+    ],
+)
+def test_archive_aborts_incompatible_remote_part_before_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    remote_body: bytes,
+    reported_size: int,
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    archive, client = archive_client(tmp_path)
+    assert archive._db is not None
+    body = b"a" * 17
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/mismatch.pcm"
+    archive._db.execute(
+        """
+        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
+        VALUES (?, ?, 'incompatible-upload', 'uploading', ?)
+        """,
+        (key, sha256_hex(body), archive._now_ms()),
+    )
+    client.parts[key] = {
+        1: (
+            remote_body[:reported_size],
+            "incompatible-etag",
+            S3Archive._crc64nvme(remote_body),
+        )
+    }
+
+    record = archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert client.aborted == ["incompatible-upload"]
+    assert record.version_id == "v2"
+    assert client.parts[key][1][0] == body[:6]
+
+
+def test_archive_startup_aborts_only_unjournaled_owned_prefix_uploads(
+    tmp_path: Path,
+) -> None:
+    client = RecordingS3Client()
+    owned_key = f"v1/meetings/{uuid4()}/audio/stt-input/source/orphan.pcm"
+    foreign_key = "foreign/uploads/do-not-touch"
+    client.active_uploads = {
+        "owned-orphan": owned_key,
+        "foreign-orphan": foreign_key,
+    }
+
+    S3Archive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
+
+    assert client.aborted == ["owned-orphan"]
+    assert client.active_uploads == {"foreign-orphan": foreign_key}
 
 
 def test_archive_recovers_completed_multipart_after_nosuchupload(
@@ -177,6 +349,9 @@ def test_archive_recovers_completed_multipart_after_nosuchupload(
     assert archive._db.execute(
         "SELECT state FROM multipart_uploads WHERE key = ?", (key,)
     ).fetchone() == ("complete",)
+    replayed = archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+    assert replayed == record
+    assert client.completion_calls == 1
 
 
 def test_archive_restarts_upload_with_unexpected_remote_part_superset(
@@ -239,7 +414,7 @@ def test_archive_startup_reconciles_remote_part_superset_and_aborts_stale_upload
     ).fetchone() == ("aborted",)
     assert reopened._db.execute(
         "SELECT COUNT(*) FROM multipart_parts WHERE key = ?", (key,)
-    ).fetchone() == (2,)
+    ).fetchone() == (1,)
 
 
 def test_archive_startup_forgets_stale_upload_missing_during_reconcile(

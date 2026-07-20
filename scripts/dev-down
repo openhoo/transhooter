@@ -2,6 +2,11 @@
 set -eu
 . "$(dirname -- "$0")/../deploy/scripts/compose-lib.sh"
 load_state
-export PROVIDER_PROFILE=$profile
-compose down --remove-orphans "$@"
-printf 'Persistent volumes and .secrets were preserved.\n'
+if volume_deletion_requested "$@" && ! compose_help_requested "$@"; then
+  confirm_volume_deletion
+  compose down --remove-orphans "$@"
+  printf '%s\n' 'Persistent volumes removed. Versioned files in .secrets were preserved.'
+else
+  compose down --remove-orphans "$@"
+  printf '%s\n' 'Persistent volumes and .secrets were preserved.'
+fi

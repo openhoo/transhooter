@@ -26,7 +26,7 @@ spec:
         app.kubernetes.io/component: {{ $component }}
     spec:
       automountServiceAccountToken: false
-      serviceAccountName: {{ $component }}
+      serviceAccountName: {{ include "transhooter.fullname" $root }}-{{ $component }}
       imagePullSecrets:
         {{- toYaml $root.Values.imagePullSecrets | nindent 8 }}
       securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
@@ -37,7 +37,7 @@ spec:
           {{- if eq $component "spool-drainer" }}
           command: [python, -m, transhooter_worker.runtime.spool_drainer]
           {{- else }}
-          command: [python, -m, transhooter_worker.runtime]
+          command: [python, -m, transhooter_worker, start]
           {{- end }}
           envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" $root }}}}]
           env:
@@ -45,7 +45,7 @@ spec:
             - {name: SPOOL_PATH, value: /var/lib/transhooter/spool}
             - {name: WORKER_INTERNAL_BEARER_FILE, value: /var/run/secrets/transhooter/token}
             {{- if $root.Values.telemetry.enabled }}
-            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ $root.Values.telemetry.endpoint | quote }}}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ default (printf "http://%s-otel-collector:%v" (include "transhooter.fullname" $root) $root.Values.telemetry.collector.ports.otlpHttp) $root.Values.telemetry.endpoint | quote }}}
             - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
             - {name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio}
             - {name: OTEL_TRACES_SAMPLER_ARG, value: {{ $root.Values.telemetry.traceSampleRatio | quote }}}
@@ -53,9 +53,13 @@ spec:
             - {name: OTEL_RESOURCE_ATTRIBUTES, value: {{ printf "service.namespace=transhooter,deployment.environment.name=%s" $root.Values.config.appEnv | quote }}}
             - {name: OTEL_SERVICE_NAME, value: {{ printf "transhooter-%s" $component | quote }}}
             {{- end }}
-          ports: [{name: health, containerPort: 8080}]
-          readinessProbe: {httpGet: {path: /health/ready, port: health}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
-          livenessProbe: {httpGet: {path: /health/live, port: health}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          {{- if eq $component "spool-drainer" }}
+          readinessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck, --drainer]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck, --drainer]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          {{- else }}
+          readinessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          {{- end }}
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
           resources:
             {{- toYaml $root.Values.resources.translationWorker | nindent 12 }}

@@ -119,15 +119,15 @@ class FixtureSttSession:
             raise RuntimeError("session terminal")
         self._chunks += 1
         failure_after = self._configured_failure_after_chunks()
-        if failure_after and self._chunks >= failure_after:
+        if failure_after is not None and self._chunks > failure_after:
             await self._end(Outcome.FAILED, _provider_error("transport", self._id, "session"))
             raise RuntimeError("injected fixture STT transport failure")
         self._accepted = chunk.samples.end
         self._revision += 1
         await self._event_queue.put(self._transcript_event(chunk.samples, Finality.PROVISIONAL))
 
-    def _configured_failure_after_chunks(self) -> int:
-        return int(self._scenario.section("stt").get("failAfterChunks", 0))
+    def _configured_failure_after_chunks(self) -> int | None:
+        return self._scenario.optional_nonnegative_int("stt", "failAfterChunks")
 
     def _transcript_event(
         self,

@@ -432,7 +432,7 @@ test("status discriminant implements all four exact wire variants", () => {
     assert.deepEqual(parsedVariant, variant);
   }
   assert.throws(() => StatusPacketSchema.parse({ ...variants[0], shutdownAtMs: 10 }));
-  assert.throws(() => StatusPacketSchema.parse({ ...variants[2], state: "ready" }));
+  assert.throws(() => StatusPacketSchema.parse({ ...variants[3], state: "ready" }));
   assert.throws(() =>
     StatusPacketSchema.parse({
       ...variants[3],
@@ -445,6 +445,104 @@ test("provider terminal permits exactly one matching raw transport reference", (
   const parsedProviderTerminal = ProviderAttemptTerminalSchema.parse(providerTerminal);
 
   assert.deepEqual(parsedProviderTerminal, providerTerminal);
+  const retryableError = {
+    kind: "rate_limit" as const,
+    scope: "operation" as const,
+    providerRetryAdvice: "retry_after" as const,
+    providerCode: "429",
+    providerRequestId: null,
+    retryDelayMs: 250,
+    attemptId,
+    rawObjectIds: [objectId],
+  };
+  const retryDecision = {
+    action: "retry" as const,
+    reason: "safe uncommitted replay",
+    retryAtMs: providerTerminal.occurredAtMs + 250,
+    previousAttemptId: attemptId,
+  };
+  assert.deepEqual(
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      outcome: "failed",
+      error: retryableError,
+      retryDecision,
+    }),
+    {
+      ...providerTerminal,
+      outcome: "failed",
+      error: retryableError,
+      retryDecision,
+    },
+  );
+  assert.throws(() =>
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      outcome: "failed",
+      error: retryableError,
+      retryDecision: {
+        ...retryDecision,
+        previousAttemptId: null,
+      },
+    }),
+  );
+  assert.deepEqual(
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      outcome: "cancelled",
+    }),
+    { ...providerTerminal, outcome: "cancelled" },
+  );
+  const cancelledTerminal = {
+    ...providerTerminal,
+    outcome: "cancelled",
+    error: {
+      ...retryableError,
+      kind: "cancelled",
+      providerRetryAdvice: "never",
+      retryDelayMs: null,
+    },
+  } as const;
+  assert.equal(ProviderAttemptTerminalSchema.parse(cancelledTerminal).outcome, "cancelled");
+  assertGeneratedAccepts([
+    ["HttpProviderAttemptTerminal", cancelledTerminal],
+    ["ProviderAttemptTerminal", cancelledTerminal],
+  ]);
+  assert.throws(() =>
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      retryDecision,
+    }),
+  );
+  assert.throws(() =>
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      outcome: "cancelled",
+      retryDecision: {
+        ...providerTerminal.retryDecision,
+        action: "degrade",
+      },
+    }),
+  );
+  assert.throws(() =>
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      outcome: "failed",
+      error: {
+        ...retryableError,
+        kind: "authentication",
+        providerRetryAdvice: "unspecified",
+      },
+      retryDecision,
+    }),
+  );
+  assert.throws(() =>
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      outcome: "failed",
+      error: { ...retryableError, kind: "cancelled" },
+    }),
+  );
   assert.throws(() =>
     ProviderAttemptTerminalSchema.parse({
       ...providerTerminal,
@@ -488,6 +586,13 @@ test("provider terminal permits exactly one matching raw transport reference", (
         rawObjectIds: [objectId],
       },
     }),
+  );
+  assert.deepEqual(
+    ProviderAttemptTerminalSchema.parse({
+      ...providerTerminal,
+      retryOfAttemptId: employeeId,
+    }).retryOfAttemptId,
+    employeeId,
   );
 });
 
@@ -544,6 +649,32 @@ test("provider attempt reports reject malformed and terminally inconsistent evid
   };
   assert.deepEqual(ProviderAttemptReportSchema.parse(retryingReport), retryingReport);
   assert.throws(() =>
+    ProviderAttemptReportSchema.parse({
+      ...report,
+      retryDecision: retryingReport.retryDecision,
+    }),
+  );
+  assert.throws(() =>
+    ProviderAttemptReportSchema.parse({
+      ...retryingReport,
+      error: {
+        ...retryingReport.error,
+        kind: "invalid_request",
+        providerRetryAdvice: "unspecified",
+      },
+    }),
+  );
+  assert.throws(() =>
+    ProviderAttemptReportSchema.parse({
+      ...report,
+      outcome: "cancelled",
+      retryDecision: {
+        ...report.retryDecision,
+        action: "degrade",
+      },
+    }),
+  );
+  assert.throws(() =>
     ProviderAttemptReportSchema.parse({ ...report, outcome: "failed", error: null }),
   );
   assert.throws(() =>
@@ -566,6 +697,12 @@ test("provider attempt reports reject malformed and terminally inconsistent evid
       retryOfAttemptId: attemptId,
     }),
   );
+  const successfulRetryReport = {
+    ...report,
+    attemptNumber: 2,
+    retryOfAttemptId: employeeId,
+  } as const;
+  assert.deepEqual(ProviderAttemptReportSchema.parse(successfulRetryReport), successfulRetryReport);
   assert.throws(() =>
     ProviderAttemptReportSchema.parse({
       ...report,
@@ -871,8 +1008,10 @@ test("generated schemas preserve representable refinements and disclose value co
   ]);
 
   const retryLinkRefinements = [
-    "retryDecision.previousAttemptId must be null or equal attemptId",
-    "retry action requires retryDecision.previousAttemptId to equal attemptId",
+    "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",
+    "successful and cancelled terminals cannot link retryDecision.previousAttemptId",
+    "retryDecision.previousAttemptId must equal attemptId for retry and when otherwise present",
+    "retries require a retryable failed provider error",
     "retryOfAttemptId must differ from attemptId",
   ];
   for (const name of [

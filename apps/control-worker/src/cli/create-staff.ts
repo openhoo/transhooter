@@ -1,14 +1,15 @@
+import { StaffRoleSchema } from "@transhooter/contracts";
 import { z } from "zod";
+import { parseCreateStaffOptions } from "./admin-options";
 import { createStaff, databaseUrlFromEnvironment } from "./admin-store";
-import { parseLongOptions } from "./long-options";
 
 const argumentSchema = z.object({
   email: z.email(),
   name: z.string().trim().min(1).max(200),
-  role: z.enum(["employee", "admin"]),
+  role: StaffRoleSchema,
 });
 
-const args = parseLongOptions(process.argv.slice(2));
+const args = parseCreateStaffOptions(process.argv.slice(2));
 const input = argumentSchema.parse(args);
 const databaseUrl = await databaseUrlFromEnvironment(process.env);
 const result = await createStaff(databaseUrl, {

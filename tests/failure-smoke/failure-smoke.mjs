@@ -14,7 +14,17 @@ import {
 import http from "node:http";
 import { chromium } from "playwright";
 import postgres from "postgres";
-import { archiveRaceWinner, restartCountIncremented } from "./harness-contracts.mjs";
+import {
+  archiveLockHierarchyBlocked,
+  archiveRaceWinner,
+  crashRecoveryMatches,
+  healthFailureAfter,
+  pollUntil,
+  restartCountIncremented,
+  runWithDeadline,
+  settlementProblems,
+  workerCrashMatches,
+} from "./harness-contracts.mjs";
 
 const baseUrl = process.env.BASE_URL ?? "http://web:3000";
 const serviceBaseUrl = (() => {
@@ -80,13 +90,34 @@ const translationFailureCases = Object.freeze([
     watermarks: Object.freeze({ accepted: 1, received: 0, emitted: 0 }),
   }),
 ]);
-const scenarioOptionIndex = process.argv.indexOf("--scenarios");
-const requestedScenarioText =
-  scenarioOptionIndex >= 0
-    ? process.argv[scenarioOptionIndex + 1]
-    : process.env.FAILURE_SMOKE_SCENARIOS;
-if (scenarioOptionIndex >= 0 && requestedScenarioText === undefined) {
-  throw new Error("--scenarios requires a comma-separated value");
+const cliOptions = { scenarios: undefined, resume: false, deadlineEpochMs: undefined };
+for (let index = 2; index < process.argv.length; index += 1) {
+  const argument = process.argv[index];
+  if (argument === "--resume") {
+    cliOptions.resume = true;
+    continue;
+  }
+  if (argument !== "--scenarios" && argument !== "--deadline-epoch-ms") {
+    throw new Error(`unknown failure-smoke argument: ${argument}`);
+  }
+  const value = process.argv[index + 1];
+  if (value === undefined || value.startsWith("--")) {
+    throw new Error(`${argument} requires a value`);
+  }
+  index += 1;
+  if (argument === "--scenarios") cliOptions.scenarios = value;
+  else cliOptions.deadlineEpochMs = value;
+}
+const requestedScenarioText = cliOptions.scenarios ?? process.env.FAILURE_SMOKE_SCENARIOS;
+const configuredDeadline =
+  cliOptions.deadlineEpochMs ?? process.env.FAILURE_SMOKE_DEADLINE_EPOCH_MS;
+const harnessDeadlineMs =
+  configuredDeadline === undefined ? Number.POSITIVE_INFINITY : Number(configuredDeadline);
+if (
+  (configuredDeadline !== undefined && !Number.isSafeInteger(harnessDeadlineMs)) ||
+  harnessDeadlineMs <= Date.now()
+) {
+  throw new Error("--deadline-epoch-ms must be a future Unix epoch in milliseconds");
 }
 const selectedScenarios =
   requestedScenarioText === undefined
@@ -104,8 +135,7 @@ const unknownScenarios = [...selectedScenarios].filter((name) => !scenarioRegist
 if (unknownScenarios.length > 0) {
   throw new Error(`unknown failure-smoke scenarios: ${unknownScenarios.join(", ")}`);
 }
-const resumeRequested =
-  process.argv.includes("--resume") || process.env.FAILURE_SMOKE_RESUME === "true";
+const resumeRequested = cliOptions.resume || process.env.FAILURE_SMOKE_RESUME === "true";
 const checkpointBinding = Object.freeze({
   harnessVersion,
   project: process.env.TARGET_COMPOSE_PROJECT ?? "",
@@ -121,7 +151,16 @@ const database = postgres((await readFile(databaseUrlFile, "utf8")).trim(), {
   connection: { statement_timeout: "15000" },
 });
 
-function docker(method, path, body = null) {
+function operationDeadline(requestedDeadline = Date.now() + 30_000) {
+  return Math.min(requestedDeadline, harnessDeadlineMs);
+}
+
+async function withAbsoluteDeadline(label, deadline, operation, parentSignal) {
+  return await runWithDeadline(label, operationDeadline(deadline), operation, parentSignal);
+}
+
+function docker(method, path, body = null, options = {}) {
+  const deadline = operationDeadline(options.deadline);
   return new Promise((resolve, reject) => {
     let settled = false;
     let responseBytes = 0;
@@ -129,6 +168,7 @@ function docker(method, path, body = null) {
       if (settled) return;
       settled = true;
       clearTimeout(absoluteTimer);
+      options.signal?.removeEventListener("abort", abort);
       operation(value);
     };
     const request = http.request(
@@ -159,24 +199,31 @@ function docker(method, path, body = null) {
           }
           const contentType = response.headers["content-type"] ?? "";
           try {
-            finish(resolve, text && contentType.includes("json") ? JSON.parse(text) : text || null);
+            finish(
+              resolve,
+              text && contentType.includes("json") && !options.raw
+                ? JSON.parse(text)
+                : text || null,
+            );
           } catch (error) {
             finish(reject, error);
           }
         });
       },
     );
+    const abort = () => request.destroy(options.signal?.reason ?? new Error("Docker cancelled"));
     const absoluteTimer = setTimeout(
-      () =>
-        request.destroy(new Error(`Docker ${method} ${path} exceeded absolute 30 second deadline`)),
-      30_000,
+      () => request.destroy(deadlineError(`Docker ${method} ${path}`, deadline)),
+      Math.max(0, deadline - Date.now()),
     );
+    options.signal?.addEventListener("abort", abort, { once: true });
     request.on("error", (error) => finish(reject, error));
-    if (body) request.end(JSON.stringify(body));
+    if (options.signal?.aborted) abort();
+    else if (body) request.end(JSON.stringify(body));
     else request.end();
   });
 }
-async function containers(service) {
+async function containers(service, options = {}) {
   const project = process.env.TARGET_COMPOSE_PROJECT;
   if (!project) {
     throw new Error("TARGET_COMPOSE_PROJECT is required");
@@ -190,16 +237,36 @@ async function containers(service) {
       ],
     }),
   );
-  return await docker("GET", `/containers/json?all=1&filters=${filters}`);
+  return await docker("GET", `/containers/json?all=1&filters=${filters}`, null, options);
 }
-async function onlyContainer(service) {
-  const matches = await containers(service);
+async function onlyContainer(service, options = {}) {
+  const matches = await containers(service, options);
   if (matches.length !== 1)
     throw new Error(`expected one ${service} container, found ${matches.length}`);
   return matches[0];
 }
-async function inspect(id) {
-  return await docker("GET", `/containers/${id}/json`);
+async function inspect(id, options = {}) {
+  return await docker("GET", `/containers/${id}/json`, null, options);
+}
+async function containerExitEvents(id, sinceMs, options = {}) {
+  const untilSeconds = Math.floor(Date.now() / 1_000);
+  const sinceSeconds = Math.floor(sinceMs / 1_000);
+  if (untilSeconds <= sinceSeconds) return [];
+  const filters = encodeURIComponent(
+    JSON.stringify({ container: [id], event: ["die"], type: ["container"] }),
+  );
+  const text = await docker(
+    "GET",
+    `/events?since=${sinceSeconds}&until=${untilSeconds}&filters=${filters}`,
+    null,
+    { ...options, raw: true },
+  );
+  return String(text ?? "")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((event) => Number(event.timeNano) / 1_000_000 >= sinceMs);
 }
 async function stop(service) {
   const container = await onlyContainer(service);
@@ -213,16 +280,16 @@ async function rerunOneShot(service) {
   const container = await onlyContainer(service);
   const initial = (await inspect(container.Id)).State;
   if (initial.Running) {
-    await waitFor(`${service} existing run`, async () => {
-      const state = (await inspect(container.Id)).State;
+    await waitFor(`${service} existing run`, async (signal, deadline) => {
+      const state = (await inspect(container.Id, { signal, deadline })).State;
       return state.Running ? null : state;
     });
   }
   await start(container.Id);
   const finished = await waitFor(
     `${service} refresh completion`,
-    async () => {
-      const state = (await inspect(container.Id)).State;
+    async (signal, deadline) => {
+      const state = (await inspect(container.Id, { signal, deadline })).State;
       return state.Running ? null : state;
     },
     180_000,
@@ -231,31 +298,11 @@ async function rerunOneShot(service) {
     throw new Error(`${service} refresh exited ${finished.ExitCode}: ${finished.Error ?? ""}`);
   }
 }
-async function waitFor(label, check, timeoutMs = 120_000) {
-  const deadline = Date.now() + timeoutMs;
-  let last;
-  while (Date.now() < deadline) {
-    let attemptTimer;
-    try {
-      const attemptTimeoutMs = Math.min(15_000, deadline - Date.now());
-      last = await Promise.race([
-        check(),
-        new Promise((_, reject) => {
-          attemptTimer = setTimeout(
-            () => reject(new Error(`${label} check timed out`)),
-            attemptTimeoutMs,
-          );
-        }),
-      ]);
-      if (last) return last;
-    } catch (error) {
-      last = error;
-    } finally {
-      clearTimeout(attemptTimer);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
-  }
-  throw new Error(`timed out waiting for ${label}: ${last}`);
+async function waitFor(label, check, timeoutMs = 120_000, parentSignal) {
+  return await pollUntil(label, check, {
+    deadline: operationDeadline(Date.now() + timeoutMs),
+    signal: parentSignal,
+  });
 }
 async function writeJsonFile(path, value) {
   const temporary = `${path}.${process.pid}.tmp`;
@@ -552,22 +599,33 @@ function signalProcessGroup(child, signal) {
   }
 }
 
+async function settleBefore(promise, deadline) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise.then((result) => ({ closed: true, result })),
+      new Promise((resolve) => {
+        timer = setTimeout(
+          () => resolve({ closed: false }),
+          Math.max(0, operationDeadline(deadline) - Date.now()),
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function terminateProcessTree(run) {
   if (run.treeTerminated) return await run.completed;
   signalProcessGroup(run.child, "SIGTERM");
   const graceful = run.closed
     ? { closed: true, result: await run.completed }
-    : await Promise.race([
-        run.completed.then((result) => ({ closed: true, result })),
-        new Promise((resolve) => setTimeout(() => resolve({ closed: false }), 10_000)),
-      ]);
+    : await settleBefore(run.completed, Date.now() + 10_000);
   signalProcessGroup(run.child, "SIGKILL");
   run.treeTerminated = true;
   if (graceful.closed) return graceful.result;
-  const forced = await Promise.race([
-    run.completed.then((result) => ({ closed: true, result })),
-    new Promise((resolve) => setTimeout(() => resolve({ closed: false }), 10_000)),
-  ]);
+  const forced = await settleBefore(run.completed, Date.now() + 10_000);
   if (!forced.closed) {
     run.closed = true;
     const result = {
@@ -596,6 +654,7 @@ async function runConsultation({
   await mkdir(releaseDirectory, { recursive: true });
   const releaseFile = `${releaseDirectory}/${randomUUID()}.release`;
   await rm(releaseFile, { force: true });
+  const runDeadline = operationDeadline(Date.now() + 8 * 60_000);
   const child = spawn(
     "bun",
     [
@@ -610,6 +669,8 @@ async function runConsultation({
       expectedProfile,
       "--expected-profile-revision",
       String(capabilityLease.current_revision),
+      "--deadline-epoch-ms",
+      String(runDeadline),
       "--emit-proof-json",
       "--failure-harness-release-file",
       releaseFile,
@@ -677,9 +738,12 @@ async function runConsultation({
     );
     completion.resolve({ code, signal, stdout: run.stdout, stderr: run.stderr });
   });
-  run.absoluteTimer = setTimeout(() => {
-    terminateProcessTree(run).catch(() => undefined);
-  }, 8 * 60_000);
+  run.absoluteTimer = setTimeout(
+    () => {
+      terminateProcessTree(run).catch(() => undefined);
+    },
+    Math.max(0, runDeadline - Date.now()),
+  );
   let created;
   try {
     created = await progress.promise;
@@ -716,8 +780,8 @@ async function assertServiceHealthy(service, timeoutMs = 120_000) {
   const container = await onlyContainer(service);
   return await waitFor(
     `${service} healthy`,
-    async () => {
-      const state = (await inspect(container.Id)).State;
+    async (signal, deadline) => {
+      const state = (await inspect(container.Id, { signal, deadline })).State;
       return state.Running && (!state.Health || state.Health.Status === "healthy");
     },
     timeoutMs,
@@ -740,8 +804,22 @@ async function resetAuthenticationThrottle() {
   await sql("TRUNCATE magic_link_requests");
 }
 
-async function latestLink(recipient) {
-  const listResponse = await fetch(`${mailpitUrl}/api/v1/messages?limit=100`);
+async function fetchWithDeadline(url, init = {}, deadline = Date.now() + 30_000, parentSignal) {
+  return await withAbsoluteDeadline(
+    `fetch ${url}`,
+    deadline,
+    (signal) => fetch(url, { ...init, signal }),
+    parentSignal ?? init.signal,
+  );
+}
+
+async function latestLink(recipient, signal, deadline = Date.now() + 15_000) {
+  const listResponse = await fetchWithDeadline(
+    `${mailpitUrl}/api/v1/messages?limit=100`,
+    {},
+    deadline,
+    signal,
+  );
   if (!listResponse.ok) throw new Error(`Mailpit list failed: ${listResponse.status}`);
   const payload = await listResponse.json();
   const messages = (payload.messages ?? payload.Messages ?? [])
@@ -757,7 +835,12 @@ async function latestLink(recipient) {
   const message = messages[0];
   if (!message) return null;
   const id = message.ID ?? message.Id ?? message.id;
-  const detailResponse = await fetch(`${mailpitUrl}/api/v1/message/${encodeURIComponent(id)}`);
+  const detailResponse = await fetchWithDeadline(
+    `${mailpitUrl}/api/v1/message/${encodeURIComponent(id)}`,
+    {},
+    deadline,
+    signal,
+  );
   if (!detailResponse.ok) throw new Error(`Mailpit message failed: ${detailResponse.status}`);
   const detail = await detailResponse.json();
   const content = `${detail.HTML ?? detail.Html ?? ""}\n${detail.Text ?? detail.text ?? ""}`;
@@ -781,8 +864,8 @@ async function authenticateAdmin(context) {
   await page.getByRole("button", { name: "Email me a sign-in link" }).click();
   const link = await waitFor(
     "admin magic link",
-    async () => {
-      const candidate = await latestLink(adminEmail);
+    async (signal, deadline) => {
+      const candidate = await latestLink(adminEmail, signal, deadline);
       return candidate && candidate !== previousLink ? candidate : null;
     },
     30_000,
@@ -793,29 +876,37 @@ async function authenticateAdmin(context) {
   return page;
 }
 
-async function pagePost(page, path, body) {
-  return await page.evaluate(
-    async ({ path, body }) => {
-      const csrf = document.cookie
-        .split("; ")
-        .find((part) => part.startsWith("csrf="))
-        ?.slice(5);
-      if (!csrf) throw new Error("CSRF cookie unavailable");
-      const response = await fetch(path, {
-        method: "POST",
-        credentials: "same-origin",
-        cache: "no-store",
-        headers: { "content-type": "application/json", "x-csrf-token": csrf },
-        body: JSON.stringify(body),
-      });
-      return {
-        ok: response.ok,
-        status: response.status,
-        body: await response.text(),
-      };
-    },
-    { path, body },
-  );
+async function pagePost(page, path, body, deadline = operationDeadline(Date.now() + 30_000)) {
+  try {
+    return await page.evaluate(
+      async ({ path, body, deadline }) => {
+        const csrf = document.cookie
+          .split("; ")
+          .find((part) => part.startsWith("csrf="))
+          ?.slice(5);
+        if (!csrf) throw new Error("CSRF cookie unavailable");
+        const response = await fetch(path, {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "content-type": "application/json", "x-csrf-token": csrf },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+        });
+        return {
+          ok: response.ok,
+          status: response.status,
+          body: await response.text(),
+        };
+      },
+      { path, body, deadline },
+    );
+  } catch (error) {
+    throw new Error(
+      `${path} request failed: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
 }
 
 async function reauthenticateForArchive(page, consultationId) {
@@ -826,8 +917,8 @@ async function reauthenticateForArchive(page, consultationId) {
   }
   const link = await waitFor(
     "archive-bound reauthentication link",
-    async () => {
-      const candidate = await latestLink(adminEmail);
+    async (signal, deadline) => {
+      const candidate = await latestLink(adminEmail, signal, deadline);
       return candidate && candidate !== previousLink ? candidate : null;
     },
     30_000,
@@ -849,19 +940,111 @@ async function raceArchiveHoldAndDelete(archiveId, consultationId) {
     const deletePage = await authenticateAdmin(deleteContext);
     await reauthenticateForArchive(holdPage, consultationId);
     await reauthenticateForArchive(deletePage, consultationId);
-    const [hold, deletion] = await Promise.all([
-      pagePost(holdPage, `/api/archives/${archiveId}/hold`, {
-        archiveId,
-        consultationId,
-        reason: "failure-smoke-race",
-        enabled: true,
-      }),
-      pagePost(deletePage, `/api/archives/${archiveId}/delete`, {
-        archiveId,
-        consultationId,
-        reason: "failure-smoke-race",
-      }),
-    ]);
+    let responses;
+    const settledResponses = {};
+    const observeResponse = (name, response) =>
+      response.then(
+        (value) => {
+          settledResponses[name] = value;
+          return value;
+        },
+        (error) => {
+          settledResponses[name] = {
+            error: error instanceof Error ? error.message : String(error),
+          };
+          throw error;
+        },
+      );
+    const raceDeadline = operationDeadline(Date.now() + 120_000);
+    await database.begin(async (transaction) => {
+      await transaction`SELECT id FROM archives WHERE id=${archiveId} FOR UPDATE`;
+      responses = Promise.all([
+        observeResponse(
+          "hold",
+          pagePost(
+            holdPage,
+            `/api/archives/${archiveId}/hold`,
+            {
+              archiveId,
+              consultationId,
+              reason: "failure-smoke-race",
+              enabled: true,
+            },
+            raceDeadline,
+          ),
+        ),
+        observeResponse(
+          "delete",
+          pagePost(
+            deletePage,
+            `/api/archives/${archiveId}/delete`,
+            {
+              archiveId,
+              consultationId,
+              reason: "failure-smoke-race",
+            },
+            raceDeadline,
+          ),
+        ),
+      ]);
+      responses.catch(() => undefined);
+      await waitFor(
+        "both archive race requests blocked on the durable consultation/archive lock hierarchy",
+        async (signal, deadline) => {
+          const observations = await withAbsoluteDeadline(
+            "archive lock observation",
+            deadline,
+            async () => {
+              const rows = await database.unsafe(`
+                SELECT wait_event_type AS "waitEventType",query
+                FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND datname=current_database()
+                  AND wait_event_type='Lock'
+                  AND query ~* '\\m(archives|consultations)\\M'`);
+              return rows;
+            },
+            signal,
+          );
+          if (Object.keys(settledResponses).length > 0) {
+            throw new Error(
+              `archive race request bypassed the durable lock hierarchy: ${JSON.stringify(settledResponses)}`,
+            );
+          }
+          return archiveLockHierarchyBlocked(observations) ? observations : null;
+        },
+        30_000,
+      );
+    });
+    let hold;
+    let deletion;
+    try {
+      [hold, deletion] = await responses;
+    } catch (error) {
+      const [activity, archiveState] = await Promise.all([
+        database.unsafe(`
+          SELECT state,wait_event_type AS "waitEventType",wait_event AS "waitEvent",query
+          FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid() AND datname=current_database() AND state <> 'idle'`),
+        queryJson(`
+          SELECT a.state,a.hold_operation_id,a.hold_operation_kind,a.hold_operation_owner,
+            a.hold_operation_lease_expires_at,
+            COALESCE(jsonb_agg(jsonb_build_object('id',h.id,'state',h.state))
+              FILTER (WHERE h.id IS NOT NULL AND h.released_at IS NULL),'[]'::jsonb) AS active_holds
+          FROM archives a
+          LEFT JOIN legal_holds h ON h.archive_id=a.id
+          WHERE a.id='${archiveId}'
+          GROUP BY a.id`),
+      ]);
+      throw new Error(
+        `archive race requests did not settle: ${JSON.stringify({
+          settledResponses,
+          activity,
+          archiveState,
+        })}`,
+        { cause: error },
+      );
+    }
     const outcome = await queryJson(`
       SELECT a.state,
         COALESCE(jsonb_agg(jsonb_build_object('id',h.id,'reason',h.reason))
@@ -889,12 +1072,17 @@ async function raceArchiveHoldAndDelete(archiveId, consultationId) {
     }
     if (winner === "hold") {
       await reauthenticateForArchive(holdPage, consultationId);
-      const release = await pagePost(holdPage, `/api/archives/${archiveId}/hold`, {
-        archiveId,
-        consultationId,
-        holdId: activeHolds[0].id,
-        enabled: false,
-      });
+      const release = await pagePost(
+        holdPage,
+        `/api/archives/${archiveId}/hold`,
+        {
+          archiveId,
+          consultationId,
+          holdId: activeHolds[0].id,
+          enabled: false,
+        },
+        operationDeadline(Date.now() + 120_000),
+      );
       if (!release.ok) {
         throw new Error(`production hold cleanup failed: ${JSON.stringify(release)}`);
       }
@@ -924,8 +1112,10 @@ async function consultationEvidence(consultationId) {
       a.id AS archive_id,a.state AS archive_state,a.final_inventory_hash,
       (SELECT row_to_json(f) FROM final_inventories f WHERE f.archive_id=a.id) AS inventory,
       COALESCE((SELECT json_agg(json_build_object(
-        'kind',e.effect_kind,'state',e.state,'attempts',e.attempts,
-        'requestHash',e.request_hash,'result',e.result,'compensationResult',e.compensation_result
+        'kind',e.effect_kind,'generation',e.generation,'subjectId',e.subject_id,
+        'state',e.state,'attempts',e.attempts,'requestHash',e.request_hash,
+        'leaseOwner',e.lease_owner,'leaseExpiresAt',e.lease_expires_at,
+        'result',e.result,'compensationResult',e.compensation_result
       ) ORDER BY e.created_at) FROM external_effects e WHERE e.consultation_id=c.id),'[]'::json) AS effects,
       COALESCE((SELECT json_agg(json_build_object(
         'kind',j.kind,'state',j.state,'egressId',j.egress_id,'terminalAt',j.terminal_at,
@@ -943,7 +1133,8 @@ async function consultationEvidence(consultationId) {
       ) ORDER BY p.started_at) FROM provider_attempts p
         WHERE p.consultation_id=c.id),'[]'::json) AS attempts,
       COALESCE((SELECT json_agg(json_build_object(
-        'epoch',w.epoch,'fencedAt',w.fenced_at,'terminalOutcome',w.terminal_outcome,
+        'workerId',w.worker_id,'generation',w.generation,'epoch',w.epoch,
+        'fencedAt',w.fenced_at,'terminalOutcome',w.terminal_outcome,
         'terminalAt',w.terminal_at,'terminalCheckpointId',w.terminal_checkpoint_id
       ) ORDER BY w.epoch) FROM worker_job_epochs w WHERE w.consultation_id=c.id),'[]'::json) AS worker_epochs,
       COALESCE((SELECT json_agg(json_build_object(
@@ -973,6 +1164,32 @@ async function consultationEvidence(consultationId) {
         WHERE e.consultation_id=c.id
           AND e.state IN ('planned','calling','applied','compensating')),0)::int
         AS active_effects,
+      COALESCE((SELECT count(*) FROM expected_archive_artifacts x
+        WHERE x.archive_id=a.id AND x.disposition='expected'
+          AND x.fulfilled_object_id IS NULL),0)::int AS unresolved_expectations,
+      COALESCE((SELECT count(*) FROM orchestration_deadlines d
+        WHERE d.consultation_id=c.id AND d.completed_at IS NULL),0)::int
+        AS unfinished_deadlines,
+      COALESCE((SELECT count(*) FROM external_effects created
+        WHERE created.consultation_id=c.id AND created.effect_kind='WORKER_DISPATCH'
+          AND created.result->>'remoteId' IS NOT NULL
+          AND created.compensation_result IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM external_effects removed
+            WHERE removed.consultation_id=c.id AND removed.effect_kind='DISPATCH_DELETE'
+              AND removed.state='done'
+              AND removed.result->'plan'->>'dispatchId'=created.result->>'remoteId'
+          )),0)::int AS unclean_dispatches,
+      COALESCE((SELECT count(*) FROM external_effects created
+        WHERE created.consultation_id=c.id AND created.effect_kind='ROOM_CREATE'
+          AND created.result->>'remoteId' IS NOT NULL
+          AND created.compensation_result IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM external_effects removed
+            WHERE removed.consultation_id=c.id AND removed.effect_kind='ROOM_DELETE'
+              AND removed.state='done'
+              AND (removed.result->'plan'->>'resourceGeneration')::integer=created.generation
+          )),0)::int AS unclean_rooms,
       COALESCE((SELECT count(*) FROM egress_jobs j
         WHERE j.consultation_id=c.id
           AND (
@@ -986,23 +1203,21 @@ async function consultationEvidence(consultationId) {
         WHERE w.consultation_id=c.id AND w.terminal_at IS NULL),0)::int
         AS unterminated_worker_epochs,
       COALESCE((SELECT json_agg(json_build_object(
-        'kind',d.kind,'dueAt',d.due_at,'completedAt',d.completed_at,
+        'kind',d.kind,'generation',d.generation,'dueAt',d.due_at,'completedAt',d.completed_at,
         'leaseOwner',d.lease_owner,'leaseExpiresAt',d.lease_expires_at
       ) ORDER BY d.kind) FROM orchestration_deadlines d
         WHERE d.consultation_id=c.id),'[]'::json) AS deadlines,
-      (
-        c.room_name IS NULL
-        OR EXISTS (
-          SELECT 1 FROM external_effects e
-          WHERE e.consultation_id=c.id AND e.generation=c.generation
-            AND e.effect_kind='ROOM_DELETE' AND e.state='done'
-        )
-        OR NOT EXISTS (
-          SELECT 1 FROM external_effects e
-          WHERE e.consultation_id=c.id AND e.generation=c.generation
-            AND e.effect_kind='ROOM_CREATE'
-            AND e.result->>'remoteId' IS NOT NULL AND e.compensation_result IS NULL
-        )
+      NOT EXISTS (
+        SELECT 1 FROM external_effects created
+        WHERE created.consultation_id=c.id AND created.effect_kind='ROOM_CREATE'
+          AND created.result->>'remoteId' IS NOT NULL
+          AND created.compensation_result IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM external_effects removed
+            WHERE removed.consultation_id=c.id AND removed.effect_kind='ROOM_DELETE'
+              AND removed.state='done'
+              AND (removed.result->'plan'->>'resourceGeneration')::integer=created.generation
+          )
       ) AS room_cleanup_confirmed
     FROM consultations c JOIN archives a ON a.consultation_id=c.id WHERE c.id='${consultationId}'`);
   if (rows.length !== 1) throw new Error(`missing durable consultation ${consultationId}`);
@@ -1010,36 +1225,57 @@ async function consultationEvidence(consultationId) {
 }
 
 function isCleanSettlement(evidence) {
-  return (
-    ["ended", "cancelled", "deleted"].includes(evidence.state) &&
-    Number(evidence.pending_outbox) === 0 &&
-    Number(evidence.pending_cancellation_outbox) === 0 &&
-    Number(evidence.active_effects) === 0 &&
-    Number(evidence.active_egress) === 0 &&
-    Number(evidence.unfenced_reservations) === 0 &&
-    Number(evidence.unterminated_worker_epochs) === 0 &&
-    evidence.room_cleanup_confirmed === true
-  );
+  return settlementProblems(evidence).length === 0;
 }
 
 function settlementSummary(evidence) {
   return {
+    problems: settlementProblems(evidence),
     state: evidence.state,
     generation: evidence.generation,
     archiveState: evidence.archive_state,
     pendingOutbox: evidence.pending_outbox,
-    pendingCancellationOutbox: evidence.pending_cancellation_outbox,
     activeEffects: evidence.active_effects,
+    unresolvedExpectations: evidence.unresolved_expectations,
+    unfinishedDeadlines: evidence.unfinished_deadlines,
+    uncleanDispatches: evidence.unclean_dispatches,
+    uncleanRooms: evidence.unclean_rooms,
     activeEgress: evidence.active_egress,
     unfencedReservations: evidence.unfenced_reservations,
     unterminatedWorkerEpochs: evidence.unterminated_worker_epochs,
     roomCleanupConfirmed: evidence.room_cleanup_confirmed,
-    workerEpochs: evidence.worker_epochs,
-    reservations: evidence.reservations,
-    deadlines: evidence.deadlines,
-    roomEffects: evidence.effects.filter(
-      (effect) => effect.kind === "ROOM_CREATE" || effect.kind === "ROOM_DELETE",
-    ),
+    effects: evidence.effects.slice(0, 10).map((effect) => ({
+      kind: effect.kind,
+      generation: effect.generation,
+      state: effect.state,
+      attempts: effect.attempts,
+    })),
+    egress: evidence.egress.slice(0, 10).map((job) => ({
+      kind: job.kind,
+      state: job.state,
+      terminal: job.terminalAt != null && job.terminalResult != null,
+    })),
+    workerEpochs: evidence.worker_epochs.slice(0, 10).map((epoch) => ({
+      generation: epoch.generation,
+      epoch: epoch.epoch,
+      terminal: epoch.terminalAt != null,
+    })),
+    reservations: evidence.reservations.slice(0, 10).map((reservation) => ({
+      generation: reservation.generation,
+      epoch: reservation.epoch,
+      fenced: reservation.fencedAt != null,
+    })),
+    deadlines: evidence.deadlines.slice(0, 10).map((deadline) => ({
+      generation: deadline.generation,
+      kind: deadline.kind,
+      completed: deadline.completedAt != null,
+    })),
+    truncated:
+      evidence.effects.length > 10 ||
+      evidence.egress.length > 10 ||
+      evidence.worker_epochs.length > 10 ||
+      evidence.reservations.length > 10 ||
+      evidence.deadlines.length > 10,
   };
 }
 
@@ -1058,6 +1294,7 @@ async function cancelBeforeStartForCleanup(consultationId) {
     await transaction`
       UPDATE consultations
       SET state='cancelled',generation=${generation},
+        admission_fenced_at=COALESCE(admission_fenced_at,now()),
         updated_at=GREATEST(now(),updated_at+interval '1 microsecond')
       WHERE id=${consultationId}`;
     await transaction`
@@ -1333,42 +1570,99 @@ async function main() {
         onlyContainer("control-worker-1"),
         onlyContainer("control-worker-2"),
       ]);
-      const restartBaseline = new Map(
+      const controlBaselines = new Map(
         await Promise.all(
-          controls.map(async (container) => [
-            container.Id,
-            (await inspect(container.Id)).RestartCount,
-          ]),
+          controls.map(async (container) => {
+            const details = await inspect(container.Id);
+            const workerId = details.Config.Env.find((entry) =>
+              entry.startsWith("INSTANCE_ID="),
+            )?.slice("INSTANCE_ID=".length);
+            if (!workerId) {
+              throw new Error(`control worker ${container.Id} has no INSTANCE_ID`);
+            }
+            return [
+              container.Id,
+              {
+                containerId: container.Id,
+                workerId,
+                restartCount: details.RestartCount,
+                startedAt: details.State.StartedAt,
+              },
+            ];
+          }),
         ),
       );
       await resetAuthenticationThrottle();
+      const crashWatermarkMs = Date.now();
       const crashRun = await runConsultation({
         faults: { crashAfterPersistCalling: ["ROOM_CREATE"] },
       });
-      const crashObservation = waitFor(
-        "control worker container RestartCount increment after persisted ROOM_CREATE",
+      const crashedEffect = await waitFor(
+        "persisted ROOM_CREATE crash owner",
         async () => {
-          for (const container of controls) {
-            const restartCount = (await inspect(container.Id)).RestartCount;
-            if (restartCountIncremented(restartBaseline.get(container.Id), restartCount)) {
-              return { containerId: container.Id, restartCount };
-            }
-          }
-          return null;
+          const evidence = await consultationEvidence(crashRun.consultationId);
+          const effect = evidence.effects.find(
+            (candidate) =>
+              candidate.kind === "ROOM_CREATE" &&
+              candidate.state === "calling" &&
+              candidate.attempts === 1 &&
+              typeof candidate.leaseOwner === "string",
+          );
+          return effect ?? null;
         },
         30_000,
       );
-      const crashOutcome = await Promise.race([
-        crashObservation.then((value) => ({ kind: "crash", value })),
-        crashRun.completed.then((result) => ({ kind: "exit", result })),
-      ]);
-      if (crashOutcome.kind === "exit") {
-        await setFaults();
-        throw new Error(
-          `crash injection consultation exited before ROOM_CREATE: ${crashOutcome.result.stderr}\n${crashOutcome.result.stdout}`,
-        );
+      const crashedWorker = [...controlBaselines.values()].find(
+        (candidate) => candidate.workerId === crashedEffect.leaseOwner,
+      );
+      if (!crashedWorker) {
+        throw new Error("persisted ROOM_CREATE owner does not match a control-worker instance");
       }
-      const restarted = crashOutcome.value;
+      const restarted = await waitFor(
+        "exact control worker restart after persisted ROOM_CREATE",
+        async (signal, deadline) => {
+          if (crashRun.closed) {
+            throw new Error(
+              `crash injection consultation exited before worker restart: ${crashRun.stderr}`,
+            );
+          }
+          const container = controls.find(
+            (candidate) => candidate.Id === crashedWorker.containerId,
+          );
+          const [current, exits] = await Promise.all([
+            inspect(crashedWorker.containerId, { signal, deadline }),
+            containerExitEvents(crashedWorker.containerId, crashWatermarkMs, {
+              signal,
+              deadline,
+            }),
+          ]);
+          const observation = {
+            workerId: crashedWorker.workerId,
+            containerId: container?.Id,
+            restartCount: current.RestartCount,
+            startedAt: current.State.StartedAt,
+          };
+          const injectedExit = exits.some(
+            (event) => String(event.Actor?.Attributes?.exitCode ?? "") === "86",
+          );
+          if (!injectedExit || !crashRecoveryMatches(crashedWorker, observation)) return null;
+          if (
+            !current.State.Running ||
+            (current.State.Health && current.State.Health.Status !== "healthy")
+          ) {
+            return null;
+          }
+          const evidence = await consultationEvidence(crashRun.consultationId);
+          const scopedEffect = evidence.effects.find(
+            (effect) =>
+              effect.kind === "ROOM_CREATE" &&
+              Number(effect.generation) === Number(evidence.generation) &&
+              effect.attempts >= 1,
+          );
+          return scopedEffect ? { ...observation, generation: evidence.generation } : null;
+        },
+        30_000,
+      );
       await setFaults();
       await setWorkerScenario();
       const recovered = await crashRun.completed;
@@ -1399,6 +1693,8 @@ async function main() {
         recoveredEvidence.archive_state !== "complete" ||
         recoveredEvidence.final_inventory_hash !== recoveryProof.inventorySha256 ||
         recoveredEvidence.inventory?.status !== "complete" ||
+        Number(recoveredEvidence.expected_count) < 1 ||
+        Number(recoveredEvidence.object_count) < Number(recoveredEvidence.expected_count) ||
         (recoveredEvidence.inventory?.missing ?? []).length !== 0 ||
         (recoveredEvidence.inventory?.errors ?? []).length !== 0
       )
@@ -1409,6 +1705,7 @@ async function main() {
         !recoveredEvidence.effects.some(
           (effect) =>
             effect.kind === "ROOM_CREATE" &&
+            Number(effect.generation) === Number(restarted.generation) &&
             effect.state === "done" &&
             effect.attempts >= 2 &&
             typeof effect.requestHash === "string" &&
@@ -1421,9 +1718,15 @@ async function main() {
         name: "outbox-crash-continuation",
         restartedContainer: restarted.containerId,
         restartCount: restarted.restartCount,
+        crashedWorkerId: crashedWorker.workerId,
+        crashedWorkerEpoch: crashedWorker.startedAt,
+        successorWorkerEpoch: restarted.startedAt,
+        generation: restarted.generation,
         consultationId: recoveryProof.consultationId,
         inventorySha256: recoveryProof.inventorySha256,
         gapFreeInventory: true,
+        expectedArtifactCount: recoveredEvidence.expected_count,
+        archiveObjectCount: recoveredEvidence.object_count,
         durableContinuation: true,
       });
 
@@ -1454,25 +1757,28 @@ async function main() {
         captureBarrierTimeoutMs: 10_000,
       });
       const denial = await deniedRun.completed;
-      await setFaults();
       const deniedConsultationId = deniedRun.consultationId;
+      await setFaults();
+      if (denial.code === 0) {
+        throw new Error("Participant Egress denial unexpectedly allowed a complete consultation");
+      }
+      await cancelBeforeStartForCleanup(deniedConsultationId);
       const deniedEvidence = await waitFor(
-        "durable Participant Egress failure",
+        "fenced durable Participant Egress failure",
         async () => {
           const evidence = await consultationEvidence(deniedConsultationId);
-          return evidence.effects.some(
-            (effect) =>
-              effect.kind === "PARTICIPANT_EGRESS" &&
-              effect.attempts >= 1 &&
-              String(effect.result?.error ?? "").includes("test fault denied PARTICIPANT_EGRESS"),
-          )
+          return evidence.admission_fenced_at != null &&
+            evidence.effects.some(
+              (effect) =>
+                effect.kind === "PARTICIPANT_EGRESS" &&
+                effect.attempts >= 1 &&
+                String(effect.result?.error ?? "").includes("test fault denied PARTICIPANT_EGRESS"),
+            )
             ? evidence
             : null;
         },
         120_000,
       );
-      if (denial.code === 0)
-        throw new Error("Participant Egress denial unexpectedly allowed a complete consultation");
       if (
         deniedEvidence.publication_grants !== 0 ||
         deniedEvidence.participant_grant_effects !== 0 ||
@@ -1646,7 +1952,13 @@ async function main() {
         "worker reservation before preservation failure",
         async () => {
           const evidence = await consultationEvidence(preservationConsultationId);
-          return evidence.reservations[0] ?? null;
+          const candidate = evidence.reservations[0];
+          return typeof candidate?.workerId === "string" &&
+            candidate.workerId.length > 0 &&
+            Number.isInteger(Number(candidate.generation)) &&
+            Number.isInteger(Number(candidate.epoch))
+            ? candidate
+            : null;
         },
         60_000,
       );
@@ -1654,8 +1966,13 @@ async function main() {
       if (preservation.code === 0)
         throw new Error("WAL/SQLite fault unexpectedly produced a complete archive");
       await waitFor(
-        "worker exit after preservation failure",
-        async () => (await inspect(workerBefore.Id)).RestartCount > workerRestartBaseline,
+        "exact worker container restart after preservation failure",
+        async (signal, deadline) => {
+          const restartCount = (await inspect(workerBefore.Id, { signal, deadline })).RestartCount;
+          return restartCountIncremented(workerRestartBaseline, restartCount)
+            ? { containerId: workerBefore.Id, restartCount }
+            : null;
+        },
         120_000,
       );
       const beforeFence = await consultationEvidence(preservationConsultationId);
@@ -1687,10 +2004,15 @@ async function main() {
           const currentReservation = evidence.reservations.find(
             (candidate) => candidate.epoch === reservation.epoch,
           );
-          return epoch?.fencedAt &&
+          const expectedCrash = {
+            workerId: reservation.workerId,
+            generation: Number(reservation.generation),
+            epoch: Number(reservation.epoch),
+          };
+          return workerCrashMatches(expectedCrash, currentReservation, epoch) &&
+            epoch.fencedAt &&
             epoch.terminalOutcome === "failed" &&
-            epoch.terminalAt &&
-            currentReservation?.fencedAt &&
+            currentReservation.fencedAt &&
             currentReservation.fenceReason
             ? evidence
             : null;
@@ -1736,6 +2058,9 @@ async function main() {
         name: "wal-sqlite-failure-report-denied",
         consultationId: preservationConsultationId,
         workerExited: true,
+        workerId: reservation.workerId,
+        workerGeneration: reservation.generation,
+        workerEpoch: reservation.epoch,
         expectedArtifactsBeforeSend: beforeFence.expected_count,
         heartbeatExpiryFencedAt: fencedEpoch.fencedAt,
         terminalCheckpointId: fencedEpoch.terminalCheckpointId,
@@ -1753,11 +2078,14 @@ async function main() {
       const minioId = await stop("minio");
       await waitFor(
         "web readiness to fail closed during MinIO outage",
-        async () => {
+        async (signal, deadline) => {
           try {
-            const response = await fetch(`${serviceBaseUrl}/api/health/ready`, {
-              signal: AbortSignal.timeout(10_000),
-            });
+            const response = await fetchWithDeadline(
+              `${serviceBaseUrl}/api/health/ready`,
+              {},
+              deadline,
+              signal,
+            );
             return !response.ok;
           } catch {
             return true;
@@ -1769,12 +2097,8 @@ async function main() {
       await assertServiceHealthy("minio");
       await waitFor(
         "web readiness after MinIO recovery",
-        async () =>
-          (
-            await fetch(`${serviceBaseUrl}/api/health/ready`, {
-              signal: AbortSignal.timeout(10_000),
-            })
-          ).ok,
+        async (signal, deadline) =>
+          (await fetchWithDeadline(`${serviceBaseUrl}/api/health/ready`, {}, deadline, signal)).ok,
         120_000,
       );
       proof.scenarios.push({ name: "minio-outage", readinessFailedClosed: true, recovered: true });
@@ -1784,6 +2108,7 @@ async function main() {
     if (shouldRunScenario("unwritable-spool")) {
       // An unwritable encrypted spool must make both worker roles unavailable. Restore
       // permissions and require semantic health before the harness exits.
+      const healthWatermarkMs = Date.now();
       const workerId = await stop("translation-worker");
       const drainerId = await stop("spool-drainer");
       await chmod("/var/lib/transhooter/spool", 0o000);
@@ -1791,21 +2116,25 @@ async function main() {
       await start(drainerId);
       const unavailable = await waitFor(
         "worker and drainer unavailable on unwritable spool",
-        async () => {
+        async (signal, deadline) => {
           const [workerState, drainerState] = await Promise.all([
-            inspect(workerId).then((value) => value.State),
-            inspect(drainerId).then((value) => value.State),
+            inspect(workerId, { signal, deadline }).then((value) => value.State),
+            inspect(drainerId, { signal, deadline }).then((value) => value.State),
           ]);
           const workerUnavailable =
             !workerState.Running ||
             workerState.Health?.Status === "unhealthy" ||
-            workerState.Health?.Log?.some((entry) => entry.ExitCode !== 0) === true;
+            workerState.Health?.Log?.some((entry) =>
+              healthFailureAfter(entry, healthWatermarkMs),
+            ) === true;
           const drainerUnavailable =
             !drainerState.Running ||
             drainerState.Health?.Status === "unhealthy" ||
-            drainerState.Health?.Log?.some((entry) => entry.ExitCode !== 0) === true;
+            drainerState.Health?.Log?.some((entry) =>
+              healthFailureAfter(entry, healthWatermarkMs),
+            ) === true;
           return workerUnavailable && drainerUnavailable
-            ? { workerUnavailable, drainerUnavailable }
+            ? { workerUnavailable, drainerUnavailable, healthWatermarkMs }
             : null;
         },
         90_000,
@@ -1819,6 +2148,10 @@ async function main() {
       await assertServiceHealthy("spool-drainer");
       proof.scenarios.push({ name: "unwritable-spool", ...unavailable, recovered: true });
       await checkpointScenario("unwritable-spool");
+    }
+
+    if (proof.scenarios.length === 0) {
+      throw new Error("failure-smoke produced no scenario evidence");
     }
 
     announcePhase("proof-emission");

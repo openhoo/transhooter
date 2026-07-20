@@ -253,12 +253,77 @@ def _translated_row(
     }
 
 
+def _supports_capability_locale(
+    capability: StageCapabilities,
+    locale: str,
+    *,
+    language_only: bool,
+) -> bool:
+    normalized_locale = locale.casefold()
+    normalized_language = (
+        _language_code(capability.provider, locale).casefold()
+        if language_only
+        else normalized_locale.split("-", 1)[0]
+    )
+    return any(
+        normalized == normalized_locale if "-" in normalized else normalized == normalized_language
+        for normalized in (language.casefold() for language in capability.languages)
+    )
+
+
+def _require_capability_locale(
+    capability: StageCapabilities,
+    locale: str,
+    *,
+    role: str,
+    language_only: bool = False,
+) -> None:
+    if not _supports_capability_locale(capability, locale, language_only=language_only):
+        raise RuntimeError(
+            f"configured {role} locale {locale} is not supported by "
+            f"{capability.provider} {capability.stage} capabilities"
+        )
+
+
+def _validate_capability_locales(
+    source: str,
+    target: str,
+    stages: dict[str, StageCapabilities],
+) -> None:
+    stt = stages["stt"]
+    _require_capability_locale(stt, source, role="source")
+    if source == target:
+        return
+
+    translation = stages["translation"]
+    tts = stages["tts"]
+    _require_capability_locale(
+        translation,
+        source,
+        role="source",
+        language_only=True,
+    )
+    _require_capability_locale(
+        translation,
+        target,
+        role="target",
+        language_only=True,
+    )
+    _require_capability_locale(tts, target, role="target")
+
+    # The catalog is bidirectional, including a same-language row for each
+    # configured locale, so the reverse direction must be fully supported too.
+    _require_capability_locale(stt, target, role="target")
+    _require_capability_locale(tts, source, role="source")
+
+
 def _capability_rows(
     profile: FixtureProfile | GoogleProfile | AlternateProfile,
     source: str,
     target: str,
     stages: dict[str, StageCapabilities],
 ) -> list[dict[str, object]]:
+    _validate_capability_locales(source, target, stages)
     locales = tuple(dict.fromkeys((source, target)))
     rows = [_same_language_row(profile, stages["stt"], locale) for locale in locales]
     if source != target:
@@ -826,7 +891,6 @@ def main() -> None:
         metric_export_interval_millis = None
     telemetry = configure_telemetry(
         service_name=os.environ.get("OTEL_SERVICE_NAME") or "transhooter-translation-worker",
-        endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"),
         environment=os.environ.get("APP_ENV"),
         metric_export_interval_millis=metric_export_interval_millis,
     )

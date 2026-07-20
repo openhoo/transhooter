@@ -3,7 +3,7 @@ import { expect, mock, test } from "bun:test";
 mock.module("server-only", () => ({}));
 
 // Import after replacing Next's server-only guard so the pure environment parser can run in Bun.
-const { parseWebEnvironment } = await import("./config");
+const { parseMagicLinkSealKeyring, parseWebEnvironment } = await import("./config");
 
 const baseEnvironment: NodeJS.ProcessEnv = {
   NODE_ENV: "production",
@@ -20,6 +20,7 @@ const baseEnvironment: NodeJS.ProcessEnv = {
   LIVEKIT_CREDENTIALS_FILE: "/run/secrets/livekit-credentials",
   SESSION_SECRET_FILE: "/run/secrets/session-secret",
   CSRF_SECRET_FILE: "/run/secrets/csrf-secret",
+  MAGIC_LINK_SEAL_KEYS_FILE: "/run/secrets/magic-link-seal-keys",
   EGRESS_LAYOUT_SIGNING_KEY_FILE: "/run/secrets/egress-layout-signing-key",
   SMTP_URL: "smtp://mail.example.test:2525",
   PUBLIC_BASE_URL: "https://app.example.test",
@@ -60,4 +61,32 @@ test("development and test use direct-local mode without a boundary header", () 
   expect(
     parseWebEnvironment({ ...baseEnvironment, APP_ENV: "test" }).TRUSTED_CLIENT_IP_HEADER,
   ).toBe(undefined);
+});
+
+test("magic-link seal keyrings require a present current 32-byte key and validate every key", () => {
+  const oldKey = Buffer.alloc(32, 1).toString("base64");
+  const currentKey = Buffer.alloc(32, 2).toString("base64");
+  const parsed = parseMagicLinkSealKeyring(
+    JSON.stringify({
+      currentKeyId: "current",
+      keys: { old: oldKey, current: currentKey },
+    }),
+  );
+  expect(parsed.currentKeyId).toBe("current");
+  expect(parsed.keys.get("old")).toEqual(new Uint8Array(Buffer.alloc(32, 1)));
+  expect(parsed.keys.get("current")).toEqual(new Uint8Array(Buffer.alloc(32, 2)));
+
+  expect(() =>
+    parseMagicLinkSealKeyring(
+      JSON.stringify({ currentKeyId: "missing", keys: { current: currentKey } }),
+    ),
+  ).toThrow("must contain its current key");
+  expect(() =>
+    parseMagicLinkSealKeyring(
+      JSON.stringify({
+        currentKeyId: "current",
+        keys: { current: currentKey, invalid: Buffer.alloc(31).toString("base64") },
+      }),
+    ),
+  ).toThrow(/invalid.*canonical base64|invalid.*32 bytes/);
 });

@@ -32,6 +32,11 @@ import {
   audioGains,
   releaseLocalTrack,
 } from "@/lib/room-policy";
+import {
+  createWithDeviceFallback,
+  persistDevicePreference,
+  readDevicePreference,
+} from "./interface-state";
 import styles from "./room.module.css";
 
 type InitialRoom = {
@@ -153,8 +158,7 @@ function handleStatusPacket(decoded: unknown, context: StatusHandlerContext) {
     status.reasonCode === "CAPTURE_READY" &&
     status.subjectParticipantId === context.initial.participantId
   ) {
-    context.state.setCaptureReady(true);
-    void context.publishDevices(context.room);
+    void context.publishDevices(context.room).then(() => context.state.setCaptureReady(true));
     return;
   }
 
@@ -348,10 +352,16 @@ function useRoomMediaController(
           !leaving.current;
         published.current = true;
         try {
-          const microphoneId = window.sessionStorage.getItem("transhooter.microphone") ?? undefined;
-          const cameraId = window.sessionStorage.getItem("transhooter.camera") ?? undefined;
-          const audioTrack = await createLocalAudioTrack(
-            microphoneId ? { deviceId: microphoneId } : {},
+          const microphoneId = readDevicePreference(
+            () => window.sessionStorage,
+            "transhooter.microphone",
+          );
+          const cameraId = readDevicePreference(() => window.sessionStorage, "transhooter.camera");
+          const audioTrack = await createWithDeviceFallback(
+            microphoneId,
+            (deviceId) => createLocalAudioTrack(deviceId ? { deviceId } : {}),
+            () =>
+              persistDevicePreference(() => window.sessionStorage, "transhooter.microphone", ""),
           );
           localTracks.current.push(audioTrack);
           if (!isCurrentAttempt()) {
@@ -359,7 +369,11 @@ function useRoomMediaController(
             return;
           }
 
-          const videoTrack = await createLocalVideoTrack(cameraId ? { deviceId: cameraId } : {});
+          const videoTrack = await createWithDeviceFallback(
+            cameraId,
+            (deviceId) => createLocalVideoTrack(deviceId ? { deviceId } : {}),
+            () => persistDevicePreference(() => window.sessionStorage, "transhooter.camera", ""),
+          );
           localTracks.current.push(videoTrack);
           if (!isCurrentAttempt()) {
             await stopPublishedDevices(room);
@@ -379,10 +393,16 @@ function useRoomMediaController(
           await room.localParticipant.publishTrack(videoTrack.mediaStreamTrack, {
             source: Track.Source.Camera,
           });
-        } catch {
+        } catch (cause) {
           await stopPublishedDevices(room);
+          const errorName =
+            typeof cause === "object" && cause !== null && "name" in cause ? cause.name : undefined;
           state.setError(
-            "Camera or microphone could not be published. Check browser permissions and try reconnecting.",
+            errorName === "NotAllowedError" ||
+              errorName === "PermissionDeniedError" ||
+              errorName === "SecurityError"
+              ? "Camera or microphone access was denied. Allow access in your browser and try reconnecting."
+              : "Camera or microphone could not be published. Check that a device is available and try reconnecting.",
           );
         }
       };
@@ -481,23 +501,25 @@ function useRoomMediaController(
         }
       });
       room.on(RoomEvent.Disconnected, () => {
-        state.setCaptureReady(false);
         published.current = false;
         if (roomRef.current === room) {
           roomRef.current = null;
         }
-        state.setConnected(false);
-        state.setInterpretationReady(false);
-        void stopPublishedDevices(room);
-        if (!leaving.current) {
-          if (reconnectTimer.current !== null) {
-            window.clearTimeout(reconnectTimer.current);
+        void (async () => {
+          await stopPublishedDevices(room);
+          state.setCaptureReady(false);
+          state.setConnected(false);
+          state.setInterpretationReady(false);
+          if (!leaving.current) {
+            if (reconnectTimer.current !== null) {
+              window.clearTimeout(reconnectTimer.current);
+            }
+            reconnectTimer.current = window.setTimeout(() => {
+              reconnectTimer.current = null;
+              void reconnect.current?.();
+            }, 1000);
           }
-          reconnectTimer.current = window.setTimeout(() => {
-            reconnectTimer.current = null;
-            void reconnect.current?.();
-          }, 1000);
-        }
+        })();
       });
 
       await room.connect(initial.liveKitUrl, tokenResult.token, {
@@ -519,10 +541,10 @@ function useRoomMediaController(
       state.setError(
         cause instanceof Error ? cause.message : "The secure room could not be reached",
       );
-      state.setCaptureReady(false);
       if (roomRef.current) {
         await stopPublishedDevices(roomRef.current);
       }
+      state.setCaptureReady(false);
       roomRef.current?.removeAllListeners();
       void roomRef.current?.disconnect();
       roomRef.current = null;
@@ -555,9 +577,8 @@ function useRoomMediaController(
     };
   }, [stopPublishedDevices]);
 
-  const leaveLocally = useCallback(() => {
+  const leaveLocally = useCallback(async () => {
     leaving.current = true;
-    state.setCaptureReady(false);
     published.current = false;
     if (reconnectTimer.current !== null) {
       window.clearTimeout(reconnectTimer.current);
@@ -565,9 +586,14 @@ function useRoomMediaController(
     }
     const room = roomRef.current;
     if (room) {
-      void stopPublishedDevices(room);
-      void room.disconnect();
+      await stopPublishedDevices(room);
+      try {
+        await room.disconnect();
+      } catch {
+        // Local media is already stopped; a transport shutdown failure cannot keep the UI joined.
+      }
     }
+    state.setCaptureReady(false);
   }, [state, stopPublishedDevices]);
 
   return { connect, leaveLocally, reattachCurrentMedia };
@@ -799,7 +825,7 @@ function RoomControls({
   callState: CallState;
   mode: AudioMode;
   onEnd: () => Promise<void>;
-  onLeave: () => void;
+  onLeave: () => Promise<void>;
   onModeChange: (mode: AudioMode) => void;
   role: "employee" | "customer";
   seconds: number | null;
@@ -851,7 +877,9 @@ function RoomControls({
           type="button"
           className="button secondary"
           disabled={seconds !== null}
-          onClick={onLeave}
+          onClick={() => {
+            void onLeave();
+          }}
         >
           Leave locally
         </button>
@@ -926,8 +954,8 @@ export function ConsultationRoom({ initial }: ConsultationRoomProps) {
     }
   }
 
-  function leaveConsultationLocally() {
-    leaveLocally();
+  async function leaveConsultationLocally() {
+    await leaveLocally();
     setLeftLocally(true);
   }
 

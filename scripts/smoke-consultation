@@ -4,12 +4,92 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/deploy/scripts/compose-lib.sh"
 
-load_state
-export PROVIDER_PROFILE="$profile"
+STACK_CLASS=reused-developer
+case "${1:-}" in
+  --harness-owned)
+    STACK_CLASS=harness-owned
+    shift
+    ;;
+  --reuse-developer-stack)
+    shift
+    ;;
+esac
+if [ "${1:-}" = "--" ]; then
+  shift
+fi
+case "${1:-}" in
+  "" | -*) ;;
+  *)
+    printf 'Unexpected wrapper positional argument: %s\n' "$1" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$STACK_CLASS" = harness-owned ]; then
+  PROJECT_NAME="transhooter-e2e-$$-$(date +%s)"
+  profile=fixture
+  OVERLAY_FILE="$ROOT/deploy/compose/compose.test.yml"
+  export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+  export APP_ENV=test
+  export PROVIDER_PROFILE=fixture
+  export BOOTSTRAP_ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:-admin@example.test}"
+  export BOOTSTRAP_ADMIN_NAME="${BOOTSTRAP_ADMIN_NAME:-Test Administrator}"
+  export RTC_SUBNET="${TEST_RTC_SUBNET:-10.254.232.0/24}"
+  export RTC_NODE_IP="${TEST_RTC_NODE_IP:-10.254.232.250}"
+  printf 'Stack proof classification: clean harness-owned stack (project=%s, label=com.docker.compose.project=%s).\n' \
+    "$PROJECT_NAME" "$PROJECT_NAME" >&2
+else
+  load_state
+  export PROVIDER_PROFILE="$profile"
+  printf 'Stack proof classification: reused developer stack (project=%s); this is not a hermetic clean-run proof.\n' \
+    "$PROJECT_NAME" >&2
+fi
 export COMPOSE_PROFILES=e2e
 
+deadline_supplied=false
+for argument do
+  if [ "$argument" = "--deadline-epoch-ms" ]; then
+    deadline_supplied=true
+  fi
+done
 LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
 LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
+COMPOSE_PHASE_TIMEOUT_SECONDS=${COMPOSE_PHASE_TIMEOUT_SECONDS:-600}
+ACTIVE_PID=
+
+terminate_active() {
+  trap - HUP INT TERM
+  if [ -n "$ACTIVE_PID" ]; then
+    kill -TERM -- "-$ACTIVE_PID" 2>/dev/null || true
+    wait "$ACTIVE_PID" 2>/dev/null || true
+  fi
+  exit 130
+}
+
+run_bounded() {
+  setsid timeout --signal=TERM --kill-after=10s "${COMPOSE_PHASE_TIMEOUT_SECONDS}s" "$@" &
+  ACTIVE_PID=$!
+  if wait "$ACTIVE_PID"; then
+    result=0
+  else
+    result=$?
+  fi
+  ACTIVE_PID=
+  return "$result"
+}
+
+compose_bounded() {
+  select_compose_command || return $?
+  set -- -p "$PROJECT_NAME" -f "$BASE_FILE" -f "$OVERLAY_FILE" "$@"
+  if [ -f "$ROOT/.env" ]; then
+    set -- --env-file "$ROOT/.env" "$@"
+  fi
+  case "$compose_implementation" in
+    plugin) run_bounded docker compose "$@" ;;
+    legacy) run_bounded docker-compose "$@" ;;
+  esac
+}
+
 exec 9>"$LOCK_FILE"
 if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
   printf 'Timed out after %s seconds waiting for the compose harness lock.\n' "$LOCK_WAIT_SECONDS" >&2
@@ -19,22 +99,34 @@ fi
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
-  announce_phase "Removing consultation-smoke one-off containers"
-  if ! compose --profile e2e rm --force --stop e2e >/dev/null; then
-    if [ "$status" -eq 0 ]; then
-      status=1
+  if [ "$STACK_CLASS" = harness-owned ]; then
+    announce_phase "Cleaning owned consultation-smoke stack $PROJECT_NAME"
+    if ! compose_bounded down --volumes --remove-orphans; then
+      [ "$status" -ne 0 ] || status=1
+      printf 'Owned consultation-smoke stack cleanup failed for %s.\n' "$PROJECT_NAME" >&2
     fi
-    printf 'Consultation-smoke cleanup failed.\n' >&2
+  else
+    announce_phase "Removing consultation-smoke one-off containers from reused stack"
+    if ! compose_bounded --profile e2e rm --force --stop e2e >/dev/null; then
+      [ "$status" -ne 0 ] || status=1
+      printf 'Consultation-smoke cleanup failed.\n' >&2
+    fi
   fi
   flock -u 9
   exit "$status"
 }
 
 trap cleanup 0
-trap 'exit 130' HUP INT TERM
-announce_phase "Removing stale consultation-smoke one-off containers"
-compose --profile e2e rm --force --stop e2e >/dev/null
+trap terminate_active HUP INT TERM
+if [ "$STACK_CLASS" = reused-developer ]; then
+  announce_phase "Removing stale consultation-smoke one-off containers"
+  compose_bounded --profile e2e rm --force --stop e2e >/dev/null
+fi
 announce_phase "Building consultation application and smoke images from the current source tree"
-build_runtime_and_harness_images e2e
+compose_bounded build egress-ready translation-worker web e2e
+if ! $deadline_supplied; then
+  deadline_epoch_ms=$((($(date +%s) + ${CONSULTATION_SMOKE_DEADLINE_SECONDS:-900}) * 1000))
+  set -- "$@" --deadline-epoch-ms "$deadline_epoch_ms"
+fi
 announce_phase "Running consultation smoke for ${profile}"
-compose --profile e2e run --rm e2e bun run smoke:consultation -- "$@"
+compose_bounded --profile e2e run --rm e2e bun run smoke:consultation -- "$@"

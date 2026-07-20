@@ -27,14 +27,6 @@ export function MagicLinkForm() {
     }
   }
 
-  if (state === "sent") {
-    return (
-      <div className="notice" role="status">
-        If this address can sign in, a private link is on its way. It expires in 15 minutes.
-      </div>
-    );
-  }
-
   return (
     <form
       className="stack"
@@ -42,6 +34,11 @@ export function MagicLinkForm() {
         void submit(event);
       }}
     >
+      {state === "sent" && (
+        <div className="notice" role="status">
+          If this address can sign in, a private link is on its way. It expires in 15 minutes.
+        </div>
+      )}
       <div className="field">
         <label htmlFor="email">Email address</label>
         <input id="email" name="email" type="email" autoComplete="email" required />
@@ -52,7 +49,11 @@ export function MagicLinkForm() {
         </p>
       )}
       <button className="button" disabled={state === "sending"} type="submit">
-        {state === "sending" ? "Sending…" : "Email me a sign-in link"}
+        {state === "sending"
+          ? "Sending…"
+          : state === "sent"
+            ? "Resend the same sign-in link"
+            : "Email me a sign-in link"}
       </button>
     </form>
   );

@@ -147,6 +147,89 @@ def test_terminal_drain_uploads_current_meeting_non_pcm_before_reconciliation(
     assert registrations == [caption.object_id]
 
 
+def test_retryable_oldest_registration_does_not_starve_later_committed_object(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    oldest = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="translation",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"translation":"retry"}',
+    )
+    later = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="caption",
+        transport="http",
+        direction="out",
+        media_type="application/json",
+        payload=b'{"translation":"accepted"}',
+    )
+    registrations: list[UUID] = []
+
+    def register(
+        _meeting: UUID,
+        object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        if object_id == oldest.object_id:
+            raise RetryableRegistrationError("control unavailable")
+        registrations.append(object_id)
+
+    with pytest.raises(RetryableRegistrationError, match="control unavailable"):
+        upload_committed_objects(spool, AlwaysVerifiedArchive(), register, meeting_id)
+
+    assert registrations == [later.object_id]
+    assert [ref.object_id for ref, _ in spool.committed()] == [oldest.object_id]
+    assert spool.context(oldest.object_id)[3] == oldest.ordinal
+
+
+def test_registration_failures_are_aggregated_after_independent_progress(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    refs = [
+        spool.append(
+            meeting_id=meeting_id,
+            attempt_id=uuid4(),
+            stage="translation",
+            transport="http",
+            direction="in",
+            media_type="application/json",
+            payload=f'{{"sequence":{sequence}}}'.encode(),
+        )
+        for sequence in range(3)
+    ]
+
+    def register(
+        _meeting: UUID,
+        object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        if object_id != refs[1].object_id:
+            raise RuntimeError(str(object_id))
+
+    with pytest.raises(RetryableRegistrationError) as caught:
+        upload_committed_objects(spool, AlwaysVerifiedArchive(), register, meeting_id)
+
+    assert [str(error) for error in caught.value.failures] == [
+        str(refs[0].object_id),
+        str(refs[2].object_id),
+    ]
+    assert [ref.object_id for ref, _ in spool.committed()] == [
+        refs[0].object_id,
+        refs[2].object_id,
+    ]
+
+
 @pytest.mark.parametrize(
     ("status", "error_type"),
     [
@@ -330,14 +413,26 @@ async def test_inline_terminal_drain_keeps_retryable_rejection_committed(
         media_type="application/json",
         payload=b'{"outcome":"failed"}',
     )
+    later = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="translation",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"translation":"accepted"}',
+    )
+    registered: list[UUID] = []
 
     async def reject(
         _meeting: UUID,
-        _object_id: UUID,
+        object_id: UUID,
         _object_class: str,
         _record: ObjectRecord,
     ) -> None:
-        raise RuntimeError("control unavailable")
+        if object_id == evidence.object_id:
+            raise RuntimeError("control unavailable")
+        registered.append(object_id)
 
     with pytest.raises(RuntimeError, match="control unavailable"):
         await upload_committed_objects_async(
@@ -347,6 +442,7 @@ async def test_inline_terminal_drain_keeps_retryable_rejection_committed(
             meeting_id,
         )
 
+    assert registered == [later.object_id]
     assert [reference.object_id for reference, _ in spool.committed()] == [evidence.object_id]
 
 
@@ -382,6 +478,114 @@ async def test_inline_terminal_drain_archives_on_connection_owner_thread(
     )
 
     assert spool.committed() == []
+
+
+def test_uploaded_envelope_compaction_is_bounded_and_preserves_replay_evidence(
+    tmp_path: Path,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    ordinary = [
+        spool.append(
+            meeting_id=meeting_id,
+            attempt_id=uuid4(),
+            stage="translation",
+            transport="http",
+            direction="in",
+            media_type="application/json",
+            payload=f'{{"sequence":{sequence}}}'.encode(),
+        )
+        for sequence in range(2)
+    ]
+    attempt_id = uuid4()
+    spool.append(
+        meeting_id=meeting_id,
+        attempt_id=attempt_id,
+        stage="translation",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"request":true}',
+    )
+    terminal = spool.terminal(attempt_id, b'{"outcome":"succeeded"}')
+    provider_terminal = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="stt-terminal",
+        transport="grpc",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"outcome":"failed"}',
+    )
+    checkpoint = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="checkpoint",
+        transport="http",
+        direction="internal",
+        media_type="application/json",
+        payload=b'{"acceptedInput":42,"terminal":true}',
+    )
+    pcm = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="stt-input",
+        transport="grpc",
+        direction="in",
+        media_type="audio/L16",
+        payload=b"\0\0",
+        sample_range=SampleRange(41, 42),
+    )
+    for ref in (*ordinary, terminal, provider_terminal, checkpoint, pcm):
+        spool.mark_uploaded(ref.object_id, "version", "checksum")
+    paths = {
+        UUID(object_id): Path(path)
+        for object_id, path in spool._db.execute(
+            "SELECT object_id, opaque_path FROM records"
+        ).fetchall()
+    }
+
+    assert spool.compact_uploaded_envelopes(limit=1) == 1
+    assert not paths[ordinary[0].object_id].exists()
+    assert paths[ordinary[1].object_id].exists()
+    assert spool.context(ordinary[0].object_id)[3] == ordinary[0].ordinal
+    assert spool.read(terminal.object_id) == b'{"outcome":"succeeded"}'
+    assert spool.read(provider_terminal.object_id) == b'{"outcome":"failed"}'
+    assert spool.read(checkpoint.object_id) == b'{"acceptedInput":42,"terminal":true}'
+    assert spool.read(pcm.object_id) == b"\0\0"
+    assert spool.committed_scoped(meeting_id, "stt-input", "in", include_uploaded=True)[0][
+        1
+    ] == SampleRange(41, 42)
+
+
+def test_compaction_recovery_accepts_crash_after_unlink(tmp_path: Path) -> None:
+    spool = make_spool(tmp_path)
+    ref = spool.append(
+        meeting_id=uuid4(),
+        attempt_id=uuid4(),
+        stage="translation",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b"archived",
+    )
+    spool.mark_uploaded(ref.object_id, "version", "checksum")
+    path = tmp_path / "payloads" / f"{ref.object_id}.wal"
+
+    def crash_before_directory_fsync() -> None:
+        raise OSError("simulated crash")
+
+    spool._fsync_directory = crash_before_directory_fsync  # type: ignore[method-assign]
+    with pytest.raises(SpoolUnavailable, match="encrypted spool operation failed"):
+        spool.compact_uploaded_envelopes()
+    assert not path.exists()
+    spool._db.close()
+
+    reopened = make_spool(tmp_path)
+    assert reopened.context(ref.object_id)[3] == ref.ordinal
+    assert reopened._db.execute(
+        "SELECT state FROM records WHERE object_id = ?", (str(ref.object_id),)
+    ).fetchone() == ("uploaded",)
 
 
 def test_spool_encrypts_fsyncs_and_authenticates(tmp_path: Path) -> None:

@@ -2,5 +2,4 @@
 set -eu
 . "$(dirname -- "$0")/../deploy/scripts/compose-lib.sh"
 load_state
-export PROVIDER_PROFILE=$profile
 compose stop "$@"

@@ -1,5 +1,5 @@
 import "server-only";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   AbortMultipartUploadCommand,
   DeleteObjectsCommand,
@@ -20,21 +20,84 @@ import {
   SegmentedFileOutput,
   SegmentedFileProtocol,
 } from "@livekit/protocol";
-import type {
-  EgressPort,
-  LiveKitRoomPort,
-  LiveKitTokenPort,
-  MailPort,
-  ObjectStoragePort,
-  UUID,
-  VerifiedWebhook,
-  WebhookVerifier,
+import type { MagicLinkPurpose } from "@transhooter/contracts";
+import {
+  type ActiveMagicLink,
+  DomainError,
+  type EgressPort,
+  type LiveKitRoomPort,
+  type LiveKitTokenPort,
+  type MagicLinkRecord,
+  type MagicLinkTokenSealer,
+  type MailPort,
+  type ObjectStoragePort,
+  type UUID,
+  type VerifiedWebhook,
+  type WebhookVerifier,
 } from "@transhooter/server-core";
-import { AccessToken, EgressClient, RoomServiceClient, WebhookReceiver } from "livekit-server-sdk";
+import {
+  AccessToken,
+  authorizeHeader,
+  EgressClient,
+  RoomServiceClient,
+  WebhookReceiver,
+} from "livekit-server-sdk";
 import nodemailer from "nodemailer";
 import { z } from "zod";
 import type { WebConfig } from "./config";
-import { normalizedEgressWebhookKind } from "./livekit-webhook";
+import { normalizedEgressWebhookKind, normalizeEgressRequestSource } from "./livekit-webhook";
+
+function magicLinkTokenAad(record: MagicLinkRecord): Buffer {
+  return Buffer.from(
+    JSON.stringify([
+      "transhooter.magic-link-token.v1",
+      record.id,
+      record.userId,
+      record.purpose,
+      record.consultationId,
+      record.sessionId,
+    ]),
+    "utf8",
+  );
+}
+
+export class AesGcmMagicLinkTokenSealer implements MagicLinkTokenSealer {
+  constructor(private readonly keyring: WebConfig["magicLinkSealKeyring"]) {}
+
+  seal(rawToken: Uint8Array, record: MagicLinkRecord) {
+    const key = this.keyring.keys.get(this.keyring.currentKeyId);
+    if (!key) {
+      throw new Error("Current magic-link seal key is unavailable");
+    }
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, nonce);
+    cipher.setAAD(magicLinkTokenAad(record));
+    const ciphertext = Buffer.concat([cipher.update(rawToken), cipher.final()]);
+    const authenticationTag = cipher.getAuthTag();
+    return {
+      sealedRawToken: Buffer.concat([nonce, authenticationTag, ciphertext]).toString("base64url"),
+      keyId: this.keyring.currentKeyId,
+    };
+  }
+
+  open(link: ActiveMagicLink): Uint8Array {
+    const key = this.keyring.keys.get(link.keyId);
+    if (!key) {
+      throw new Error("Magic-link seal key is unavailable");
+    }
+    if (!/^[A-Za-z0-9_-]+$/u.test(link.sealedRawToken)) {
+      throw new Error("Magic-link ciphertext is malformed");
+    }
+    const payload = Buffer.from(link.sealedRawToken, "base64url");
+    if (payload.length <= 28 || payload.toString("base64url") !== link.sealedRawToken) {
+      throw new Error("Magic-link ciphertext is malformed");
+    }
+    const decipher = createDecipheriv("aes-256-gcm", key, payload.subarray(0, 12));
+    decipher.setAAD(magicLinkTokenAad(link.record));
+    decipher.setAuthTag(payload.subarray(12, 28));
+    return new Uint8Array(Buffer.concat([decipher.update(payload.subarray(28)), decipher.final()]));
+  }
+}
 
 const LiveKitCredentialsSchema = z.object({
   apiKey: z.string().min(1),
@@ -97,7 +160,7 @@ export class SmtpMailAdapter implements MailPort {
 
   async sendMagicLink(input: {
     to: string;
-    purpose: "sign_in" | "consultation_invite" | "archive_delete_reauth";
+    purpose: MagicLinkPurpose;
     url: string;
     expiresAt: Date;
   }): Promise<void> {
@@ -152,6 +215,38 @@ function isNotFoundError(error: unknown): boolean {
   );
 }
 
+type VersionCursor = {
+  keyMarker: string;
+  versionIdMarker: string | null;
+};
+
+function encodeVersionCursor(cursor: VersionCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeVersionCursor(cursor: string): VersionCursor {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as unknown;
+  } catch {
+    throw new Error("Invalid S3 version cursor");
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    !("keyMarker" in parsed) ||
+    typeof parsed.keyMarker !== "string" ||
+    !("versionIdMarker" in parsed) ||
+    (parsed.versionIdMarker !== null && typeof parsed.versionIdMarker !== "string")
+  ) {
+    throw new Error("Invalid S3 version cursor");
+  }
+  return {
+    keyMarker: parsed.keyMarker,
+    versionIdMarker: parsed.versionIdMarker,
+  };
+}
+
 export class S3ArchiveAdapter implements ObjectStoragePort {
   readonly #client: S3Client;
   readonly #publicClient: S3Client;
@@ -184,6 +279,9 @@ export class S3ArchiveAdapter implements ObjectStoragePort {
     checksum: string;
   }) {
     const sha256 = createHash("sha256").update(input.body).digest("hex");
+    if (input.checksum !== sha256) {
+      throw new Error("Archive body SHA-256 does not match the caller-provided checksum");
+    }
     const kmsOptions = this.config.archiveRequireKms
       ? {
           ServerSideEncryption: "aws:kms" as const,
@@ -267,19 +365,33 @@ export class S3ArchiveAdapter implements ObjectStoragePort {
   }
 
   async listMeetingVersions(consultationId: UUID, cursor?: string) {
+    const markers = cursor ? decodeVersionCursor(cursor) : undefined;
     const result = await this.#client.send(
       new ListObjectVersionsCommand({
         Bucket: this.config.s3Bucket,
         Prefix: `v1/meetings/${consultationId}/`,
-        KeyMarker: cursor,
+        KeyMarker: markers?.keyMarker,
+        VersionIdMarker: markers?.versionIdMarker ?? undefined,
       }),
     );
-    const versions = (result.Versions ?? []).flatMap((version) =>
-      version.Key && version.VersionId ? [{ key: version.Key, versionId: version.VersionId }] : [],
+    const versions = [...(result.Versions ?? []), ...(result.DeleteMarkers ?? [])].flatMap(
+      (version) =>
+        version.Key && version.VersionId
+          ? [{ key: version.Key, versionId: version.VersionId }]
+          : [],
     );
+    if (!result.IsTruncated) {
+      return { versions, cursor: null };
+    }
+    if (!result.NextKeyMarker) {
+      throw new Error("S3 version listing omitted its next key marker");
+    }
     return {
       versions,
-      cursor: result.IsTruncated ? (result.NextKeyMarker ?? null) : null,
+      cursor: encodeVersionCursor({
+        keyMarker: result.NextKeyMarker,
+        versionIdMarker: result.NextVersionIdMarker ?? null,
+      }),
     };
   }
 
@@ -303,15 +415,32 @@ export class S3ArchiveAdapter implements ObjectStoragePort {
   }
 
   async listMultipart(consultationId: UUID) {
-    const result = await this.#client.send(
-      new ListMultipartUploadsCommand({
-        Bucket: this.config.s3Bucket,
-        Prefix: `v1/meetings/${consultationId}/`,
-      }),
-    );
-    return (result.Uploads ?? []).flatMap((upload) =>
-      upload.Key && upload.UploadId ? [{ key: upload.Key, uploadId: upload.UploadId }] : [],
-    );
+    const uploads: { key: string; uploadId: string }[] = [];
+    let keyMarker: string | undefined;
+    let uploadIdMarker: string | undefined;
+    for (;;) {
+      const result = await this.#client.send(
+        new ListMultipartUploadsCommand({
+          Bucket: this.config.s3Bucket,
+          Prefix: `v1/meetings/${consultationId}/`,
+          KeyMarker: keyMarker,
+          UploadIdMarker: uploadIdMarker,
+        }),
+      );
+      uploads.push(
+        ...(result.Uploads ?? []).flatMap((upload) =>
+          upload.Key && upload.UploadId ? [{ key: upload.Key, uploadId: upload.UploadId }] : [],
+        ),
+      );
+      if (!result.IsTruncated) {
+        return uploads;
+      }
+      if (!result.NextKeyMarker || !result.NextUploadIdMarker) {
+        throw new Error("S3 multipart listing omitted its continuation markers");
+      }
+      keyMarker = result.NextKeyMarker;
+      uploadIdMarker = result.NextUploadIdMarker;
+    }
   }
 
   async abortMultipart(key: string, uploadId: string): Promise<void> {
@@ -494,53 +623,125 @@ function createEgressPort(
 function createWebhookVerifier(webhookReceiver: WebhookReceiver): WebhookVerifier {
   return {
     async verify(rawBody, headers): Promise<VerifiedWebhook> {
-      const event = await webhookReceiver.receive(
-        new TextDecoder().decode(rawBody),
-        headers.authorization,
-      );
-      let kind: VerifiedWebhook["kind"] = "ignored";
-      if (event.event === "participant_joined") {
-        kind = "participant_joined";
-      } else if (event.event === "participant_left") {
-        kind = "participant_left";
-      } else {
-        kind = normalizedEgressWebhookKind(event.event, event.egressInfo?.status) ?? "ignored";
-      }
-
-      const roomName = event.room?.name ?? event.egressInfo?.roomName;
-      if (!event.id || !event.createdAt || (kind !== "ignored" && !roomName)) {
-        throw new Error("Incomplete LiveKit webhook");
-      }
-
-      let binding: { consultationId: UUID; generation: number } | undefined;
-      if (event.room?.metadata) {
-        let metadata: unknown;
-        try {
-          metadata = JSON.parse(event.room.metadata) as unknown;
-        } catch {
-          throw new Error("LiveKit room metadata is not valid JSON");
+      try {
+        const event = await webhookReceiver.receive(
+          new TextDecoder().decode(rawBody),
+          headers[authorizeHeader.toLowerCase()] ?? headers.authorization,
+        );
+        let kind: VerifiedWebhook["kind"] = "ignored";
+        if (event.event === "participant_joined") {
+          kind = "participant_joined";
+        } else if (event.event === "participant_left") {
+          kind = "participant_left";
+        } else {
+          kind = normalizedEgressWebhookKind(event.event, event.egressInfo?.status) ?? "ignored";
         }
-        binding = z
-          .object({
-            consultationId: z.uuid(),
-            generation: z.number().int().nonnegative(),
-          })
-          .parse(metadata);
-      }
 
-      const isParticipantEvent = kind === "participant_joined" || kind === "participant_left";
-      const participantIdentity =
-        isParticipantEvent && event.participant?.identity ? event.participant.identity : undefined;
-      return {
-        id: event.id,
-        occurredAt: new Date(Number(event.createdAt) * 1000),
-        kind,
-        roomName: roomName ?? "",
-        ...(binding ? binding : {}),
-        ...(participantIdentity ? { identity: participantIdentity as UUID } : {}),
-        ...(event.egressInfo?.egressId ? { egressId: event.egressInfo.egressId } : {}),
-        payload: event,
-      };
+        const egressSource = normalizeEgressRequestSource(event.egressInfo);
+        const roomName = event.room?.name ?? event.egressInfo?.roomName ?? egressSource?.roomName;
+        if (!event.id) {
+          throw new Error("LiveKit webhook event ID is missing");
+        }
+        if (!event.createdAt) {
+          throw new Error("LiveKit webhook createdAt is missing");
+        }
+        if (!roomName && kind === "participant_joined") {
+          throw new Error("LiveKit participant_joined webhook roomName is missing");
+        }
+        if (!roomName && kind === "participant_left") {
+          throw new Error("LiveKit participant_left webhook roomName is missing");
+        }
+
+        let binding: { consultationId: UUID; generation: number } | undefined;
+        if (event.room?.metadata) {
+          let metadata: unknown;
+          try {
+            metadata = JSON.parse(event.room.metadata) as unknown;
+          } catch {
+            throw new Error("LiveKit room metadata is not valid JSON");
+          }
+          binding = z
+            .object({
+              consultationId: z.uuid(),
+              generation: z.number().int().nonnegative(),
+            })
+            .parse(metadata);
+        }
+
+        const isParticipantEvent = kind === "participant_joined" || kind === "participant_left";
+        const participantIdentity =
+          isParticipantEvent && event.participant?.identity
+            ? event.participant.identity
+            : undefined;
+        return {
+          id: event.id,
+          occurredAt: new Date(Number(event.createdAt) * 1000),
+          kind,
+          ...(roomName ? { roomName } : {}),
+          ...(binding ? binding : {}),
+          ...(participantIdentity ? { identity: participantIdentity as UUID } : {}),
+          ...(event.egressInfo?.egressId ? { egressId: event.egressInfo.egressId } : {}),
+          ...(egressSource ? { egressSource } : {}),
+          payload: event,
+        };
+      } catch (error) {
+        let reason:
+          | "authorization_header_empty"
+          | "body_checksum_mismatch"
+          | "missing_event_id"
+          | "missing_created_at"
+          | "missing_room_name_participant_joined"
+          | "missing_room_name_participant_left"
+          | "invalid_room_metadata"
+          | "zod_validation_failed"
+          | "json_parse_failed"
+          | "unknown" = "unknown";
+        if (error instanceof Error && error.message === "authorization header is empty") {
+          reason = "authorization_header_empty";
+        } else if (
+          error instanceof Error &&
+          error.message === "sha256 checksum of body does not match"
+        ) {
+          reason = "body_checksum_mismatch";
+        } else if (
+          error instanceof Error &&
+          error.message === "LiveKit webhook event ID is missing"
+        ) {
+          reason = "missing_event_id";
+        } else if (
+          error instanceof Error &&
+          error.message === "LiveKit webhook createdAt is missing"
+        ) {
+          reason = "missing_created_at";
+        } else if (
+          error instanceof Error &&
+          error.message === "LiveKit participant_joined webhook roomName is missing"
+        ) {
+          reason = "missing_room_name_participant_joined";
+        } else if (
+          error instanceof Error &&
+          error.message === "LiveKit participant_left webhook roomName is missing"
+        ) {
+          reason = "missing_room_name_participant_left";
+        } else if (
+          error instanceof Error &&
+          error.message === "LiveKit room metadata is not valid JSON"
+        ) {
+          reason = "invalid_room_metadata";
+        } else if (
+          error instanceof z.ZodError ||
+          (error instanceof Error && error.name === "ZodError")
+        ) {
+          reason = "zod_validation_failed";
+        } else if (
+          error instanceof SyntaxError ||
+          (error instanceof Error && error.name === "SyntaxError")
+        ) {
+          reason = "json_parse_failed";
+        }
+        console.warn("LiveKit webhook rejected", { reason });
+        throw new DomainError("INVALID_WEBHOOK");
+      }
     },
   };
 }

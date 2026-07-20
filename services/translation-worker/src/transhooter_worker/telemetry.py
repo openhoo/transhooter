@@ -135,10 +135,20 @@ def configure_telemetry(
         if _handle is not None:
             return _handle
 
-        configured_endpoint = (
-            endpoint if endpoint is not None else os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        configured_endpoint = endpoint.strip() if endpoint is not None else None
+        endpoint_configured = (
+            bool(configured_endpoint)
+            if endpoint is not None
+            else any(
+                os.environ.get(name, "").strip()
+                for name in (
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                )
+            )
         )
-        if _sdk_disabled() or not configured_endpoint or not configured_endpoint.strip():
+        if _sdk_disabled() or not endpoint_configured:
             _handle = _disabled_handle(service_name)
             return _handle
 
@@ -192,7 +202,7 @@ def _metric_views() -> list[Any]:
 def _enabled_handle(
     *,
     service_name: str,
-    endpoint: str,
+    endpoint: str | None,
     environment: str | None,
     metric_export_interval_millis: int | None,
 ) -> TelemetryHandle:
@@ -212,8 +222,8 @@ def _enabled_handle(
     }
     if environment and environment.strip():
         attributes["deployment.environment.name"] = environment.strip()
-    resource = Resource(attributes=attributes)
-    traces_endpoint, metrics_endpoint = _signal_endpoints(endpoint)
+    resource = Resource.create(attributes)
+    signal_endpoints = _signal_endpoints(endpoint) if endpoint is not None else None
     export_interval = _metric_export_interval(metric_export_interval_millis)
 
     span_processor: Any = None
@@ -221,12 +231,16 @@ def _enabled_handle(
     metric_reader: Any = None
     meter_provider: Any = None
     try:
-        span_processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=traces_endpoint))
+        span_processor = BatchSpanProcessor(
+            OTLPSpanExporter(endpoint=signal_endpoints[0] if signal_endpoints is not None else None)
+        )
         tracer_provider = TracerProvider(resource=resource)
         tracer_provider.add_span_processor(span_processor)
 
         metric_reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint=metrics_endpoint),
+            OTLPMetricExporter(
+                endpoint=signal_endpoints[1] if signal_endpoints is not None else None
+            ),
             export_interval_millis=export_interval,
         )
         meter_provider = MeterProvider(

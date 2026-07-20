@@ -14,6 +14,7 @@ import type {
   ArchiveRepository,
   AuditPort,
   ConsultationRepository,
+  EgressEventEarlySource,
   LanguageCapability,
   LanguageRepository,
   ProviderProfileRevision,
@@ -33,6 +34,8 @@ import {
   consultationParticipants,
   consultations,
   egressJobs,
+  expectedArchiveArtifacts,
+  externalEffects,
   finalInventories,
   languageCapabilities,
   legalHolds,
@@ -53,7 +56,6 @@ type CapabilitySnapshot = (
       "sourceParticipantId" | "destinationParticipantId" | "capabilityRowId"
     >
 ) & { capabilityVersion?: string };
-type ProfileLockRow = { id: UUID; name: string; current_revision: number };
 type BypassSelectionRow = {
   profile_name: string;
   current_revision: number;
@@ -70,12 +72,6 @@ type ArchiveLockRow = {
   completed_deletion_epoch: number | null;
   final_inventory_hash: string | null;
   reconciliation_deadline_at: Date | null;
-};
-type ExpectedArtifactLockRow = {
-  id: UUID;
-  sample_start: number | null;
-  sample_end: number | null;
-  owner_epoch: number;
 };
 type ArchiveObjectLockRow = {
   id: UUID;
@@ -94,20 +90,6 @@ type ArchiveObjectLockRow = {
   sequence: number | null;
   writer_epoch: number;
 };
-type UnresolvedExpectationRow = {
-  id: UUID;
-  object_class: string;
-  causal_key: string;
-  sample_start: number | null;
-  sample_end: number | null;
-};
-type ActiveHoldRow = {
-  id: UUID;
-  reason: string;
-  actor_id: UUID;
-  state: "applying" | "active" | "releasing" | "failed";
-  per_version_results: unknown;
-};
 
 abstract class DrizzleRepository {
   constructor(protected readonly database: NodePgDatabase<DrizzleSchema>) {}
@@ -122,16 +104,35 @@ export class DrizzleConsultationRepository
   implements ConsultationRepository
 {
   async lock(id: UUID, tx: Transaction): Promise<Consultation | null> {
-    await unwrap(tx).execute<{ id: UUID }>(sql`
-      SELECT id
-      FROM consultations
-      WHERE id = ${id}
-      FOR UPDATE
-    `);
+    await unwrap(tx)
+      .select({ id: consultations.id })
+      .from(consultations)
+      .where(eq(consultations.id, id))
+      .for("update");
     return this.load(id, unwrap(tx));
   }
   get(id: UUID): Promise<Consultation | null> {
     return this.load(id, this.database);
+  }
+
+  async findByCreationIdempotencyKey(
+    employeeUserId: UUID,
+    creationIdempotencyKey: UUID,
+    tx: Transaction,
+  ): Promise<Consultation | null> {
+    const database = unwrap(tx);
+    const rows = await database
+      .select({ id: consultations.id })
+      .from(consultations)
+      .where(
+        and(
+          eq(consultations.employeeUserId, employeeUserId),
+          eq(consultations.creationIdempotencyKey, creationIdempotencyKey),
+        ),
+      )
+      .limit(1);
+    const id = rows[0]?.id;
+    return id ? this.load(id, database) : null;
   }
 
   async listForUser(userId: UUID): Promise<readonly Consultation[]> {
@@ -147,28 +148,45 @@ export class DrizzleConsultationRepository
     return consultationsForUser.filter((value): value is Consultation => value !== null);
   }
 
-  async create(value: Consultation, tx: Transaction): Promise<void> {
+  async create(
+    value: Consultation,
+    employeeUserId: UUID,
+    creationIdempotencyKey: UUID,
+    tx: Transaction,
+  ): Promise<boolean> {
     const database = unwrap(tx);
-    await database.insert(consultations).values({
-      id: value.id,
-      state: value.state,
-      providerProfileId: value.providerProfileId,
-      providerProfileRevision: value.providerProfileRevision,
-      providerSelection: value.providerSelection,
-      snapshotHash: value.snapshotHash,
-      generation: value.generation,
-      roomName: value.roomName,
-      roomSid: value.roomSid,
-      dispatchId: value.dispatchId,
-      compositeEgressId: value.compositeEgressId,
-      workerIdentity: value.workerIdentity,
-      readyDeadlineAt: value.readyDeadlineAt,
-      finalizeDeadlineAt: value.finalizeDeadlineAt,
-      bothAbsentSince: value.bothAbsentSince,
-      admissionFencedAt: value.admissionFencedAt,
-      createdAt: value.createdAt,
-      updatedAt: value.updatedAt,
-    });
+    const inserted = await database
+      .insert(consultations)
+      .values({
+        id: value.id,
+        state: value.state,
+        providerProfileId: value.providerProfileId,
+        providerProfileRevision: value.providerProfileRevision,
+        providerSelection: value.providerSelection,
+        snapshotHash: value.snapshotHash,
+        generation: value.generation,
+        roomName: value.roomName,
+        roomSid: value.roomSid,
+        dispatchId: value.dispatchId,
+        compositeEgressId: value.compositeEgressId,
+        workerIdentity: value.workerIdentity,
+        readyDeadlineAt: value.readyDeadlineAt,
+        finalizeDeadlineAt: value.finalizeDeadlineAt,
+        bothAbsentSince: value.bothAbsentSince,
+        admissionFencedAt: value.admissionFencedAt,
+        employeeUserId,
+        creationIdempotencyKey,
+        createdAt: value.createdAt,
+        updatedAt: value.updatedAt,
+      })
+      .onConflictDoNothing({
+        target: [consultations.employeeUserId, consultations.creationIdempotencyKey],
+      })
+      .returning({ id: consultations.id });
+    if (inserted.length === 0) {
+      return false;
+    }
+
     for (const slot of value.participants) {
       await database.insert(consultationParticipants).values({
         id: slot.id,
@@ -198,6 +216,7 @@ export class DrizzleConsultationRepository
       createdAt: value.createdAt,
       updatedAt: value.updatedAt,
     });
+    return true;
   }
   async save(value: Consultation, expectedUpdatedAt: Instant, tx: Transaction): Promise<boolean> {
     const database = unwrap(tx);
@@ -394,10 +413,14 @@ export class DrizzleConsultationRepository
     return participants[0] ?? null;
   }
 
-  async resolveEgressEvent(egressId: string): Promise<{
+  async resolveEgressEvent(
+    egressId: string,
+    earlySource?: EgressEventEarlySource,
+  ): Promise<{
     consultationId: UUID;
     generation: number;
     roomName: string;
+    earlySubject?: { participantId: UUID | null };
   } | null> {
     const rows = await this.database
       .select({
@@ -411,14 +434,82 @@ export class DrizzleConsultationRepository
         and(eq(egressJobs.egressId, egressId), eq(consultations.generation, egressJobs.generation)),
       );
     const row = rows[0];
-    if (!row || rows.length !== 1 || row.roomName === null) {
+    if (row && rows.length === 1 && row.roomName !== null) {
+      return {
+        consultationId: row.consultationId,
+        generation: row.generation,
+        roomName: row.roomName,
+      };
+    }
+    if (!earlySource) {
       return null;
     }
 
+    if (earlySource.kind === "room_composite") {
+      const earlyRows = await this.database
+        .select({
+          consultationId: externalEffects.consultationId,
+          generation: externalEffects.generation,
+          roomName: consultations.roomName,
+        })
+        .from(externalEffects)
+        .innerJoin(consultations, eq(consultations.id, externalEffects.consultationId))
+        .where(
+          and(
+            eq(consultations.roomName, earlySource.roomName),
+            eq(consultations.generation, externalEffects.generation),
+            eq(externalEffects.effectKind, "ROOM_COMPOSITE_EGRESS"),
+            inArray(externalEffects.state, ["planned", "calling", "applied", "done"]),
+          ),
+        )
+        .limit(2);
+      const earlyRow = earlyRows[0];
+      if (!earlyRow || earlyRows.length !== 1 || earlyRow.roomName === null) {
+        return null;
+      }
+      return {
+        consultationId: earlyRow.consultationId,
+        generation: earlyRow.generation,
+        roomName: earlyRow.roomName,
+        earlySubject: { participantId: null },
+      };
+    }
+
+    const earlyRows = await this.database
+      .select({
+        consultationId: externalEffects.consultationId,
+        generation: externalEffects.generation,
+        roomName: consultations.roomName,
+        participantId: consultationParticipants.id,
+      })
+      .from(externalEffects)
+      .innerJoin(consultations, eq(consultations.id, externalEffects.consultationId))
+      .innerJoin(
+        consultationParticipants,
+        and(
+          eq(consultationParticipants.consultationId, externalEffects.consultationId),
+          eq(consultationParticipants.id, externalEffects.subjectId),
+        ),
+      )
+      .where(
+        and(
+          eq(consultations.roomName, earlySource.roomName),
+          eq(consultations.generation, externalEffects.generation),
+          eq(externalEffects.effectKind, "PARTICIPANT_EGRESS"),
+          eq(consultationParticipants.livekitIdentity, earlySource.identity),
+          inArray(externalEffects.state, ["planned", "calling", "applied", "done"]),
+        ),
+      )
+      .limit(2);
+    const earlyRow = earlyRows[0];
+    if (!earlyRow || earlyRows.length !== 1 || earlyRow.roomName === null) {
+      return null;
+    }
     return {
-      consultationId: row.consultationId,
-      generation: row.generation,
-      roomName: row.roomName,
+      consultationId: earlyRow.consultationId,
+      generation: earlyRow.generation,
+      roomName: earlyRow.roomName,
+      earlySubject: { participantId: earlyRow.participantId },
     };
   }
 
@@ -510,10 +601,18 @@ export class DrizzleConsultationRepository
       .from(consultationParticipants)
       .where(eq(consultationParticipants.consultationId, id))
       .orderBy(asc(consultationParticipants.role));
-    if (participantRows.length !== 2) {
+    const [firstParticipant, secondParticipant] = participantRows;
+    if (
+      firstParticipant === undefined ||
+      secondParticipant === undefined ||
+      participantRows.length !== 2
+    ) {
       throw new DomainError("INVALID_PARTICIPANTS");
     }
-    const participants = participantRows.map(mapParticipant) as [ParticipantSlot, ParticipantSlot];
+    const participants: [ParticipantSlot, ParticipantSlot] = [
+      mapParticipant(firstParticipant),
+      mapParticipant(secondParticipant),
+    ];
     const consultation = row.consultation;
 
     return {
@@ -552,16 +651,16 @@ export class DrizzleLanguageRepository extends DrizzleRepository implements Lang
     tx: Transaction,
   ): Promise<void> {
     const database = unwrap(tx);
-    const existing = await database.execute<ProfileLockRow>(
-      sql`
-      SELECT id, name, current_revision
-      FROM provider_profiles
-      WHERE id = ${profileId}
-        FOR UPDATE
-      `,
-    );
-    const current = existing.rows[0];
-    if (current && String(current.name) !== profile.name) {
+    const [current] = await database
+      .select({
+        id: providerProfiles.id,
+        name: providerProfiles.name,
+        currentRevision: providerProfiles.currentRevision,
+      })
+      .from(providerProfiles)
+      .where(eq(providerProfiles.id, profileId))
+      .for("update");
+    if (current && current.name !== profile.name) {
       throw new DomainError("PROFILE_IDENTITY_MISMATCH");
     }
 
@@ -611,7 +710,7 @@ export class DrizzleLanguageRepository extends DrizzleRepository implements Lang
     }
 
     const revision = current
-      ? Math.max(Number(current.current_revision) + 1, requestedRevision)
+      ? Math.max(current.currentRevision + 1, requestedRevision)
       : requestedRevision;
     if (!Number.isSafeInteger(revision) || revision < 1) {
       throw new DomainError("INVALID_PROFILE_REVISION");
@@ -705,14 +804,32 @@ export class DrizzleLanguageRepository extends DrizzleRepository implements Lang
     }));
   }
 
-  async setEnabled(id: UUID, enabled: boolean, tx: Transaction): Promise<void> {
+  async setEnabled(
+    id: UUID,
+    profileId: UUID,
+    profileRevision: number,
+    enabled: boolean,
+    tx: Transaction,
+  ): Promise<void> {
     const updated = await unwrap(tx)
       .update(languageCapabilities)
       .set({ enabled })
-      .where(eq(languageCapabilities.id, id))
+      .where(
+        and(
+          eq(languageCapabilities.id, id),
+          eq(languageCapabilities.profileId, profileId),
+          eq(languageCapabilities.revision, profileRevision),
+          sql`EXISTS (
+            SELECT 1
+            FROM ${providerProfiles}
+            WHERE ${providerProfiles.id} = ${profileId}
+              AND ${providerProfiles.currentRevision} = ${profileRevision}
+          )`,
+        ),
+      )
       .returning({ id: languageCapabilities.id });
     if (updated.length !== 1) {
-      throw new DomainError("CAPABILITY_NOT_FOUND");
+      throw new DomainError("CAPABILITY_REVISION_CONFLICT");
     }
   }
 }
@@ -921,12 +1038,11 @@ export class DrizzleArchiveRepository extends DrizzleRepository implements Archi
     const database = unwrap(tx);
     // Coupled consultation/archive operations always lock the consultation first.
     // This matches consultation lifecycle transactions and prevents inverse-order deadlocks.
-    await database.execute<{ id: UUID }>(sql`
-      SELECT id
-      FROM consultations
-      WHERE id = ${consultationId}
-      FOR UPDATE
-    `);
+    await database
+      .select({ id: consultations.id })
+      .from(consultations)
+      .where(eq(consultations.id, consultationId))
+      .for("update");
     const result = await database.execute<ArchiveLockRow>(
       sql`
         SELECT
@@ -1022,23 +1138,27 @@ export class DrizzleArchiveRepository extends DrizzleRepository implements Archi
       return input.id;
     }
 
-    const existing = await database.execute<ExpectedArtifactLockRow>(
-      sql`
-      SELECT id, sample_start, sample_end, owner_epoch
-      FROM expected_archive_artifacts
-      WHERE
-        archive_id = ${input.archiveId}
-        AND object_class = ${input.objectClass}
-        AND causal_key = ${input.causalKey}
-        FOR UPDATE
-      `,
-    );
-    const row = existing.rows[0];
+    const [row] = await database
+      .select({
+        id: expectedArchiveArtifacts.id,
+        sampleStart: expectedArchiveArtifacts.sampleStart,
+        sampleEnd: expectedArchiveArtifacts.sampleEnd,
+        ownerEpoch: expectedArchiveArtifacts.ownerEpoch,
+      })
+      .from(expectedArchiveArtifacts)
+      .where(
+        and(
+          eq(expectedArchiveArtifacts.archiveId, input.archiveId),
+          eq(expectedArchiveArtifacts.objectClass, input.objectClass),
+          eq(expectedArchiveArtifacts.causalKey, input.causalKey),
+        ),
+      )
+      .for("update");
     if (
       !row ||
-      Number(row.owner_epoch) !== input.ownerEpoch ||
-      (row.sample_start === null ? null : Number(row.sample_start)) !== input.sampleStart ||
-      (row.sample_end === null ? null : Number(row.sample_end)) !== input.sampleEnd
+      row.ownerEpoch !== input.ownerEpoch ||
+      row.sampleStart !== input.sampleStart ||
+      row.sampleEnd !== input.sampleEnd
     ) {
       throw new DomainError("EXPECTED_ARTIFACT_CONFLICT");
     }
@@ -1229,22 +1349,24 @@ export class DrizzleArchiveRepository extends DrizzleRepository implements Archi
   }
 
   async unresolvedExpectations(archiveId: UUID, tx: Transaction) {
-    const result = await unwrap(tx).execute<UnresolvedExpectationRow>(
-      sql`
-      SELECT id, object_class, causal_key, sample_start, sample_end
-      FROM expected_archive_artifacts
-      WHERE archive_id = ${archiveId} AND fulfilled_object_id IS NULL
-      ORDER BY id
-        FOR UPDATE SKIP LOCKED
-      `,
-    );
-    return result.rows.map((row) => ({
-      id: row.id,
-      objectClass: String(row.object_class),
-      causalKey: String(row.causal_key),
-      sampleStart: row.sample_start === null ? null : Number(row.sample_start),
-      sampleEnd: row.sample_end === null ? null : Number(row.sample_end),
-    }));
+    const rows = await unwrap(tx)
+      .select({
+        id: expectedArchiveArtifacts.id,
+        objectClass: expectedArchiveArtifacts.objectClass,
+        causalKey: expectedArchiveArtifacts.causalKey,
+        sampleStart: expectedArchiveArtifacts.sampleStart,
+        sampleEnd: expectedArchiveArtifacts.sampleEnd,
+      })
+      .from(expectedArchiveArtifacts)
+      .where(
+        and(
+          eq(expectedArchiveArtifacts.archiveId, archiveId),
+          isNull(expectedArchiveArtifacts.fulfilledObjectId),
+        ),
+      )
+      .orderBy(asc(expectedArchiveArtifacts.id))
+      .for("update", { skipLocked: true });
+    return rows;
   }
 
   async inventoryObjects(archiveId: UUID, tx: Transaction): Promise<readonly ArchiveObject[]> {
@@ -1507,19 +1629,19 @@ export class DrizzleArchiveRepository extends DrizzleRepository implements Archi
   }
 
   async activeHolds(archiveId: UUID, tx: Transaction) {
-    const result = await unwrap(tx).execute<ActiveHoldRow>(
-      sql`
-      SELECT id, reason, actor_id, state, per_version_results
-      FROM legal_holds
-        WHERE archive_id = ${archiveId} AND released_at IS NULL
-        FOR UPDATE
-      `,
-    );
-    return result.rows.map((row) => ({
-      id: row.id,
-      reason: row.reason,
-      actorId: row.actor_id,
-      perVersionResults: row.per_version_results,
+    const rows = await unwrap(tx)
+      .select({
+        id: legalHolds.id,
+        reason: legalHolds.reason,
+        actorId: legalHolds.actorId,
+        state: legalHolds.state,
+        perVersionResults: legalHolds.perVersionResults,
+      })
+      .from(legalHolds)
+      .where(and(eq(legalHolds.archiveId, archiveId), isNull(legalHolds.releasedAt)))
+      .for("update");
+    return rows.map((row) => ({
+      ...row,
       state: row.state as "applying" | "active" | "releasing" | "failed",
     }));
   }
