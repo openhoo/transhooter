@@ -8,7 +8,7 @@
     "test:contracts": "bun test harness-contracts.test.mjs && ./wrapper-contracts.test.sh"
   },
   "dependencies": {
-    "playwright": "1.55.0",
+    "playwright": "1.55.1",
     "postgres": "3.4.7"
   }
 }
