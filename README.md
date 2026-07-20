@@ -179,6 +179,50 @@ Wire-Pakete, Retry-Entscheidungen, Checkpoints und Archive. Daraus wird
 `packages/contracts/generated/contracts.schema.json` erzeugt und an der
 Python-Grenze zur Laufzeit validiert.
 
+### Technische Leitentscheidungen
+
+Die folgenden Entscheidungen sind für Änderungen und Betrieb des Systems
+maßgeblich. Sie sind keine austauschbaren Implementierungsdetails:
+
+1. **PostgreSQL ist die fachliche Wahrheit.** Fachzustand, Audit, Outbox,
+   Deadlines und externe Effekte werden gemeinsam persistiert. Redis,
+   LiveKit und S3 sind angebundene Laufzeit- beziehungsweise Ressourcensysteme,
+   aus denen der fachliche Zustand nicht rekonstruiert werden muss.
+2. **Externe Aufrufe sind persistierte Zustandsmaschinen.** Control-Worker
+   claimen Outbox und Effekte mit Owner, Lease und `FOR UPDATE SKIP LOCKED`.
+   Kanonische Request-Hashes erlauben nur die Adoption exakt derselben
+   Remote-Anfrage. Consultation-Generationen grenzen veraltete Arbeit ab;
+   laufende Leases werden während längerer Remote-Aufrufe erneuert.
+3. **Providerselektion wird vor dem Join eingefroren.** Die Auswahl verweist
+   auf eine konkrete Profilrevision und einen Snapshot-Hash. Ändern sich
+   Fähigkeiten oder Gesundheit, wird nicht unsichtbar auf einen anderen
+   Provider gewechselt: Auswahl und Zustimmung müssen erneut konvergieren.
+4. **Archivvollständigkeit ist ein Beweis, kein Erfolgsflag.** `complete`
+   verlangt terminale Room-, Worker- und Egress-Nachweise, die erwarteten
+   Objekte und keine ungelösten Gaps oder Fehler. Teilresultate bleiben als
+   `incomplete` sichtbar; spätere Supplements sind an den Hash des finalen
+   Inventars gebunden.
+5. **Die Sprachgrenze ist strikt.** Zod ist die kanonische
+   TypeScript-Vertragsquelle; generiertes JSON Schema validiert die
+   Python-Grenze. Unbekannte Felder, widersprüchliche Retry-Verknüpfungen oder
+   ungültige Identitäten werden abgewiesen statt bestmöglich interpretiert.
+6. **Interne Dienste teilen keine Universalidentität.** Compose verwendet
+   getrennte Bearer-Secrets und Rechte. Kubernetes verwendet explizit
+   zugeordnete ServiceAccounts und kurzlebige, audience-gebundene Tokens;
+   automatisches Token-Mounting ist standardmäßig deaktiviert.
+7. **Produktionskonfiguration scheitert geschlossen.** Das Helm-Schema erlaubt
+   nur unterstützte Providerprofile, verlangt sichere öffentliche URLs und
+   KMS-Archivverschlüsselung. Migrationen laufen mit einem separaten
+   Datenbankzugang statt mit den eingeschränkten Runtime-Credentials.
+
+Diese Grenzen sind vor allem in
+`apps/control-worker/src/orchestration/effect-runner.ts`,
+`apps/control-worker/src/adapters/postgres-store.ts`,
+`packages/server-core/src/consultations/service.ts`,
+`packages/contracts/src`, `apps/web/lib/composition.ts` und
+`deploy/helm/transhooter` implementiert.
+
+
 ## Repository-Struktur
 
 ```text
@@ -713,18 +757,126 @@ Das Archiv kann unter anderem folgende Objektklassen enthalten:
 - Worker-Checkpoints,
 - finales Inventar und spätere Supplements.
 
-Der lokale verschlüsselte Spool schützt bereits akzeptierte Evidenz vor einem
-vorübergehenden S3-Ausfall. Checkpoints verketten Eingabe-, Provider-Ausgabe-
-und veröffentlichte Ausgabewasserstände kryptografisch; die Felder für
-erwartete und beobachtete Objekt-IDs sind derzeit leer. Der Spool Drainer lädt
-erhaltene Objekte mit begrenzten S3-Rechten nach. Compose verwendet dafür eine
-eigene Drainer-Identität; im Helm-Chart teilen Worker und Drainer derzeit den
-Runtime-Key `s3-credentials`.
+### Warum es den Spool gibt
 
-Die Orchestrierung unterscheidet zwischen geplantem, aufgerufenem, remote
-angewandtem und lokal abgeschlossenem Effekt. Dadurch können Prozesse nach
-einem Absturz die persistierte Remote-Antwort weiterverarbeiten. Abgelaufene
-Leases und veraltete Generationen dürfen keinen neueren Besitzer überschreiben.
+Der **Spool** ist kein gewöhnlicher Message-Queue-Puffer, sondern ein lokales,
+verschlüsseltes **Write-before-effect-Journal**. Er schützt bereits akzeptierte
+Audio-, Provider- und Checkpoint-Evidenz in dem Zeitfenster, in dem S3, der
+Control-Worker oder der Worker-Prozess ausfallen können.
+
+Die zentrale Reihenfolge lautet:
+
+```text
+lokal verschlüsselt und dauerhaft schreiben
+    → idempotent nach S3 hochladen
+    → beim Control-Worker registrieren
+    → lokal als uploaded quittieren
+    → nur geeignete lokale Payloads kompaktieren
+```
+
+Beispielsweise wird eingehendes LiveKit-Audio zuerst als `stt-input` gespult
+und erst danach an den STT-Provider übergeben. Kann der Spool die Evidenz nicht
+sicher erhalten, stoppt der Worker diesen Pfad bewusst, anstatt ungesicherte
+Providerarbeit fortzusetzen.
+
+### Persistenz und Verschlüsselung
+
+Jeder Spool-Eintrag besteht aus einem verschlüsselten `.wal`-Envelope und einem
+SQLite-Indexeintrag. Der Envelope bindet unter anderem Objekt-, Consultation-
+und Attempt-ID, Stage, Richtung, Medientyp, Sample-Range, Schlüssel-ID sowie
+Klartext- und Ciphertext-Hash kryptografisch an den Payload.
+
+- Der Payload wird mit AES-256-GCM und einer zufälligen 12-Byte-Nonce
+  verschlüsselt; der kanonische Header ist Additional Authenticated Data.
+- Der Keyring kann mehrere Schlüssel enthalten. Neue Einträge verwenden den
+  aktiven Schlüssel; alte Einträge bleiben lesbar, solange ihr Schlüssel
+  vorhanden ist.
+- SQLite verwendet WAL-Modus, `synchronous=FULL` und Foreign Keys.
+- Prozess- und Dateisperren serialisieren Zugriffe von Translation-Worker und
+  Spool Drainer auf dem gemeinsam gemounteten Spool.
+
+Der Dateicommit ist absichtlich **Datei vor Index**:
+
+```text
+temporäre Datei vollständig schreiben und fsyncen
+    → atomar nach <object-id>.wal umbenennen
+    → Spool-Verzeichnis fsyncen
+    → SQLite-Datensatz als committed anlegen
+```
+
+Nach einem Absturz kann daher eine authentifizierte finale Datei ohne
+Indexeintrag übrig bleiben, aber kein gültiger Index auf eine noch nicht
+veröffentlichte Datei entstehen. Beim Start entfernt die Recovery alte
+Tempdateien, validiert und importiert authentifizierte verwaiste Envelopes und
+prüft, dass alle nicht kompaktierten indexierten Payload-Dateien vorhanden
+sind. Ungültige verwaiste Envelopes werden quarantänisiert. Die Integrität
+indexierter Payloads wird beim Lesen authentifiziert; fehlende Dateien oder
+eine dabei erkannte ungültige Integrität führen zu `SpoolUnavailable`.
+
+### Idempotenz, Backpressure und Quarantäne
+
+Eine deterministische `object_id` darf wiederverwendet werden, wenn Identität,
+Metadaten, Sample-Range, Hashes, Header und entschlüsselter Payload exakt
+übereinstimmen. Eine abweichende Wiederverwendung wird fail-closed abgewiesen.
+Damit können Wiederholungen nach Crash oder Netzfehler dieselbe Evidenz
+fortsetzen, ohne widersprüchliche Duplikate zu erzeugen.
+
+Vor jedem Append projiziert der Spool die Belegung inklusive Payload und
+1 MiB Sicherheitsreserve. Ab 80 Prozent wird der Write mit
+`SpoolUnavailable` abgelehnt. Diese frühe Backpressure nimmt lieber keine neue
+Arbeit an, als das Journal während einer kritischen Persistierung volllaufen zu
+lassen.
+
+Der Spool Drainer verarbeitet `committed`-Objekte mit deterministischen
+Create-once-S3-Schlüsseln. Erst nach erfolgreichem Upload **und** erfolgreicher
+Registrierung beim Control-Worker wird ein Objekt `uploaded`. Temporäre
+Registrierungsfehler lassen es für einen späteren Versuch `committed`;
+permanent abgelehnte Objekte werden isoliert `quarantined` und nicht
+stillschweigend verworfen.
+
+```text
+committed → uploaded → lokal kompaktierbar
+    ├─────→ committed     # temporärer Fehler, später erneut versuchen
+    └─────→ quarantined   # permanente, objektspezifische Ablehnung
+```
+
+Nur explizit replay-unabhängige, bereits hochgeladene Envelopes sind für die
+lokale Kompaktierung geeignet. Checkpoints, Terminalevidenz und PCM besitzen
+strengere Aufbewahrungs- beziehungsweise Kompaktierungsregeln.
+
+### Checkpoints und Recovery-Wasserstände
+
+Checkpoints verketten akzeptierte Eingabe-, Provider-Ausgabe- und
+veröffentlichte Ausgabewasserstände kryptografisch. Wasserstände müssen pro
+Richtung monoton sein; jeder Checkpoint referenziert den Hash seines
+Vorgängers. Die Checkpoint-Evidenz und ihre Delivery-Zeile werden vor der
+Übermittlung an den Control-Worker gemeinsam im Spool registriert und können
+bis zur Bestätigung erneut zugestellt werden.
+
+Dadurch kann derselbe Worker-Epoch nach einem Prozessabsturz seine bestätigten
+beziehungsweise noch ausstehenden Checkpoints wiederherstellen und erkennen,
+welche Samples sicher akzeptiert oder emittiert wurden. Ein neuer Worker-Epoch
+beginnt eine eigene Checkpoint-Kette. Die Felder für erwartete und beobachtete
+Objekt-IDs in Checkpoints sind derzeit leer; Inventar und PCM-Abgleich
+verwenden deshalb die übrigen Identitäts-, Sample- und Hashbelege.
+
+### Zusammenspiel mit der Control-Orchestrierung
+
+Der Spool schützt den Workerpfad; die persistierten externen Effekte schützen
+den Control-Pfad. Die Orchestrierung unterscheidet zwischen geplantem,
+aufgerufenem, remote angewandtem und lokal abgeschlossenem Effekt. Ein
+`applied`-Effekt bleibt claimbar, sodass ein anderer Control-Worker die bereits
+persistierte Remote-Antwort nach einem Absturz fortsetzen kann, ohne den
+Remote-Aufruf erneut auszuführen.
+
+Effektclaims besitzen Owner und Ablaufzeit. Generations-Fencing wird vor
+Remote-Arbeit, bei der lokalen Anwendung und bei Kompensation geprüft;
+abgelaufene Leases und veraltete Generationen dürfen keinen neueren Besitzer
+überschreiben.
+
+Compose verwendet für den Drainer eine eigene, begrenzte S3-Identität. Im
+Helm-Chart mounten Translation-Worker und Spool Drainer denselben persistenten
+Spool-PVC; beide verwenden derzeit den Runtime-Key `s3-credentials`.
 
 ## Observability
 
