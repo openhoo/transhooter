@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import signal
@@ -12,6 +13,7 @@ from transhooter_worker.domain.models import StageCapabilities
 from transhooter_worker.runtime.job import (
     SourceTrackTimeline,
     SttStage,
+    _heartbeat_loop,
     _reported_preflight,
     _validate_frozen_stage,
     _validated_job_metadata,
@@ -93,6 +95,40 @@ def job_metadata_payload() -> dict[str, object]:
 def configure_contract_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     schema_path = Path(__file__).parents[3] / "packages/contracts/generated/contracts.schema.json"
     monkeypatch.setenv("CONTRACTS_SCHEMA_FILE", str(schema_path))
+
+
+@pytest.mark.asyncio
+async def test_rejected_heartbeat_requests_graceful_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_contract_schema(monkeypatch)
+    metadata = _validated_job_metadata(json.dumps(job_metadata_payload()))
+    drain_requested = asyncio.Event()
+
+    class HealthySpool:
+        @staticmethod
+        def usage_ratio() -> float:
+            return 0.1
+
+    class RejectingControl:
+        calls = 0
+
+        async def heartbeat(self, health: dict[str, object]) -> bool:
+            self.calls += 1
+            return False
+
+    control = RejectingControl()
+    await _heartbeat_loop(
+        metadata,
+        HealthySpool(),  # type: ignore[arg-type]
+        control,  # type: ignore[arg-type]
+        (),
+        [],
+        drain_requested,
+    )
+
+    assert drain_requested.is_set()
+    assert control.calls == 1
 
 
 def test_metadata_is_validated_against_generated_contract(

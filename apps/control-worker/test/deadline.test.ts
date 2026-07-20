@@ -184,6 +184,7 @@ test("ready deadline finalizes while a human remains present", async () => {
     planned.map(({ kind }) => kind),
     ["STATUS_PACKET", "ROOM_DELETE"],
   );
+  assert.equal(Object.hasOwn(planned[0]?.plan ?? {}, "destinationIdentities"), false);
 });
 
 test("ready deadline remains claimable when finalization loses its presence fence", async () => {

@@ -391,21 +391,6 @@ class EncryptedSpool:
         }
 
     @staticmethod
-    def _envelope_aad(
-        meeting_id: UUID,
-        attempt_id: UUID,
-        object_id: UUID,
-        stage: str,
-        metadata: tuple[tuple[str, ...], ...],
-        *,
-        version: int,
-    ) -> bytes:
-        base = f"{meeting_id}:{attempt_id}:{object_id}:{stage}".encode()
-        if version < 2:
-            return base
-        return base + b":" + json.dumps(metadata, separators=(",", ":")).encode()
-
-    @staticmethod
     def _header_aad(header: dict[str, Any]) -> bytes:
         if int(header.get("aad_version", 0)) != 3:
             raise ValueError("unsupported full-header AAD version")
@@ -860,19 +845,7 @@ class EncryptedSpool:
         ):
             raise SpoolUnavailable("ciphertext authentication hash mismatch")
         try:
-            version = int(header.get("aad_version", 1))
-            if version >= 3:
-                aad = self._header_aad(header)
-            else:
-                metadata = tuple(tuple(str(value) for value in item) for item in header["metadata"])
-                aad = self._envelope_aad(
-                    UUID(row[0]),
-                    UUID(row[1]),
-                    object_id,
-                    str(row[2]),
-                    metadata,
-                    version=version,
-                )
+            aad = self._header_aad(header)
         except (KeyError, TypeError, ValueError) as exc:
             raise SpoolUnavailable("invalid authenticated spool header") from exc
         try:
@@ -1197,11 +1170,6 @@ class EncryptedSpool:
         if final.stem != str(object_id) or hashlib.sha256(encrypted).hexdigest() != ciphertext_hash:
             raise ValueError("orphan ciphertext hash mismatch")
         try:
-            version = int(header.get("aad_version", 1))
-            if version < 3:
-                raise ValueError(
-                    "legacy spool envelope cannot be imported without authenticated recovery metadata"
-                )
             aad = self._header_aad(header)
             plain = AESGCM(self._keys[key_id]).decrypt(nonce, encrypted, aad)
         except (KeyError, TypeError, ValueError) as exc:
@@ -1293,8 +1261,6 @@ class EncryptedSpool:
         checkpoint_id: UUID,
         meeting_id: UUID,
     ) -> None:
-        if int(header.get("aad_version", 1)) < 2:
-            raise ValueError("legacy orphan checkpoint lacks authenticated replay identity")
         payload = json.loads(body.decode("utf-8"))
         if (
             not isinstance(payload, dict)

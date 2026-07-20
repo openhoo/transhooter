@@ -43,6 +43,16 @@ from transhooter_worker.ports.providers import SttEvent, TtsEvent
 
 _COMPLETION_TIMEOUT_SECONDS = 10.0
 _CLOSE_TIMEOUT_SECONDS = 5.0
+_TTS_MESSAGE_CHARACTER_LIMIT = 2_000
+
+
+def _tts_text_messages(text: str) -> tuple[str, ...]:
+    if not text:
+        return ("",)
+    return tuple(
+        text[offset : offset + _TTS_MESSAGE_CHARACTER_LIMIT]
+        for offset in range(0, len(text), _TTS_MESSAGE_CHARACTER_LIMIT)
+    )
 
 
 class _SttCompletionState(Enum):
@@ -281,6 +291,8 @@ class DeepgramSttProvider:
 
 
 class DeepgramSttSession:
+    _EVENT_QUEUE_SIZE = 64
+
     def __init__(
         self,
         config: DeepgramConfig,
@@ -296,7 +308,8 @@ class DeepgramSttSession:
         self._id = session_id
         self._websocket = websocket
         self._refs = references
-        self._events: asyncio.Queue[SttEvent] = asyncio.Queue()
+        self._events: asyncio.Queue[SttEvent] = asyncio.Queue(maxsize=self._EVENT_QUEUE_SIZE + 1)
+        self._event_slots = asyncio.Semaphore(self._EVENT_QUEUE_SIZE)
         self._send_lock = asyncio.Lock()
         self._terminal_lock = asyncio.Lock()
         self._terminal: SessionTerminal | None = None
@@ -334,6 +347,8 @@ class DeepgramSttSession:
         async def stream() -> AsyncIterator[SttEvent]:
             while True:
                 item = await self._events.get()
+                if not isinstance(item, SessionTerminalEvent):
+                    self._event_slots.release()
                 yield item
                 if isinstance(item, SessionTerminalEvent):
                     return
@@ -526,7 +541,7 @@ class DeepgramSttSession:
             if not is_committed_final:
                 if is_final and span.start < self._commit_watermark:
                     words, text, span = self._trim_replayed_final(words, text, span)
-                await self._events.put(
+                await self._emit_event(
                     TranscriptEvent(
                         span,
                         self._received,
@@ -606,13 +621,13 @@ class DeepgramSttSession:
         committed_through = max(self._emitted_watermark, requested_through)
         self._emitted_watermark = committed_through
         self._commit_watermark = max(self._commit_watermark, committed_through)
-        await self._events.put(BoundaryEvent(boundary_id, committed_through, reference))
+        await self._emit_event(BoundaryEvent(boundary_id, committed_through, reference))
 
     async def _emit_spontaneous_boundary(self, reference: RawRef) -> None:
         committed_through = max(self._emitted_watermark, self._accepted)
         self._emitted_watermark = committed_through
         self._commit_watermark = max(self._commit_watermark, committed_through)
-        await self._events.put(BoundaryEvent(uuid4(), committed_through, reference))
+        await self._emit_event(BoundaryEvent(uuid4(), committed_through, reference))
 
     def _record_close(self) -> None:
         close_payload = json.dumps(
@@ -631,6 +646,14 @@ class DeepgramSttSession:
                 None,
             )
         )
+
+    async def _emit_event(self, event: SttEvent) -> None:
+        await self._event_slots.acquire()
+        try:
+            self._events.put_nowait(event)
+        except BaseException:
+            self._event_slots.release()
+            raise
 
     async def _terminalize(self, outcome: Outcome, error: ProviderError | None) -> SessionTerminal:
         async with self._terminal_lock:
@@ -685,7 +708,11 @@ class DeepgramTtsProvider:
             ("eu",),
             self._config.supported_languages,
             ("aura-2",),
-            (("characters_message", 2000), ("characters_minute", 2400), ("flushes_minute", 20)),
+            (
+                ("characters_message", _TTS_MESSAGE_CHARACTER_LIMIT),
+                ("characters_minute", 2400),
+                ("flushes_minute", 20),
+            ),
             None,
             self._config.approved_voices,
         )
@@ -824,8 +851,6 @@ class DeepgramTtsSession:
         self._completion_state = _TtsCompletionState.OPEN
 
     async def start(self, utterance: SynthesisUtterance) -> DeepgramSynthesisAttempt:
-        if len(utterance.text) > 2000:
-            raise ValueError("Deepgram TTS text exceeds 2,000 characters")
         async with self._lock:
             if self._terminal:
                 raise RuntimeError("session terminal")
@@ -907,6 +932,8 @@ class DeepgramTtsSession:
 
 
 class DeepgramSynthesisAttempt:
+    _EVENT_QUEUE_SIZE = 64
+
     def __init__(
         self,
         config: DeepgramConfig,
@@ -918,7 +945,10 @@ class DeepgramSynthesisAttempt:
         self._journal = journal
         self._websocket = websocket
         self._utterance = utterance
-        self._event_queue: asyncio.Queue[TtsEvent] = asyncio.Queue()
+        self._event_queue: asyncio.Queue[TtsEvent] = asyncio.Queue(
+            maxsize=self._EVENT_QUEUE_SIZE + 1
+        )
+        self._event_slots = asyncio.Semaphore(self._EVENT_QUEUE_SIZE)
         self._terminal: OperationTerminal | None = None
         self._terminal_lock = asyncio.Lock()
         self._samples = 0
@@ -934,6 +964,8 @@ class DeepgramSynthesisAttempt:
         async def stream() -> AsyncIterator[TtsEvent]:
             while True:
                 event = await self._event_queue.get()
+                if not isinstance(event, OperationTerminalEvent):
+                    self._event_slots.release()
                 yield event
                 if isinstance(event, OperationTerminalEvent):
                     return
@@ -969,10 +1001,11 @@ class DeepgramSynthesisAttempt:
     async def _run(self) -> None:
         try:
             async with asyncio.timeout(_COMPLETION_TIMEOUT_SECONDS):
-                await self._send_command(
-                    "text-out",
-                    _json_command("Speak", text=self._utterance.text),
-                )
+                for text in _tts_text_messages(self._utterance.text):
+                    await self._send_command(
+                        "text-out",
+                        _json_command("Speak", text=text),
+                    )
                 await self._send_command("flush-out", _json_command("Flush"))
                 self._completion_state = _TtsCompletionState.FLUSH_SENT
                 async for message in self._websocket:
@@ -1044,7 +1077,7 @@ class DeepgramSynthesisAttempt:
             self._samples + len(payload) // 2,
         )
         self._samples = sample_range.end
-        await self._event_queue.put(
+        await self._emit_event(
             AudioEvent(
                 self._utterance.operation_id,
                 len(self._refs),
@@ -1064,7 +1097,7 @@ class DeepgramSynthesisAttempt:
         message_type = json.loads(message).get("type")
         if message_type == "Flushed":
             self._completion_state = _TtsCompletionState.FLUSH_ACKNOWLEDGED
-            await self._event_queue.put(
+            await self._emit_event(
                 SynthesisBoundary(
                     self._utterance.operation_id,
                     SampleRange(0, max(1, self._samples)),
@@ -1075,6 +1108,14 @@ class DeepgramSynthesisAttempt:
         if message_type not in {"Metadata", "Cleared", "Warning"}:
             raise ValueError(f"unsupported Deepgram TTS message {message_type}")
         return False
+
+    async def _emit_event(self, event: TtsEvent) -> None:
+        await self._event_slots.acquire()
+        try:
+            self._event_queue.put_nowait(event)
+        except BaseException:
+            self._event_slots.release()
+            raise
 
     async def _terminalize(
         self, outcome: Outcome, error: ProviderError | None

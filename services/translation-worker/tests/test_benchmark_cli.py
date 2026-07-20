@@ -31,7 +31,7 @@ def test_benchmark_cli_accepts_versioned_language_manifest(tmp_path: Path) -> No
     environment = os.environ.copy()
     environment.update(
         APP_ENV="test",
-        SPOOL_DIR=str(tmp_path / "spool"),
+        SPOOL_PATH=str(tmp_path / "spool"),
         SPOOL_KEY_B64=base64.b64encode(b"k" * 32).decode(),
     )
     command = [

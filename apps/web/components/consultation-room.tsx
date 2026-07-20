@@ -91,7 +91,7 @@ type StatusHandlerContext = {
   generation: MutableRefObject<number>;
   initial: InitialRoom;
   participant: RemoteParticipant | undefined;
-  publishDevices: (room: Room) => Promise<void>;
+  publishDevices: (room: Room) => Promise<boolean>;
   room: Room;
   state: RoomControllerState;
 };
@@ -158,7 +158,11 @@ function handleStatusPacket(decoded: unknown, context: StatusHandlerContext) {
     status.reasonCode === "CAPTURE_READY" &&
     status.subjectParticipantId === context.initial.participantId
   ) {
-    void context.publishDevices(context.room).then(() => context.state.setCaptureReady(true));
+    void context.publishDevices(context.room).then((published) => {
+      if (published) {
+        context.state.setCaptureReady(true);
+      }
+    });
     return;
   }
 
@@ -340,8 +344,11 @@ function useRoomMediaController(
     (room: Room) => {
       const publish = async () => {
         await cleanupPromise.current;
-        if (published.current || roomRef.current !== room || leaving.current) {
-          return;
+        if (roomRef.current !== room || leaving.current) {
+          return false;
+        }
+        if (published.current) {
+          return true;
         }
 
         const attempt = publicationEpoch.current;
@@ -366,7 +373,7 @@ function useRoomMediaController(
           localTracks.current.push(audioTrack);
           if (!isCurrentAttempt()) {
             await stopPublishedDevices(room);
-            return;
+            return false;
           }
 
           const videoTrack = await createWithDeviceFallback(
@@ -377,7 +384,7 @@ function useRoomMediaController(
           localTracks.current.push(videoTrack);
           if (!isCurrentAttempt()) {
             await stopPublishedDevices(room);
-            return;
+            return false;
           }
 
           if (media.localVideo.current) {
@@ -388,11 +395,16 @@ function useRoomMediaController(
           });
           if (!isCurrentAttempt()) {
             await stopPublishedDevices(room);
-            return;
+            return false;
           }
           await room.localParticipant.publishTrack(videoTrack.mediaStreamTrack, {
             source: Track.Source.Camera,
           });
+          if (!isCurrentAttempt()) {
+            await stopPublishedDevices(room);
+            return false;
+          }
+          return true;
         } catch (cause) {
           await stopPublishedDevices(room);
           const errorName =
@@ -404,11 +416,15 @@ function useRoomMediaController(
               ? "Camera or microphone access was denied. Allow access in your browser and try reconnecting."
               : "Camera or microphone could not be published. Check that a device is available and try reconnecting.",
           );
+          return false;
         }
       };
 
       const task = publicationPromise.current.then(publish, publish);
-      publicationPromise.current = task;
+      publicationPromise.current = task.then(
+        () => undefined,
+        () => undefined,
+      );
       return task;
     },
     [media.localVideo, state, stopPublishedDevices],

@@ -54,6 +54,25 @@ from transhooter_worker.ports.exchange_journal import ExchangeJournal
 from transhooter_worker.ports.providers import SttEvent, TtsEvent
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
+_TTS_MESSAGE_BYTE_LIMIT = 5_000
+
+
+def _tts_text_messages(text: str) -> tuple[str, ...]:
+    if not text:
+        return ("",)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for character in text:
+        encoded_bytes = len(character.encode("utf-8"))
+        if current and current_bytes + encoded_bytes > _TTS_MESSAGE_BYTE_LIMIT:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(character)
+        current_bytes += encoded_bytes
+    chunks.append("".join(current))
+    return tuple(chunks)
 
 
 def _duration_samples(duration: duration_pb2.Duration | timedelta, sample_rate: int) -> int:
@@ -1347,7 +1366,12 @@ class GoogleTtsProvider:
                 ("eu",),
                 languages,
                 ("Chirp3-HD",),
-                (("sample_rate", 48000), ("sessions", 2), ("starts_minute", 40)),
+                (
+                    ("sample_rate", 48000),
+                    ("sessions", 2),
+                    ("starts_minute", 40),
+                    ("bytes_message", _TTS_MESSAGE_BYTE_LIMIT),
+                ),
                 rpc.evidence,
                 voices,
             )
@@ -1377,11 +1401,13 @@ class GoogleTtsProvider:
     async def health(self, snapshot: str) -> ProviderHealth:
         attempt_id = uuid4()
         attempt: GoogleTtsAttempt | None = None
+        owned_channel = False
+        channel: grpc.aio.Channel | None = None
         try:
+            owned_channel = self._channel is None
             channel = self._channel or authenticated_channel(
                 self._config.tts_endpoint, self._config.quota_project
             )
-            owned_channel = self._channel is None
             utterance = SynthesisUtterance(
                 uuid4(),
                 attempt_id,
@@ -1431,8 +1457,10 @@ class GoogleTtsProvider:
         except Exception as exc:
             return ProviderHealth(False, int(time.time() * 1000), type(exc).__name__, None)
         finally:
-            if owned_channel and attempt is not None:
-                if attempt._terminal is None:
+            if owned_channel and channel is not None:
+                if attempt is None:
+                    await channel.close()
+                elif attempt._terminal is None:
                     await asyncio.shield(attempt.cancel())
                 else:
                     await asyncio.shield(attempt.finish())
@@ -1553,6 +1581,8 @@ class GoogleTtsSession:
 
 
 class GoogleTtsAttempt:
+    _EVENT_QUEUE_SIZE = 64
+
     def __init__(
         self,
         c: GoogleConfig,
@@ -1571,7 +1601,8 @@ class GoogleTtsAttempt:
         self._utterance = u
         self._language = language
         self._voice = voice
-        self._events: asyncio.Queue[TtsEvent] = asyncio.Queue()
+        self._events: asyncio.Queue[TtsEvent] = asyncio.Queue(maxsize=self._EVENT_QUEUE_SIZE + 1)
+        self._event_slots = asyncio.Semaphore(self._EVENT_QUEUE_SIZE)
         self._terminal: OperationTerminal | None = None
         self._refs: list[RawRef] = []
         self._received = 0
@@ -1585,6 +1616,8 @@ class GoogleTtsAttempt:
         async def stream() -> AsyncIterator[TtsEvent]:
             while True:
                 event = await self._events.get()
+                if not isinstance(event, OperationTerminalEvent):
+                    self._event_slots.release()
                 yield event
                 if isinstance(event, OperationTerminalEvent):
                     return
@@ -1678,7 +1711,7 @@ class GoogleTtsAttempt:
             if self._emitted <= 0:
                 raise RuntimeError("Google streaming TTS returned no audio")
             boundary = SampleRange(start=0, end=self._emitted)
-            await self._events.put(
+            await self._emit_event(
                 SynthesisBoundary(
                     operation_id=self._utterance.operation_id,
                     samples=boundary,
@@ -1722,9 +1755,10 @@ class GoogleTtsAttempt:
                 ),
             )
         )
-        yield cloud_tts.StreamingSynthesizeRequest(
-            input=cloud_tts.StreamingSynthesisInput(text=self._utterance.text)
-        )
+        for text in _tts_text_messages(self._utterance.text):
+            yield cloud_tts.StreamingSynthesizeRequest(
+                input=cloud_tts.StreamingSynthesisInput(text=text)
+            )
 
     def _serialize_request(
         self,
@@ -1778,7 +1812,7 @@ class GoogleTtsAttempt:
         raw_ref: RawRef,
     ) -> int:
         samples = SampleRange(start=emitted, end=emitted + len(pcm) // 2)
-        await self._events.put(
+        await self._emit_event(
             AudioEvent(
                 operation_id=self._utterance.operation_id,
                 sequence=sequence,
@@ -1837,6 +1871,14 @@ class GoogleTtsAttempt:
             payload=payload,
             sample_range=self._utterance.source_range,
         )
+
+    async def _emit_event(self, event: TtsEvent) -> None:
+        await self._event_slots.acquire()
+        try:
+            self._events.put_nowait(event)
+        except BaseException:
+            self._event_slots.release()
+            raise
 
     async def _end(
         self,

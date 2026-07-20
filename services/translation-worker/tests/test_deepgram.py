@@ -8,7 +8,11 @@ from websockets.client import ClientProtocol
 from websockets.exceptions import InvalidStatus
 from websockets.uri import parse_uri
 
-from transhooter_worker.adapters.deepgram.provider import DeepgramConfig, DeepgramSttSession
+from transhooter_worker.adapters.deepgram.provider import (
+    DeepgramConfig,
+    DeepgramSttSession,
+    DeepgramSynthesisAttempt,
+)
 from transhooter_worker.adapters.deepgram.sansio import SansIoWebSocket
 from transhooter_worker.application.session import _audio_after_watermark
 from transhooter_worker.domain.models import (
@@ -18,6 +22,7 @@ from transhooter_worker.domain.models import (
     RawRef,
     SampleRange,
     SessionTerminalEvent,
+    SynthesisUtterance,
     TranscriptEvent,
 )
 
@@ -25,6 +30,7 @@ from transhooter_worker.domain.models import (
 class Journal:
     def __init__(self) -> None:
         self.ordinal = 0
+        self.terminals = 0
 
     def append(self, **kwargs: Any) -> RawRef:
         self.ordinal += 1
@@ -37,6 +43,7 @@ class Journal:
         )
 
     def terminal(self, *_: object) -> RawRef:
+        self.terminals += 1
         return self.append(payload=b"terminal")
 
 
@@ -124,6 +131,63 @@ def deepgram_config() -> DeepgramConfig:
         approved_voices=("voice",),
         credential_fingerprint="fingerprint",
     )
+
+
+class RecordingSynthesisSocket:
+    close_code = 1000
+    close_reason = "complete"
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def __aiter__(self):
+        async def messages():
+            yield '{"type":"Flushed"}'
+
+        return messages()
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def close(self, **_: object) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_deepgram_tts_reconstructs_text_across_ordered_character_limited_messages() -> None:
+    text = "a" * 1_999 + "ö" + "b" * 2_001
+    journal = Journal()
+    socket = RecordingSynthesisSocket()
+    utterance = SynthesisUtterance(
+        uuid4(),
+        uuid4(),
+        text,
+        "de-DE",
+        "voice",
+        SampleRange(0, 1),
+    )
+    attempt = DeepgramSynthesisAttempt(
+        deepgram_config(),
+        journal,
+        socket,  # type: ignore[arg-type]
+        utterance,
+    )
+
+    terminal = await attempt.finish()
+    commands = [json.loads(message) for message in socket.sent]
+    speak_texts = [command["text"] for command in commands if command["type"] == "Speak"]
+
+    assert "".join(speak_texts) == text
+    assert len(speak_texts) > 1
+    assert all(len(chunk) <= 2_000 for chunk in speak_texts)
+    assert [command["type"] for command in commands] == [
+        "Speak",
+        "Speak",
+        "Speak",
+        "Flush",
+    ]
+    assert terminal.outcome is Outcome.SUCCEEDED
+    assert journal.terminals == 1
 
 
 @pytest.mark.asyncio

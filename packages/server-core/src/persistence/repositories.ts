@@ -429,9 +429,6 @@ export class DrizzleAuthRepository implements AuthRepository {
         .limit(1)
         .for("update");
       if (current && current.expiresAt > now) {
-        if (!current.sealedRawToken || !current.sealedTokenKeyId) {
-          throw new DomainError("MAGIC_LINK_DELIVERY_UNRECOVERABLE");
-        }
         return {
           record: mapMagicLink(current),
           sealedRawToken: current.sealedRawToken,
@@ -493,15 +490,34 @@ export class DrizzleAuthRepository implements AuthRepository {
   }
 
   async createPendingExchange(exchange: PendingExchangeRecord, tx: Transaction): Promise<void> {
-    await unwrap(tx).insert(pendingExchanges).values({
-      id: exchange.id,
-      magicLinkId: exchange.magicLinkId,
-      nonceHash: exchange.nonceHash,
-      csrfHash: exchange.csrfHash,
-      expiresAt: exchange.expiresAt,
-      consumedAt: exchange.consumedAt,
-      createdAt: sql`now()`,
-    });
+    const database = unwrap(tx);
+    await database
+      .delete(pendingExchanges)
+      .where(
+        and(
+          eq(pendingExchanges.magicLinkId, exchange.magicLinkId),
+          or(
+            sql`${pendingExchanges.consumedAt} IS NOT NULL`,
+            lte(pendingExchanges.expiresAt, sql`CURRENT_TIMESTAMP`),
+          ),
+        ),
+      );
+    const inserted = await database
+      .insert(pendingExchanges)
+      .values({
+        id: exchange.id,
+        magicLinkId: exchange.magicLinkId,
+        nonceHash: exchange.nonceHash,
+        csrfHash: exchange.csrfHash,
+        expiresAt: exchange.expiresAt,
+        consumedAt: exchange.consumedAt,
+        createdAt: sql`CURRENT_TIMESTAMP`,
+      })
+      .onConflictDoNothing()
+      .returning({ id: pendingExchanges.id });
+    if (inserted.length !== 1) {
+      throw new DomainError("INVALID_OR_EXPIRED_LINK");
+    }
   }
 
   async lockPendingExchangeByNonceHash(
@@ -628,16 +644,24 @@ export class DrizzleAuthRepository implements AuthRepository {
         `);
       }
 
+      await database.delete(magicLinkRequests).where(lte(magicLinkRequests.requestedAt, since));
+
       const result = await database.execute<RateLimitCountRow>(sql`
         SELECT
           count(*) FILTER (WHERE email_hash = ${emailHash})::int AS email,
           count(*) FILTER (WHERE ip_hash = ${ipHash})::int AS ip
         FROM magic_link_requests
-        WHERE requested_at >= ${since}
+        WHERE requested_at > ${since}
       `);
       const row = result.rows[0];
       if (!row) {
         throw new Error("magic-link admission count returned no row");
+      }
+
+      const admitted =
+        Number(row.ip) < ipLimit && (emailHash === null || Number(row.email) < emailLimit);
+      if (!admitted) {
+        return false;
       }
 
       await database.insert(magicLinkRequests).values({
@@ -645,7 +669,7 @@ export class DrizzleAuthRepository implements AuthRepository {
         ipHash,
         requestedAt: at,
       });
-      return Number(row.ip) < ipLimit && (emailHash === null || Number(row.email) < emailLimit);
+      return true;
     });
   }
 }

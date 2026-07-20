@@ -183,7 +183,8 @@ class WireModel(BaseModel):
         alias_generator=lambda name: "".join(
             [name.split("_")[0], *(part.title() for part in name.split("_")[1:])]
         ),
-        populate_by_name=True,
+        validate_by_alias=True,
+        validate_by_name=True,
         extra="forbid",
     )
 
@@ -310,7 +311,7 @@ class CaptionPacket(BaseModel):
 
 
 def _spool() -> EncryptedSpool:
-    root = Path(os.environ.get("SPOOL_PATH") or os.environ["SPOOL_DIR"])
+    root = Path(os.environ["SPOOL_PATH"])
     database = Path(os.environ.get("SPOOL_DATABASE", str(root / "journal.sqlite3")))
     capacity_probe = (
         deterministic_roomy_capacity if os.environ.get("APP_ENV") == "test" else statvfs_capacity
@@ -340,7 +341,7 @@ def _validated_job_metadata(payload: str) -> JobMetadata:
     Draft202012Validator(definitions["WorkerJobMetadata"], format_checker=FormatChecker()).validate(
         candidate
     )
-    return JobMetadata.model_validate(candidate)
+    return JobMetadata.model_validate(candidate, by_alias=True, by_name=False)
 
 
 async def _reported_preflight(
@@ -561,6 +562,7 @@ async def _heartbeat_loop(
     control: ControlClient,
     provider_health: tuple[ProviderHealth, ...],
     quota_leases: list[tuple[RedisQuotaGate, str, str]],
+    drain_requested: asyncio.Event,
 ) -> None:
     while True:
         usage = spool.usage_ratio()
@@ -570,7 +572,7 @@ async def _heartbeat_loop(
         await asyncio.gather(
             *(gate.reserve_active(stage, reservation) for gate, stage, reservation in quota_leases)
         )
-        await control.heartbeat(
+        accepted = await control.heartbeat(
             {
                 "writeEpoch": metadata.write_epoch,
                 "snapshotHash": metadata.snapshot_hash,
@@ -579,6 +581,9 @@ async def _heartbeat_loop(
                 "acceptingLoad": usage < 0.70,
             }
         )
+        if not accepted:
+            drain_requested.set()
+            return
         await asyncio.sleep(5)
 
 
@@ -664,7 +669,7 @@ async def _supervise_runtime(
     interpretation_tracks: dict[str, tuple[rtc.AudioSource, rtc.LocalTrackPublication]],
 ) -> None:
     heartbeat_task = asyncio.create_task(
-        _heartbeat_loop(metadata, spool, control, provider_health, quota_leases)
+        _heartbeat_loop(metadata, spool, control, provider_health, quota_leases, drain_requested)
     )
     disconnect_task = asyncio.create_task(disconnected.wait())
     drain_task = asyncio.create_task(drain_requested.wait())
@@ -1751,7 +1756,7 @@ def _install_room_handlers(
 async def _run_consultation(ctx: agents.JobContext) -> None:
     metadata = _validated_job_metadata(ctx.job.metadata)
     spool = _spool()
-    archive = build_archive(Path(os.environ.get("SPOOL_PATH") or os.environ["SPOOL_DIR"]))
+    archive = build_archive(Path(os.environ["SPOOL_PATH"]))
     livekit_by_participant = dict(
         zip(metadata.expected_participant_ids, metadata.expected_livekit_identities, strict=True)
     )
@@ -1766,7 +1771,7 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         raise RuntimeError("encrypted spool admission requires capacity below 70%")
     control = ControlClient(
         os.environ["CONTROL_INTERNAL_URL"],
-        Path(os.environ["WORKER_INTERNAL_BEARER_FILE"]),
+        Path(os.environ["INTERNAL_TOKEN_FILE"]),
         metadata.consultation_id,
         metadata.generation,
         metadata.worker_identity,

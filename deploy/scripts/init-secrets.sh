@@ -7,8 +7,8 @@ runtime_gid=${RUNTIME_GID:-10001}
 temporary_generation=
 temporary_link=
 
-primitive_secrets='postgres-password redis-password minio-access-key minio-secret-key livekit-api-key livekit-api-secret session-secret csrf-secret egress-layout-signing-key internal-control-token internal-translation-token internal-spool-drainer-token spool-keyring magic-link-seal-keys'
-derived_secrets='database-url redis-url livekit-credentials minio-credentials'
+primitive_secrets='postgres-owner-password postgres-migrator-password postgres-web-password postgres-control-password postgres-translation-password postgres-capability-password redis-password minio-root-access-key minio-root-secret-key minio-web-access-key minio-web-secret-key minio-control-access-key minio-control-secret-key minio-translation-access-key minio-translation-secret-key minio-spool-drainer-access-key minio-spool-drainer-secret-key livekit-api-key livekit-api-secret session-secret csrf-secret egress-layout-signing-key internal-control-token internal-translation-token internal-spool-drainer-token spool-keyring magic-link-seal-keys'
+derived_secrets='database-migrator-url database-integration-migrator-url database-web-url database-control-url database-translation-url database-capability-url redis-url livekit-credentials minio-web-credentials minio-control-credentials minio-translation-credentials minio-spool-drainer-credentials'
 managed_secrets="$primitive_secrets $derived_secrets"
 
 mkdir -p "$secrets_directory"
@@ -222,10 +222,23 @@ build_generation() {
   chown 0:"$runtime_gid" "$temporary_generation"
   chmod 0750 "$temporary_generation"
 
-  postgres_password=$(load_or_generate_hex postgres-password 32)
+  postgres_owner_password=$(load_or_generate_hex postgres-owner-password 32)
+  postgres_migrator_password=$(load_or_generate_hex postgres-migrator-password 32)
+  postgres_web_password=$(load_or_generate_hex postgres-web-password 32)
+  postgres_control_password=$(load_or_generate_hex postgres-control-password 32)
+  postgres_translation_password=$(load_or_generate_hex postgres-translation-password 32)
+  postgres_capability_password=$(load_or_generate_hex postgres-capability-password 32)
   redis_password=$(load_or_generate_hex redis-password 32)
-  minio_access_key=$(load_or_generate_hex minio-access-key 10 ts)
-  minio_secret_key=$(load_or_generate_hex minio-secret-key 32)
+  minio_root_access_key=$(load_or_generate_hex minio-root-access-key 8 root)
+  minio_root_secret_key=$(load_or_generate_hex minio-root-secret-key 32)
+  minio_web_access_key=$(load_or_generate_hex minio-web-access-key 8 web_)
+  minio_web_secret_key=$(load_or_generate_hex minio-web-secret-key 32)
+  minio_control_access_key=$(load_or_generate_hex minio-control-access-key 8 ctl_)
+  minio_control_secret_key=$(load_or_generate_hex minio-control-secret-key 32)
+  minio_translation_access_key=$(load_or_generate_hex minio-translation-access-key 8 trn_)
+  minio_translation_secret_key=$(load_or_generate_hex minio-translation-secret-key 32)
+  minio_spool_drainer_access_key=$(load_or_generate_hex minio-spool-drainer-access-key 8 drn_)
+  minio_spool_drainer_secret_key=$(load_or_generate_hex minio-spool-drainer-secret-key 32)
   livekit_api_key=$(load_or_generate_hex livekit-api-key 12 lk_)
   livekit_api_secret=$(load_or_generate_hex livekit-api-secret 32)
   session_secret=$(load_or_generate_hex session-secret 48)
@@ -237,10 +250,23 @@ build_generation() {
   spool_keyring=$(load_or_generate_spool_keyring)
   magic_link_seal_keys=$(load_or_generate_magic_link_keyring)
 
-  write_generation_secret postgres-password "$postgres_password"
+  write_generation_secret postgres-owner-password "$postgres_owner_password"
+  write_generation_secret postgres-migrator-password "$postgres_migrator_password"
+  write_generation_secret postgres-web-password "$postgres_web_password"
+  write_generation_secret postgres-control-password "$postgres_control_password"
+  write_generation_secret postgres-translation-password "$postgres_translation_password"
+  write_generation_secret postgres-capability-password "$postgres_capability_password"
   write_generation_secret redis-password "$redis_password"
-  write_generation_secret minio-access-key "$minio_access_key"
-  write_generation_secret minio-secret-key "$minio_secret_key"
+  write_generation_secret minio-root-access-key "$minio_root_access_key"
+  write_generation_secret minio-root-secret-key "$minio_root_secret_key"
+  write_generation_secret minio-web-access-key "$minio_web_access_key"
+  write_generation_secret minio-web-secret-key "$minio_web_secret_key"
+  write_generation_secret minio-control-access-key "$minio_control_access_key"
+  write_generation_secret minio-control-secret-key "$minio_control_secret_key"
+  write_generation_secret minio-translation-access-key "$minio_translation_access_key"
+  write_generation_secret minio-translation-secret-key "$minio_translation_secret_key"
+  write_generation_secret minio-spool-drainer-access-key "$minio_spool_drainer_access_key"
+  write_generation_secret minio-spool-drainer-secret-key "$minio_spool_drainer_secret_key"
   write_generation_secret livekit-api-key "$livekit_api_key"
   write_generation_secret livekit-api-secret "$livekit_api_secret"
   write_generation_secret session-secret "$session_secret"
@@ -252,17 +278,35 @@ build_generation() {
   write_generation_secret spool-keyring "$spool_keyring"
   write_generation_secret magic-link-seal-keys "$magic_link_seal_keys"
 
-  database_password=$(url_encode "$postgres_password")
+  database_migrator_password=$(url_encode "$postgres_migrator_password")
+  database_web_password=$(url_encode "$postgres_web_password")
+  database_control_password=$(url_encode "$postgres_control_password")
+  database_translation_password=$(url_encode "$postgres_translation_password")
+  database_capability_password=$(url_encode "$postgres_capability_password")
   redis_url_password=$(url_encode "$redis_password")
   livekit_key_json=$(json_escape "$livekit_api_key")
   livekit_secret_json=$(json_escape "$livekit_api_secret")
-  minio_access_json=$(json_escape "$minio_access_key")
-  minio_secret_json=$(json_escape "$minio_secret_key")
+  minio_web_access_json=$(json_escape "$minio_web_access_key")
+  minio_web_secret_json=$(json_escape "$minio_web_secret_key")
+  minio_control_access_json=$(json_escape "$minio_control_access_key")
+  minio_control_secret_json=$(json_escape "$minio_control_secret_key")
+  minio_translation_access_json=$(json_escape "$minio_translation_access_key")
+  minio_translation_secret_json=$(json_escape "$minio_translation_secret_key")
+  minio_spool_drainer_access_json=$(json_escape "$minio_spool_drainer_access_key")
+  minio_spool_drainer_secret_json=$(json_escape "$minio_spool_drainer_secret_key")
 
-  write_generation_secret database-url "postgresql://transhooter:${database_password}@postgres:5432/transhooter"
+  write_generation_secret database-migrator-url "postgresql://transhooter_migrator:${database_migrator_password}@postgres:5432/transhooter?options=-csearch_path%3Dpublic%2Cpg_catalog"
+  write_generation_secret database-integration-migrator-url "postgresql://transhooter_migrator:${database_migrator_password}@postgres:5432/transhooter_integration?options=-csearch_path%3Dpublic%2Cpg_catalog"
+  write_generation_secret database-web-url "postgresql://transhooter_web:${database_web_password}@postgres:5432/transhooter"
+  write_generation_secret database-control-url "postgresql://transhooter_control:${database_control_password}@postgres:5432/transhooter"
+  write_generation_secret database-translation-url "postgresql://transhooter_translation:${database_translation_password}@postgres:5432/transhooter"
+  write_generation_secret database-capability-url "postgresql://transhooter_capability:${database_capability_password}@postgres:5432/transhooter"
   write_generation_secret redis-url "redis://:${redis_url_password}@redis:6379/0"
   write_generation_secret livekit-credentials "{\"apiKey\":\"${livekit_key_json}\",\"apiSecret\":\"${livekit_secret_json}\"}"
-  write_generation_secret minio-credentials "{\"accessKeyId\":\"${minio_access_json}\",\"secretAccessKey\":\"${minio_secret_json}\"}"
+  write_generation_secret minio-web-credentials "{\"accessKeyId\":\"${minio_web_access_json}\",\"secretAccessKey\":\"${minio_web_secret_json}\"}"
+  write_generation_secret minio-control-credentials "{\"accessKeyId\":\"${minio_control_access_json}\",\"secretAccessKey\":\"${minio_control_secret_json}\"}"
+  write_generation_secret minio-translation-credentials "{\"accessKeyId\":\"${minio_translation_access_json}\",\"secretAccessKey\":\"${minio_translation_secret_json}\"}"
+  write_generation_secret minio-spool-drainer-credentials "{\"accessKeyId\":\"${minio_spool_drainer_access_json}\",\"secretAccessKey\":\"${minio_spool_drainer_secret_json}\"}"
 
   for secret_name in $managed_secrets; do
     [ -f "$temporary_generation/$secret_name" ] && [ -s "$temporary_generation/$secret_name" ] || {
@@ -311,6 +355,40 @@ publish_generation() {
   sync
 }
 
+export_secret_set() {
+  export_directory=$1
+  shift
+  [ -d "$export_directory" ] || return 0
+
+  for secret_name do
+    export_target="$export_directory/$secret_name"
+    export_temporary="$export_directory/.tmp-$secret_name.$$"
+    cp "$secrets_directory/.current/$secret_name" "$export_temporary"
+    chown 0:"$runtime_gid" "$export_temporary"
+    chmod 0440 "$export_temporary"
+    mv -f "$export_temporary" "$export_target"
+  done
+}
+
+export_runtime_secret_sets() {
+  export_secret_set /exports/migrator database-migrator-url
+  export_secret_set /exports/integration-migrator database-integration-migrator-url
+  export_secret_set /exports/capability \
+    database-capability-url spool-keyring internal-translation-token
+  export_secret_set /exports/web \
+    database-web-url redis-url livekit-credentials minio-web-credentials \
+    session-secret csrf-secret internal-control-token internal-translation-token \
+    internal-spool-drainer-token egress-layout-signing-key magic-link-seal-keys
+  export_secret_set /exports/control \
+    database-control-url redis-url livekit-credentials minio-control-credentials \
+    internal-control-token egress-layout-signing-key
+  export_secret_set /exports/translation \
+    database-translation-url redis-url livekit-credentials minio-translation-credentials \
+    spool-keyring internal-translation-token
+  export_secret_set /exports/spool-drainer \
+    minio-spool-drainer-credentials spool-keyring internal-spool-drainer-token
+}
+
 cleanup() {
   if [ -n "$temporary_link" ]; then
     rm -f "$temporary_link"
@@ -327,6 +405,7 @@ main() {
   validate_existing_secrets
   build_generation
   publish_generation
+  export_runtime_secret_sets
 }
 
 main "$@"

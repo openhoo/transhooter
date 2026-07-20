@@ -32,7 +32,7 @@ x-control-worker-env: &control-worker-env
   <<: *otel-env
   LIVEKIT_INTERNAL_URL: ws://livekit:7880
   LIVEKIT_CREDENTIALS_FILE: /run/secrets/livekit-credentials
-  S3_CREDENTIALS_FILE: /run/secrets/minio-credentials
+  S3_CREDENTIALS_FILE: /run/secrets/minio-control-credentials
   INTERNAL_TOKEN_FILE: /run/secrets/internal-control-token
   EGRESS_LAYOUT_SIGNING_KEY_FILE: /run/secrets/egress-layout-signing-key
 
@@ -42,7 +42,7 @@ x-web-runtime-env: &web-runtime-env
   PORT: 3000
   LIVEKIT_INTERNAL_URL: ws://livekit:7880
   LIVEKIT_CREDENTIALS_FILE: /run/secrets/livekit-credentials
-  S3_CREDENTIALS_FILE: /run/secrets/minio-credentials
+  S3_CREDENTIALS_FILE: /run/secrets/minio-web-credentials
   SESSION_SECRET_FILE: /run/secrets/session-secret
   CSRF_SECRET_FILE: /run/secrets/csrf-secret
   INTERNAL_CONTROL_TOKEN_FILE: /run/secrets/internal-control-token
@@ -53,10 +53,23 @@ x-web-runtime-env: &web-runtime-env
   NEXT_TELEMETRY_DISABLED: "1"
 
 x-web-runtime-volumes: &web-runtime-volumes
-  - ../../.secrets/database-url:/run/secrets/database-url:ro
+  - ../../.secrets/database-web-url:/run/secrets/database-url:ro
   - ../../.secrets/redis-url:/run/secrets/redis-url:ro
   - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
-  - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+  - ../../.secrets/minio-web-credentials:/run/secrets/minio-web-credentials:ro
+  - ../../.secrets/session-secret:/run/secrets/session-secret:ro
+  - ../../.secrets/csrf-secret:/run/secrets/csrf-secret:ro
+  - ../../.secrets/internal-control-token:/run/secrets/internal-control-token:ro
+  - ../../.secrets/internal-translation-token:/run/secrets/internal-translation-token:ro
+  - ../../.secrets/internal-spool-drainer-token:/run/secrets/internal-spool-drainer-token:ro
+  - ../../.secrets/egress-layout-signing-key:/run/secrets/egress-layout-signing-key:ro
+  - ../../.secrets/magic-link-seal-keys:/run/secrets/magic-link-seal-keys:ro
+
+x-capability-publisher-volumes: &capability-publisher-volumes
+  - ../../.secrets/database-capability-url:/run/secrets/database-capability-url:ro
+  - ../../.secrets/redis-url:/run/secrets/redis-url:ro
+  - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
+  - ../../.secrets/minio-web-credentials:/run/secrets/minio-web-credentials:ro
   - ../../.secrets/session-secret:/run/secrets/session-secret:ro
   - ../../.secrets/csrf-secret:/run/secrets/csrf-secret:ro
   - ../../.secrets/internal-control-token:/run/secrets/internal-control-token:ro
@@ -67,7 +80,7 @@ x-web-runtime-volumes: &web-runtime-volumes
 
 services:
   secrets-init:
-    image: alpine:3.22.1
+    image: alpine:3.22.5
     user: "0:0"
     restart: "no"
     networks: [backend]
@@ -79,7 +92,7 @@ services:
       RUNTIME_GID: "10001"
 
   spool-init:
-    image: alpine:3.22.1
+    image: alpine:3.22.5
     user: "0:0"
     restart: "no"
     networks: [backend]
@@ -89,29 +102,59 @@ services:
 
 
   postgres:
-    image: postgres:17.5-bookworm
+    image: postgres:17.10-bookworm
     restart: unless-stopped
     networks: [backend]
+    depends_on:
+      secrets-init: {condition: service_completed_successfully}
     environment:
       POSTGRES_DB: transhooter
-      POSTGRES_USER: transhooter
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+      POSTGRES_USER: transhooter_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-owner-password
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ../../.secrets/postgres-password:/run/secrets/postgres-password:ro
+      - type: bind
+        source: ../../.secrets/postgres-owner-password
+        target: /run/secrets/postgres-owner-password
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
-      test: [CMD-SHELL, "pg_isready -U transhooter -d transhooter"]
+      test: [CMD-SHELL, "pg_isready -U transhooter_owner -d transhooter"]
       interval: 5s
       timeout: 5s
       retries: 20
+  postgres-role-bootstrap:
+    image: postgres:17.10-bookworm
+    restart: "no"
+    networks: [backend]
+    depends_on:
+      postgres: {condition: service_healthy}
+      secrets-init: {condition: service_completed_successfully}
+    volumes:
+      - ../../.secrets/postgres-owner-password:/run/secrets/postgres-owner-password:ro
+      - ../../.secrets/postgres-migrator-password:/run/secrets/postgres-migrator-password:ro
+      - ../../.secrets/postgres-web-password:/run/secrets/postgres-web-password:ro
+      - ../../.secrets/postgres-control-password:/run/secrets/postgres-control-password:ro
+      - ../../.secrets/postgres-translation-password:/run/secrets/postgres-translation-password:ro
+      - ../../.secrets/postgres-capability-password:/run/secrets/postgres-capability-password:ro
+      - ../scripts/postgres_bootstrap.sh:/usr/local/bin/postgres-bootstrap:ro
+    command: [/bin/sh, /usr/local/bin/postgres-bootstrap]
 
   redis:
     image: redis:8.0.2-bookworm
     restart: unless-stopped
     networks: [backend]
+    depends_on:
+      secrets-init: {condition: service_completed_successfully}
     volumes:
       - redis-data:/data
-      - ../../.secrets/redis-password:/run/secrets/redis-password:ro
+      - type: bind
+        source: ../../.secrets/redis-password
+        target: /run/secrets/redis-password
+        read_only: true
+        bind:
+          create_host_path: false
     command: [/bin/sh, -ec, "exec redis-server --appendonly yes --requirepass \"$$(cat /run/secrets/redis-password)\""]
     healthcheck:
       test: [CMD-SHELL, "REDISCLI_AUTH=$$(cat /run/secrets/redis-password) redis-cli ping | grep -qx PONG"]
@@ -119,22 +162,46 @@ services:
       timeout: 5s
       retries: 20
 
+  minio-data-init:
+    image: alpine:3.22.5
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - minio-data:/data
+    command: [/bin/sh, -ec, "mkdir -p /data && chown 1000:10001 /data && chmod 0700 /data"]
+
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+    image: transhooter-minio:RELEASE.2025-07-23T15-54-02Z
+    build:
+      context: ../..
+      dockerfile: deploy/docker/minio.Dockerfile
     restart: unless-stopped
     networks: [backend, edge]
+    depends_on:
+      minio-data-init: {condition: service_completed_successfully}
+      secrets-init: {condition: service_completed_successfully}
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     environment:
-      MINIO_ROOT_USER_FILE: /run/secrets/minio-access-key
-      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio-secret-key
+      MINIO_ROOT_USER_FILE: /run/secrets/minio-root-access-key
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio-root-secret-key
       MINIO_API_STALE_UPLOADS_EXPIRY: 168h
       MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL: 1h
     volumes:
       - minio-data:/data
-      - ../../.secrets/minio-access-key:/run/secrets/minio-access-key:ro
-      - ../../.secrets/minio-secret-key:/run/secrets/minio-secret-key:ro
+      - type: bind
+        source: ../../.secrets/minio-root-access-key
+        target: /run/secrets/minio-root-access-key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../../.secrets/minio-root-secret-key
+        target: /run/secrets/minio-root-secret-key
+        read_only: true
+        bind:
+          create_host_path: false
     command: [server, /data, --console-address, ":9001"]
     healthcheck:
       test: [CMD, curl, -fsS, http://127.0.0.1:9000/minio/health/ready]
@@ -155,16 +222,40 @@ services:
       secrets-init: {condition: service_completed_successfully}
     environment:
       S3_ENDPOINT: http://minio:9000
+      S3_ENDPOINT_COMPATIBILITY: minio
       S3_REGION: eu-central-1
       S3_BUCKET: transhooter
-      S3_ACCESS_KEY_FILE: /run/secrets/minio-access-key
-      S3_SECRET_KEY_FILE: /run/secrets/minio-secret-key
-      ARCHIVE_REQUIRE_KMS: "false"
+      S3_ACCESS_KEY_FILE: /run/secrets/minio-root-access-key
+      S3_SECRET_KEY_FILE: /run/secrets/minio-root-secret-key
       MINIO_STALE_UPLOADS_EXPIRY: 168h
     volumes:
-      - ../../.secrets/minio-access-key:/run/secrets/minio-access-key:ro
-      - ../../.secrets/minio-secret-key:/run/secrets/minio-secret-key:ro
+      - ../../.secrets/minio-root-access-key:/run/secrets/minio-root-access-key:ro
+      - ../../.secrets/minio-root-secret-key:/run/secrets/minio-root-secret-key:ro
     command: [python, /opt/transhooter/minio_bootstrap.py]
+
+  minio-identity-bootstrap:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    restart: "no"
+    networks: [backend]
+    depends_on:
+      minio-bootstrap: {condition: service_completed_successfully}
+      secrets-init: {condition: service_completed_successfully}
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: transhooter
+    volumes:
+      - ../../.secrets/minio-root-access-key:/run/secrets/minio-root-access-key:ro
+      - ../../.secrets/minio-root-secret-key:/run/secrets/minio-root-secret-key:ro
+      - ../../.secrets/minio-web-access-key:/run/secrets/minio-web-access-key:ro
+      - ../../.secrets/minio-web-secret-key:/run/secrets/minio-web-secret-key:ro
+      - ../../.secrets/minio-control-access-key:/run/secrets/minio-control-access-key:ro
+      - ../../.secrets/minio-control-secret-key:/run/secrets/minio-control-secret-key:ro
+      - ../../.secrets/minio-translation-access-key:/run/secrets/minio-translation-access-key:ro
+      - ../../.secrets/minio-translation-secret-key:/run/secrets/minio-translation-secret-key:ro
+      - ../../.secrets/minio-spool-drainer-access-key:/run/secrets/minio-spool-drainer-access-key:ro
+      - ../../.secrets/minio-spool-drainer-secret-key:/run/secrets/minio-spool-drainer-secret-key:ro
+      - ../scripts/minio_identities.sh:/usr/local/bin/minio-identities:ro
+    entrypoint: [/bin/sh, /usr/local/bin/minio-identities]
 
   livekit:
     image: livekit/livekit-server:v1.9.2
@@ -212,11 +303,12 @@ services:
     image: livekit/egress:v1.12.0
     restart: unless-stopped
     init: true
+    stop_grace_period: 1h
     networks: [backend]
     depends_on:
       livekit: {condition: service_healthy}
       redis: {condition: service_healthy}
-      minio-bootstrap: {condition: service_completed_successfully}
+      minio-identity-bootstrap: {condition: service_completed_successfully}
     environment:
       EGRESS_CONFIG_FILE: /runtime/egress.yaml
       RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:-}
@@ -253,7 +345,7 @@ services:
       retries: 30
       start_period: 20s
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.130.1
+    image: otel/opentelemetry-collector-contrib:0.156.0
     restart: unless-stopped
     init: true
     user: "10001:10001"
@@ -291,20 +383,20 @@ services:
     networks: [backend]
     depends_on:
       egress: {condition: service_healthy}
-      minio-bootstrap: {condition: service_completed_successfully}
+      minio-identity-bootstrap: {condition: service_completed_successfully}
       livekit: {condition: service_healthy}
     environment:
       LIVEKIT_HTTP_URL: http://livekit:7880
       S3_ENDPOINT: http://minio:9000
       S3_REGION: eu-central-1
       S3_BUCKET: transhooter
-      S3_ACCESS_KEY_FILE: /run/secrets/minio-access-key
-      S3_SECRET_KEY_FILE: /run/secrets/minio-secret-key
+      S3_ACCESS_KEY_FILE: /run/secrets/minio-root-access-key
+      S3_SECRET_KEY_FILE: /run/secrets/minio-root-secret-key
       LIVEKIT_API_KEY_FILE: /run/secrets/livekit-api-key
       LIVEKIT_API_SECRET_FILE: /run/secrets/livekit-api-secret
     volumes:
-      - ../../.secrets/minio-access-key:/run/secrets/minio-access-key:ro
-      - ../../.secrets/minio-secret-key:/run/secrets/minio-secret-key:ro
+      - ../../.secrets/minio-root-access-key:/run/secrets/minio-root-access-key:ro
+      - ../../.secrets/minio-root-secret-key:/run/secrets/minio-root-secret-key:ro
       - ../../.secrets/livekit-api-key:/run/secrets/livekit-api-key:ro
       - ../../.secrets/livekit-api-secret:/run/secrets/livekit-api-secret:ro
     command: [python, /opt/transhooter/egress_readiness.py]
@@ -318,20 +410,35 @@ services:
       target: runtime
     restart: "no"
     depends_on:
-      postgres: {condition: service_healthy}
+      postgres-role-bootstrap: {condition: service_completed_successfully}
       secrets-init: {condition: service_completed_successfully}
-    environment: &server-env
-      APP_ENV: ${APP_ENV:-development}
-      PROVIDER_PROFILE: ${PROVIDER_PROFILE:?set PROVIDER_PROFILE}
-      DATABASE_URL_FILE: /run/secrets/database-url
-      REDIS_URL_FILE: /run/secrets/redis-url
-      S3_ENDPOINT: http://minio:9000
-      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
-      S3_REGION: eu-central-1
-      S3_BUCKET: transhooter
+    environment:
+      <<: &server-env
+        APP_ENV: ${APP_ENV:-development}
+        PROVIDER_PROFILE: ${PROVIDER_PROFILE:?set PROVIDER_PROFILE}
+        DATABASE_URL_FILE: /run/secrets/database-url
+        REDIS_URL_FILE: /run/secrets/redis-url
+        S3_ENDPOINT: http://minio:9000
+        S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
+        S3_REGION: eu-central-1
+        S3_BUCKET: transhooter
+      DATABASE_URL_FILE: /run/secrets/database-migrator-url
     volumes:
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - ../../.secrets/database-migrator-url:/run/secrets/database-migrator-url:ro
     command: [bun, deploy/scripts/migrate.mjs]
+
+  postgres-capability-bootstrap:
+    image: postgres:17.10-bookworm
+    restart: "no"
+    networks: [backend]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    environment:
+      POSTGRES_BOOTSTRAP_PHASE: capability-grants
+    volumes:
+      - ../../.secrets/postgres-owner-password:/run/secrets/postgres-owner-password:ro
+      - ../scripts/postgres_bootstrap.sh:/usr/local/bin/postgres-bootstrap:ro
+    command: [/bin/sh, /usr/local/bin/postgres-bootstrap]
 
   bootstrap-admin:
     <<: *app-base
@@ -347,7 +454,7 @@ services:
       <<: *server-env
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL}
       BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Local Administrator}
-    volumes: ["../../.secrets/database-url:/run/secrets/database-url:ro"]
+    volumes: ["../../.secrets/database-web-url:/run/secrets/database-url:ro"]
     command: [bun, run, admin:create-staff, --email, "${BOOTSTRAP_ADMIN_EMAIL}", --name, "${BOOTSTRAP_ADMIN_NAME:-Local Administrator}", --role, admin]
 
   profile-preflight:
@@ -361,6 +468,7 @@ services:
       APP_ENV: ${APP_ENV:-development}
       PROVIDER_PROFILE: ${PROVIDER_PROFILE:?set PROVIDER_PROFILE}
       SPOOL_KEYRING_FILE: /run/secrets/spool-keyring
+      SPOOL_PATH: /tmp/transhooter-spool
     volumes:
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
     command: [python, -m, transhooter_worker.providers, preflight]
@@ -373,13 +481,15 @@ services:
       dockerfile: deploy/docker/typescript.Dockerfile
       target: runtime
     depends_on:
-      migrate: {condition: service_completed_successfully}
+      postgres-capability-bootstrap: {condition: service_completed_successfully}
+      minio-identity-bootstrap: {condition: service_completed_successfully}
     environment:
       <<: [*server-env, *web-runtime-env]
+      DATABASE_URL_FILE: /run/secrets/database-capability-url
       OTEL_SERVICE_NAME: transhooter-capability-publisher
       PUBLIC_BASE_URL: http://capability-publisher:3000
       PUBLIC_LIVEKIT_URL: ws://livekit:7880
-    volumes: *web-runtime-volumes
+    volumes: *capability-publisher-volumes
     command: [bun, apps/web/.next/standalone/apps/web/server.js]
     healthcheck:
       test: [CMD, bun, -e, "fetch('http://127.0.0.1:3000/api/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
@@ -402,12 +512,13 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-development}
       PROVIDER_PROFILE: ${PROVIDER_PROFILE:?set PROVIDER_PROFILE}
-      DATABASE_URL_FILE: /run/secrets/database-url
+      DATABASE_URL_FILE: /run/secrets/database-capability-url
       SPOOL_KEYRING_FILE: /run/secrets/spool-keyring
+      SPOOL_PATH: /tmp/transhooter-spool
       CAPABILITY_PUBLISH_URL: http://capability-publisher:3000/api/internal/capabilities
       INTERNAL_TOKEN_FILE: /run/secrets/internal-token
     volumes:
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - ../../.secrets/database-capability-url:/run/secrets/database-capability-url:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
     command: [python, -m, transhooter_worker.providers, sync]
@@ -424,7 +535,7 @@ services:
       spool-init: {condition: service_completed_successfully}
       livekit: {condition: service_healthy}
       redis: {condition: service_healthy}
-      minio-bootstrap: {condition: service_completed_successfully}
+      minio-identity-bootstrap: {condition: service_completed_successfully}
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: transhooter-translation-worker
@@ -437,21 +548,19 @@ services:
       S3_ENDPOINT: http://minio:9000
       S3_REGION: eu-central-1
       S3_BUCKET: transhooter
-      S3_CREDENTIALS_FILE: /run/secrets/minio-credentials
-      ARCHIVE_REQUIRE_KMS: "false"
+      S3_CREDENTIALS_FILE: /run/secrets/minio-translation-credentials
       SPOOL_KEYRING_FILE: /run/secrets/spool-keyring
       INTERNAL_TOKEN_FILE: /run/secrets/internal-token
       CONTROL_INTERNAL_URL: http://web:3000
-      WORKER_INTERNAL_BEARER_FILE: /run/secrets/internal-token
       SPOOL_WORKER_HEALTH_RATIO: ${SPOOL_WORKER_HEALTH_RATIO:-0.7}
       SPOOL_DRAINER_HEALTH_RATIO: ${SPOOL_DRAINER_HEALTH_RATIO:-0.8}
       SPOOL_PATH: /var/lib/transhooter/spool
     volumes:
       - spool-data:/var/lib/transhooter/spool
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - ../../.secrets/database-translation-url:/run/secrets/database-url:ro
       - ../../.secrets/redis-url:/run/secrets/redis-url:ro
       - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
-      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+      - ../../.secrets/minio-translation-credentials:/run/secrets/minio-translation-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
     command: [python, -m, transhooter_worker, start]
@@ -463,11 +572,31 @@ services:
       start_period: 20s
 
   spool-drainer:
-    extends: translation-worker
+    <<: *app-base
+    image: *translation-runtime-image
+    build:
+      context: ../..
+      dockerfile: deploy/docker/translation-worker.Dockerfile
+    depends_on:
+      spool-init: {condition: service_completed_successfully}
+      minio-identity-bootstrap: {condition: service_completed_successfully}
     environment:
+      <<: *otel-env
       OTEL_SERVICE_NAME: transhooter-spool-drainer
+      APP_ENV: ${APP_ENV:-development}
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: eu-central-1
+      S3_BUCKET: transhooter
+      S3_CREDENTIALS_FILE: /run/secrets/minio-spool-drainer-credentials
+      SPOOL_KEYRING_FILE: /run/secrets/spool-keyring
       INTERNAL_TOKEN_FILE: /run/secrets/internal-token
+      CONTROL_INTERNAL_URL: http://web:3000
+      SPOOL_DRAINER_HEALTH_RATIO: ${SPOOL_DRAINER_HEALTH_RATIO:-0.8}
+      SPOOL_PATH: /var/lib/transhooter/spool
     volumes:
+      - spool-data:/var/lib/transhooter/spool
+      - ../../.secrets/minio-spool-drainer-credentials:/run/secrets/minio-spool-drainer-credentials:ro
+      - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-spool-drainer-token:/run/secrets/internal-token:ro
     command: [python, -m, transhooter_worker.runtime.spool_drainer]
     healthcheck:
@@ -493,10 +622,10 @@ services:
       OTEL_SERVICE_NAME: transhooter-control-worker
       INSTANCE_ID: 11111111-1111-4111-8111-111111111111
     volumes:
-      - ../../.secrets/database-url:/run/secrets/database-url:ro
+      - ../../.secrets/database-control-url:/run/secrets/database-url:ro
       - ../../.secrets/redis-url:/run/secrets/redis-url:ro
       - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
-      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+      - ../../.secrets/minio-control-credentials:/run/secrets/minio-control-credentials:ro
       - ../../.secrets/internal-control-token:/run/secrets/internal-control-token:ro
       - ../../.secrets/egress-layout-signing-key:/run/secrets/egress-layout-signing-key:ro
     command: [bun, run, --filter, "@transhooter/control-worker", start]
@@ -550,16 +679,19 @@ services:
       context: ../..
       dockerfile: deploy/docker/translation-worker.Dockerfile
     restart: "no"
+    depends_on:
+      minio-identity-bootstrap: {condition: service_completed_successfully}
     environment:
       APP_ENV: benchmark
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: transhooter
       S3_REGION: eu-central-1
-      S3_CREDENTIALS_FILE: /run/secrets/minio-credentials
+      S3_CREDENTIALS_FILE: /run/secrets/minio-translation-credentials
       SPOOL_KEYRING_FILE: /run/secrets/spool-keyring
+      SPOOL_PATH: /tmp/transhooter-spool
     volumes:
       - ../../tests/fixtures:/workspace/tests/fixtures:ro
-      - ../../.secrets/minio-credentials:/run/secrets/minio-credentials:ro
+      - ../../.secrets/minio-translation-credentials:/run/secrets/minio-translation-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
     command: [python, -m, transhooter_worker.providers, benchmark]
 

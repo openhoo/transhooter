@@ -8,7 +8,6 @@ import json
 import os
 import statistics
 import sys
-import tempfile
 import time
 import wave
 from dataclasses import replace
@@ -78,7 +77,7 @@ def _capacity_probe() -> CapacityProbe:
 
 
 def _spool() -> EncryptedSpool:
-    root = Path(os.environ.get("SPOOL_DIR", tempfile.mkdtemp(prefix="transhooter-spool-")))
+    root = Path(_required("SPOOL_PATH"))
     capacity_probe = _capacity_probe()
     keyring_file = os.environ.get("SPOOL_KEYRING_FILE")
     if keyring_file:
@@ -419,6 +418,46 @@ def _capability_refresh(
     }
 
 
+def _capability_publication_error(response: httpx.Response) -> RuntimeError:
+    code: str | None = None
+    issue_summary: str | None = None
+    try:
+        body = response.json()
+        candidate = body.get("code") if isinstance(body, dict) else None
+        if (
+            isinstance(candidate, str)
+            and 1 <= len(candidate) <= 80
+            and all(
+                character.isupper() or character.isdigit() or character == "_"
+                for character in candidate
+            )
+        ):
+            code = candidate
+        issues = body.get("issues") if isinstance(body, dict) else None
+        if isinstance(issues, list):
+            safe_issues: list[str] = []
+            for issue in issues[:5]:
+                if not isinstance(issue, dict):
+                    continue
+                issue_code = issue.get("code")
+                path = issue.get("path")
+                if not isinstance(issue_code, str) or not isinstance(path, list):
+                    continue
+                safe_path = ".".join(
+                    str(segment) for segment in path if isinstance(segment, str | int)
+                )
+                safe_issues.append(f"{safe_path or '<root>'}:{issue_code}")
+            if safe_issues:
+                issue_summary = ",".join(safe_issues)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+    suffix = f" ({code})" if code else ""
+    issue_suffix = f" [{issue_summary}]" if issue_summary else ""
+    return RuntimeError(
+        f"capability publication rejected with HTTP {response.status_code}{suffix}{issue_suffix}"
+    )
+
+
 async def _publish_capabilities(payload: dict[str, object]) -> None:
     url = os.environ.get("CAPABILITY_PUBLISH_URL")
     if not url:
@@ -435,7 +474,8 @@ async def _publish_capabilities(payload: dict[str, object]) -> None:
             headers={"authorization": f"Bearer {token}"},
             json=payload,
         )
-    response.raise_for_status()
+    if response.is_error:
+        raise _capability_publication_error(response)
 
 
 def _wav_seconds(path: Path) -> float:
@@ -514,9 +554,7 @@ def _probe_archive() -> S3Archive:
         aws_access_key_id=_probe_archive_secret("S3_ACCESS_KEY"),
         aws_secret_access_key=_probe_archive_secret("S3_SECRET_KEY"),
     )
-    multipart_database = (
-        Path(os.environ.get("SPOOL_DIR", tempfile.mkdtemp())) / "probe-multipart.sqlite3"
-    )
+    multipart_database = Path(_required("SPOOL_PATH")) / "probe-multipart.sqlite3"
     return S3Archive(
         client,
         _probe_archive_secret("S3_BUCKET"),
@@ -640,8 +678,7 @@ async def _one_probe(
 
 
 def _capability_database_path() -> Path:
-    default_directory = os.environ.get("SPOOL_DIR", tempfile.gettempdir())
-    default_path = os.path.join(default_directory, "capabilities.sqlite3")
+    default_path = os.path.join(_required("SPOOL_PATH"), "capabilities.sqlite3")
     return Path(os.environ.get("CAPABILITY_DATABASE", default_path))
 
 

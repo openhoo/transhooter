@@ -353,16 +353,37 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
     const now = this.clock.now();
     const leaseExpiresAt = new Date(now.getTime() + 30_000);
     const result = await this.database.execute(
-      sql`WITH reservation AS (
-        UPDATE worker_reservations SET heartbeat_at=${now},lease_expires_at=${leaseExpiresAt}
-        WHERE consultation_id=${consultationId} AND generation=${generation} AND worker_id=${workerId} AND epoch=${epoch}
-          AND accepting_load AND released_at IS NULL AND fenced_at IS NULL
-        RETURNING consultation_id,generation,worker_id,epoch
+      sql`WITH active_job AS (
+        SELECT reservation.consultation_id,reservation.generation,reservation.worker_id,reservation.epoch
+        FROM consultations consultation
+        JOIN worker_reservations reservation
+          ON reservation.consultation_id=consultation.id
+          AND reservation.generation=consultation.generation
+        JOIN worker_job_epochs job
+          ON job.consultation_id=reservation.consultation_id
+          AND job.generation=reservation.generation
+          AND job.worker_id=reservation.worker_id
+          AND job.epoch=reservation.epoch
+        WHERE consultation.id=${consultationId} AND consultation.generation=${generation}
+          AND consultation.state IN ('ready','active')
+          AND reservation.worker_id=${workerId} AND reservation.epoch=${epoch}
+          AND reservation.accepting_load AND reservation.released_at IS NULL AND reservation.fenced_at IS NULL
+          AND job.fenced_at IS NULL AND job.terminal_at IS NULL
+        FOR UPDATE OF consultation,reservation,job
+      ), reservation AS (
+        UPDATE worker_reservations reservation
+        SET heartbeat_at=${now},lease_expires_at=${leaseExpiresAt}
+        FROM active_job
+        WHERE reservation.consultation_id=active_job.consultation_id
+          AND reservation.generation=active_job.generation
+          AND reservation.worker_id=active_job.worker_id
+          AND reservation.epoch=active_job.epoch
+        RETURNING reservation.consultation_id,reservation.generation,reservation.worker_id,reservation.epoch
       )
       UPDATE worker_job_epochs job SET heartbeat_at=${now}
       FROM reservation
       WHERE job.consultation_id=reservation.consultation_id AND job.generation=reservation.generation
-        AND job.worker_id=reservation.worker_id AND job.epoch=reservation.epoch AND job.fenced_at IS NULL AND job.terminal_at IS NULL
+        AND job.worker_id=reservation.worker_id AND job.epoch=reservation.epoch
       RETURNING job.worker_id`,
     );
     return result.rowCount === 1;
@@ -405,7 +426,28 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
         }
 
         const result = await transaction.execute(
-          sql`INSERT INTO worker_checkpoints(id,consultation_id,generation,worker_id,worker_epoch,write_epoch,source_participant_id,destination_participant_id,accepted_input_sequence,high_watermark,received_output,emitted_output,previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,object_key,created_at)
+          sql`WITH chain_heads AS (
+            SELECT head.checkpoint_hash
+            FROM worker_checkpoints head
+            WHERE head.consultation_id=${input.consultationId}
+              AND head.generation=${input.generation}
+              AND head.worker_id=${input.workerId}
+              AND head.worker_epoch=${checkpoint.workerEpoch}
+              AND head.source_participant_id=${persisted.sourceParticipantId}
+              AND head.destination_participant_id=${persisted.destinationParticipantId}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM worker_checkpoints child
+                WHERE child.consultation_id=head.consultation_id
+                  AND child.generation=head.generation
+                  AND child.worker_id=head.worker_id
+                  AND child.worker_epoch=head.worker_epoch
+                  AND child.source_participant_id=head.source_participant_id
+                  AND child.destination_participant_id=head.destination_participant_id
+                  AND child.previous_hash=head.checkpoint_hash
+              )
+          )
+          INSERT INTO worker_checkpoints(id,consultation_id,generation,worker_id,worker_epoch,write_epoch,source_participant_id,destination_participant_id,accepted_input_sequence,accepted_input,received_output,emitted_output,previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,object_key,created_at)
           SELECT ${checkpoint.checkpointId},${input.consultationId},${input.generation},${input.workerId},${checkpoint.workerEpoch},${input.writeEpoch},${persisted.sourceParticipantId},${persisted.destinationParticipantId},${persisted.acceptedInputSequence},${persisted.acceptedInput},${persisted.receivedOutput},${persisted.emittedOutput},${checkpoint.previousCheckpointSha256},${checkpoint.highWatermarkSha256},${expected}::jsonb,${observed}::jsonb,${gaps}::jsonb,${checkpoint.terminal},${input.objectKey},${persisted.createdAt}
           FROM consultations consultation
           JOIN worker_reservations reservation ON reservation.consultation_id=consultation.id
@@ -419,16 +461,9 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
             AND reservation.fenced_at IS NULL AND reservation.released_at IS NULL
             AND job.fenced_at IS NULL AND job.terminal_at IS NULL
             AND archive.write_epoch=${input.writeEpoch}
+            AND (SELECT count(*) FROM chain_heads) <= 1
             AND ${checkpoint.previousCheckpointSha256} IS NOT DISTINCT FROM (
-              SELECT head.checkpoint_hash FROM worker_checkpoints head
-              WHERE head.consultation_id=${input.consultationId}
-                AND head.generation=${input.generation}
-                AND head.worker_id=${input.workerId}
-                AND head.worker_epoch=${checkpoint.workerEpoch}
-                AND head.source_participant_id=${persisted.sourceParticipantId}
-                AND head.destination_participant_id=${persisted.destinationParticipantId}
-              ORDER BY head.accepted_input_sequence DESC,head.high_watermark DESC,head.created_at DESC
-              LIMIT 1
+              SELECT max(chain_heads.checkpoint_hash) FROM chain_heads
             )
             AND NOT EXISTS (
               SELECT 1 FROM worker_checkpoints prior
@@ -462,7 +497,7 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
                 AND checkpoint.write_epoch=${input.writeEpoch}
                 AND checkpoint.source_participant_id=${persisted.sourceParticipantId}
                 AND checkpoint.destination_participant_id=${persisted.destinationParticipantId}
-                AND checkpoint.high_watermark=${persisted.acceptedInput}
+                AND checkpoint.accepted_input=${persisted.acceptedInput}
                 AND checkpoint.accepted_input_sequence=${persisted.acceptedInputSequence}
                 AND checkpoint.received_output=${persisted.receivedOutput}
                 AND checkpoint.emitted_output=${persisted.emittedOutput}

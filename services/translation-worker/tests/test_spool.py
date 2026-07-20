@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
+import signal
 import sqlite3
-from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Lock, get_ident
@@ -13,7 +12,6 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from transhooter_worker.adapters.spool import (
     CapacityProbe,
@@ -25,6 +23,7 @@ from transhooter_worker.adapters.spool import (
 from transhooter_worker.application.compactor import PcmCompactor
 from transhooter_worker.domain.models import SampleRange
 from transhooter_worker.ports.archive import ObjectRecord
+from transhooter_worker.runtime import spool_drainer
 from transhooter_worker.runtime.control_client import PermanentControlRequestError
 from transhooter_worker.runtime.spool_drainer import (
     ArchiveObjectRegistrationClient,
@@ -234,6 +233,8 @@ def test_registration_failures_are_aggregated_after_independent_progress(
     ("status", "error_type"),
     [
         (503, RetryableRegistrationError),
+        (401, RetryableRegistrationError),
+        (403, RetryableRegistrationError),
         (429, RetryableRegistrationError),
         (409, PermanentRegistrationError),
     ],
@@ -252,6 +253,75 @@ def test_archive_registration_classifies_only_retryable_http_failures(
     with pytest.raises(error_type) as caught:
         registration.register(uuid4(), uuid4(), "pipeline_exchange", record)
     assert type(caught.value) is error_type
+
+
+def test_archive_registration_recovers_after_bearer_rotation(tmp_path: Path) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("expired", "utf-8")
+    observed_authorization: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        authorization = request.headers["Authorization"]
+        observed_authorization.append(authorization)
+        return httpx.Response(204 if authorization == "Bearer rotated" else 401)
+
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    registration = ArchiveObjectRegistrationClient("http://web:3000", bearer_file, client)
+    record = ObjectRecord("object", "key", "version", 1, "a" * 64, "checksum", "application/json")
+
+    with pytest.raises(RetryableRegistrationError):
+        registration.register(uuid4(), uuid4(), "pipeline_exchange", record)
+    bearer_file.write_text("rotated", "utf-8")
+    registration.register(uuid4(), uuid4(), "pipeline_exchange", record)
+
+    assert observed_authorization == ["Bearer expired", "Bearer rotated"]
+
+
+def test_sigterm_unwinds_drainer_telemetry_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdown = Event()
+    installed_handlers: list[object] = []
+
+    class Telemetry:
+        def shutdown(self) -> None:
+            shutdown.set()
+
+    monkeypatch.setattr(
+        spool_drainer,
+        "configure_telemetry",
+        lambda *_args, **_kwargs: Telemetry(),
+    )
+    monkeypatch.setattr(
+        spool_drainer.signal,
+        "signal",
+        lambda _signal, handler: installed_handlers.append(handler) or signal.SIG_DFL,
+    )
+    monkeypatch.setattr(spool_drainer, "_build_spool", lambda _root: object())
+    monkeypatch.setattr(spool_drainer, "build_archive", lambda _root: object())
+    monkeypatch.setattr(
+        spool_drainer,
+        "ArchiveObjectRegistrationClient",
+        lambda *_args: type("Registration", (), {"register": lambda *_values: None})(),
+    )
+    monkeypatch.setattr(spool_drainer, "_drain_once", lambda *_args: None)
+
+    def interrupt_sleep(_seconds: float) -> None:
+        handler = installed_handlers[0]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    monkeypatch.setattr(spool_drainer.time, "sleep", interrupt_sleep)
+    monkeypatch.setenv("INTERNAL_TOKEN_FILE", "/unused/token")
+    monkeypatch.setenv("CONTROL_INTERNAL_URL", "http://web:3000")
+    monkeypatch.setenv("SPOOL_PATH", "/unused/spool")
+
+    with pytest.raises(SystemExit) as caught:
+        spool_drainer.main()
+
+    assert caught.value.code == 0
+    assert shutdown.is_set()
+    assert installed_handlers == [spool_drainer._handle_sigterm, signal.SIG_DFL]
 
 
 def test_non_pcm_upload_is_not_acknowledged_until_ledger_registration_succeeds(
@@ -396,6 +466,38 @@ async def test_inline_terminal_drain_quarantines_permanent_rejection_and_continu
     assert registered == [accepted.object_id]
     assert spool.committed() == []
     assert spool.read(rejected.object_id) == b'{"outcome":"failed"}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_inline_terminal_drain_keeps_auth_rejection_retryable(
+    tmp_path: Path,
+    status: int,
+) -> None:
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    evidence = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="terminal",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=b'{"outcome":"failed"}',
+    )
+
+    async def reject(*_arguments: object) -> None:
+        raise PermanentControlRequestError(f"internal archive-object rejected with HTTP {status}")
+
+    with pytest.raises(RetryableRegistrationError):
+        await upload_committed_objects_async(
+            spool,
+            AlwaysVerifiedArchive(),
+            reject,
+            meeting_id,
+        )
+
+    assert [reference.object_id for reference, _ in spool.committed()] == [evidence.object_id]
 
 
 @pytest.mark.asyncio
@@ -731,41 +833,6 @@ def test_orphan_recovery_rejects_tampered_full_header(
     path = next((tmp_path / "payloads").glob("*.wal"))
     header, encrypted = EncryptedSpool._unpack(path.read_bytes())
     header[field] = replacement
-    path.write_bytes(EncryptedSpool._pack(header, encrypted))
-    first._db.close()
-
-    recovered = make_spool(tmp_path, database_name="recovered.sqlite3")
-
-    assert recovered.committed() == []
-    assert path.with_suffix(".quarantine").exists()
-
-
-def test_orphan_recovery_explicitly_quarantines_valid_legacy_aad(tmp_path: Path) -> None:
-    first = make_spool(tmp_path, database_name="first.sqlite3")
-    ref = first.append(
-        meeting_id=uuid4(),
-        attempt_id=uuid4(),
-        stage="stt",
-        transport="grpc",
-        direction="in",
-        media_type="application/protobuf",
-        payload=b"legacy-orphan",
-    )
-    path = next((tmp_path / "payloads").glob("*.wal"))
-    header, _ = EncryptedSpool._unpack(path.read_bytes())
-    header["aad_version"] = 2
-    metadata = tuple(tuple(str(value) for value in item) for item in header["metadata"])
-    nonce = b64decode(header["nonce"])
-    aad = EncryptedSpool._envelope_aad(
-        UUID(header["meeting_id"]),
-        UUID(header["attempt_id"]),
-        ref.object_id,
-        header["stage"],
-        metadata,
-        version=2,
-    )
-    encrypted = AESGCM(TEST_KEYRING["v1"]).encrypt(nonce, b"legacy-orphan", aad)
-    header["ciphertext_sha256"] = hashlib.sha256(encrypted).hexdigest()
     path.write_bytes(EncryptedSpool._pack(header, encrypted))
     first._db.close()
 

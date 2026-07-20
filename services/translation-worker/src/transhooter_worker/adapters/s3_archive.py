@@ -14,6 +14,10 @@ from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 from transhooter_worker.ports.archive import ObjectRecord
 
 _MULTIPART_SCHEMA = """
+CREATE TABLE IF NOT EXISTS multipart_journal (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    owner_id TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS multipart_uploads (
     key TEXT PRIMARY KEY,
     sha256 TEXT NOT NULL,
@@ -24,7 +28,8 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     version_id TEXT,
     object_size INTEGER,
     object_checksum TEXT,
-    content_type TEXT
+    content_type TEXT,
+    owner_id TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS multipart_parts (
     key TEXT NOT NULL,
@@ -56,21 +61,21 @@ class S3Archive:
     require_kms: bool = True
     multipart_database: Path | None = None
     _db: sqlite3.Connection | None = field(init=False, default=None, repr=False)
+    _multipart_owner_id: str | None = field(init=False, default=None, repr=False)
 
     MULTIPART_THRESHOLD = 100 * 1024 * 1024
     PART_SIZE = 16 * 1024 * 1024
     _CLASSES = frozenset({"pipeline", "audio", "captions", "media", "inventory"})
-    _OWNED_MULTIPART_PREFIX = "v1/meetings/"
 
     def __post_init__(self) -> None:
         self._db = None
+        self._multipart_owner_id = None
         if self.multipart_database:
             self._db = sqlite3.connect(self.multipart_database, isolation_level=None)
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.executescript(_MULTIPART_SCHEMA)
-            self._migrate_multipart_schema(self._db)
-            self._abort_unjournaled_uploads()
+            self._multipart_owner_id = self._load_multipart_owner(self._db)
             self.abort_abandoned(self._now_ms() - 24 * 60 * 60 * 1000)
 
     def put_create_once(
@@ -116,7 +121,7 @@ class S3Archive:
         allow_restart: bool = True,
     ) -> ObjectRecord:
         database = self._multipart_db()
-        completed = self._load_completed_record(database, key, sha256)
+        completed = self._load_completed_record(database, key, sha256, content_type)
         if completed is not None:
             if not self.verify(completed):
                 raise RuntimeError("durable completed multipart object no longer verifies")
@@ -209,21 +214,31 @@ class S3Archive:
     ) -> str:
         existing = database.execute(
             """
-            SELECT sha256, upload_id, state
+            SELECT sha256, upload_id, state, content_type, owner_id
             FROM multipart_uploads
             WHERE key = ?
             """,
             (key,),
         ).fetchone()
         if existing is not None:
-            if existing[0] != sha256 or existing[2] != "uploading":
+            if (
+                existing[0] != sha256
+                or existing[2] != "uploading"
+                or existing[4] != self._multipart_owner()
+            ):
                 raise ArchiveConflict(key)
-            return str(existing[1])
+            if existing[3] is None:
+                self._abort_and_forget(database, key, str(existing[1]))
+            elif existing[3] != content_type:
+                raise ArchiveConflict(key)
+            else:
+                return str(existing[1])
 
         args = self._object_arguments(
             key=key,
             content_type=content_type,
             sha256=sha256,
+            multipart_owner_id=self._multipart_owner(),
         )
         created = self.client.create_multipart_upload(**args)
         upload_id = str(created["UploadId"])
@@ -231,10 +246,18 @@ class S3Archive:
             database.execute(
                 """
                 INSERT INTO multipart_uploads(
-                    key, sha256, upload_id, state, updated_ms
-                ) VALUES (?, ?, ?, ?, ?)
+                    key, sha256, upload_id, state, updated_ms, content_type, owner_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (key, sha256, upload_id, "uploading", self._now_ms()),
+                (
+                    key,
+                    sha256,
+                    upload_id,
+                    "uploading",
+                    self._now_ms(),
+                    content_type,
+                    self._multipart_owner(),
+                ),
             )
         except BaseException:
             self.client.abort_multipart_upload(Bucket=self.bucket, Key=key, UploadId=upload_id)
@@ -305,25 +328,25 @@ class S3Archive:
         }
 
     @staticmethod
-    def _migrate_multipart_schema(database: sqlite3.Connection) -> None:
-        upload_columns = {
-            str(row[1]) for row in database.execute("PRAGMA table_info(multipart_uploads)")
-        }
-        for name, sql_type in (
-            ("object_id", "TEXT"),
-            ("version_id", "TEXT"),
-            ("object_size", "INTEGER"),
-            ("object_checksum", "TEXT"),
-            ("content_type", "TEXT"),
-        ):
-            if name not in upload_columns:
-                database.execute(f"ALTER TABLE multipart_uploads ADD COLUMN {name} {sql_type}")
-        part_columns = {
-            str(row[1]) for row in database.execute("PRAGMA table_info(multipart_parts)")
-        }
-        for name in ("byte_start", "byte_end"):
-            if name not in part_columns:
-                database.execute(f"ALTER TABLE multipart_parts ADD COLUMN {name} INTEGER")
+    def _load_multipart_owner(database: sqlite3.Connection) -> str:
+        database.execute(
+            """
+            INSERT OR IGNORE INTO multipart_journal(singleton, owner_id)
+            VALUES (1, ?)
+            """,
+            (str(uuid4()),),
+        )
+        row = database.execute(
+            "SELECT owner_id FROM multipart_journal WHERE singleton = 1"
+        ).fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            raise RuntimeError("multipart journal ownership identity is unavailable")
+        return row[0]
+
+    def _multipart_owner(self) -> str:
+        if self._multipart_owner_id is None:
+            raise RuntimeError("durable multipart ownership identity is unavailable")
+        return self._multipart_owner_id
 
     def _journal_intended_parts(
         self, database: sqlite3.Connection, key: str, body: bytes
@@ -391,14 +414,17 @@ class S3Archive:
         value = (crc ^ 0xFFFFFFFFFFFFFFFF).to_bytes(8, "big")
         return base64.b64encode(value).decode("ascii")
 
-    @staticmethod
     def _load_completed_record(
-        database: sqlite3.Connection, key: str, sha256: str
+        self,
+        database: sqlite3.Connection,
+        key: str,
+        sha256: str,
+        content_type: str,
     ) -> ObjectRecord | None:
         row = database.execute(
             """
             SELECT sha256, state, object_id, version_id, object_size,
-                   object_checksum, content_type
+                   object_checksum, content_type, owner_id
             FROM multipart_uploads
             WHERE key = ?
             """,
@@ -406,9 +432,9 @@ class S3Archive:
         ).fetchone()
         if row is None or row[1] != "complete":
             return None
-        if row[0] != sha256:
+        if row[0] != sha256 or row[6] != content_type or row[7] != self._multipart_owner():
             raise ArchiveConflict(key)
-        if any(value is None for value in row[2:]):
+        if any(value is None for value in row[2:7]):
             raise RuntimeError("completed multipart journal identity is incomplete")
         return ObjectRecord(
             object_id=str(row[2]),
@@ -434,7 +460,7 @@ class S3Archive:
                     object_size = ?,
                     object_checksum = ?,
                     content_type = ?
-                WHERE key = ? AND sha256 = ?
+                WHERE key = ? AND sha256 = ? AND content_type = ?
                 """,
                 (
                     S3Archive._now_ms(),
@@ -445,6 +471,7 @@ class S3Archive:
                     record.content_type,
                     record.key,
                     record.sha256,
+                    record.content_type,
                 ),
             )
             if cursor.rowcount != 1:
@@ -455,8 +482,18 @@ class S3Archive:
         database.execute("COMMIT")
 
     def _abort_and_forget(self, database: sqlite3.Connection, key: str, upload_id: str) -> None:
+        owner = database.execute(
+            "SELECT upload_id, owner_id FROM multipart_uploads WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if owner != (upload_id, self._multipart_owner()):
+            raise ArchiveConflict(key)
         try:
-            self.client.abort_multipart_upload(Bucket=self.bucket, Key=key, UploadId=upload_id)
+            self.client.abort_multipart_upload(
+                Bucket=self.bucket,
+                Key=key,
+                UploadId=upload_id,
+            )
         except ClientError as exc:
             if not self._is_missing_upload(exc):
                 raise
@@ -493,54 +530,6 @@ class S3Archive:
     def _now_ms() -> int:
         return int(time.time() * 1000)
 
-    def _abort_unjournaled_uploads(self) -> int:
-        if self._db is None or not hasattr(self.client, "list_multipart_uploads"):
-            return 0
-        journaled = {
-            (str(row[0]), str(row[1]))
-            for row in self._db.execute(
-                "SELECT key, upload_id FROM multipart_uploads WHERE state = 'uploading'"
-            )
-        }
-        aborted = 0
-        key_marker: str | None = None
-        upload_marker: str | None = None
-        while True:
-            arguments: dict[str, Any] = {
-                "Bucket": self.bucket,
-                "Prefix": self._OWNED_MULTIPART_PREFIX,
-            }
-            if key_marker is not None:
-                arguments["KeyMarker"] = key_marker
-            if upload_marker is not None:
-                arguments["UploadIdMarker"] = upload_marker
-            response = self.client.list_multipart_uploads(**arguments)
-            for upload in response.get("Uploads", []):
-                key = str(upload["Key"])
-                upload_id = str(upload["UploadId"])
-                if not key.startswith(self._OWNED_MULTIPART_PREFIX):
-                    continue
-                if (key, upload_id) in journaled:
-                    continue
-                try:
-                    self.client.abort_multipart_upload(
-                        Bucket=self.bucket, Key=key, UploadId=upload_id
-                    )
-                except ClientError as exc:
-                    if not self._is_missing_upload(exc):
-                        raise
-                aborted += 1
-            if not response.get("IsTruncated"):
-                return aborted
-            next_key = response.get("NextKeyMarker")
-            next_upload = response.get("NextUploadIdMarker")
-            if next_key is None:
-                raise RuntimeError(
-                    "truncated multipart upload listing omitted its continuation marker"
-                )
-            key_marker = str(next_key)
-            upload_marker = str(next_upload) if next_upload is not None else None
-
     def abort_abandoned(self, older_than_ms: int) -> int:
         if self._db is None:
             return 0
@@ -548,9 +537,9 @@ class S3Archive:
             """
             SELECT key, upload_id
             FROM multipart_uploads
-            WHERE state = 'uploading' AND updated_ms < ?
+            WHERE state = 'uploading' AND updated_ms < ? AND owner_id = ?
             """,
-            (older_than_ms,),
+            (older_than_ms, self._multipart_owner()),
         ).fetchall()
         aborted = 0
         for key, upload_id in rows:
@@ -656,13 +645,17 @@ class S3Archive:
         sha256: str,
         body: bytes | None = None,
         conditional: bool = False,
+        multipart_owner_id: str | None = None,
     ) -> dict[str, Any]:
+        metadata = {"sha256": sha256}
+        if multipart_owner_id is not None:
+            metadata["transhooter-multipart-owner"] = multipart_owner_id
         args: dict[str, Any] = {
             "Bucket": self.bucket,
             "Key": key,
             "ContentType": content_type,
             "ChecksumAlgorithm": "CRC64NVME",
-            "Metadata": {"sha256": sha256},
+            "Metadata": metadata,
         }
         if body is not None:
             args["Body"] = body

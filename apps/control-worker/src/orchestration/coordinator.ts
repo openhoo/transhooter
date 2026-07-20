@@ -352,7 +352,6 @@ export class Coordinator {
 
   private async handleFinalizationRequested(item: OutboxItem): Promise<void> {
     const lifecycle = finalizationSchema.parse(item.payload);
-    const identities = await this.store.humanIdentities(lifecycle.consultationId);
     const status = this.effectInput(
       lifecycle.consultationId,
       lifecycle.generation,
@@ -363,7 +362,6 @@ export class Coordinator {
         reasonCode: "SHUTDOWN",
         state: "finalizing",
         shutdownAtMs: lifecycle.shutdownAtMs,
-        destinationIdentities: identities,
       },
       item.id,
     );
@@ -806,12 +804,9 @@ export class Coordinator {
   }
 
   private async handleRoomDeadline(deadline: Deadline): Promise<boolean> {
-    let humanIdentities: readonly Uuid[];
     if (deadline.kind === "ready") {
       const observedState = await this.store.consultationState(deadline.consultationId);
-      if (observedState === "finalizing") {
-        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
-      } else {
+      if (observedState !== "finalizing") {
         if (observedState !== "ready") {
           return true;
         }
@@ -822,7 +817,6 @@ export class Coordinator {
         if (presenceEpoch === null) {
           return true;
         }
-        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
         const admission = await this.store.admitFinalization(
           deadline.consultationId,
           deadline.generation,
@@ -838,9 +832,7 @@ export class Coordinator {
       }
     } else if (deadline.kind === "absence") {
       const observedState = await this.store.consultationState(deadline.consultationId);
-      if (observedState === "finalizing") {
-        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
-      } else {
+      if (observedState !== "finalizing") {
         if (observedState !== "ready" && observedState !== "active") {
           return true;
         }
@@ -851,7 +843,7 @@ export class Coordinator {
         if (presenceEpoch === null) {
           return true;
         }
-        humanIdentities = await this.store.humanIdentities(deadline.consultationId);
+        const humanIdentities = await this.store.humanIdentities(deadline.consultationId);
         const roomName = deterministicRoomName(deadline.consultationId, deadline.generation);
         if (!(await this.remote.areHumansAbsent(roomName, humanIdentities))) {
           return false;
@@ -874,7 +866,6 @@ export class Coordinator {
       if (state !== "finalizing") {
         return true;
       }
-      humanIdentities = await this.store.humanIdentities(deadline.consultationId);
     }
 
     const notBeforeMs = this.clock.now().getTime() + 5_000;
@@ -888,7 +879,6 @@ export class Coordinator {
         reasonCode: "SHUTDOWN",
         state: "finalizing",
         shutdownAtMs: notBeforeMs,
-        destinationIdentities: humanIdentities,
       },
       `${deadline.kind}:${deadline.dueAt.toISOString()}`,
     );

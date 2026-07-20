@@ -35,13 +35,6 @@ function hasInternalAuthentication(value: {
   return hasBearerFiles || hasJwtConfiguration;
 }
 
-function hasTrustedClientIpBoundary(value: {
-  APP_ENV: "development" | "test" | "production";
-  TRUSTED_CLIENT_IP_HEADER?: string | undefined;
-}): boolean {
-  return value.APP_ENV !== "production" || value.TRUSTED_CLIENT_IP_HEADER !== undefined;
-}
-
 const MagicLinkSealKeyringSchema = z
   .object({
     currentKeyId: z.string().min(1),
@@ -65,7 +58,11 @@ const EnvironmentSchema = z
     S3_REGION: z.string().min(1),
     S3_BUCKET: z.string().min(1),
     PUBLIC_LIVEKIT_URL: z.url(),
-    LIVEKIT_INTERNAL_URL: z.url(),
+    LIVEKIT_INTERNAL_URL: z
+      .url()
+      .refine((value) => ["http:", "https:", "ws:", "wss:"].includes(new URL(value).protocol), {
+        message: "LIVEKIT_INTERNAL_URL must use http, https, ws, or wss",
+      }),
     LIVEKIT_CREDENTIALS_FILE: z.string().min(1),
     SESSION_SECRET_FILE: z.string().min(1),
     CSRF_SECRET_FILE: z.string().min(1),
@@ -98,9 +95,6 @@ const EnvironmentSchema = z
   })
   .refine(hasRequiredKmsKey, {
     message: "S3_KMS_KEY_ID is required when ARCHIVE_REQUIRE_KMS=true",
-  })
-  .refine(hasTrustedClientIpBoundary, {
-    message: "TRUSTED_CLIENT_IP_HEADER is required in production",
   })
   .refine(hasInternalAuthentication, {
     message:

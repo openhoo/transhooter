@@ -165,7 +165,7 @@ async def test_control_client_reloads_projected_bearer_for_each_request(tmp_path
 
     async def handler(request: httpx.Request) -> httpx.Response:
         authorizations.append(request.headers.get("authorization"))
-        return httpx.Response(204, request=request)
+        return httpx.Response(200, json=True, request=request)
 
     client = make_client(
         bearer_file,
@@ -177,6 +177,27 @@ async def test_control_client_reloads_projected_bearer_for_each_request(tmp_path
     await client.heartbeat({})
 
     assert authorizations == ["Bearer first", "Bearer second"]
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_false_response_without_retrying(tmp_path: Path) -> None:
+    bearer_file = tmp_path / "bearer"
+    bearer_file.write_text("secret", "utf-8")
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json=False, request=request)
+
+    client = make_client(
+        bearer_file,
+        httpx.MockTransport(handler),
+        RecordingSpool(),
+    )
+
+    assert await client.heartbeat({}) is False
+    assert requests == 1
 
 
 @pytest.mark.asyncio

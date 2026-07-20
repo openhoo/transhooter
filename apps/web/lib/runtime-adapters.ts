@@ -757,7 +757,19 @@ export function liveKitAdapters(config: WebConfig): {
     JSON.parse(config.liveKitCredentials) as unknown,
   );
   const apiUrl = new URL(config.liveKitInternalUrl);
-  apiUrl.protocol = apiUrl.protocol === "wss:" ? "https:" : "http:";
+  switch (apiUrl.protocol) {
+    case "wss:":
+      apiUrl.protocol = "https:";
+      break;
+    case "ws:":
+      apiUrl.protocol = "http:";
+      break;
+    case "https:":
+    case "http:":
+      break;
+    default:
+      throw new Error("LIVEKIT_INTERNAL_URL must use http, https, ws, or wss");
+  }
   const roomsClient = new RoomServiceClient(
     apiUrl.toString(),
     credentials.apiKey,

@@ -44,8 +44,37 @@ mock.module("@aws-sdk/client-s3", () => ({
   },
 }));
 
-// This import must follow the module mocks so the adapter captures the test S3 client.
-const { S3ArchiveAdapter } = await import("./runtime-adapters");
+const liveKitClientUrls: string[] = [];
+
+mock.module("livekit-server-sdk", () => ({
+  AccessToken: class {
+    addGrant() {}
+
+    async toJwt() {
+      return "token";
+    }
+  },
+  authorizeHeader: () => "authorization",
+  EgressClient: class {
+    constructor(url: string) {
+      liveKitClientUrls.push(url);
+    }
+  },
+  RoomServiceClient: class {
+    constructor(url: string) {
+      liveKitClientUrls.push(url);
+    }
+
+    async listRooms() {
+      return [];
+    }
+  },
+  WebhookReceiver: class {},
+}));
+
+// These imports must follow the module mocks so the adapters capture the test clients.
+const { liveKitAdapters, S3ArchiveAdapter } = await import("./runtime-adapters");
+const { parseWebEnvironment } = await import("./config");
 
 const config = {
   appEnv: "test",
@@ -78,6 +107,83 @@ const config = {
   podNamespace: null,
   trustedClientIpHeader: null,
 } satisfies WebConfig;
+
+const baseEnvironment = {
+  APP_ENV: "test",
+  NODE_ENV: "test" as const,
+  PROVIDER_PROFILE: "fixture",
+  DATABASE_URL_FILE: "/run/secrets/database-url",
+  REDIS_URL_FILE: "/run/secrets/redis-url",
+  S3_ENDPOINT: "https://s3.example.test",
+  S3_PUBLIC_ENDPOINT: "https://public-s3.example.test",
+  S3_REGION: "eu-central-1",
+  S3_BUCKET: "archive",
+  PUBLIC_LIVEKIT_URL: "wss://browser-livekit.example.test",
+  LIVEKIT_CREDENTIALS_FILE: "/run/secrets/livekit-credentials",
+  SESSION_SECRET_FILE: "/run/secrets/session-secret",
+  CSRF_SECRET_FILE: "/run/secrets/csrf-secret",
+  MAGIC_LINK_SEAL_KEYS_FILE: "/run/secrets/magic-link-seal-keys",
+  INTERNAL_CONTROL_TOKEN_FILE: "/run/secrets/internal-control-token",
+  INTERNAL_TRANSLATION_TOKEN_FILE: "/run/secrets/internal-translation-token",
+  INTERNAL_SPOOL_DRAINER_TOKEN_FILE: "/run/secrets/internal-spool-drainer-token",
+  EGRESS_LAYOUT_SIGNING_KEY_FILE: "/run/secrets/egress-layout-signing-key",
+  SMTP_URL: "smtp://mail.example.test",
+  PUBLIC_BASE_URL: "https://app.example.test",
+};
+
+describe("LiveKit internal API URLs", () => {
+  const acceptedUrls = [
+    ["https://livekit.example.test", "https://livekit.example.test/"],
+    ["http://livekit.example.test", "http://livekit.example.test/"],
+    ["wss://livekit.example.test", "https://livekit.example.test/"],
+    ["ws://livekit.example.test", "http://livekit.example.test/"],
+  ] as const;
+
+  for (const [configuredUrl, sdkUrl] of acceptedUrls) {
+    test(`maps ${configuredUrl} to ${sdkUrl}`, () => {
+      expect(() =>
+        parseWebEnvironment({
+          ...baseEnvironment,
+          LIVEKIT_INTERNAL_URL: configuredUrl,
+        }),
+      ).not.toThrow();
+      liveKitClientUrls.length = 0;
+
+      liveKitAdapters({
+        ...config,
+        liveKitInternalUrl: configuredUrl,
+        liveKitCredentials: JSON.stringify({
+          apiKey: "test-api-key",
+          apiSecret: "test-api-secret",
+        }),
+      });
+
+      expect(liveKitClientUrls).toEqual([sdkUrl, sdkUrl]);
+    });
+  }
+
+  test("rejects unsupported internal URL schemes", () => {
+    expect(() =>
+      parseWebEnvironment({
+        ...baseEnvironment,
+        LIVEKIT_INTERNAL_URL: "ftp://livekit.example.test",
+      }),
+    ).toThrow("LIVEKIT_INTERNAL_URL must use http, https, ws, or wss");
+    liveKitClientUrls.length = 0;
+
+    expect(() =>
+      liveKitAdapters({
+        ...config,
+        liveKitInternalUrl: "ftp://livekit.example.test",
+        liveKitCredentials: JSON.stringify({
+          apiKey: "test-api-key",
+          apiSecret: "test-api-secret",
+        }),
+      }),
+    ).toThrow("LIVEKIT_INTERNAL_URL must use http, https, ws, or wss");
+    expect(liveKitClientUrls).toHaveLength(0);
+  });
+});
 
 const consultationId = "10000000-0000-4000-8000-000000000001";
 

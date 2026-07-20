@@ -127,6 +127,25 @@ function signalEndpoint(baseEndpoint: string, signal: "traces" | "metrics"): str
   return url.toString();
 }
 
+function configuredSignalEndpoints(
+  configuredCommonEndpoint: string | undefined,
+): Readonly<{ traces?: string; metrics?: string }> {
+  const commonEndpoint =
+    configuredCommonEndpoint === undefined
+      ? process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim()
+      : configuredCommonEndpoint.trim();
+  const traceEndpoint = process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT?.trim();
+  const metricEndpoint = process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT?.trim();
+  const traces =
+    traceEndpoint || (commonEndpoint ? signalEndpoint(commonEndpoint, "traces") : undefined);
+  const metrics =
+    metricEndpoint || (commonEndpoint ? signalEndpoint(commonEndpoint, "metrics") : undefined);
+  return {
+    ...(traces ? { traces } : {}),
+    ...(metrics ? { metrics } : {}),
+  };
+}
+
 function resourceAttributes(options: StartNodeTelemetryOptions): Record<string, string> {
   const attributes: Record<string, string> = {
     [ATTR_SERVICE_NAME]: options.serviceName,
@@ -168,46 +187,35 @@ export function startNodeTelemetry(options: StartNodeTelemetryOptions): NodeTele
     return existingHandle;
   }
 
-  const explicitEndpoint = options.endpoint;
-  const endpointConfigured =
-    explicitEndpoint !== undefined
-      ? explicitEndpoint.trim() !== ""
-      : [
-          process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-          process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
-          process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
-        ].some((value) => value?.trim());
-  if (process.env.OTEL_SDK_DISABLED?.trim().toLowerCase() === "true" || !endpointConfigured) {
+  const signalEndpoints = configuredSignalEndpoints(options.endpoint);
+  if (
+    process.env.OTEL_SDK_DISABLED?.trim().toLowerCase() === "true" ||
+    (!signalEndpoints.traces && !signalEndpoints.metrics)
+  ) {
     return disabledHandle(options.serviceName, options.serviceVersion);
   }
 
   try {
-    const traceExporter =
-      explicitEndpoint === undefined
-        ? new OTLPTraceExporter()
-        : new OTLPTraceExporter({
-            url: signalEndpoint(explicitEndpoint.trim(), "traces"),
-          });
-    const metricExporter =
-      explicitEndpoint === undefined
-        ? new OTLPMetricExporter()
-        : new OTLPMetricExporter({
-            url: signalEndpoint(explicitEndpoint.trim(), "metrics"),
-          });
-    const spanProcessor = new BatchSpanProcessor({ exporter: traceExporter });
+    const spanProcessor = signalEndpoints.traces
+      ? new BatchSpanProcessor({
+          exporter: new OTLPTraceExporter({ url: signalEndpoints.traces }),
+        })
+      : undefined;
     const interval = metricExportInterval(options.metricExportIntervalMillis);
-    const metricReader = new PeriodicExportingMetricReader({
-      exporter: metricExporter,
-      exportIntervalMillis: interval,
-      exportTimeoutMillis: Math.min(interval, 30_000),
-    });
+    const metricReader = signalEndpoints.metrics
+      ? new PeriodicExportingMetricReader({
+          exporter: new OTLPMetricExporter({ url: signalEndpoints.metrics }),
+          exportIntervalMillis: interval,
+          exportTimeoutMillis: Math.min(interval, 30_000),
+        })
+      : undefined;
     const sdk = new NodeSDK({
       autoDetectResources: true,
       instrumentations: [],
       logRecordProcessors: [],
-      metricReaders: [metricReader],
+      metricReaders: metricReader ? [metricReader] : [],
       resource: defaultResource().merge(resourceFromAttributes(resourceAttributes(options))),
-      spanProcessors: [spanProcessor],
+      spanProcessors: spanProcessor ? [spanProcessor] : [],
       views: histogramViews(options.serviceName),
     });
 
@@ -223,7 +231,11 @@ export function startNodeTelemetry(options: StartNodeTelemetryOptions): NodeTele
         if (stopped || shutdownPromise) {
           return;
         }
-        await Promise.allSettled([spanProcessor.forceFlush(), metricReader.forceFlush()]);
+        await Promise.allSettled(
+          [spanProcessor?.forceFlush(), metricReader?.forceFlush()].filter(
+            (flush): flush is Promise<void> => flush !== undefined,
+          ),
+        );
       },
       shutdown(): Promise<void> {
         if (shutdownPromise) {

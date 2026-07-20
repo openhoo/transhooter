@@ -57,7 +57,9 @@ data:
   SMTP_URL_FILE: "/run/secrets/smtp-url"
   PUBLIC_BASE_URL: {{ .Values.config.publicUrl | quote }}
   PUBLIC_LIVEKIT_URL: {{ .Values.config.publicLivekitUrl | quote }}
-  TRUSTED_CLIENT_IP_HEADER: {{ required "config.trustedClientIpHeader must name an ingress-overwritten single-IP header" .Values.config.trustedClientIpHeader | quote }}
+  {{- if .Values.config.trustedClientIpHeader }}
+  TRUSTED_CLIENT_IP_HEADER: {{ .Values.config.trustedClientIpHeader | quote }}
+  {{- end }}
   INTERNAL_JWT_ISSUER: {{ .Values.config.internalIssuer | quote }}
   INTERNAL_JWT_AUDIENCE: {{ .Values.config.internalAudience | quote }}
   SPOOL_KEYRING_FILE: "/run/secrets/spool-keyring"

@@ -30,10 +30,8 @@ const baseEnvironment: NodeJS.ProcessEnv = {
   POD_NAMESPACE: "transhooter",
 };
 
-test("production requires an explicit trusted client IP boundary header", () => {
-  expect(() => parseWebEnvironment(baseEnvironment)).toThrow(
-    "TRUSTED_CLIENT_IP_HEADER is required in production",
-  );
+test("production supports direct-local admission when no trusted ingress boundary is configured", () => {
+  expect(parseWebEnvironment(baseEnvironment).TRUSTED_CLIENT_IP_HEADER).toBe(undefined);
 });
 
 test("trusted client IP header is validated and normalized", () => {

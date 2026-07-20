@@ -1,3 +1,5 @@
+{{- include "transhooter.validateTrustedClientIp" . -}}
+
 {{- range $component := list "web" "control-worker" "translation-worker" "spool-drainer" }}
 apiVersion: v1
 kind: ServiceAccount
@@ -63,6 +65,36 @@ roleRef:
   kind: Role
   name: {{ include "transhooter.fullname" . }}-language-refresh-cleanup
 ---
+{{- if .Values.ingress.trustedClientIp.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "transhooter.fullname" . }}-web-ingress
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "transhooter.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: web
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            {{- toYaml .Values.ingress.trustedClientIp.namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .Values.ingress.trustedClientIp.podSelector | nindent 12 }}
+      ports:
+        - {protocol: TCP, port: 3000}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "transhooter.selectorLabels" . | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: 3000}
+---
+{{- end }}
+
 {{- if .Values.ingress.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -71,6 +103,10 @@ metadata:
   labels:
     {{- include "transhooter.labels" . | nindent 4 }}
   annotations:
+    {{- if .Values.ingress.trustedClientIp.enabled }}
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header {{ .Values.config.trustedClientIpHeader }} $remote_addr;
+    {{- end }}
     {{- toYaml .Values.ingress.annotations | nindent 4 }}
 spec:
   {{- with .Values.ingress.className }}

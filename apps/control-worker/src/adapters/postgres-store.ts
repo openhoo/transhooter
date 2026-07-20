@@ -15,6 +15,7 @@ import { and, eq, inArray, type SQL, sql } from "drizzle-orm";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres, { type Row as PostgresRow, type Sql, type TransactionSql } from "postgres";
 import type {
+  AppliedTransition,
   ArchivedObject,
   ClaimOptions,
   ConsultationState,
@@ -76,6 +77,10 @@ interface ReservationRow extends PostgresRow {
 
 interface IdRow extends PostgresRow {
   readonly id: string;
+}
+
+interface AppliedTransitionRow extends PostgresRow {
+  readonly transitioned: boolean;
 }
 
 interface RoomResourceRow extends PostgresRow {
@@ -301,8 +306,18 @@ export class PostgresStore implements DurableStore {
     owner: Uuid,
     remoteId: string | null,
     result: unknown,
-  ): Promise<void> {
-    await this.db.execute(markAppliedStatement(effectId, owner, remoteId, result));
+  ): Promise<AppliedTransition> {
+    return this.db.transaction(async (transaction) => {
+      await transaction.execute(sql`SELECT consultation.id
+        FROM consultations consultation
+        JOIN external_effects effect ON effect.consultation_id=consultation.id
+        WHERE effect.id=${effectId}
+        FOR UPDATE OF consultation`);
+      const rows = await transaction.execute<AppliedTransitionRow>(
+        markAppliedStatement(effectId, owner, remoteId, result),
+      );
+      return rows[0]?.transitioned === true ? "applied" : "rejected";
+    });
   }
 
   async markDone(effectId: Uuid, owner: Uuid): Promise<void> {
@@ -326,9 +341,10 @@ export class PostgresStore implements DurableStore {
   }
 
   async renewEffectLease(effectId: Uuid, owner: Uuid, leaseExpiresAt: Date): Promise<boolean> {
-    const rows =
-      await this.db.execute<IdRow>(sql`UPDATE external_effects SET lease_expires_at=${leaseExpiresAt.toISOString()},updated_at=now()
-      WHERE id=${effectId} AND lease_owner=${owner} AND state IN ('calling','applied','compensating') RETURNING id`);
+    const rows = await this.db.execute<IdRow>(sql`UPDATE external_effects
+      SET lease_expires_at=GREATEST(lease_expires_at,${leaseExpiresAt.toISOString()}::timestamptz),updated_at=now()
+      WHERE id=${effectId} AND lease_owner=${owner} AND lease_expires_at > now()
+        AND state IN ('calling','applied','compensating') RETURNING id`);
     return rows.length === 1;
   }
 
@@ -1112,7 +1128,7 @@ export async function persistSupervisorTerminalCheckpoints(
       direction.destination_participant_id,
     );
     await transaction`WITH previous AS (
-        SELECT accepted_input_sequence,high_watermark,received_output,emitted_output,
+        SELECT accepted_input_sequence,accepted_input,received_output,emitted_output,
           checkpoint_hash,expected_ids,observed_ids,gaps
         FROM worker_checkpoints
         WHERE consultation_id=${reservation.consultationId}
@@ -1121,13 +1137,13 @@ export async function persistSupervisorTerminalCheckpoints(
           AND worker_epoch=${reservation.epoch}
           AND source_participant_id=${direction.source_participant_id}
           AND destination_participant_id=${direction.destination_participant_id}
-        ORDER BY accepted_input_sequence DESC,high_watermark DESC LIMIT 1
+        ORDER BY accepted_input_sequence DESC,accepted_input DESC LIMIT 1
         FOR UPDATE
       )
       INSERT INTO worker_checkpoints(
         id,consultation_id,generation,worker_id,worker_epoch,write_epoch,
         source_participant_id,destination_participant_id,
-        accepted_input_sequence,high_watermark,received_output,emitted_output,
+        accepted_input_sequence,accepted_input,received_output,emitted_output,
         previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,
         object_key,object_version_id,created_at
       )
@@ -1136,14 +1152,14 @@ export async function persistSupervisorTerminalCheckpoints(
         COALESCE((SELECT write_epoch FROM archives WHERE consultation_id=${reservation.consultationId}),0),
         ${direction.source_participant_id},${direction.destination_participant_id},
         COALESCE(previous.accepted_input_sequence+1,0),
-        COALESCE(previous.high_watermark+1,0),
+        COALESCE(previous.accepted_input+1,0),
         COALESCE(previous.received_output,0),
         COALESCE(previous.emitted_output,0),
         previous.checkpoint_hash,${hash},
         COALESCE(previous.expected_ids,'[]'::jsonb),COALESCE(previous.observed_ids,'[]'::jsonb),
         COALESCE(previous.gaps,'[]'::jsonb) || jsonb_build_array(jsonb_build_object(
-          'reason',CASE WHEN previous.high_watermark IS NULL THEN 'checkpoint_missing' ELSE 'after_last_checkpoint' END,
-          'sampleStart',previous.high_watermark,'sampleEnd',NULL)),
+          'reason',CASE WHEN previous.accepted_input IS NULL THEN 'checkpoint_missing' ELSE 'after_last_checkpoint' END,
+          'sampleStart',previous.accepted_input,'sampleEnd',NULL)),
         true,${objectKey},NULL,now()
       FROM (SELECT 1) seed LEFT JOIN previous ON true
       WHERE NOT EXISTS (
@@ -1170,7 +1186,7 @@ export async function persistSupervisorTerminalCheckpoints(
         AND checkpoint.source_participant_id=(direction->>'sourceParticipantId')::uuid
         AND checkpoint.destination_participant_id=(direction->>'destinationParticipantId')::uuid
         AND checkpoint.terminal
-      ORDER BY checkpoint.high_watermark DESC LIMIT 1
+      ORDER BY checkpoint.accepted_input DESC LIMIT 1
     ) latest
     WHERE selection.consultation_id=${reservation.consultationId}`;
   if (terminals.length !== 2 || terminals[0] === undefined) {
@@ -1271,7 +1287,13 @@ function markAppliedStatement(
       UPDATE external_effects SET state='applied',
         result=COALESCE(result,'{}'::jsonb) || ${JSON.stringify({ remoteId, value: result })}::jsonb,updated_at=now()
       WHERE id=${effectId} AND lease_owner=${owner} AND lease_expires_at > now()
-        AND state='calling' RETURNING *
+        AND state='calling'
+        AND EXISTS (
+          SELECT 1 FROM consultations consultation
+          WHERE consultation.id=external_effects.consultation_id
+            AND consultation.generation=external_effects.generation
+        )
+      RETURNING *
     ), egress_inserted AS (
       INSERT INTO egress_jobs(id,consultation_id,generation,kind,subject_id,egress_id,request_hash,state,output_prefix,expected_artifact_id,created_at)
       SELECT id,consultation_id,generation,CASE effect_kind WHEN 'ROOM_COMPOSITE_EGRESS' THEN 'room_composite' ELSE 'participant' END,subject_id,result->>'remoteId',request_hash,
@@ -1298,12 +1320,14 @@ function markAppliedStatement(
       WHERE consultation.id=changed.consultation_id AND consultation.generation=changed.generation
         AND changed.effect_kind IN ('ROOM_CREATE','ROOM_COMPOSITE_EGRESS','WORKER_DISPATCH')
       RETURNING consultation.id
-    ) INSERT INTO outbox(id,topic,aggregate_id,generation,payload,available_at,attempts)
+    ), outbox_inserted AS (
+      INSERT INTO outbox(id,topic,aggregate_id,generation,payload,available_at,attempts)
       SELECT gen_random_uuid(),'orchestration.effect.applied',consultation_id,generation,
         jsonb_build_object('consultationId',consultation_id,'generation',generation,'subjectId',subject_id,'kind',effect_kind,
           'resourceGeneration',COALESCE((result->'plan'->>'resourceGeneration')::integer,generation),
           'participantEgressId',CASE WHEN effect_kind IN ('ROOM_COMPOSITE_EGRESS','PARTICIPANT_EGRESS') THEN result->>'remoteId' ELSE result->'plan'->>'barrierEgressId' END),now(),0 FROM changed
-      ON CONFLICT (id) DO NOTHING`;
+      RETURNING id
+    ) SELECT EXISTS(SELECT 1 FROM changed) AS transitioned`;
 }
 
 function verifiedEgressUpdate(event: VerifiedWebhook): SQL {

@@ -5,64 +5,8 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1784332800000,
-      "tag": "0000_initial",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1784355600000,
-      "tag": "0001_effect_occurrences",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1784401023132,
-      "tag": "0002_egress_state_literals",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "7",
-      "when": 1784411437899,
-      "tag": "0003_even_phalanx",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "7",
-      "when": 1784419414239,
-      "tag": "0004_long_ben_urich",
-      "breakpoints": true
-    },
-    {
-      "idx": 5,
-      "version": "7",
-      "when": 1784419567087,
-      "tag": "0005_cultured_ezekiel",
-      "breakpoints": true
-    },
-    {
-      "idx": 6,
-      "version": "7",
-      "when": 1784505600000,
-      "tag": "0006_orchestration_safety",
-      "breakpoints": true
-    },
-    {
-      "idx": 7,
-      "version": "7",
-      "when": 1784509200000,
-      "tag": "0007_redact_egress_intents",
-      "breakpoints": true
-    },
-    {
-      "idx": 8,
-      "version": "7",
-      "when": 1784512800000,
-      "tag": "0008_magic_link_idempotency",
+      "when": 1784549760398,
+      "tag": "0000_baseline",
       "breakpoints": true
     }
   ]

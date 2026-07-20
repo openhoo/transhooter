@@ -10,6 +10,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { Uuid } from "../orchestration/model";
 import type { ArchiveVersionDeleter } from "./livekit-effects";
 
@@ -56,6 +57,13 @@ export class S3ArchiveVersionDeleter implements ArchiveVersionDeleter {
       endpoint: config.endpoint,
       region: config.region,
       forcePathStyle: config.forcePathStyle,
+      maxAttempts: 2,
+      requestHandler: new NodeHttpHandler({
+        connectionTimeout: 3_000,
+        requestTimeout: 10_000,
+        socketTimeout: 10_000,
+        throwOnRequestTimeout: true,
+      }),
       credentials: {
         accessKeyId: config.accessKey,
         secretAccessKey: config.secretKey,

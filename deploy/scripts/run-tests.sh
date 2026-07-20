@@ -33,8 +33,31 @@ run_typescript_gates() {
   run_phase "Checking generated cross-runtime contracts" bun run contracts:check
   run_phase "Type-checking TypeScript workspaces" bun run typecheck
   run_phase "Running repository lint and boundary checks" bun run lint
+  run_phase "Checking lightweight contract suite discovery" \
+    "$workspace/scripts/run-tests" --contract-discovery-only
   run_phase "Running scoped TypeScript tests" \
     bun test packages/contracts/test packages/server-core/tests packages/telemetry/test apps/control-worker/test apps/web/lib
+}
+
+run_infrastructure_contracts() {
+  cd "$workspace"
+  integration_database_url_file=${POSTGRES_CONCURRENCY_DATABASE_URL_FILE:-}
+  if [ -z "$integration_database_url_file" ] || [ ! -r "$integration_database_url_file" ]; then
+    printf 'POSTGRES_CONCURRENCY_DATABASE_URL_FILE must name a readable dedicated integration database URL.\n' >&2
+    return 2
+  fi
+  for contract_script in "$workspace"/tests/e2e/*-integration.test.sh; do
+    [ -e "$contract_script" ] || continue
+    if [ ! -x "$contract_script" ]; then
+      printf 'Infrastructure contract script is not executable: %s\n' "$contract_script" >&2
+      return 1
+    fi
+    (
+      unset DATABASE_URL
+      export DATABASE_URL_FILE="$integration_database_url_file"
+      run_phase "Running ${contract_script##*/}" "$contract_script"
+    )
+  done
 }
 
 run_python_gates() {
@@ -47,6 +70,7 @@ run_python_gates() {
 
 main() {
   run_typescript_gates
+  run_infrastructure_contracts
   run_python_gates
 }
 

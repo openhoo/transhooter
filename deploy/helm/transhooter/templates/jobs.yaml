@@ -30,8 +30,10 @@ spec:
       volumes:
         - name: secrets
           secret:
-            secretName: {{ .Values.existingSecret }}
-            items: [{key: database-url, path: database-url}]
+            secretName: {{ required "migratorSecret.existingSecret must name the migration-only Secret" .Values.migratorSecret.existingSecret | quote }}
+            items:
+              - key: {{ required "migratorSecret.secretKey must name the database URL entry" .Values.migratorSecret.secretKey | quote }}
+                path: database-url
         - {name: tmp, emptyDir: {}}
 ---
 apiVersion: v1
@@ -105,17 +107,24 @@ spec:
             - {name: tmp, mountPath: /tmp}
       volumes:
         - name: runtime-secrets
-          secret:
-            secretName: {{ .Values.existingSecret }}
-            items:
-              - {key: database-url, path: database-url}
-              - {key: redis-url, path: redis-url}
-              - {key: livekit-credentials, path: livekit-credentials}
-              - {key: s3-credentials, path: s3-credentials}
-              - {key: smtp-url, path: smtp-url}
-              - {key: session-secret, path: session-secret}
-              - {key: csrf-secret, path: csrf-secret}
-              - {key: egress-layout-signing-key, path: egress-layout-signing-key}
+          projected:
+            sources:
+              - secret:
+                  name: {{ .Values.existingSecret }}
+                  items:
+                    - {key: database-url, path: database-url}
+                    - {key: redis-url, path: redis-url}
+                    - {key: livekit-credentials, path: livekit-credentials}
+                    - {key: s3-credentials, path: s3-credentials}
+                    - {key: smtp-url, path: smtp-url}
+                    - {key: session-secret, path: session-secret}
+                    - {key: csrf-secret, path: csrf-secret}
+                    - {key: egress-layout-signing-key, path: egress-layout-signing-key}
+              - secret:
+                  name: {{ required "magicLinkSealKeys.existingSecret must name the Secret containing the keyring" .Values.magicLinkSealKeys.existingSecret | quote }}
+                  items:
+                    - key: {{ required "magicLinkSealKeys.secretKey must name the keyring entry" .Values.magicLinkSealKeys.secretKey | quote }}
+                      path: {{ base .Values.magicLinkSealKeys.mountPath | quote }}
         - name: kubernetes-ca
           configMap:
             name: kube-root-ca.crt
@@ -188,6 +197,7 @@ spec:
             - name: CAPABILITY_PUBLISH_URL
               value: {{ printf "http://%s-capability-publisher:%v/api/internal/capabilities" (include "transhooter.fullname" .) .Values.service.port | quote }}
             - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
+            - {name: SPOOL_PATH, value: /tmp/transhooter-spool}
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
             - {name: CAPABILITY_PUBLISHER_NAME, value: {{ printf "%s-capability-publisher" (include "transhooter.fullname" .) | quote }}}

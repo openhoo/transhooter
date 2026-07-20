@@ -10,6 +10,7 @@ const NOW = new Date("2026-01-01T00:00:00Z");
 const EMPLOYEE_ID = "00000000-0000-4000-8000-000000000001";
 const CUSTOMER_ID = "00000000-0000-4000-8000-000000000002";
 const PROFILE_ID = "00000000-0000-4000-8000-000000000003";
+const PROFILE_NAME = "google-eu";
 const CREATION_KEY = "00000000-0000-4000-8000-000000000004";
 const OTHER_CUSTOMER_ID = "00000000-0000-4000-8000-000000000005";
 const OTHER_PROFILE_ID = "00000000-0000-4000-8000-000000000006";
@@ -22,6 +23,7 @@ const ENABLED_PROFILE_REVISION = {
 function createConsultationFixture() {
   let aggregate: Consultation | null = null;
   let sequence = 10;
+  let profilesAvailable = true;
   const creations = new Map<string, Consultation>();
   const auditAppend = mock(async () => undefined);
   const enqueue = mock(async () => undefined);
@@ -52,6 +54,14 @@ function createConsultationFixture() {
   const authRepository = {
     revokeConsultationLinks,
   } as unknown as AuthRepository;
+  const currentEnabledRevision = mock(async (profileReference: string) => {
+    if (!profilesAvailable) {
+      throw new Error("provider profiles unavailable");
+    }
+    return profileReference === OTHER_PROFILE_ID
+      ? { profileId: OTHER_PROFILE_ID, revision: 3 }
+      : ENABLED_PROFILE_REVISION;
+  });
   const service = new ConsultationService(
     repository,
     {
@@ -61,7 +71,7 @@ function createConsultationFixture() {
       enqueue,
     } as never,
     {
-      currentEnabledRevision: async () => ENABLED_PROFILE_REVISION,
+      currentEnabledRevision,
       assertFreshAndHealthy: async () => undefined,
     } as never,
     { issue: tokenIssue },
@@ -86,6 +96,10 @@ function createConsultationFixture() {
     setAggregate: (value: Consultation) => {
       aggregate = value;
     },
+    removeProfiles: () => {
+      profilesAvailable = false;
+    },
+    currentEnabledRevision,
   };
 }
 
@@ -169,6 +183,59 @@ describe("ConsultationService", () => {
       employeeUserId: OTHER_EMPLOYEE_ID,
     });
     expect(otherEmployee.id).not.toBe(first.id);
+  });
+  it("returns the original consultation when a profile-name replay resolves to its stored UUID", async () => {
+    const { service, auditAppend } = createConsultationFixture();
+    const input = {
+      employeeUserId: EMPLOYEE_ID,
+      customerUserId: CUSTOMER_ID,
+      providerProfileId: PROFILE_NAME,
+      creationIdempotencyKey: CREATION_KEY,
+    };
+
+    const first = await service.create(input);
+    const nameReplay = await service.create(input);
+    const uuidReplay = await service.create({
+      ...input,
+      providerProfileId: PROFILE_ID,
+    });
+
+    expect(nameReplay).toBe(first);
+    expect(uuidReplay).toBe(first);
+    expect(first.providerProfileId).toBe(PROFILE_ID);
+    expect(auditAppend).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays a committed create after its profile is removed and still rejects mismatches", async () => {
+    const { service, removeProfiles, currentEnabledRevision, auditAppend } =
+      createConsultationFixture();
+    const input = {
+      employeeUserId: EMPLOYEE_ID,
+      customerUserId: CUSTOMER_ID,
+      providerProfileId: PROFILE_ID,
+      creationIdempotencyKey: CREATION_KEY,
+    };
+    const committed = await service.create(input);
+    removeProfiles();
+
+    const replay = await service.create(input);
+
+    expect(replay).toBe(committed);
+    expect(currentEnabledRevision).toHaveBeenCalledTimes(1);
+    expect(auditAppend).toHaveBeenCalledTimes(1);
+    await expect(
+      service.create({
+        ...input,
+        providerProfileId: OTHER_PROFILE_ID,
+      }),
+    ).rejects.toMatchObject({ code: "CONSULTATION_CREATION_CONFLICT" });
+    await expect(
+      service.create({
+        ...input,
+        customerUserId: OTHER_CUSTOMER_ID,
+      }),
+    ).rejects.toMatchObject({ code: "CONSULTATION_CREATION_CONFLICT" });
+    expect(currentEnabledRevision).toHaveBeenCalledTimes(1);
   });
 
   it("returns CONSENT_REQUIRED while only one participant has consented", async () => {

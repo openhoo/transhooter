@@ -83,11 +83,21 @@ export class ConsultationService {
         tx,
       );
       if (existing) {
-        this.assertCreationPayload(existing, input.customerUserId, input.providerProfileId);
+        this.assertCreationCustomer(existing, input.customerUserId);
+        if (existing.providerProfileId === input.providerProfileId) {
+          return existing;
+        }
+        if (this.isProviderProfileId(input.providerProfileId)) {
+          throw new DomainError("CONSULTATION_CREATION_CONFLICT");
+        }
+        const replayProfile = await this.snapshots.currentEnabledRevision(
+          input.providerProfileId,
+          tx,
+        );
+        this.assertCreationProvider(existing, replayProfile.profileId);
         return existing;
       }
       const profile = await this.snapshots.currentEnabledRevision(input.providerProfileId, tx);
-
       const now = this.clock.now();
       const id = this.ids.uuid();
       const employee = this.newParticipant("employee", input.employeeUserId);
@@ -398,15 +408,27 @@ export class ConsultationService {
     customerUserId: UUID,
     providerProfileId: string,
   ): void {
+    this.assertCreationCustomer(consultation, customerUserId);
+    this.assertCreationProvider(consultation, providerProfileId);
+  }
+
+  private assertCreationCustomer(consultation: Consultation, customerUserId: UUID): void {
     const customer = consultation.participants.find(
       (participant) => participant.role === "customer",
     );
-    if (
-      customer?.userId !== customerUserId ||
-      consultation.providerProfileId !== providerProfileId
-    ) {
+    if (customer?.userId !== customerUserId) {
       throw new DomainError("CONSULTATION_CREATION_CONFLICT");
     }
+  }
+
+  private assertCreationProvider(consultation: Consultation, providerProfileId: string): void {
+    if (consultation.providerProfileId !== providerProfileId) {
+      throw new DomainError("CONSULTATION_CREATION_CONFLICT");
+    }
+  }
+
+  private isProviderProfileId(reference: string): boolean {
+    return /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(reference);
   }
 
   private newParticipant(role: ParticipantSlot["role"], userId: UUID): ParticipantSlot {

@@ -2,6 +2,11 @@ x-production-env: &production-env
   APP_ENV: ${APP_ENV:-production}
   RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:?set RTC_ADVERTISED_IP to the externally reachable LiveKit RTC address}
   S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?set S3_PUBLIC_ENDPOINT to the externally reachable S3 address}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to an explicit https:// URL}
+  PUBLIC_LIVEKIT_URL: ${PUBLIC_LIVEKIT_URL:?set PUBLIC_LIVEKIT_URL to an explicit wss:// URL}
+  LIVEKIT_BROWSER_URL: ${PUBLIC_LIVEKIT_URL:?set PUBLIC_LIVEKIT_URL to an explicit wss:// URL}
+  ARCHIVE_REQUIRE_KMS: "false"
+
 
 x-production-mail-env: &production-mail-env
   <<: *production-env
@@ -59,7 +64,7 @@ services:
 
   spool-drainer:
     environment:
-      <<: *provider-env
+      <<: *production-env
 
   control-worker-1:
     environment:

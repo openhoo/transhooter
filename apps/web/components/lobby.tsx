@@ -72,6 +72,7 @@ function useLobbyPolling(
     let active = true;
     let timer: number | undefined;
     let joinRequested = false;
+    const joinController = new AbortController();
 
     async function poll() {
       const requestGeneration = pollGeneration.current;
@@ -92,8 +93,16 @@ function useLobbyPolling(
               {
                 method: "POST",
                 body: JSON.stringify({ snapshotHash: next.snapshotHash }),
+                signal: joinController.signal,
               },
             );
+            if (
+              !active ||
+              joinController.signal.aborted ||
+              requestGeneration !== pollGeneration.current
+            ) {
+              return;
+            }
             if (joined.redirectTo) {
               window.location.replace(joined.redirectTo);
             } else {
@@ -123,6 +132,7 @@ function useLobbyPolling(
 
     return () => {
       active = false;
+      joinController.abort();
       if (timer !== undefined) {
         window.clearTimeout(timer);
       }

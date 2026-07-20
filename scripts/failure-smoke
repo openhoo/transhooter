@@ -66,6 +66,10 @@ require_positive_seconds COMPOSE_SCENARIO_TIMEOUT_SECONDS "$COMPOSE_SCENARIO_TIM
 require_positive_seconds COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS"
 require_positive_seconds COMPOSE_OWNERSHIP_TIMEOUT_SECONDS "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS"
 require_positive_seconds COMPOSE_CLEANUP_TIMEOUT_SECONDS "$COMPOSE_CLEANUP_TIMEOUT_SECONDS"
+if ! $deadline_supplied; then
+  deadline_epoch_ms=$((($(date +%s) + ${FAILURE_SMOKE_DEADLINE_SECONDS:-3600}) * 1000))
+  set -- "$@" --deadline-epoch-ms "$deadline_epoch_ms"
+fi
 
 terminate_active() {
   signal_status=$1
@@ -105,14 +109,9 @@ run_bounded() {
 }
 
 select_compose_command_bounded() {
-  if run_bounded "Detecting Docker Compose plugin" "$COMPOSE_DETECTION_TIMEOUT_SECONDS" \
+  if ! run_bounded "Detecting Docker Compose plugin" "$COMPOSE_DETECTION_TIMEOUT_SECONDS" \
     docker compose version >/dev/null 2>&1; then
-    compose_implementation=plugin
-  elif run_bounded "Detecting legacy Docker Compose" "$COMPOSE_DETECTION_TIMEOUT_SECONDS" \
-    docker-compose version >/dev/null 2>&1; then
-    compose_implementation=legacy
-  else
-    printf 'Docker Compose is required (plugin or docker-compose executable).\n' >&2
+    printf 'Docker Compose plugin is required.\n' >&2
     return 127
   fi
 }
@@ -125,10 +124,7 @@ compose_bounded() {
   if [ -f "$ROOT/.env" ]; then
     set -- --env-file "$ROOT/.env" "$@"
   fi
-  case "$compose_implementation" in
-    plugin) run_bounded "$phase" "$phase_timeout" docker compose "$@" ;;
-    legacy) run_bounded "$phase" "$phase_timeout" docker-compose "$@" ;;
-  esac
+  run_bounded "$phase" "$phase_timeout" docker compose "$@"
 }
 
 verify_failure_smoke_stack_ownership() {
@@ -185,25 +181,43 @@ if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
   exit 1
 fi
 
+capture_database_diagnostic() {
+  phase=$1
+  statement=$2
+  compose_bounded "$phase" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
+    run --rm --no-deps --workdir /workspace/tests/failure-smoke \
+      -e "FAILURE_DIAGNOSTIC_SQL=$statement" failure-smoke bun --eval '
+      import postgres from "postgres";
+      const connectionString = (await Bun.file(process.env.DATABASE_URL_FILE).text()).trim();
+      const database = postgres(connectionString, {
+        max: 1,
+        prepare: false,
+        connect_timeout: 10,
+      });
+      try {
+        const rows = await database.unsafe(process.env.FAILURE_DIAGNOSTIC_SQL);
+        for (const row of rows) console.log(JSON.stringify(row));
+      } finally {
+        await database.end({ timeout: 1 });
+      }
+    '
+}
+
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
   if [ "$status" -ne 0 ]; then
     compose_bounded "Capturing failure-smoke service status" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" ps || true
     compose_bounded "Capturing failure-smoke logs" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
-      logs --no-color --tail=80 web translation-worker spool-drainer control-worker-1 control-worker-2 livekit egress || true
-    compose_bounded "Capturing consultation diagnostics" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
-      exec -T postgres psql --no-psqlrc --set ON_ERROR_STOP=1 --tuples-only --no-align \
-      -U transhooter -d transhooter \
-      -c "SELECT state, generation, room_name IS NOT NULL AS room_name_set, room_sid IS NOT NULL AS room_sid_set, dispatch_id IS NOT NULL AS dispatch_id_set, composite_egress_id IS NOT NULL AS composite_egress_id_set FROM consultations ORDER BY created_at DESC LIMIT 3" || true
-    compose_bounded "Capturing external-effect diagnostics" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
-      exec -T postgres psql --no-psqlrc --set ON_ERROR_STOP=1 --tuples-only --no-align \
-      -U transhooter -d transhooter \
-      -c "SELECT generation, effect_kind, state, attempts, left(COALESCE(result->>'error',''),512) AS error, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, left(COALESCE(result->>'error',''),512) ORDER BY generation, effect_kind, state, attempts, error" || true
-    compose_bounded "Capturing outbox diagnostics" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
-      exec -T postgres psql --no-psqlrc --set ON_ERROR_STOP=1 --tuples-only --no-align \
-      -U transhooter -d transhooter \
-      -c "SELECT topic, generation, delivered_at IS NOT NULL AS delivered, attempts, count(*), left(COALESCE(payload->>'lastDispatchError',''),512) FROM outbox GROUP BY topic, generation, delivered_at IS NOT NULL, attempts, left(COALESCE(payload->>'lastDispatchError',''),512) ORDER BY topic, generation, delivered, attempts" || true
+      logs --no-color --tail=80 web translation-worker spool-drainer control-worker-1 control-worker-2 capability-publisher language-refresh postgres-role-bootstrap postgres-capability-bootstrap migrate livekit egress minio || true
+    capture_database_diagnostic "Capturing consultation diagnostics" \
+      "SELECT state, generation, room_name IS NOT NULL AS room_name_set, room_sid IS NOT NULL AS room_sid_set, dispatch_id IS NOT NULL AS dispatch_id_set, composite_egress_id IS NOT NULL AS composite_egress_id_set FROM consultations ORDER BY created_at DESC LIMIT 3" || true
+    capture_database_diagnostic "Capturing external-effect diagnostics" \
+      "SELECT generation, effect_kind, state, attempts, result ? 'error' AS has_error, max(result->>'error') AS latest_error, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, result ? 'error' ORDER BY generation, effect_kind, state, attempts, has_error" || true
+    capture_database_diagnostic "Capturing archive recovery diagnostics" \
+      "SELECT a.state, a.final_inventory_hash IS NOT NULL AS inventory_hashed, count(DISTINCT o.id) AS objects, count(DISTINCT m.id) FILTER (WHERE m.state IN ('open','completing')) AS pending_multipart FROM archives a LEFT JOIN archive_objects o ON o.archive_id=a.id LEFT JOIN multipart_uploads m ON m.archive_id=a.id GROUP BY a.id, a.state, a.final_inventory_hash ORDER BY a.created_at DESC LIMIT 3" || true
+    capture_database_diagnostic "Capturing outbox diagnostics" \
+      "SELECT topic, generation, delivered_at IS NOT NULL AS delivered, attempts, payload ? 'lastDispatchError' AS has_last_dispatch_error, count(*) FROM outbox GROUP BY topic, generation, delivered_at IS NOT NULL, attempts, payload ? 'lastDispatchError' ORDER BY topic, generation, delivered, attempts, has_last_dispatch_error" || true
   fi
   if verify_failure_smoke_stack_ownership; then
     if ! compose_bounded "Cleaning owned failure-smoke stack $PROJECT_NAME" \
@@ -226,11 +240,7 @@ trap 'terminate_active 143' TERM
 compose_bounded "Initializing failure-smoke runtime secrets" "$COMPOSE_SETUP_TIMEOUT_SECONDS" \
   run --rm --no-deps secrets-init
 compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
-  build egress-ready translation-worker web failure-smoke
-if ! $deadline_supplied; then
-  deadline_epoch_ms=$((($(date +%s) + ${FAILURE_SMOKE_DEADLINE_SECONDS:-3600}) * 1000))
-  set -- "$@" --deadline-epoch-ms "$deadline_epoch_ms"
-fi
+  build minio egress-ready translation-worker web failure-smoke
 
 compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIMEOUT_SECONDS" \
   run --rm failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@"

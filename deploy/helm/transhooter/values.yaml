@@ -29,7 +29,7 @@ telemetry:
     enabled: true
     image:
       repository: otel/opentelemetry-collector-contrib
-      tag: "0.130.1"
+      tag: "0.156.0"
       pullPolicy: IfNotPresent
     replicas: 1
     ports:
@@ -48,6 +48,9 @@ replicas:
   spoolDrainer: 1
 
 existingSecret: transhooter-runtime
+migratorSecret:
+  existingSecret: transhooter-migrator
+  secretKey: database-url
 magicLinkSealKeys:
   existingSecret: transhooter-runtime
   # Project this key into the web pod. Rotate the JSON keyring in-place while
@@ -76,8 +79,8 @@ config:
   archiveRequireKms: true
   publicUrl: https://transhooter.example.invalid
   publicLivekitUrl: wss://livekit.example.invalid
-  # The ingress/LB must overwrite this single-IP header and strip any client value.
-  trustedClientIpHeader: x-transhooter-client-ip
+  # Leave empty unless ingress.trustedClientIp is enabled with its enforced boundary.
+  trustedClientIpHeader: ""
   internalIssuer: https://kubernetes.default.svc
   internalAudience: transhooter-internal
   kubernetesApiAudience: https://kubernetes.default.svc
@@ -124,6 +127,12 @@ ingress:
   enabled: false
   className: ""
   annotations: {}
+  trustedClientIp:
+    enabled: false
+    controller: nginx
+    configurationSnippetEnabled: false
+    namespaceSelector: {}
+    podSelector: {}
   hosts: []
   tls: []
 

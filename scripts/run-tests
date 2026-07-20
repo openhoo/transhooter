@@ -2,6 +2,61 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+CONTRACT_SCRIPT_DIRECTORY=${CONTRACT_SCRIPT_DIRECTORY:-"$ROOT/tests/e2e"}
+
+validate_lightweight_contract_discovery() {
+  for contract_script in "$CONTRACT_SCRIPT_DIRECTORY"/*contract*.test.sh; do
+    [ -e "$contract_script" ] || continue
+    case "${contract_script##*/}" in
+      *-integration.test.sh) ;;
+      *-contracts.test.sh)
+        if [ ! -x "$contract_script" ]; then
+          printf 'Lightweight contract script is not executable: %s\n' "$contract_script" >&2
+          return 1
+        fi
+        ;;
+      *)
+        printf 'Contract script exists but is omitted from lightweight discovery: %s\n' \
+          "$contract_script" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+run_discovered_lightweight_contract_scripts() {
+  validate_lightweight_contract_discovery
+  for contract_script in "$CONTRACT_SCRIPT_DIRECTORY"/*-contracts.test.sh; do
+    [ -e "$contract_script" ] || continue
+    "$contract_script"
+  done
+}
+
+run_lightweight_contract_suites() {
+  validate_lightweight_contract_discovery
+  bun test \
+    "$ROOT/tests/e2e/harness-contracts.test.mjs" \
+    "$ROOT/tests/failure-smoke/harness-contracts.test.mjs"
+  "$ROOT/tests/failure-smoke/wrapper-contracts.test.sh"
+  run_discovered_lightweight_contract_scripts
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = "--contracts-only" ]; then
+  run_lightweight_contract_suites
+  exit 0
+fi
+if [ "$#" -eq 1 ] && [ "$1" = "--contract-discovery-only" ]; then
+  validate_lightweight_contract_discovery
+  exit 0
+fi
+if [ "$#" -eq 1 ] && [ "$1" = "--contract-scripts-only" ]; then
+  run_discovered_lightweight_contract_scripts
+  exit 0
+fi
+
+run_lightweight_contract_suites
+
 . "$ROOT/deploy/scripts/compose-lib.sh"
 
 LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
@@ -56,13 +111,9 @@ require_deadline COMPOSE_TEST_DEADLINE_SECONDS "$TEST_DEADLINE_SECONDS"
 require_deadline COMPOSE_CLEANUP_DEADLINE_SECONDS "$CLEANUP_DEADLINE_SECONDS"
 select_compose_command_bounded() {
   detection_deadline=15
-  announce_phase "Selecting Docker Compose (deadline: ${detection_deadline}s per implementation)"
-  if timeout --signal=TERM --kill-after=5s "${detection_deadline}s" docker compose version >/dev/null 2>&1; then
-    compose_implementation=plugin
-  elif timeout --signal=TERM --kill-after=5s "${detection_deadline}s" docker-compose version >/dev/null 2>&1; then
-    compose_implementation=legacy
-  else
-    printf 'Phase "Selecting Docker Compose" failed or exceeded its deadline.\n' >&2
+  announce_phase "Selecting Docker Compose plugin (deadline: ${detection_deadline}s)"
+  if ! timeout --signal=TERM --kill-after=5s "${detection_deadline}s" docker compose version >/dev/null 2>&1; then
+    printf 'Phase "Selecting Docker Compose plugin" failed or exceeded its deadline.\n' >&2
     rm -rf -- "$RUN_DIRECTORY"
     exit 127
   fi
@@ -79,11 +130,7 @@ compose_with_deadline() {
 
   set -- --env-file "$COMPOSE_ENV_FILE" -p "$PROJECT_NAME" -f "$BASE_FILE" -f "$OVERLAY_FILE" "$@"
 
-  if [ "$compose_implementation" = plugin ]; then
-    set -- docker compose "$@"
-  else
-    set -- docker-compose "$@"
-  fi
+  set -- docker compose "$@"
 
   if timeout --signal=TERM --kill-after=15s "${deadline}s" "$@"; then
     return 0
@@ -125,6 +172,6 @@ trap 'exit 130' HUP INT TERM
 
 compose_with_deadline "Removing stale hermetic containers and volumes" "$CLEANUP_DEADLINE_SECONDS" down --volumes --remove-orphans
 compose_with_deadline "Initializing isolated hermetic runtime secrets" "$START_DEADLINE_SECONDS" run --rm --no-deps secrets-init
-compose_with_deadline "Building application and harness images from the current source tree" "$BUILD_DEADLINE_SECONDS" build egress-ready translation-worker web e2e failure-smoke test
+compose_with_deadline "Building application and harness images from the current source tree" "$BUILD_DEADLINE_SECONDS" build minio egress-ready translation-worker web e2e failure-smoke test
 compose_with_deadline "Starting hermetic test dependencies" "$START_DEADLINE_SECONDS" up --wait --no-build test-dependencies-ready
 compose_with_deadline "Running hermetic type, boundary, and test gates" "$TEST_DEADLINE_SECONDS" run --rm --no-deps test

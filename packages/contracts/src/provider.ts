@@ -326,6 +326,13 @@ export const RetryDecisionSchema = z
         path: ["retryAtMs"],
       });
     }
+    if (isRetry && decision.previousAttemptId === null) {
+      context.addIssue({
+        code: "custom",
+        message: "retry decisions require the terminal attempt link",
+        path: ["previousAttemptId"],
+      });
+    }
   });
 export type RetryDecision = z.infer<typeof RetryDecisionSchema>;
 

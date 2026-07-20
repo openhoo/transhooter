@@ -23,9 +23,13 @@ from transhooter_worker.adapters.google.provider import (
 from transhooter_worker.domain.models import (
     AudioChunk,
     BoundaryEvent,
+    OperationTerminalEvent,
     Outcome,
     RawRef,
     SampleRange,
+    SessionTerminalEvent,
+    SynthesisBoundary,
+    SynthesisUtterance,
     TranslationRequest,
 )
 from transhooter_worker.runtime.redis_quota import RedisQuotaGate
@@ -316,8 +320,11 @@ async def test_google_stt_queues_apply_backpressure_and_reserve_terminal_slot() 
     terminal = await asyncio.wait_for(session.cancel(), 1)
     with pytest.raises(RuntimeError, match="session terminal"):
         await blocked
+    events = [event async for event in session.events()]
     assert terminal.outcome is Outcome.CANCELLED
-    assert session._events.qsize() == session._EVENT_QUEUE_SIZE + 1
+    assert len(events) == session._EVENT_QUEUE_SIZE + 1
+    assert isinstance(events[-1], SessionTerminalEvent)
+    assert events[-1].terminal.terminal_id == terminal.terminal_id
 
 
 @pytest.mark.asyncio
@@ -489,6 +496,90 @@ class HangingFinalizeSocket:
 
     async def close(self, **_: object) -> None:
         self.closed.set()
+
+
+@pytest.mark.asyncio
+async def test_deepgram_tts_event_queue_backpressures_and_delivers_terminal() -> None:
+    journal = MemoryJournal()
+    socket = HangingFinalizeSocket()
+    utterance = SynthesisUtterance(
+        uuid4(),
+        uuid4(),
+        "hello",
+        "de-DE",
+        "voice",
+        SampleRange(0, 1),
+    )
+    attempt = deepgram_provider.DeepgramSynthesisAttempt(
+        deepgram_provider.DeepgramConfig(
+            "secret",
+            uuid4(),
+            "en-US",
+            "voice",
+            ("voice",),
+            credential_fingerprint="credential",
+        ),
+        journal,
+        socket,  # type: ignore[arg-type]
+        utterance,
+    )
+    raw_ref = journal.append(payload=b"event", media_type="application/json")
+    boundary = SynthesisBoundary(utterance.operation_id, SampleRange(0, 1), raw_ref)
+    for _ in range(attempt._EVENT_QUEUE_SIZE):
+        await attempt._emit_event(boundary)
+    blocked = asyncio.create_task(attempt._emit_event(boundary))
+    await asyncio.sleep(0)
+
+    assert not blocked.done()
+    blocked.cancel()
+    await asyncio.gather(blocked, return_exceptions=True)
+    terminal = await attempt.cancel()
+    events = [event async for event in attempt.events()]
+
+    assert len(events) == attempt._EVENT_QUEUE_SIZE + 1
+    assert isinstance(events[-1], OperationTerminalEvent)
+    assert events[-1].terminal.terminal_id == terminal.terminal_id
+    assert terminal.outcome is Outcome.CANCELLED
+    assert len(journal.terminals) == 1
+
+
+@pytest.mark.asyncio
+async def test_google_tts_event_queue_backpressures_and_delivers_terminal() -> None:
+    journal = MemoryJournal()
+    utterance = SynthesisUtterance(
+        uuid4(),
+        uuid4(),
+        "hello",
+        "de-DE",
+        "voice",
+        SampleRange(0, 1),
+    )
+    attempt = google_provider.GoogleTtsAttempt(
+        google_config(),
+        journal,
+        HangingSttChannel(),  # type: ignore[arg-type]
+        utterance,
+        "de-DE",
+        "voice",
+    )
+    raw_ref = journal.append(payload=b"event", media_type="application/json")
+    boundary = SynthesisBoundary(utterance.operation_id, SampleRange(0, 1), raw_ref)
+    for _ in range(attempt._EVENT_QUEUE_SIZE):
+        await attempt._emit_event(boundary)
+    blocked = asyncio.create_task(attempt._emit_event(boundary))
+    await asyncio.sleep(0)
+
+    assert not blocked.done()
+    blocked.cancel()
+    await asyncio.gather(blocked, return_exceptions=True)
+    terminal = await attempt.cancel()
+    events = [event async for event in attempt.events()]
+
+    assert len(events) == attempt._EVENT_QUEUE_SIZE + 1
+    assert isinstance(events[-1], OperationTerminalEvent)
+    assert events[-1].terminal.terminal_id == terminal.terminal_id
+    assert terminal.outcome is Outcome.CANCELLED
+    assert len(journal.terminals) == 1
 
 
 @pytest.mark.asyncio

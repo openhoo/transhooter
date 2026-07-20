@@ -61,6 +61,41 @@ resolve_profile() {
   export APP_ENV
 }
 
+profile_configuration_value() {
+  environment=$1
+  requested=$2
+  value=
+  while IFS='=' read -r name candidate; do
+    if [ "$name" = "$requested" ]; then
+      value=$candidate
+    fi
+  done <<EOF
+$environment
+EOF
+  printf '%s\n' "$value"
+}
+
+validate_profile_configuration() {
+  [ "$profile" = fixture ] && return 0
+
+  environment=${1:-}
+  public_base_url=${PUBLIC_BASE_URL:-}
+  public_livekit_url=${PUBLIC_LIVEKIT_URL:-}
+  if [ -n "$environment" ]; then
+    public_base_url=$(profile_configuration_value "$environment" PUBLIC_BASE_URL)
+    public_livekit_url=$(profile_configuration_value "$environment" PUBLIC_LIVEKIT_URL)
+  fi
+
+  case "$public_base_url" in
+    https://?*) ;;
+    *) echo "PUBLIC_BASE_URL must be an explicit https:// URL for production provider profiles" >&2; return 1 ;;
+  esac
+  case "$public_livekit_url" in
+    wss://?*) ;;
+    *) echo "PUBLIC_LIVEKIT_URL must be an explicit wss:// URL for production provider profiles" >&2; return 1 ;;
+  esac
+}
+
 validate_project_name() {
   case "$PROJECT_NAME" in
     "" | -* | *[!a-zA-Z0-9_.-]*)
@@ -108,10 +143,8 @@ load_state() {
   PROJECT_NAME=transhooter
 
   profile=
-  recorded_overlay=
   recorded_project=
   seen_profile=false
-  seen_overlay=false
   seen_project=false
 
   while IFS='=' read -r key value || [ -n "$key$value" ]; do
@@ -120,11 +153,6 @@ load_state() {
         $seen_profile && invalid_state
         profile=$value
         seen_profile=true
-        ;;
-      overlay)
-        $seen_overlay && invalid_state
-        recorded_overlay=$value
-        seen_overlay=true
         ;;
       project)
         $seen_project && invalid_state
@@ -137,51 +165,25 @@ load_state() {
     esac
   done < "$STATE_FILE"
 
-  if [ -z "$profile" ]; then
+  if [ -z "$profile" ] || ! $seen_project; then
     invalid_state
   fi
-  if $seen_project; then
-    PROJECT_NAME=$recorded_project
-  fi
+  PROJECT_NAME=$recorded_project
 
   validate_project_name
   export COMPOSE_PROJECT_NAME=$PROJECT_NAME
   resolve_profile "$profile"
-  if $seen_overlay; then
-    $seen_project || invalid_state
-    case "$recorded_overlay" in
-      "$overlay" | "$OVERLAY_FILE")
-        ;;
-      *)
-        echo "Legacy compose state overlay does not match profile $profile." >&2
-        exit 1
-        ;;
-    esac
-
-    write_compose_state
-  fi
 }
 
 select_compose_command() {
-  if docker compose version >/dev/null 2>&1; then
-    compose_implementation=plugin
-  elif docker-compose version >/dev/null 2>&1; then
-    compose_implementation=legacy
-  else
-    echo "Docker Compose is required (plugin or docker-compose executable)." >&2
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "Docker Compose plugin is required." >&2
     return 127
   fi
 }
 
 invoke_compose() {
-  case "$compose_implementation" in
-    plugin)
-      docker compose "$@"
-      ;;
-    legacy)
-      docker-compose "$@"
-      ;;
-  esac
+  docker compose "$@"
 }
 
 compose() {
@@ -227,6 +229,7 @@ failure_smoke_resource_is_owned() {
 
 build_runtime_and_harness_images() {
   compose build \
+    minio \
     egress-ready \
     translation-worker \
     web \

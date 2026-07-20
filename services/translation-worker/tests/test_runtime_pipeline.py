@@ -319,7 +319,7 @@ async def test_same_language_direction_bypasses_translation_and_tts(
 
 
 @pytest.mark.asyncio
-async def test_pcm_framing_uses_cursor_without_front_deleting_buffer(
+async def test_pcm_framing_removes_consumed_prefix_and_preserves_remainder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("APP_ENV", "test")
@@ -342,15 +342,78 @@ async def test_pcm_framing_uses_cursor_without_front_deleting_buffer(
     )
     original = bytes(range(256)) * 7_502 + b"tail"
     pending = bytearray(original)
+    remainder_length = len(original) % 1_920
 
-    cursor = await session._flush_complete_pcm_frames(pending, 0)
+    published_samples = await pipeline_module.publish_complete_pcm_frames(pending, capture, 1_920)
 
-    assert bytes(pending) == original
-    assert b"".join(frames) == original[:cursor]
-    assert cursor % 1_920 == 0
-    remainder = pending[cursor:]
-    await session._flush_final_pcm_frame(remainder)
-    assert frames[-1] == bytes(remainder).ljust(1_920, b"\0")
+    assert published_samples == (len(original) - remainder_length) // 2
+    assert b"".join(frames) == original[:-remainder_length]
+    assert bytes(pending) == original[-remainder_length:]
+    complete_frame_count = len(frames)
+
+    await pipeline_module.publish_complete_pcm_frames(pending, capture, 1_920)
+
+    assert len(frames) == complete_frame_count
+    assert bytes(pending) == original[-remainder_length:]
+
+    await session._flush_final_pcm_frame(pending)
+    assert frames[-1] == original[-remainder_length:].ljust(1_920, b"\0")
+
+
+@pytest.mark.asyncio
+async def test_partial_pcm_publication_checkpoints_delivered_frame_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "test")
+    first_frame = b"\x01\x00" * 960
+    second_frame = b"\x02\x00" * 960
+    pending = bytearray(first_frame + second_frame)
+    delivered: list[bytes] = []
+    checkpoints: list[tuple[int, int, bool]] = []
+    publication_attempt = 0
+
+    async def publish(frame: bytes) -> None:
+        nonlocal publication_attempt
+        publication_attempt += 1
+        if publication_attempt == 2:
+            raise RuntimeError("injected publication failure")
+        delivered.append(frame)
+
+    async def checkpoint(
+        input_sample: int,
+        output_sample: int,
+        terminal: bool,
+    ) -> None:
+        checkpoints.append((input_sample, output_sample, terminal))
+
+    async def ignore(*_: object) -> None:
+        return None
+
+    session = DirectionSession(
+        DirectionSpec(uuid4(), uuid4(), "en-US", "de-DE", "fixture-voice", False),
+        FixtureSttProvider(),
+        FixtureTranslationProvider(),
+        FixtureTtsProvider(),
+        ignore,
+        publish,
+        checkpoint,
+    )
+    session._last_input = 4_000
+
+    with pytest.raises(RuntimeError, match="injected publication failure"):
+        await session._publish_complete_pcm_frames(pending)
+
+    assert delivered == [first_frame]
+    assert bytes(pending) == second_frame
+    assert checkpoints == [(4_000, 960, False)]
+    assert session._last_output == 960
+
+    await session._publish_complete_pcm_frames(pending)
+
+    assert delivered == [first_frame, second_frame]
+    assert not pending
+    assert checkpoints == [(4_000, 960, False)]
+    assert session._last_output == 1_920
 
 
 @pytest.mark.asyncio

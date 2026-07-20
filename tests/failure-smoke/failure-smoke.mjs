@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -12,6 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import postgres from "postgres";
 import {
@@ -26,6 +28,10 @@ import {
   workerCrashMatches,
 } from "./harness-contracts.mjs";
 
+const consultationHarness = fileURLToPath(
+  new URL("../e2e/smoke-consultation.mjs", import.meta.url),
+);
+
 const baseUrl = process.env.BASE_URL ?? "http://web:3000";
 const serviceBaseUrl = (() => {
   const url = new URL(baseUrl);
@@ -36,12 +42,12 @@ const serviceBaseUrl = (() => {
 })();
 const livekitUrl = process.env.LIVEKIT_URL ?? "ws://livekit:7880";
 const mailpitUrl = process.env.MAILPIT_URL ?? "http://mailpit:8025";
-const adminEmail = process.env.E2E_EMPLOYEE_EMAIL ?? process.env.BOOTSTRAP_ADMIN_EMAIL;
+const adminEmail = process.env.E2E_EMPLOYEE_EMAIL;
 if (!adminEmail) throw new Error("E2E_EMPLOYEE_EMAIL is required");
 const faultFile = process.env.FAULT_CONTROL_FILE ?? "/shared/faults.json";
 const workerScenarioFile = process.env.WORKER_SCENARIO_FILE ?? "/shared/worker-scenarios.json";
 const expectedProfile = process.env.EXPECTED_PROFILE ?? "fixture";
-const databaseUrlFile = process.env.DATABASE_URL_FILE ?? "/run/secrets/database-url";
+const databaseUrlFile = process.env.DATABASE_URL_FILE ?? "/run/secrets/database-web-url";
 const releaseDirectory = process.env.FAILURE_RELEASE_DIR ?? "/shared/releases";
 const dockerResponseLimit = 2 * 1024 * 1024;
 const configLockFile = "/shared/.failure-smoke-config.lock";
@@ -56,12 +62,16 @@ const capabilityMinimumRemainingMs = 10 * 60_000;
 const scenarioRegistry = Object.freeze([
   "recovery-hold",
   "participant-egress-denied",
+  "remote-success-crash",
+  "applied-state-crash",
+  "stale-owner-fencing",
   "translation-rate_limit",
   "translation-quota",
   "translation-transport",
   "tts-partial-finalization",
   "preservation-fence",
-  "minio-outage",
+  "minio-inflight-recovery",
+  "spool-durable-recovery",
   "unwritable-spool",
 ]);
 const translationFailureCases = Object.freeze([
@@ -150,6 +160,23 @@ const database = postgres((await readFile(databaseUrlFile, "utf8")).trim(), {
   idle_timeout: 20,
   connection: { statement_timeout: "15000" },
 });
+
+function checkpointDeliveries(meetingId) {
+  const spool = new Database("/var/lib/transhooter/spool/journal.sqlite3", { readonly: true });
+  try {
+    return spool
+      .query(
+        `SELECT checkpoint_id AS checkpointId, control_event_id AS controlEventId,
+          acknowledged
+        FROM checkpoint_deliveries
+        WHERE meeting_id = ?
+        ORDER BY checkpoint_id`,
+      )
+      .all(meetingId);
+  } finally {
+    spool.close();
+  }
+}
 
 function operationDeadline(requestedDeadline = Date.now() + 30_000) {
   return Math.min(requestedDeadline, harnessDeadlineMs);
@@ -503,6 +530,10 @@ async function setFaults(consultationId = null, faults = {}) {
       ? {
           failEffects: faults.failEffects ?? [],
           crashAfterPersistCalling: faults.crashAfterPersistCalling ?? [],
+          holdAfterPersistCalling: faults.holdAfterPersistCalling ?? [],
+          crashAfterRemoteSuccess: faults.crashAfterRemoteSuccess ?? [],
+          crashAfterMarkApplied: faults.crashAfterMarkApplied ?? [],
+          holdAfterRemoteSuccess: faults.holdAfterRemoteSuccess ?? [],
         }
       : null,
   );
@@ -658,7 +689,7 @@ async function runConsultation({
   const child = spawn(
     "bun",
     [
-      "smoke-consultation.mjs",
+      consultationHarness,
       "--base-url",
       baseUrl,
       "--livekit-url",
@@ -801,7 +832,7 @@ async function sql(statement) {
 }
 
 async function resetAuthenticationThrottle() {
-  await sql("TRUNCATE magic_link_requests");
+  await sql("DELETE FROM magic_link_requests");
 }
 
 async function fetchWithDeadline(url, init = {}, deadline = Date.now() + 30_000, parentSignal) {
@@ -996,12 +1027,16 @@ async function raceArchiveHoldAndDelete(archiveId, consultationId) {
             deadline,
             async () => {
               const rows = await database.unsafe(`
-                SELECT wait_event_type AS "waitEventType",query
-                FROM pg_stat_activity
-                WHERE pid <> pg_backend_pid()
-                  AND datname=current_database()
-                  AND wait_event_type='Lock'
-                  AND query ~* '\\m(archives|consultations)\\M'`);
+                SELECT 'Lock' AS "waitEventType",relation.relname AS query
+                FROM pg_locks waiting
+                JOIN pg_locks held_by_waiter
+                  ON held_by_waiter.pid=waiting.pid
+                  AND held_by_waiter.locktype='relation'
+                  AND held_by_waiter.granted
+                JOIN pg_class relation ON relation.oid=held_by_waiter.relation
+                WHERE NOT waiting.granted
+                  AND waiting.pid <> pg_backend_pid()
+                  AND relation.relname IN ('archives','consultations')`);
               return rows;
             },
             signal,
@@ -1023,9 +1058,11 @@ async function raceArchiveHoldAndDelete(archiveId, consultationId) {
     } catch (error) {
       const [activity, archiveState] = await Promise.all([
         database.unsafe(`
-          SELECT state,wait_event_type AS "waitEventType",wait_event AS "waitEvent",query
-          FROM pg_stat_activity
-          WHERE pid <> pg_backend_pid() AND datname=current_database() AND state <> 'idle'`),
+          SELECT lock.locktype,lock.mode,lock.granted,relation.relname AS relation
+          FROM pg_locks lock
+          LEFT JOIN pg_class relation ON relation.oid=lock.relation
+          WHERE lock.pid <> pg_backend_pid()
+            AND (NOT lock.granted OR relation.relname IN ('archives','consultations'))`),
         queryJson(`
           SELECT a.state,a.hold_operation_id,a.hold_operation_kind,a.hold_operation_owner,
             a.hold_operation_lease_expires_at,
@@ -1112,7 +1149,7 @@ async function consultationEvidence(consultationId) {
       a.id AS archive_id,a.state AS archive_state,a.final_inventory_hash,
       (SELECT row_to_json(f) FROM final_inventories f WHERE f.archive_id=a.id) AS inventory,
       COALESCE((SELECT json_agg(json_build_object(
-        'kind',e.effect_kind,'generation',e.generation,'subjectId',e.subject_id,
+        'id',e.id,'kind',e.effect_kind,'generation',e.generation,'subjectId',e.subject_id,
         'state',e.state,'attempts',e.attempts,'requestHash',e.request_hash,
         'leaseOwner',e.lease_owner,'leaseExpiresAt',e.lease_expires_at,
         'result',e.result,'compensationResult',e.compensation_result
@@ -1550,6 +1587,115 @@ function assertTranslationFailureEvidence(evidence, expected) {
   return attempt;
 }
 
+async function controlWorkerBaselines() {
+  const controls = await Promise.all([
+    onlyContainer("control-worker-1"),
+    onlyContainer("control-worker-2"),
+  ]);
+  const baselines = new Map(
+    await Promise.all(
+      controls.map(async (container) => {
+        const details = await inspect(container.Id);
+        const workerId = details.Config.Env.find((entry) =>
+          entry.startsWith("INSTANCE_ID="),
+        )?.slice("INSTANCE_ID=".length);
+        if (!workerId) throw new Error(`control worker ${container.Id} has no INSTANCE_ID`);
+        return [
+          workerId,
+          {
+            containerId: container.Id,
+            workerId,
+            restartCount: details.RestartCount,
+            startedAt: details.State.StartedAt,
+          },
+        ];
+      }),
+    ),
+  );
+  return { controls, baselines };
+}
+
+async function runEffectBoundaryCrash({ scenario, fault, expectedState, exitCode }) {
+  const { baselines } = await controlWorkerBaselines();
+  await resetAuthenticationThrottle();
+  const crashWatermarkMs = Date.now();
+  const run = await runConsultation({ faults: { [fault]: ["ROOM_CREATE"] } });
+  const crashedEffect = await waitFor(
+    `${scenario} durable boundary`,
+    async () => {
+      const evidence = await consultationEvidence(run.consultationId);
+      return (
+        evidence.effects.find(
+          (candidate) =>
+            candidate.kind === "ROOM_CREATE" &&
+            candidate.state === expectedState &&
+            typeof candidate.leaseOwner === "string",
+        ) ?? null
+      );
+    },
+    60_000,
+  );
+  const crashedWorker = baselines.get(crashedEffect.leaseOwner);
+  if (!crashedWorker) throw new Error(`${scenario} owner was not a live control replica`);
+  const restarted = await waitFor(
+    `${scenario} exact owner restart`,
+    async (signal, deadline) => {
+      const [current, exits] = await Promise.all([
+        inspect(crashedWorker.containerId, { signal, deadline }),
+        containerExitEvents(crashedWorker.containerId, crashWatermarkMs, { signal, deadline }),
+      ]);
+      const injectedExit = exits.some(
+        (event) => String(event.Actor?.Attributes?.exitCode ?? "") === String(exitCode),
+      );
+      return injectedExit &&
+        current.State.Running &&
+        (!current.State.Health || current.State.Health.Status === "healthy") &&
+        restartCountIncremented(crashedWorker.restartCount, current.RestartCount)
+        ? { restartCount: current.RestartCount, startedAt: current.State.StartedAt }
+        : null;
+    },
+    90_000,
+  );
+  await setFaults();
+  const completed = await run.completed;
+  if (completed.code !== 0) {
+    throw new Error(`${scenario} consultation failed: ${completed.stderr}\n${completed.stdout}`);
+  }
+  const evidence = await waitFor(
+    `${scenario} clean durable settlement`,
+    async () => {
+      const current = await consultationEvidence(run.consultationId);
+      return isCleanSettlement(current) ? current : null;
+    },
+    120_000,
+  );
+  const recoveredEffect = evidence.effects.find(
+    (candidate) =>
+      candidate.kind === "ROOM_CREATE" &&
+      candidate.state === "done" &&
+      typeof candidate.result?.remoteId === "string",
+  );
+  if (!recoveredEffect) {
+    throw new Error(`${scenario} lacks one durable remote ROOM_CREATE outcome`);
+  }
+  if (expectedState === "calling" && recoveredEffect.attempts < 2) {
+    throw new Error(`${scenario} did not recover by adopting the ambiguous remote success`);
+  }
+  if (expectedState === "applied" && recoveredEffect.attempts !== crashedEffect.attempts) {
+    throw new Error(`${scenario} replayed a remote effect after durable applied evidence`);
+  }
+  return {
+    name: scenario,
+    consultationId: run.consultationId,
+    remoteId: recoveredEffect.result.remoteId,
+    effectAttempts: recoveredEffect.attempts,
+    crashedWorkerId: crashedWorker.workerId,
+    restartedEpoch: restarted.startedAt,
+    restartCount: restarted.restartCount,
+    cleanSettlement: true,
+  };
+}
+
 async function main() {
   const proof = { scenarios: [] };
   let primaryError = null;
@@ -1748,6 +1894,126 @@ async function main() {
       });
       await checkpointScenario("recovery-hold");
     }
+    if (shouldRunScenario("remote-success-crash")) {
+      proof.scenarios.push(
+        await runEffectBoundaryCrash({
+          scenario: "remote-success-crash",
+          fault: "crashAfterRemoteSuccess",
+          expectedState: "calling",
+          exitCode: 87,
+        }),
+      );
+      await checkpointScenario("remote-success-crash");
+    }
+    if (shouldRunScenario("applied-state-crash")) {
+      proof.scenarios.push(
+        await runEffectBoundaryCrash({
+          scenario: "applied-state-crash",
+          fault: "crashAfterMarkApplied",
+          expectedState: "applied",
+          exitCode: 88,
+        }),
+      );
+      await checkpointScenario("applied-state-crash");
+    }
+    if (shouldRunScenario("stale-owner-fencing")) {
+      const { baselines } = await controlWorkerBaselines();
+      await resetAuthenticationThrottle();
+      const run = await runConsultation({
+        faults: { holdAfterRemoteSuccess: ["ROOM_CREATE"] },
+      });
+      const held = await waitFor(
+        "first replica held after remote ROOM_CREATE success",
+        async () => {
+          const evidence = await consultationEvidence(run.consultationId);
+          const candidate = evidence.effects.find(
+            (effect) =>
+              effect.kind === "ROOM_CREATE" &&
+              effect.state === "calling" &&
+              typeof effect.leaseOwner === "string",
+          );
+          if (!candidate) return null;
+          try {
+            await stat(`${faultFile}.${run.consultationId}.ROOM_CREATE.remote-success-owner`);
+            return candidate;
+          } catch {
+            return null;
+          }
+        },
+        60_000,
+      );
+      const staleOwner = baselines.get(held.leaseOwner);
+      const successor = [...baselines.values()].find(
+        (candidate) => candidate.workerId !== held.leaseOwner,
+      );
+      if (!staleOwner || !successor) {
+        throw new Error("stale-owner fencing did not identify two distinct live replicas");
+      }
+      const [staleState, successorState] = await Promise.all([
+        inspect(staleOwner.containerId),
+        inspect(successor.containerId),
+      ]);
+      if (!staleState.State.Running || !successorState.State.Running) {
+        throw new Error("expired-lease overlap requires both control replicas to remain live");
+      }
+      await sql(`
+        UPDATE external_effects
+        SET lease_owner='${successor.workerId}',lease_expires_at=now()-interval '1 second'
+        WHERE id='${held.id}' AND lease_owner='${staleOwner.workerId}' AND state='calling'`);
+      const stolen = await waitFor(
+        "designated successor replica ownership of expired effect lease",
+        async () => {
+          const evidence = await consultationEvidence(run.consultationId);
+          const candidate = evidence.effects.find((effect) => effect.id === held.id);
+          return candidate?.attempts >= 2 &&
+            (candidate.leaseOwner === successor.workerId ||
+              (candidate.state === "done" && typeof candidate.result?.remoteId === "string"))
+            ? candidate
+            : null;
+        },
+        60_000,
+      );
+      await setFaults();
+      const completed = await run.completed;
+      if (completed.code !== 0) {
+        throw new Error(
+          `stale-owner fencing consultation failed: ${completed.stderr}\n${completed.stdout}`,
+        );
+      }
+      const settled = await waitFor(
+        "stale-owner fencing clean settlement",
+        async () => {
+          const evidence = await consultationEvidence(run.consultationId);
+          return isCleanSettlement(evidence) ? evidence : null;
+        },
+        120_000,
+      );
+      const outcome = settled.effects.find(
+        (effect) =>
+          effect.id === held.id &&
+          effect.state === "done" &&
+          typeof effect.result?.remoteId === "string",
+      );
+      if (!outcome || outcome.attempts !== stolen.attempts) {
+        throw new Error("stale owner changed the successor's single durable remote outcome");
+      }
+      await rm(`${faultFile}.${run.consultationId}.ROOM_CREATE.remote-success-owner`, {
+        force: true,
+      });
+      proof.scenarios.push({
+        name: "stale-owner-fencing",
+        consultationId: run.consultationId,
+        staleOwner: staleOwner.workerId,
+        successorOwner: successor.workerId,
+        effectAttempts: outcome.attempts,
+        remoteId: outcome.result.remoteId,
+        overlappingLiveReplicas: true,
+        successorOwnershipObserved: true,
+        staleOwnerFenced: true,
+        cleanSettlement: true,
+      });
+      await checkpointScenario("stale-owner-fencing");
+    }
     if (shouldRunScenario("participant-egress-denied")) {
       // Denying Participant Egress after the durable effect row must keep publication
       // blocked and surface a durable retry/failure rather than silently joining.
@@ -1937,9 +2203,17 @@ async function main() {
       await setWorkerScenario();
       await checkpointScenario("tts-partial-finalization");
     }
-    if (shouldRunScenario("preservation-fence")) {
+    const preservationFenceSelected = shouldRunScenario("preservation-fence");
+    const spoolRecoverySelected = shouldRunScenario("spool-durable-recovery");
+    if (preservationFenceSelected || spoolRecoverySelected) {
       const workerBefore = await onlyContainer("translation-worker");
-      const workerRestartBaseline = (await inspect(workerBefore.Id)).RestartCount;
+      const drainerBefore = await onlyContainer("spool-drainer");
+      const [workerBeforeState, drainerBeforeState] = await Promise.all([
+        inspect(workerBefore.Id),
+        inspect(drainerBefore.Id),
+      ]);
+      const workerRestartBaseline = workerBeforeState.RestartCount;
+      if (spoolRecoverySelected) await stop("spool-drainer");
       await resetAuthenticationThrottle();
       const preservationRun = await runConsultation({
         workerScenario: {
@@ -2051,11 +2325,78 @@ async function main() {
         },
         30_000,
       );
+      const pendingCheckpointDeliveries = spoolRecoverySelected
+        ? await waitFor(
+            "durable checkpoint delivery before drainer restart",
+            async () => {
+              const deliveries = checkpointDeliveries(preservationConsultationId);
+              return deliveries.some((delivery) => delivery.acknowledged === 0)
+                ? deliveries.filter((delivery) => delivery.acknowledged === 0)
+                : null;
+            },
+            30_000,
+          )
+        : [];
       await setWorkerScenario();
       await assertServiceHealthy("translation-worker");
+      if (spoolRecoverySelected) {
+        await start(drainerBefore.Id);
+      } else {
+        await stop("spool-drainer");
+        await start(drainerBefore.Id);
+      }
+      await waitFor(
+        "same-volume spool drainer restart",
+        async (signal, deadline) => {
+          const current = await inspect(drainerBefore.Id, { signal, deadline });
+          return current.State.Running &&
+            current.State.StartedAt !== drainerBeforeState.State.StartedAt &&
+            (!current.State.Health || current.State.Health.Status === "healthy")
+            ? current.State.StartedAt
+            : null;
+        },
+        120_000,
+      );
+      if (spoolRecoverySelected) {
+        const pendingIds = new Set(
+          pendingCheckpointDeliveries.map((delivery) => delivery.checkpointId),
+        );
+        await waitFor(
+          "exact checkpoint delivery replay after drainer restart",
+          async () => {
+            const deliveries = checkpointDeliveries(preservationConsultationId);
+            const replayed = deliveries.filter((delivery) => pendingIds.has(delivery.checkpointId));
+            return pendingIds.size > 0 &&
+              replayed.length === pendingIds.size &&
+              replayed.every((delivery) => delivery.acknowledged === 1)
+              ? deliveries
+              : null;
+          },
+          60_000,
+        );
+      }
       await sql(`DELETE FROM outbox WHERE id='${staleHeartbeatId}'`);
+      const settled = await settleConsultation(preservationConsultationId);
+      const duplicateEffects = await queryJson(`
+        SELECT occurrence_key,generation,count(*)::int AS copies
+        FROM external_effects
+        WHERE consultation_id='${preservationConsultationId}'
+        GROUP BY occurrence_key,generation
+        HAVING count(*) > 1`);
+      if (
+        duplicateEffects.length > 0 ||
+        settled.pending_outbox !== 0 ||
+        settled.active_effects !== 0
+      ) {
+        throw new Error(
+          `spool recovery did not converge exactly once: ${JSON.stringify({
+            duplicateEffects,
+            settlement: settlementSummary(settled),
+          })}`,
+        );
+      }
       proof.scenarios.push({
-        name: "wal-sqlite-failure-report-denied",
+        name: spoolRecoverySelected ? "spool-durable-recovery" : "preservation-fence",
         consultationId: preservationConsultationId,
         workerExited: true,
         workerId: reservation.workerId,
@@ -2067,17 +2408,48 @@ async function main() {
         fenceReason: fencedEvidence.reservations[0].fenceReason,
         staleHeartbeatAttempts: staleRejected.attempts,
         archiveFailureStatusCount: failedStatus.length,
+        replayedCheckpointIds: pendingCheckpointDeliveries.map((delivery) => delivery.checkpointId),
+        supervisorRestarted: true,
+        drainerRestarted: true,
+        duplicateEffects: 0,
+        pendingDelivery: settled.pending_outbox,
+        cleanSettlement: true,
       });
-      await settleConsultation(preservationConsultationId);
-
-      await checkpointScenario("preservation-fence");
+      if (preservationFenceSelected) await checkpointScenario("preservation-fence");
+      if (spoolRecoverySelected) await checkpointScenario("spool-durable-recovery");
     }
-    if (shouldRunScenario("minio-outage")) {
-      // A real MinIO outage must make semantic readiness fail and recover only after
-      // the same persistent service is restarted.
+    if (shouldRunScenario("minio-inflight-recovery")) {
+      await resetAuthenticationThrottle();
+      const minioBefore = await onlyContainer("minio");
+      const minioStateBefore = await inspect(minioBefore.Id);
+      const run = await runConsultation({
+        faults: { holdAfterPersistCalling: ["ARCHIVE_RECONCILE"] },
+      });
+      const reconciliationHoldMarker = `${faultFile}.${run.consultationId}.ARCHIVE_RECONCILE.calling-owner`;
+      const reconciling = await waitFor(
+        "archive reconciliation held before its remote call",
+        async () => {
+          const evidence = await consultationEvidence(run.consultationId);
+          if (evidence.archive_state !== "reconciling") return null;
+          try {
+            await stat(reconciliationHoldMarker);
+            return evidence;
+          } catch {
+            return null;
+          }
+        },
+        120_000,
+      );
+      const reconciliationAttemptsBeforeOutage = new Map(
+        reconciling.effects
+          .filter((effect) => effect.kind === "ARCHIVE_RECONCILE")
+          .map((effect) => [effect.id, effect.attempts]),
+      );
       const minioId = await stop("minio");
+      await setFaults(run.consultationId);
+      await rm(reconciliationHoldMarker, { force: true });
       await waitFor(
-        "web readiness to fail closed during MinIO outage",
+        "web readiness to fail closed during in-flight archive outage",
         async (signal, deadline) => {
           try {
             const response = await fetchWithDeadline(
@@ -2093,16 +2465,109 @@ async function main() {
         },
         60_000,
       );
+      const outageEvidence = await consultationEvidence(run.consultationId);
+      if (outageEvidence.archive_state !== "reconciling") {
+        throw new Error("archive completed before the MinIO outage could exercise reconciliation");
+      }
+      const failedReconciliation = await waitFor(
+        "archive reconciliation retries after the MinIO outage",
+        async () => {
+          const evidence = await consultationEvidence(run.consultationId);
+          return (
+            evidence.effects.find(
+              (effect) =>
+                effect.kind === "ARCHIVE_RECONCILE" &&
+                effect.attempts > (reconciliationAttemptsBeforeOutage.get(effect.id) ?? 0),
+            ) ?? null
+          );
+        },
+        120_000,
+      );
       await start(minioId);
       await assertServiceHealthy("minio");
+      const minioStateAfter = await inspect(minioId);
+      if (
+        minioStateAfter.State.StartedAt === minioStateBefore.State.StartedAt ||
+        !minioStateAfter.State.Running
+      ) {
+        throw new Error("MinIO did not restart on the same Compose volume");
+      }
       await waitFor(
         "web readiness after MinIO recovery",
         async (signal, deadline) =>
           (await fetchWithDeadline(`${serviceBaseUrl}/api/health/ready`, {}, deadline, signal)).ok,
         120_000,
       );
-      proof.scenarios.push({ name: "minio-outage", readinessFailedClosed: true, recovered: true });
-      await checkpointScenario("minio-outage");
+      const completed = await run.completed;
+      if (completed.code !== 0) {
+        throw new Error(
+          `MinIO recovery consultation failed: ${completed.stderr}\n${completed.stdout}`,
+        );
+      }
+      const settled = await waitFor(
+        "MinIO recovery clean settlement",
+        async () => {
+          const evidence = await consultationEvidence(run.consultationId);
+          return isCleanSettlement(evidence) ? evidence : null;
+        },
+        120_000,
+      );
+      const [objects, pendingMultipart] = await Promise.all([
+        queryJson(`
+          SELECT count(*)::int AS object_count,
+            bool_and(version_id <> '' AND sha256 ~ '^[0-9a-f]{64}$' AND s3_checksum <> '')
+              AS version_hash_complete
+          FROM archive_objects WHERE archive_id='${settled.archive_id}'`),
+        queryJson(`
+          SELECT count(*)::int AS pending
+          FROM multipart_uploads
+          WHERE archive_id='${settled.archive_id}' AND state IN ('open','completing')`),
+      ]);
+      if (
+        settled.archive_state !== "complete" ||
+        !/^[0-9a-f]{64}$/u.test(settled.final_inventory_hash ?? "") ||
+        objects[0]?.object_count < 1 ||
+        objects[0]?.version_hash_complete !== true ||
+        pendingMultipart[0]?.pending !== 0 ||
+        settled.active_effects !== 0
+      ) {
+        throw new Error(
+          `MinIO recovery lacks complete versioned inventory settlement: ${JSON.stringify({
+            settlement: settlementSummary(settled),
+            objects,
+            pendingMultipart,
+          })}`,
+        );
+      }
+      const recoveredReconciliation = settled.effects.find(
+        (effect) =>
+          effect.id === failedReconciliation.id &&
+          effect.kind === "ARCHIVE_RECONCILE" &&
+          effect.state === "done" &&
+          effect.attempts >= failedReconciliation.attempts,
+      );
+      if (!recoveredReconciliation) {
+        throw new Error(
+          "MinIO-dependent reconciliation did not retry to completion after recovery",
+        );
+      }
+      proof.scenarios.push({
+        name: "minio-inflight-recovery",
+        consultationId: run.consultationId,
+        consultationExitCode: completed.code,
+        reconciliationEffectId: failedReconciliation.id,
+        outageAttempts: failedReconciliation.attempts,
+        recoveredAttempts: recoveredReconciliation.attempts,
+        minioFailureObserved: true,
+        sameVolumeRestart: true,
+        inventorySha256: settled.final_inventory_hash,
+        objectCount: objects[0].object_count,
+        versionHashComplete: true,
+        pendingMultipart: 0,
+        pendingEffects: settled.active_effects,
+        cleanSettlement: true,
+      });
+      await checkpointScenario("minio-inflight-recovery");
     }
 
     if (shouldRunScenario("unwritable-spool")) {
@@ -2161,6 +2626,7 @@ async function main() {
       `[failure-smoke] phase ${activePhase} failed: ${error?.message ?? String(error)}`,
       { cause: error },
     );
+    console.error(primaryError.message);
   } finally {
     announcePhase("cleanup");
     const cleanup = async (label, operation) => {
@@ -2261,4 +2727,9 @@ async function main() {
   }
 }
 
-await main();
+try {
+  await main();
+} catch (error) {
+  console.error(error);
+  process.exitCode = 1;
+}

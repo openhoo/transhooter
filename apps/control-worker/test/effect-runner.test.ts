@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EgressStatus } from "livekit-server-sdk";
+import { isViableEgressAdoption } from "../src/adapters/livekit-effects";
 import { EffectRunner } from "../src/orchestration/effect-runner";
 import type { DurableStore, Effect } from "../src/orchestration/model";
 import type { RemoteEffects } from "../src/orchestration/remote";
@@ -58,6 +60,7 @@ function harness(
     renewEffectLease: async () => true,
     markApplied: async () => {
       calls.push("applied");
+      return "applied" as const;
     },
     markDone: async () => {
       calls.push("done");
@@ -163,6 +166,7 @@ test("renews the effect lease until markApplied commits for execution and adopti
           applied.resolve();
           await commit.promise;
           applying = false;
+          return "applied" as const;
         },
         markDone: async () => undefined,
         markFailed: async () => undefined,
@@ -194,6 +198,115 @@ test("renews the effect lease until markApplied commits for execution and adopti
     }
   } finally {
     vi.useRealTimers();
+  }
+});
+
+test("serializes overlapping lease renewals and never requests an earlier expiry", async () => {
+  vi.useFakeTimers();
+  try {
+    const executeStarted = Promise.withResolvers<void>();
+    const executeRelease = Promise.withResolvers<void>();
+    const blockedRenewalStarted = Promise.withResolvers<void>();
+    const blockedRenewalRelease = Promise.withResolvers<void>();
+    const queuedRenewalStarted = Promise.withResolvers<void>();
+    const queuedRenewalRequested = Promise.withResolvers<void>();
+    let observeQueuedRenewalRequest = false;
+    const expiries: number[] = [];
+    let nowMs = 1_000;
+    let activeRenewals = 0;
+    let maximumActiveRenewals = 0;
+    const store = {
+      claimEffects: async () => [effect],
+      currentGeneration: async () => effect.generation,
+      persistCalling: async () => ({ ...effect, state: "calling" as const, attempt: 1 }),
+      renewEffectLease: async (_id: string, _owner: string, expiresAt: Date) => {
+        expiries.push(expiresAt.getTime());
+        activeRenewals += 1;
+        maximumActiveRenewals = Math.max(maximumActiveRenewals, activeRenewals);
+        if (expiries.length === 2) {
+          blockedRenewalStarted.resolve();
+          await blockedRenewalRelease.promise;
+        } else if (expiries.length === 3) {
+          queuedRenewalStarted.resolve();
+        }
+        activeRenewals -= 1;
+        return true;
+      },
+      markApplied: async () => "applied" as const,
+      markDone: async () => undefined,
+      markFailed: async () => undefined,
+      markCompensating: async () => undefined,
+    } as unknown as DurableStore;
+    const remote = {
+      adopt: async () => null,
+      execute: async () => {
+        executeStarted.resolve();
+        await executeRelease.promise;
+        return { remoteId: "created", result: {} };
+      },
+      compensate: async () => undefined,
+    } as unknown as RemoteEffects;
+    const runner = new EffectRunner(
+      store,
+      remote,
+      {
+        now: () => {
+          if (observeQueuedRenewalRequest) {
+            observeQueuedRenewalRequest = false;
+            queuedRenewalRequested.resolve();
+          }
+          return new Date(nowMs);
+        },
+      },
+      {
+        owner: "10000000-0000-4000-8000-000000000009",
+        leaseMs: 300,
+        batchSize: 1,
+      },
+    );
+
+    const tick = runner.tick();
+    await executeStarted.promise;
+    nowMs = 2_000;
+    vi.advanceTimersByTime(100);
+    await blockedRenewalStarted.promise;
+
+    nowMs = 100;
+    observeQueuedRenewalRequest = true;
+    vi.advanceTimersByTime(100);
+    await queuedRenewalRequested.promise;
+    assert.equal(expiries.length, 2);
+    assert.equal(maximumActiveRenewals, 1);
+
+    blockedRenewalRelease.resolve();
+    await queuedRenewalStarted.promise;
+    assert.equal(maximumActiveRenewals, 1);
+    assert.equal(expiries.length, 3);
+    assert.ok(
+      expiries.every(
+        (expiry, index) =>
+          index === 0 || expiry >= (expiries[index - 1] ?? Number.NEGATIVE_INFINITY),
+      ),
+    );
+    executeRelease.resolve();
+    await tick;
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("only starting and active Egress states are viable for adoption", () => {
+  for (const status of [EgressStatus.EGRESS_STARTING, EgressStatus.EGRESS_ACTIVE]) {
+    assert.equal(isViableEgressAdoption(status), true);
+  }
+  for (const status of [
+    EgressStatus.EGRESS_ENDING,
+    EgressStatus.EGRESS_COMPLETE,
+    EgressStatus.EGRESS_FAILED,
+    EgressStatus.EGRESS_ABORTED,
+    EgressStatus.EGRESS_LIMIT_REACHED,
+  ]) {
+    assert.equal(isViableEgressAdoption(status), false);
   }
 });
 
@@ -267,14 +380,20 @@ test("compensates a recovered applied effect when its generation is stale", asyn
   assert.deepEqual(calls, ["compensating", "compensate:persisted-room", "done"]);
 });
 
-test("passes the exact consultation ID to both fault decisions", async () => {
+test("passes the exact consultation ID to every fault boundary", async () => {
   const decisions: string[] = [];
   const faults: EffectFaultControl = {
     afterPersist: async (kind, consultationId) => {
-      decisions.push(`after:${kind}:${consultationId}`);
+      decisions.push(`persist:${kind}:${consultationId}`);
     },
     shouldFail: async (kind, consultationId) => {
       decisions.push(`before:${kind}:${consultationId}`);
+    },
+    afterRemoteSuccess: async (kind, consultationId) => {
+      decisions.push(`remote:${kind}:${consultationId}`);
+    },
+    afterMarkApplied: async (kind, consultationId) => {
+      decisions.push(`applied:${kind}:${consultationId}`);
     },
   };
   const { runner } = harness(4, null, "planned", faults);
@@ -282,8 +401,10 @@ test("passes the exact consultation ID to both fault decisions", async () => {
   await runner.tick();
 
   assert.deepEqual(decisions, [
-    `after:ROOM_CREATE:${effect.consultationId}`,
+    `persist:ROOM_CREATE:${effect.consultationId}`,
     `before:ROOM_CREATE:${effect.consultationId}`,
+    `remote:ROOM_CREATE:${effect.consultationId}`,
+    `applied:ROOM_CREATE:${effect.consultationId}`,
   ]);
 });
 
@@ -305,6 +426,8 @@ test("faults are scoped to the exact consultation and effect kind", async () => 
 
       await faults.shouldFail("PARTICIPANT_GRANT", configuredConsultationId);
       await faults.afterPersist("PARTICIPANT_GRANT", configuredConsultationId);
+      await faults.afterRemoteSuccess("PARTICIPANT_GRANT", configuredConsultationId);
+      await faults.afterMarkApplied("PARTICIPANT_GRANT", configuredConsultationId);
       await assert.rejects(
         () => faults.shouldFail("ROOM_CREATE", configuredConsultationId),
         /test fault denied ROOM_CREATE/,
@@ -323,8 +446,45 @@ test("consultation fault arrays default to empty", async () => {
     async (faults) => {
       await faults.shouldFail("ROOM_CREATE", effect.consultationId);
       await faults.afterPersist("ROOM_CREATE", effect.consultationId);
+      await faults.afterRemoteSuccess("ROOM_CREATE", effect.consultationId);
+      await faults.afterMarkApplied("ROOM_CREATE", effect.consultationId);
     },
   );
+});
+
+test("remote-success and applied crash hooks are scoped and use distinct exits", async () => {
+  const configuredConsultationId = "10000000-0000-4000-8000-000000000012";
+  const exit = vi.spyOn(process, "exit").mockImplementation((code) => {
+    throw new Error(`injected-exit:${code}`);
+  });
+  try {
+    await withFaultFile(
+      {
+        consultations: {
+          [configuredConsultationId]: {
+            crashAfterRemoteSuccess: ["ROOM_CREATE"],
+            crashAfterMarkApplied: ["ROOM_CREATE"],
+          },
+        },
+      },
+      async (faults) => {
+        await faults.afterRemoteSuccess("ROOM_CREATE", effect.consultationId);
+        await faults.afterMarkApplied("ROOM_CREATE", effect.consultationId);
+        await faults.afterRemoteSuccess("PARTICIPANT_GRANT", configuredConsultationId);
+        await faults.afterMarkApplied("PARTICIPANT_GRANT", configuredConsultationId);
+        await assert.rejects(
+          () => faults.afterRemoteSuccess("ROOM_CREATE", configuredConsultationId),
+          /injected-exit:87/,
+        );
+        await assert.rejects(
+          () => faults.afterMarkApplied("ROOM_CREATE", configuredConsultationId),
+          /injected-exit:88/,
+        );
+      },
+    );
+  } finally {
+    exit.mockRestore();
+  }
 });
 
 test("rejects global, non-UUID, and unknown-effect fault configurations", async () => {
@@ -356,19 +516,19 @@ test("rejects global, non-UUID, and unknown-effect fault configurations", async 
   }
 });
 
-test("generation fenced after a remote create compensates instead of completing", async () => {
+test("a rejected atomic applied transition compensates stale remote work", async () => {
   const calls: string[] = [];
-  let generationRead = 0;
+  let transitionAttempted = false;
   const store = {
     claimEffects: async () => [effect],
-    currentGeneration: async () => {
-      generationRead += 1;
-      return generationRead < 3 ? effect.generation : effect.generation + 1;
-    },
+    currentGeneration: async () =>
+      transitionAttempted ? effect.generation + 1 : effect.generation,
     persistCalling: async () => ({ ...effect, state: "calling" as const, attempt: 1 }),
     renewEffectLease: async () => true,
     markApplied: async () => {
-      calls.push("applied");
+      transitionAttempted = true;
+      calls.push("applied-rejected");
+      return "rejected" as const;
     },
     markDone: async () => {
       calls.push("done");
@@ -403,7 +563,7 @@ test("generation fenced after a remote create compensates instead of completing"
 
   await runner.tick();
 
-  assert.deepEqual(calls, ["compensating", "compensate:RM_created", "done"]);
+  assert.deepEqual(calls, ["applied-rejected", "compensating", "compensate:RM_created", "done"]);
 });
 
 test("lost compensation lease stops settlement", async () => {
@@ -439,4 +599,49 @@ test("lost compensation lease stops settlement", async () => {
   await runner.tick();
 
   assert.deepEqual(calls, ["compensate"]);
+});
+
+test("a stale owner cannot persist a remote success after its lease is stolen", async () => {
+  const calls: string[] = [];
+  let renewals = 0;
+  const store = {
+    claimEffects: async () => [effect],
+    currentGeneration: async () => effect.generation,
+    persistCalling: async () => ({ ...effect, state: "calling" as const, attempt: 1 }),
+    renewEffectLease: async () => {
+      renewals += 1;
+      return renewals === 1;
+    },
+    markApplied: async () => {
+      calls.push("applied");
+      return "applied" as const;
+    },
+    markDone: async () => {
+      calls.push("done");
+    },
+    markFailed: async () => {
+      calls.push("failed");
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    adopt: async () => null,
+    execute: async () => {
+      calls.push("remote-success");
+      return { remoteId: "RM_stale", result: {} };
+    },
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "10000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["remote-success"]);
 });

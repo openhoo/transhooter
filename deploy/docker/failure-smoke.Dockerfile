@@ -23,6 +23,6 @@ COPY --chown=transhooter:transhooter tests/failure-smoke/failure-smoke.mjs tests
 COPY --chown=transhooter:transhooter tests/failure-smoke/harness-contracts.mjs tests/failure-smoke/harness-contracts.mjs
 COPY --chown=transhooter:transhooter tests/failure-smoke/harness-contracts.test.mjs tests/failure-smoke/harness-contracts.test.mjs
 COPY --chown=transhooter:transhooter tests/fixtures tests/fixtures
-WORKDIR /workspace/tests/e2e
+WORKDIR /workspace/tests/failure-smoke
 USER transhooter
-CMD ["bun", "../failure-smoke/failure-smoke.mjs"]
+CMD ["bun", "failure-smoke.mjs"]

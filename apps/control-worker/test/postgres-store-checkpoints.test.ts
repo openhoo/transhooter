@@ -77,7 +77,7 @@ describe("PostgresStore supervisor checkpoint settlement", () => {
     expect(fake.calls[3]?.values).toContain(DESTINATION);
     expect(fake.calls[3]?.values).toContain(SOURCE);
     expect(fake.calls[2]?.text).toContain(
-      "accepted_input_sequence,high_watermark,received_output,emitted_output",
+      "accepted_input_sequence,accepted_input,received_output,emitted_output",
     );
     expect(fake.calls[2]?.text).toContain("COALESCE(previous.accepted_input_sequence+1,0)");
   });

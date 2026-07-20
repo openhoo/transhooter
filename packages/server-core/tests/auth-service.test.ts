@@ -24,7 +24,7 @@ type AuthState = {
   sealedLinksById: Map<string, Omit<MagicLinkCandidate, "record">>;
   exchangesByNonceHash: Map<string, PendingExchangeRecord>;
   sessionsById: Map<string, SessionRecord>;
-  admissionCounts: Map<string, number>;
+  admissionRequests: Array<{ emailHash: string | null; ipHash: string; requestedAt: Date }>;
 };
 
 function hash(value: Uint8Array | string): string {
@@ -134,6 +134,21 @@ function createRepository(state: AuthState): AuthRepository {
     lockMagicLinkById: async (id: string) =>
       [...state.magicLinksByTokenHash.values()].find((link) => link.id === id) ?? null,
     createPendingExchange: async (exchange: PendingExchangeRecord) => {
+      const preparedAt = new Date(exchange.expiresAt.getTime() - 5 * 60_000);
+      for (const [nonceHash, existing] of state.exchangesByNonceHash) {
+        if (
+          existing.magicLinkId === exchange.magicLinkId &&
+          (existing.consumedAt !== null || existing.expiresAt <= preparedAt)
+        ) {
+          state.exchangesByNonceHash.delete(nonceHash);
+        }
+      }
+      const live = [...state.exchangesByNonceHash.values()].some(
+        (existing) => existing.magicLinkId === exchange.magicLinkId && existing.consumedAt === null,
+      );
+      if (live) {
+        throw new Error("INVALID_OR_EXPIRED_LINK");
+      }
       state.exchangesByNonceHash.set(exchange.nonceHash, exchange);
     },
     lockPendingExchangeByNonceHash: async (nonceHash: string) =>
@@ -165,18 +180,23 @@ function createRepository(state: AuthState): AuthRepository {
     admitMagicLinkRequest: async (
       emailHash: string | null,
       ipHash: string,
-      _since: Date,
-      _at: Date,
+      since: Date,
+      at: Date,
       emailLimit: number,
       ipLimit: number,
     ) => {
-      const emailKey = `e:${emailHash}`;
-      const ipKey = `i:${ipHash}`;
-      const emailCount = state.admissionCounts.get(emailKey) ?? 0;
-      const ipCount = state.admissionCounts.get(ipKey) ?? 0;
-      state.admissionCounts.set(emailKey, emailCount + 1);
-      state.admissionCounts.set(ipKey, ipCount + 1);
-      return ipCount < ipLimit && (emailHash === null || emailCount < emailLimit);
+      state.admissionRequests = state.admissionRequests.filter(
+        (request) => request.requestedAt > since,
+      );
+      const emailCount = state.admissionRequests.filter(
+        (request) => request.emailHash === emailHash,
+      ).length;
+      const ipCount = state.admissionRequests.filter((request) => request.ipHash === ipHash).length;
+      const admitted = ipCount < ipLimit && (emailHash === null || emailCount < emailLimit);
+      if (admitted) {
+        state.admissionRequests.push({ emailHash, ipHash, requestedAt: at });
+      }
+      return admitted;
     },
     revokeConsultationLinks: async (consultationId: string, revokedAt: Date) => {
       for (const link of state.magicLinksByTokenHash.values()) {
@@ -222,7 +242,7 @@ function createAuthFixture(
     sealedLinksById: new Map(),
     exchangesByNonceHash: new Map(),
     sessionsById: new Map(),
-    admissionCounts: new Map(),
+    admissionRequests: [],
   };
   const repository = createRepository(state);
   const mail = {
@@ -339,6 +359,90 @@ describe("AuthService", () => {
     expect(fixture.mail.sendMagicLink).toHaveBeenCalledTimes(5);
   });
 
+  it("retains only admitted requests after the limit and expires admission rows", async () => {
+    const fixture = createAuthFixture();
+
+    for (let request = 0; request < 100; request += 1) {
+      await requestKnownSignIn(fixture, {
+        ip: "bounded-ip",
+        publicBaseUrl: PUBLIC_BASE_URL,
+      });
+    }
+
+    expect(fixture.mail.sendMagicLink).toHaveBeenCalledTimes(5);
+    expect(fixture.state.admissionRequests).toHaveLength(5);
+
+    fixture.advance(15 * 60_000 + 1);
+    await requestKnownSignIn(fixture, {
+      ip: "bounded-ip",
+      publicBaseUrl: PUBLIC_BASE_URL,
+    });
+
+    expect(fixture.mail.sendMagicLink).toHaveBeenCalledTimes(6);
+    expect(fixture.state.admissionRequests).toHaveLength(1);
+  });
+
+  it("allows only one concurrent live preparation for a magic link", async () => {
+    const fixture = createAuthFixture();
+    await requestKnownSignIn(fixture, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+    const token = tokenFromMagicLinkUrl(
+      requireLastMagicLinkUrl(fixture.mail.sendMagicLink.mock.calls),
+    );
+
+    const preparations = await Promise.allSettled(
+      Array.from({ length: 20 }, () => fixture.service.beginExchange(token)),
+    );
+    const prepared = preparations.filter(
+      (
+        result,
+      ): result is PromiseFulfilledResult<{
+        exchangeNonce: string;
+        verificationCsrfToken: string;
+      }> => result.status === "fulfilled",
+    );
+
+    expect(prepared).toHaveLength(1);
+    expect(fixture.state.exchangesByNonceHash.size).toBe(1);
+    const successfulPreparation = prepared[0];
+    if (!successfulPreparation) {
+      throw new Error("Expected one successful exchange preparation");
+    }
+    await fixture.service.verifyExchange(successfulPreparation.value.exchangeNonce, {
+      csrfToken: successfulPreparation.value.verificationCsrfToken,
+      origin: PUBLIC_BASE_URL,
+      publicBaseUrl: PUBLIC_BASE_URL,
+      requestIp: "1",
+    });
+  });
+
+  it("replaces an expired preparation without retaining or accepting its nonce", async () => {
+    const fixture = createAuthFixture();
+    await requestKnownSignIn(fixture, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL });
+    const token = tokenFromMagicLinkUrl(
+      requireLastMagicLinkUrl(fixture.mail.sendMagicLink.mock.calls),
+    );
+    const expired = await fixture.service.beginExchange(token);
+
+    fixture.advance(5 * 60_000 + 1);
+    const current = await fixture.service.beginExchange(token);
+
+    expect(fixture.state.exchangesByNonceHash.size).toBe(1);
+    await expect(
+      fixture.service.verifyExchange(expired.exchangeNonce, {
+        csrfToken: expired.verificationCsrfToken,
+        origin: PUBLIC_BASE_URL,
+        publicBaseUrl: PUBLIC_BASE_URL,
+        requestIp: "1",
+      }),
+    ).rejects.toThrow(/INVALID_EXCHANGE/);
+    await fixture.service.verifyExchange(current.exchangeNonce, {
+      csrfToken: current.verificationCsrfToken,
+      origin: PUBLIC_BASE_URL,
+      publicBaseUrl: PUBLIC_BASE_URL,
+      requestIp: "1",
+    });
+  });
+
   it("reuses one usable token after ambiguous delivery and duplicate submissions", async () => {
     const fixture = createAuthFixture();
     fixture.mail.sendMagicLink.mockImplementationOnce(async () => {
@@ -445,7 +549,7 @@ describe("AuthService", () => {
     expect(current && restarted.state.sealedLinksById.get(current.id)?.keyId).toBe("new");
   });
 
-  it("fails closed for missing retained keys, legacy rows, and corrupt ciphertext", async () => {
+  it("fails closed for missing retained keys and corrupt ciphertext", async () => {
     const first = createAuthFixture({
       sealer: new TestTokenSealer("old", { old: true }),
     });
@@ -462,14 +566,6 @@ describe("AuthService", () => {
     ).rejects.toThrow(/MAGIC_LINK_DELIVERY_UNRECOVERABLE/);
     expect(missingKey.mail.sendMagicLink).not.toHaveBeenCalled();
     expect(missingKey.state.magicLinksByTokenHash.size).toBe(1);
-
-    first.state.sealedLinksById.delete(link.id);
-    const legacy = createAuthFixture({ state: first.state, sequenceStart: 200 });
-    await expect(
-      requestKnownSignIn(legacy, { ip: "1", publicBaseUrl: PUBLIC_BASE_URL }),
-    ).rejects.toThrow(/MAGIC_LINK_DELIVERY_UNRECOVERABLE/);
-    expect(legacy.mail.sendMagicLink).not.toHaveBeenCalled();
-    expect(legacy.state.magicLinksByTokenHash.size).toBe(1);
 
     first.state.sealedLinksById.set(link.id, {
       keyId: "old",

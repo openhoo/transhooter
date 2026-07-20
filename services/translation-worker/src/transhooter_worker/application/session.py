@@ -12,6 +12,7 @@ from transhooter_worker.application.pipeline import (
     OrderedStageQueue,
     ProviderTerminalSink,
     UtteranceAssembler,
+    publish_complete_pcm_frames,
     upsert_final_span,
 )
 from transhooter_worker.application.retry import FrozenRetryPolicy
@@ -804,42 +805,53 @@ class DirectionSession:
         self._active_synthesis_attempt = attempt
         terminal: OperationTerminal | None = None
         pending_pcm = bytearray()
-        cursor = 0
         try:
             async for event in attempt.events():
                 await self._emit_normalized(event)
                 if isinstance(event, AudioEvent):
                     pending_pcm.extend(event.pcm)
-                    cursor = await self._flush_complete_pcm_frames(pending_pcm, cursor)
+                    await self._publish_complete_pcm_frames(pending_pcm)
                 elif isinstance(event, OperationTerminalEvent):
                     terminal = event.terminal
         finally:
             if self._active_synthesis_attempt is attempt:
                 self._active_synthesis_attempt = None
-        if cursor:
-            del pending_pcm[:cursor]
         if terminal is None:
             raise RuntimeError("synthesis stream ended without terminal")
         return terminal, pending_pcm, int(time.time() * 1000)
 
-    async def _flush_complete_pcm_frames(
-        self,
-        pending_pcm: bytearray,
-        cursor: int,
-    ) -> int:
-        end = len(pending_pcm)
-        while end - cursor >= 1_920:
-            frame = bytes(pending_pcm[cursor : cursor + 1_920])
-            cursor += 1_920
-            await self._audio_sink(frame)
-            self._last_output += 960
-        return cursor
+    async def _publish_complete_pcm_frames(self, pending_pcm: bytearray) -> None:
+        pending_before = len(pending_pcm)
+        try:
+            published_samples = await publish_complete_pcm_frames(
+                pending_pcm,
+                self._audio_sink,
+                1_920,
+            )
+        except Exception:
+            delivered_samples = (pending_before - len(pending_pcm)) // 2
+            self._last_output += delivered_samples
+            await self._checkpoint_published_output_after_failure()
+            raise
+        self._last_output += published_samples
+
+    async def _checkpoint_published_output_after_failure(self) -> None:
+        if self._last_output:
+            await self._checkpoint_sink(
+                self._last_input,
+                self._last_output,
+                False,
+            )
 
     async def _flush_final_pcm_frame(self, pending_pcm: bytearray) -> None:
         if not pending_pcm:
             return
         pending_pcm.extend(b"\0" * (1_920 - len(pending_pcm)))
-        await self._audio_sink(bytes(pending_pcm))
+        try:
+            await self._audio_sink(bytes(pending_pcm))
+        except Exception:
+            await self._checkpoint_published_output_after_failure()
+            raise
         self._last_output += 960
 
     async def _handle_failed_synthesis(

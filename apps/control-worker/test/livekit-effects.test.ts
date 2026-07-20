@@ -2,7 +2,11 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { TrackSource } from "@livekit/protocol";
 import { EgressStatus } from "livekit-server-sdk";
-import { egressStatusName, LiveKitEffects } from "../src/adapters/livekit-effects";
+import {
+  egressStatusName,
+  isViableEgressAdoption,
+  LiveKitEffects,
+} from "../src/adapters/livekit-effects";
 import type { Effect } from "../src/orchestration/model";
 
 const consultationId = "50000000-0000-4000-8000-000000000001";
@@ -84,6 +88,28 @@ test("canonical Egress intent contains only durable identities and semantic outp
   ]) {
     assert.equal(bytes.includes(forbidden), false, `persisted ${forbidden}`);
   }
+});
+
+test("shutdown status is broadcast even when an old plan targets only humans", () => {
+  const adapter = createAdapter();
+  const request = {
+    roomName: "50000000-0000-4000-8000-000000000003",
+    topic: "consultation.status.v1",
+    reasonCode: "SHUTDOWN",
+    state: "finalizing",
+    shutdownAtMs: 123_456,
+    occurredAtMs: 123_000,
+    destinationIdentities: [
+      "50000000-0000-4000-8000-000000000004",
+      "50000000-0000-4000-8000-000000000005",
+    ],
+  };
+  const bytes = Buffer.from(
+    adapter.canonicalRequest({ ...effect, kind: "STATUS_PACKET" }, request),
+  );
+  const encoded = JSON.parse(bytes.toString("utf8"));
+
+  assert.deepEqual(encoded.destinationIdentities ?? [], []);
 });
 
 test("Egress creation returns the durable accepted status without claiming ACTIVE", async () => {
@@ -590,5 +616,20 @@ test("LiveKit numeric Egress statuses persist as canonical literals", () => {
       "EGRESS_ABORTED",
       "EGRESS_LIMIT_REACHED",
     ],
+  );
+});
+
+test("Egress adoption reuses only live lifecycle states", () => {
+  assert.deepEqual(
+    [
+      EgressStatus.EGRESS_STARTING,
+      EgressStatus.EGRESS_ACTIVE,
+      EgressStatus.EGRESS_ENDING,
+      EgressStatus.EGRESS_COMPLETE,
+      EgressStatus.EGRESS_FAILED,
+      EgressStatus.EGRESS_ABORTED,
+      EgressStatus.EGRESS_LIMIT_REACHED,
+    ].map(isViableEgressAdoption),
+    [true, true, false, false, false, false, false],
   );
 });

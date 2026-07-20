@@ -3669,6 +3669,11 @@
           ],
           "then": {
             "properties": {
+              "previousAttemptId": {
+                "not": {
+                  "type": "null"
+                }
+              },
               "retryAtMs": {
                 "not": {
                   "type": "null"
@@ -3676,7 +3681,8 @@
               }
             },
             "required": [
-              "retryAtMs"
+              "retryAtMs",
+              "previousAttemptId"
             ]
           },
           "type": "object"
@@ -4620,6 +4626,11 @@
           ],
           "then": {
             "properties": {
+              "previousAttemptId": {
+                "not": {
+                  "type": "null"
+                }
+              },
               "retryAtMs": {
                 "not": {
                   "type": "null"
@@ -4627,7 +4638,8 @@
               }
             },
             "required": [
-              "retryAtMs"
+              "retryAtMs",
+              "previousAttemptId"
             ]
           },
           "type": "object"
@@ -5942,6 +5954,11 @@
           ],
           "then": {
             "properties": {
+              "previousAttemptId": {
+                "not": {
+                  "type": "null"
+                }
+              },
               "retryAtMs": {
                 "not": {
                   "type": "null"
@@ -5949,7 +5966,8 @@
               }
             },
             "required": [
-              "retryAtMs"
+              "retryAtMs",
+              "previousAttemptId"
             ]
           },
           "type": "object"
@@ -6775,6 +6793,11 @@
               ],
               "then": {
                 "properties": {
+                  "previousAttemptId": {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
                   "retryAtMs": {
                     "not": {
                       "type": "null"
@@ -6782,7 +6805,8 @@
                   }
                 },
                 "required": [
-                  "retryAtMs"
+                  "retryAtMs",
+                  "previousAttemptId"
                 ]
               },
               "type": "object"
@@ -7494,6 +7518,11 @@
               ],
               "then": {
                 "properties": {
+                  "previousAttemptId": {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
                   "retryAtMs": {
                     "not": {
                       "type": "null"
@@ -7501,7 +7530,8 @@
                   }
                 },
                 "required": [
-                  "retryAtMs"
+                  "retryAtMs",
+                  "previousAttemptId"
                 ]
               },
               "type": "object"
@@ -8185,6 +8215,11 @@
               ],
               "then": {
                 "properties": {
+                  "previousAttemptId": {
+                    "not": {
+                      "type": "null"
+                    }
+                  },
                   "retryAtMs": {
                     "not": {
                       "type": "null"
@@ -8192,7 +8227,8 @@
                   }
                 },
                 "required": [
-                  "retryAtMs"
+                  "retryAtMs",
+                  "previousAttemptId"
                 ]
               },
               "type": "object"
@@ -9363,6 +9399,11 @@
       ],
       "then": {
         "properties": {
+          "previousAttemptId": {
+            "not": {
+              "type": "null"
+            }
+          },
           "retryAtMs": {
             "not": {
               "type": "null"
@@ -9370,7 +9411,8 @@
           }
         },
         "required": [
-          "retryAtMs"
+          "retryAtMs",
+          "previousAttemptId"
         ]
       },
       "type": "object"
@@ -11919,6 +11961,11 @@
           ],
           "then": {
             "properties": {
+              "previousAttemptId": {
+                "not": {
+                  "type": "null"
+                }
+              },
               "retryAtMs": {
                 "not": {
                   "type": "null"
@@ -11926,7 +11973,8 @@
               }
             },
             "required": [
-              "retryAtMs"
+              "retryAtMs",
+              "previousAttemptId"
             ]
           },
           "type": "object"

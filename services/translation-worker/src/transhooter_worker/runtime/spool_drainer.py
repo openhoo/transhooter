@@ -4,10 +4,12 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import FrameType
 from uuid import UUID
 
 import boto3  # type: ignore[import-untyped]
@@ -276,7 +278,7 @@ class ArchiveObjectRegistrationClient:
         if response.status_code // 100 != 2:
             error_type = (
                 RetryableRegistrationError
-                if response.status_code in {408, 425, 429} or response.status_code >= 500
+                if response.status_code in {401, 403, 408, 425, 429} or response.status_code >= 500
                 else PermanentRegistrationError
             )
             response_code = "unknown"
@@ -352,6 +354,11 @@ def _register_object(
         _finish_span(span, "ok")
 
 
+def _is_transient_auth_rejection(error: PermanentControlRequestError) -> bool:
+    message = str(error)
+    return message.endswith("HTTP 401") or message.endswith("HTTP 403")
+
+
 async def _register_object_async(
     register: Callable[[UUID, UUID, str, ObjectRecord], Awaitable[None]],
     meeting: UUID,
@@ -367,6 +374,11 @@ async def _register_object_async(
         try:
             await register(meeting, object_id, object_class, record)
         except PermanentControlRequestError as error:
+            if _is_transient_auth_rejection(error):
+                retryable = RetryableRegistrationError(str(error), (error,))
+                _record_registration("retryable", normalized_class, retryable)
+                _finish_span(span, "retryable", retryable)
+                raise retryable from error
             _record_registration("permanent", normalized_class, error)
             _finish_span(span, "permanent", error)
             raise
@@ -524,6 +536,10 @@ def _drain_once(
             _finish_span(span, result, drain_error)
 
 
+def _handle_sigterm(_signum: int, _frame: FrameType | None) -> None:
+    raise SystemExit(0)
+
+
 def main() -> None:
     telemetry = configure_telemetry(
         os.environ.get("OTEL_SERVICE_NAME", "").strip() or "transhooter-spool-drainer",
@@ -531,15 +547,12 @@ def main() -> None:
         environment=os.environ.get("APP_ENV"),
         metric_export_interval_millis=_metric_export_interval(),
     )
+    previous_sigterm_handler = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
-        token_file = (
-            os.environ.get("INTERNAL_TOKEN_FILE")
-            or os.environ.get("WORKER_INTERNAL_BEARER_FILE")
-            or os.environ.get("INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE")
-        )
+        token_file = os.environ.get("INTERNAL_TOKEN_FILE")
         if not token_file:
-            raise RuntimeError("spool drainer internal bearer file is required")
-        root = Path(os.environ.get("SPOOL_PATH", os.environ.get("SPOOL_DIR", "")))
+            raise RuntimeError("INTERNAL_TOKEN_FILE is required for spool draining")
+        root = Path(os.environ["SPOOL_PATH"])
         spool = _build_spool(root)
         archive = build_archive(root)
         registration = ArchiveObjectRegistrationClient(
@@ -562,6 +575,7 @@ def main() -> None:
                     return
             time.sleep(1)
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm_handler)
         telemetry.shutdown()
 
 

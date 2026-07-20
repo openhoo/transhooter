@@ -49,6 +49,7 @@ CREATE TABLE "archives" (
 	"created_at" timestamp with time zone NOT NULL,
 	"updated_at" timestamp with time zone NOT NULL,
 	CONSTRAINT "archives_consultation_id_key" UNIQUE("consultation_id"),
+	CONSTRAINT "archives_id_consultation_id_key" UNIQUE("id","consultation_id"),
 	CONSTRAINT "archives_write_epoch_check" CHECK (write_epoch >= 0),
 	CONSTRAINT "archives_hold_operation_kind_check" CHECK (hold_operation_kind = ANY (ARRAY['add'::text, 'release'::text])),
 	CONSTRAINT "archives_check" CHECK (((hold_operation_id IS NULL) = (hold_operation_owner IS NULL)) AND ((hold_operation_id IS NULL) = (hold_operation_kind IS NULL)) AND ((hold_operation_id IS NULL) = (hold_operation_started_at IS NULL)) AND ((hold_operation_id IS NULL) = (hold_operation_lease_expires_at IS NULL)))
@@ -112,6 +113,7 @@ CREATE TABLE "consultation_participants" (
 	"participant_egress_id" text,
 	"joined_at" timestamp with time zone,
 	"disconnected_at" timestamp with time zone,
+	CONSTRAINT "consultation_participants_consultation_id_id_key" UNIQUE("consultation_id","id"),
 	CONSTRAINT "consultation_participants_consultation_id_role_key" UNIQUE("consultation_id","role"),
 	CONSTRAINT "consultation_participants_consultation_id_user_id_key" UNIQUE("consultation_id","user_id"),
 	CONSTRAINT "consultation_participants_livekit_identity_key" UNIQUE("livekit_identity"),
@@ -141,13 +143,19 @@ CREATE TABLE "consultations" (
 	"both_absent_since" timestamp with time zone,
 	"admission_fenced_at" timestamp with time zone,
 	"effect_generation" integer DEFAULT 0 NOT NULL,
+	"employee_user_id" uuid,
+	"creation_idempotency_key" text,
+	"presence_epoch" bigint DEFAULT 0 NOT NULL,
 	"created_at" timestamp with time zone NOT NULL,
 	"updated_at" timestamp with time zone NOT NULL,
 	"deleted_at" timestamp with time zone,
 	CONSTRAINT "consultations_room_name_key" UNIQUE("room_name"),
 	CONSTRAINT "consultations_worker_identity_key" UNIQUE("worker_identity"),
+	CONSTRAINT "consultations_employee_user_id_creation_idempotency_key_key" UNIQUE("employee_user_id","creation_idempotency_key"),
 	CONSTRAINT "consultations_generation_check" CHECK (generation >= 0),
 	CONSTRAINT "consultations_effect_generation_check" CHECK (effect_generation >= 0),
+	CONSTRAINT "consultations_presence_epoch_check" CHECK (presence_epoch >= 0),
+	CONSTRAINT "consultations_creation_idempotency_key_scope_check" CHECK ((employee_user_id IS NULL) = (creation_idempotency_key IS NULL)),
 	CONSTRAINT "consultations_check" CHECK ((provider_selection IS NULL) = (snapshot_hash IS NULL)),
 	CONSTRAINT "consultations_check1" CHECK ((state = 'invited'::consultation_state) OR (room_name IS NOT NULL) OR (state = ANY (ARRAY['cancelled'::consultation_state, 'deleted'::consultation_state])))
 );
@@ -191,12 +199,14 @@ CREATE TABLE "egress_jobs" (
 	"created_at" timestamp with time zone NOT NULL,
 	CONSTRAINT "egress_jobs_consultation_id_generation_kind_subject_id_key" UNIQUE("consultation_id","generation","kind","subject_id"),
 	CONSTRAINT "egress_jobs_egress_id_key" UNIQUE("egress_id"),
-	CONSTRAINT "egress_jobs_kind_check" CHECK (kind = ANY (ARRAY['room_composite'::text, 'participant'::text, 'track'::text]))
+	CONSTRAINT "egress_jobs_kind_check" CHECK (kind = ANY (ARRAY['room_composite'::text, 'participant'::text, 'track'::text])),
+	CONSTRAINT "egress_jobs_state_check" CHECK (state = ANY (ARRAY['requested'::text, 'EGRESS_STARTING'::text, 'EGRESS_ACTIVE'::text, 'EGRESS_ENDING'::text, 'EGRESS_COMPLETE'::text, 'EGRESS_FAILED'::text, 'EGRESS_ABORTED'::text, 'EGRESS_LIMIT_REACHED'::text]))
 );
 --> statement-breakpoint
 CREATE TABLE "expected_archive_artifacts" (
 	"id" uuid PRIMARY KEY NOT NULL,
 	"archive_id" uuid NOT NULL,
+	"effect_id" uuid,
 	"profile_id" uuid NOT NULL,
 	"profile_revision" integer NOT NULL,
 	"object_class" text NOT NULL,
@@ -210,6 +220,7 @@ CREATE TABLE "expected_archive_artifacts" (
 	"fulfilled_object_id" uuid,
 	"created_at" timestamp with time zone NOT NULL,
 	CONSTRAINT "expected_archive_artifacts_archive_id_object_class_causal_k_key" UNIQUE("archive_id","object_class","causal_key"),
+	CONSTRAINT "expected_archive_artifacts_effect_id_key" UNIQUE("effect_id"),
 	CONSTRAINT "expected_archive_artifacts_check" CHECK (((sample_start IS NULL) AND (sample_end IS NULL)) OR ((sample_start >= 0) AND (sample_end > sample_start))),
 	CONSTRAINT "expected_archive_artifacts_check1" CHECK (((segment_start IS NULL) AND (segment_end IS NULL)) OR ((segment_start >= 0) AND (segment_end > segment_start)))
 );
@@ -230,10 +241,12 @@ CREATE TABLE "external_effects" (
 	"compensation_result" jsonb,
 	"created_at" timestamp with time zone NOT NULL,
 	"updated_at" timestamp with time zone NOT NULL,
-	CONSTRAINT "external_effect_occurrence_unique" UNIQUE("consultation_id","generation","effect_kind","subject_id"),
+	"occurrence_key" text DEFAULT '' NOT NULL,
+	CONSTRAINT "external_effect_occurrence_unique" UNIQUE("consultation_id","generation","effect_kind","subject_id","occurrence_key"),
 	CONSTRAINT "external_effects_attempts_check" CHECK (attempts >= 0),
 	CONSTRAINT "external_effects_check" CHECK ((request_bytes IS NULL) = (request_hash IS NULL)),
-	CONSTRAINT "external_effects_check1" CHECK ((state = 'planned'::external_effect_state) OR (request_hash IS NOT NULL))
+	CONSTRAINT "external_effects_check1" CHECK ((state = 'planned'::external_effect_state) OR (request_hash IS NOT NULL)),
+	CONSTRAINT "external_effects_egress_intent_redacted_check" CHECK (effect_kind NOT IN ('ROOM_COMPOSITE_EGRESS', 'PARTICIPANT_EGRESS') OR request_bytes IS NULL OR lower(convert_from(request_bytes, 'UTF8')) !~ '"(accesskey|secret|custombaseurl|signature|authorization|token|filenameprefix|playlistname|liveplaylistname)"')
 );
 --> statement-breakpoint
 CREATE TABLE "final_inventories" (
@@ -344,8 +357,11 @@ CREATE TABLE "magic_links" (
 	"consumed_at" timestamp with time zone,
 	"revoked_at" timestamp with time zone,
 	"created_at" timestamp with time zone NOT NULL,
+	"sealed_raw_token" text NOT NULL,
+	"sealed_token_key_id" text NOT NULL,
 	CONSTRAINT "magic_links_token_hash_key" UNIQUE("token_hash"),
-	CONSTRAINT "magic_links_check" CHECK ((purpose <> 'archive_delete_reauth'::magic_link_purpose) OR ((user_id IS NOT NULL) AND (consultation_id IS NOT NULL) AND (session_id IS NOT NULL)))
+	CONSTRAINT "magic_links_check" CHECK ((purpose <> 'archive_delete_reauth'::magic_link_purpose) OR ((user_id IS NOT NULL) AND (consultation_id IS NOT NULL) AND (session_id IS NOT NULL))),
+	CONSTRAINT "magic_links_sealed_token_nonempty_check" CHECK (length(sealed_raw_token) > 0 AND length(sealed_token_key_id) > 0)
 );
 --> statement-breakpoint
 CREATE TABLE "multipart_parts" (
@@ -527,7 +543,12 @@ CREATE TABLE "worker_checkpoints" (
 	"worker_id" uuid NOT NULL,
 	"worker_epoch" bigint NOT NULL,
 	"write_epoch" integer NOT NULL,
-	"high_watermark" bigint NOT NULL,
+	"source_participant_id" uuid NOT NULL,
+	"destination_participant_id" uuid NOT NULL,
+	"accepted_input_sequence" bigint NOT NULL,
+	"accepted_input" bigint NOT NULL,
+	"received_output" bigint NOT NULL,
+	"emitted_output" bigint NOT NULL,
 	"previous_hash" text,
 	"checkpoint_hash" text NOT NULL,
 	"expected_ids" jsonb NOT NULL,
@@ -537,9 +558,12 @@ CREATE TABLE "worker_checkpoints" (
 	"object_key" text NOT NULL,
 	"object_version_id" text,
 	"created_at" timestamp with time zone NOT NULL,
-	CONSTRAINT "worker_checkpoints_consultation_id_worker_epoch_high_waterm_key" UNIQUE("consultation_id","worker_epoch","high_watermark"),
+	CONSTRAINT "worker_checkpoints_direction_watermarks_key" UNIQUE("consultation_id","worker_epoch","source_participant_id","destination_participant_id","accepted_input_sequence","accepted_input","received_output","emitted_output"),
 	CONSTRAINT "worker_checkpoints_checkpoint_hash_key" UNIQUE("checkpoint_hash"),
-	CONSTRAINT "worker_checkpoints_high_watermark_check" CHECK (high_watermark >= 0)
+	CONSTRAINT "worker_checkpoints_accepted_input_sequence_check" CHECK (accepted_input_sequence >= 0),
+	CONSTRAINT "worker_checkpoints_accepted_input_check" CHECK (accepted_input >= 0),
+	CONSTRAINT "worker_checkpoints_received_output_check" CHECK (received_output >= 0),
+	CONSTRAINT "worker_checkpoints_emitted_output_check" CHECK (emitted_output >= 0)
 );
 --> statement-breakpoint
 CREATE TABLE "worker_job_epochs" (
@@ -607,11 +631,13 @@ ALTER TABLE "consultation_participants" ADD CONSTRAINT "consultation_participant
 ALTER TABLE "consultation_participants" ADD CONSTRAINT "consultation_participants_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "consultation_participants" ADD CONSTRAINT "consultation_participants_capability_row_id_fkey" FOREIGN KEY ("capability_row_id") REFERENCES "public"."language_capabilities"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "consultations" ADD CONSTRAINT "consultations_provider_profile_id_provider_profile_revisio_fkey" FOREIGN KEY ("provider_profile_id","provider_profile_revision") REFERENCES "public"."provider_profile_revisions"("profile_id","revision") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "consultations" ADD CONSTRAINT "consultations_employee_user_id_fkey" FOREIGN KEY ("employee_user_id") REFERENCES "public"."users"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "deletion_scans" ADD CONSTRAINT "deletion_scans_archive_id_fkey" FOREIGN KEY ("archive_id") REFERENCES "public"."archives"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "effect_compensation_attempts" ADD CONSTRAINT "effect_compensation_attempts_effect_id_fkey" FOREIGN KEY ("effect_id") REFERENCES "public"."external_effects"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "egress_jobs" ADD CONSTRAINT "egress_jobs_consultation_id_fkey" FOREIGN KEY ("consultation_id") REFERENCES "public"."consultations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "egress_jobs" ADD CONSTRAINT "egress_expected_artifact_fk" FOREIGN KEY ("expected_artifact_id") REFERENCES "public"."expected_archive_artifacts"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "expected_archive_artifacts" ADD CONSTRAINT "expected_archive_artifacts_archive_id_fkey" FOREIGN KEY ("archive_id") REFERENCES "public"."archives"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "expected_archive_artifacts" ADD CONSTRAINT "expected_archive_artifacts_effect_id_fkey" FOREIGN KEY ("effect_id") REFERENCES "public"."external_effects"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "expected_archive_artifacts" ADD CONSTRAINT "expected_archive_artifacts_profile_id_profile_revision_fkey" FOREIGN KEY ("profile_id","profile_revision") REFERENCES "public"."provider_profile_revisions"("profile_id","revision") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "expected_archive_artifacts" ADD CONSTRAINT "expected_fulfilled_object_fk" FOREIGN KEY ("fulfilled_object_id") REFERENCES "public"."archive_objects"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "external_effects" ADD CONSTRAINT "external_effects_consultation_id_fkey" FOREIGN KEY ("consultation_id") REFERENCES "public"."consultations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
@@ -632,8 +658,7 @@ ALTER TABLE "multipart_parts" ADD CONSTRAINT "multipart_parts_upload_id_fkey" FO
 ALTER TABLE "multipart_uploads" ADD CONSTRAINT "multipart_uploads_archive_id_fkey" FOREIGN KEY ("archive_id") REFERENCES "public"."archives"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "orchestration_deadlines" ADD CONSTRAINT "orchestration_deadlines_consultation_id_fkey" FOREIGN KEY ("consultation_id") REFERENCES "public"."consultations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "pending_exchanges" ADD CONSTRAINT "pending_exchanges_magic_link_id_fkey" FOREIGN KEY ("magic_link_id") REFERENCES "public"."magic_links"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "provider_attempts" ADD CONSTRAINT "provider_attempts_archive_id_fkey" FOREIGN KEY ("archive_id") REFERENCES "public"."archives"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "provider_attempts" ADD CONSTRAINT "provider_attempts_consultation_id_fkey" FOREIGN KEY ("consultation_id") REFERENCES "public"."consultations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "provider_attempts" ADD CONSTRAINT "provider_attempts_archive_consultation_fkey" FOREIGN KEY ("archive_id","consultation_id") REFERENCES "public"."archives"("id","consultation_id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "provider_attempts" ADD CONSTRAINT "provider_attempts_retry_of_fkey" FOREIGN KEY ("retry_of") REFERENCES "public"."provider_attempts"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "provider_attempts" ADD CONSTRAINT "provider_attempts_profile_id_profile_revision_fkey" FOREIGN KEY ("profile_id","profile_revision") REFERENCES "public"."provider_profile_revisions"("profile_id","revision") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "provider_profile_revisions" ADD CONSTRAINT "provider_profile_revisions_profile_id_fkey" FOREIGN KEY ("profile_id") REFERENCES "public"."provider_profiles"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
@@ -644,6 +669,8 @@ ALTER TABLE "sessions" ADD CONSTRAINT "sessions_reauth_consultation_id_fkey" FOR
 ALTER TABLE "sessions" ADD CONSTRAINT "sessions_replaced_by_fkey" FOREIGN KEY ("replaced_by") REFERENCES "public"."sessions"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "worker_checkpoints" ADD CONSTRAINT "worker_checkpoints_consultation_id_fkey" FOREIGN KEY ("consultation_id") REFERENCES "public"."consultations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "worker_checkpoints" ADD CONSTRAINT "worker_checkpoints_consultation_id_generation_worker_id_wo_fkey" FOREIGN KEY ("consultation_id","generation","worker_id","worker_epoch") REFERENCES "public"."worker_reservations"("consultation_id","generation","worker_id","epoch") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "worker_checkpoints" ADD CONSTRAINT "worker_checkpoints_source_participant_fkey" FOREIGN KEY ("consultation_id","source_participant_id") REFERENCES "public"."consultation_participants"("consultation_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "worker_checkpoints" ADD CONSTRAINT "worker_checkpoints_destination_participant_fkey" FOREIGN KEY ("consultation_id","destination_participant_id") REFERENCES "public"."consultation_participants"("consultation_id","id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "worker_job_epochs" ADD CONSTRAINT "worker_job_epochs_consultation_id_fkey" FOREIGN KEY ("consultation_id") REFERENCES "public"."consultations"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "worker_job_epochs" ADD CONSTRAINT "worker_job_epochs_worker_id_fkey" FOREIGN KEY ("worker_id") REFERENCES "public"."worker_leases"("worker_id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "worker_job_epochs" ADD CONSTRAINT "worker_job_terminal_checkpoint_fk" FOREIGN KEY ("terminal_checkpoint_id") REFERENCES "public"."worker_checkpoints"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
@@ -653,4 +680,8 @@ CREATE INDEX "audit_aggregate_sequence_idx" ON "audit_events" USING btree ("aggr
 CREATE UNIQUE INDEX "legal_holds_active_unique" ON "legal_holds" USING btree ("archive_id" uuid_ops,"id" uuid_ops) WHERE (released_at IS NULL);--> statement-breakpoint
 CREATE INDEX "magic_link_email_rate_idx" ON "magic_link_requests" USING btree ("email_hash" text_ops,"requested_at" timestamptz_ops);--> statement-breakpoint
 CREATE INDEX "magic_link_ip_rate_idx" ON "magic_link_requests" USING btree ("ip_hash" text_ops,"requested_at" timestamptz_ops);--> statement-breakpoint
-CREATE INDEX "outbox_claim_idx" ON "outbox" USING btree ("available_at" timestamptz_ops) WHERE (delivered_at IS NULL);
+CREATE INDEX "magic_link_requested_at_idx" ON "magic_link_requests" USING btree ("requested_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "magic_links_active_identity_unique" ON "magic_links" USING btree (COALESCE("user_id"::text, ''),"purpose",COALESCE("consultation_id"::text, ''),COALESCE("session_id"::text, '')) WHERE "magic_links"."consumed_at" IS NULL AND "magic_links"."revoked_at" IS NULL;--> statement-breakpoint
+CREATE INDEX "outbox_claim_idx" ON "outbox" USING btree ("available_at" timestamptz_ops) WHERE (delivered_at IS NULL);--> statement-breakpoint
+CREATE UNIQUE INDEX "pending_exchanges_live_magic_link_unique" ON "pending_exchanges" USING btree ("magic_link_id") WHERE "pending_exchanges"."consumed_at" IS NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "worker_checkpoints_terminal_direction_unique" ON "worker_checkpoints" USING btree ("consultation_id" uuid_ops,"generation" int4_ops,"worker_id" uuid_ops,"worker_epoch" int8_ops,"source_participant_id" uuid_ops,"destination_participant_id" uuid_ops) WHERE terminal;

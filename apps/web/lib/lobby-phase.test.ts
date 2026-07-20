@@ -102,6 +102,29 @@ describe("lobby preview request fence", () => {
     expect(supersedingRequest.signal.aborted).toBe(true);
   });
 
+  test("a canceled acquisition cannot adopt or retain a late stream", () => {
+    let stops = 0;
+    const stream: PreviewStream = {
+      getTracks: () => [
+        {
+          stop: () => {
+            stops += 1;
+          },
+        },
+      ],
+    };
+    const fence = new LobbyPreviewFence();
+    const request = fence.begin();
+
+    fence.cancel();
+
+    expect(request.signal.aborted).toBe(true);
+    expect(fence.adopt(request, stream)).toBe(false);
+    expect(fence.owns(request, stream)).toBe(false);
+    expect(fence.settle(request)).toBe(false);
+    expect(stops).toBe(1);
+  });
+
   test("a throwing track cannot prevent the remaining tracks from stopping", () => {
     let secondTrackStops = 0;
     const stream: PreviewStream = {

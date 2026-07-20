@@ -49,11 +49,7 @@ export function MagicLinkForm() {
         </p>
       )}
       <button className="button" disabled={state === "sending"} type="submit">
-        {state === "sending"
-          ? "Sending…"
-          : state === "sent"
-            ? "Resend the same sign-in link"
-            : "Email me a sign-in link"}
+        {state === "sending" ? "Sending…" : "Email me a sign-in link"}
       </button>
     </form>
   );

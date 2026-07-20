@@ -1,5 +1,5 @@
 {
-  "id": "9debf7c9-0a1a-476f-859b-7e0de2b79aa4",
+  "id": "90078be7-7cc4-4c81-ab96-a595e80c1050",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -289,6 +289,14 @@
           "name": "archives_consultation_id_key",
           "nullsNotDistinct": false,
           "columns": [
+            "consultation_id"
+          ]
+        },
+        "archives_id_consultation_id_key": {
+          "name": "archives_id_consultation_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
             "consultation_id"
           ]
         }
@@ -761,6 +769,14 @@
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
+        "consultation_participants_consultation_id_id_key": {
+          "name": "consultation_participants_consultation_id_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "consultation_id",
+            "id"
+          ]
+        },
         "consultation_participants_consultation_id_role_key": {
           "name": "consultation_participants_consultation_id_role_key",
           "nullsNotDistinct": false,
@@ -924,6 +940,25 @@
           "notNull": true,
           "default": 0
         },
+        "employee_user_id": {
+          "name": "employee_user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "creation_idempotency_key": {
+          "name": "creation_idempotency_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "presence_epoch": {
+          "name": "presence_epoch",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",
@@ -959,6 +994,19 @@
           ],
           "onDelete": "no action",
           "onUpdate": "no action"
+        },
+        "consultations_employee_user_id_fkey": {
+          "name": "consultations_employee_user_id_fkey",
+          "tableFrom": "consultations",
+          "tableTo": "users",
+          "columnsFrom": [
+            "employee_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -976,6 +1024,14 @@
           "columns": [
             "worker_identity"
           ]
+        },
+        "consultations_employee_user_id_creation_idempotency_key_key": {
+          "name": "consultations_employee_user_id_creation_idempotency_key_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "employee_user_id",
+            "creation_idempotency_key"
+          ]
         }
       },
       "policies": {},
@@ -987,6 +1043,14 @@
         "consultations_effect_generation_check": {
           "name": "consultations_effect_generation_check",
           "value": "effect_generation >= 0"
+        },
+        "consultations_presence_epoch_check": {
+          "name": "consultations_presence_epoch_check",
+          "value": "presence_epoch >= 0"
+        },
+        "consultations_creation_idempotency_key_scope_check": {
+          "name": "consultations_creation_idempotency_key_scope_check",
+          "value": "(employee_user_id IS NULL) = (creation_idempotency_key IS NULL)"
         },
         "consultations_check": {
           "name": "consultations_check",
@@ -1295,6 +1359,10 @@
         "egress_jobs_kind_check": {
           "name": "egress_jobs_kind_check",
           "value": "kind = ANY (ARRAY['room_composite'::text, 'participant'::text, 'track'::text])"
+        },
+        "egress_jobs_state_check": {
+          "name": "egress_jobs_state_check",
+          "value": "state = ANY (ARRAY['requested'::text, 'EGRESS_STARTING'::text, 'EGRESS_ACTIVE'::text, 'EGRESS_ENDING'::text, 'EGRESS_COMPLETE'::text, 'EGRESS_FAILED'::text, 'EGRESS_ABORTED'::text, 'EGRESS_LIMIT_REACHED'::text])"
         }
       },
       "isRLSEnabled": false
@@ -1314,6 +1382,12 @@
           "type": "uuid",
           "primaryKey": false,
           "notNull": true
+        },
+        "effect_id": {
+          "name": "effect_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
         },
         "profile_id": {
           "name": "profile_id",
@@ -1404,6 +1478,19 @@
           "onDelete": "no action",
           "onUpdate": "no action"
         },
+        "expected_archive_artifacts_effect_id_fkey": {
+          "name": "expected_archive_artifacts_effect_id_fkey",
+          "tableFrom": "expected_archive_artifacts",
+          "tableTo": "external_effects",
+          "columnsFrom": [
+            "effect_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
         "expected_archive_artifacts_profile_id_profile_revision_fkey": {
           "name": "expected_archive_artifacts_profile_id_profile_revision_fkey",
           "tableFrom": "expected_archive_artifacts",
@@ -1442,6 +1529,13 @@
             "archive_id",
             "object_class",
             "causal_key"
+          ]
+        },
+        "expected_archive_artifacts_effect_id_key": {
+          "name": "expected_archive_artifacts_effect_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "effect_id"
           ]
         }
       },
@@ -1553,6 +1647,13 @@
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": true
+        },
+        "occurrence_key": {
+          "name": "occurrence_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "''"
         }
       },
       "indexes": {},
@@ -1580,7 +1681,8 @@
             "consultation_id",
             "generation",
             "effect_kind",
-            "subject_id"
+            "subject_id",
+            "occurrence_key"
           ]
         }
       },
@@ -1597,6 +1699,10 @@
         "external_effects_check1": {
           "name": "external_effects_check1",
           "value": "(state = 'planned'::external_effect_state) OR (request_hash IS NOT NULL)"
+        },
+        "external_effects_egress_intent_redacted_check": {
+          "name": "external_effects_egress_intent_redacted_check",
+          "value": "effect_kind NOT IN ('ROOM_COMPOSITE_EGRESS', 'PARTICIPANT_EGRESS') OR request_bytes IS NULL OR lower(convert_from(request_bytes, 'UTF8')) !~ '\"(accesskey|secret|custombaseurl|signature|authorization|token|filenameprefix|playlistname|liveplaylistname)\"'"
         }
       },
       "isRLSEnabled": false
@@ -2354,6 +2460,21 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "magic_link_requested_at_idx": {
+          "name": "magic_link_requested_at_idx",
+          "columns": [
+            {
+              "expression": "requested_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {},
@@ -2427,9 +2548,56 @@
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": true
+        },
+        "sealed_raw_token": {
+          "name": "sealed_raw_token",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sealed_token_key_id": {
+          "name": "sealed_token_key_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
         }
       },
-      "indexes": {},
+      "indexes": {
+        "magic_links_active_identity_unique": {
+          "name": "magic_links_active_identity_unique",
+          "columns": [
+            {
+              "expression": "COALESCE(\"user_id\"::text, '')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "purpose",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "COALESCE(\"consultation_id\"::text, '')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "COALESCE(\"session_id\"::text, '')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"magic_links\".\"consumed_at\" IS NULL AND \"magic_links\".\"revoked_at\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {
         "magic_links_user_id_fkey": {
           "name": "magic_links_user_id_fkey",
@@ -2486,6 +2654,10 @@
         "magic_links_check": {
           "name": "magic_links_check",
           "value": "(purpose <> 'archive_delete_reauth'::magic_link_purpose) OR ((user_id IS NOT NULL) AND (consultation_id IS NOT NULL) AND (session_id IS NOT NULL))"
+        },
+        "magic_links_sealed_token_nonempty_check": {
+          "name": "magic_links_sealed_token_nonempty_check",
+          "value": "length(sealed_raw_token) > 0 AND length(sealed_token_key_id) > 0"
         }
       },
       "isRLSEnabled": false
@@ -2901,7 +3073,24 @@
           "notNull": true
         }
       },
-      "indexes": {},
+      "indexes": {
+        "pending_exchanges_live_magic_link_unique": {
+          "name": "pending_exchanges_live_magic_link_unique",
+          "columns": [
+            {
+              "expression": "magic_link_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"pending_exchanges\".\"consumed_at\" IS NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {
         "pending_exchanges_magic_link_id_fkey": {
           "name": "pending_exchanges_magic_link_id_fkey",
@@ -3156,28 +3345,17 @@
       },
       "indexes": {},
       "foreignKeys": {
-        "provider_attempts_archive_id_fkey": {
-          "name": "provider_attempts_archive_id_fkey",
+        "provider_attempts_archive_consultation_fkey": {
+          "name": "provider_attempts_archive_consultation_fkey",
           "tableFrom": "provider_attempts",
           "tableTo": "archives",
           "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "no action",
-          "onUpdate": "no action"
-        },
-        "provider_attempts_consultation_id_fkey": {
-          "name": "provider_attempts_consultation_id_fkey",
-          "tableFrom": "provider_attempts",
-          "tableTo": "consultations",
-          "columnsFrom": [
+            "archive_id",
             "consultation_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "consultation_id"
           ],
           "onDelete": "no action",
           "onUpdate": "no action"
@@ -3728,8 +3906,38 @@
           "primaryKey": false,
           "notNull": true
         },
-        "high_watermark": {
-          "name": "high_watermark",
+        "source_participant_id": {
+          "name": "source_participant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "destination_participant_id": {
+          "name": "destination_participant_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "accepted_input_sequence": {
+          "name": "accepted_input_sequence",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "accepted_input": {
+          "name": "accepted_input",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "received_output": {
+          "name": "received_output",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "emitted_output": {
+          "name": "emitted_output",
           "type": "bigint",
           "primaryKey": false,
           "notNull": true
@@ -3789,7 +3997,60 @@
           "notNull": true
         }
       },
-      "indexes": {},
+      "indexes": {
+        "worker_checkpoints_terminal_direction_unique": {
+          "name": "worker_checkpoints_terminal_direction_unique",
+          "columns": [
+            {
+              "expression": "consultation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last",
+              "opclass": "uuid_ops"
+            },
+            {
+              "expression": "generation",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last",
+              "opclass": "int4_ops"
+            },
+            {
+              "expression": "worker_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last",
+              "opclass": "uuid_ops"
+            },
+            {
+              "expression": "worker_epoch",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last",
+              "opclass": "int8_ops"
+            },
+            {
+              "expression": "source_participant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last",
+              "opclass": "uuid_ops"
+            },
+            {
+              "expression": "destination_participant_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last",
+              "opclass": "uuid_ops"
+            }
+          ],
+          "isUnique": true,
+          "where": "terminal",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {
         "worker_checkpoints_consultation_id_fkey": {
           "name": "worker_checkpoints_consultation_id_fkey",
@@ -3822,17 +4083,52 @@
           ],
           "onDelete": "no action",
           "onUpdate": "no action"
+        },
+        "worker_checkpoints_source_participant_fkey": {
+          "name": "worker_checkpoints_source_participant_fkey",
+          "tableFrom": "worker_checkpoints",
+          "tableTo": "consultation_participants",
+          "columnsFrom": [
+            "consultation_id",
+            "source_participant_id"
+          ],
+          "columnsTo": [
+            "consultation_id",
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        },
+        "worker_checkpoints_destination_participant_fkey": {
+          "name": "worker_checkpoints_destination_participant_fkey",
+          "tableFrom": "worker_checkpoints",
+          "tableTo": "consultation_participants",
+          "columnsFrom": [
+            "consultation_id",
+            "destination_participant_id"
+          ],
+          "columnsTo": [
+            "consultation_id",
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
-        "worker_checkpoints_consultation_id_worker_epoch_high_waterm_key": {
-          "name": "worker_checkpoints_consultation_id_worker_epoch_high_waterm_key",
+        "worker_checkpoints_direction_watermarks_key": {
+          "name": "worker_checkpoints_direction_watermarks_key",
           "nullsNotDistinct": false,
           "columns": [
             "consultation_id",
             "worker_epoch",
-            "high_watermark"
+            "source_participant_id",
+            "destination_participant_id",
+            "accepted_input_sequence",
+            "accepted_input",
+            "received_output",
+            "emitted_output"
           ]
         },
         "worker_checkpoints_checkpoint_hash_key": {
@@ -3845,9 +4141,21 @@
       },
       "policies": {},
       "checkConstraints": {
-        "worker_checkpoints_high_watermark_check": {
-          "name": "worker_checkpoints_high_watermark_check",
-          "value": "high_watermark >= 0"
+        "worker_checkpoints_accepted_input_sequence_check": {
+          "name": "worker_checkpoints_accepted_input_sequence_check",
+          "value": "accepted_input_sequence >= 0"
+        },
+        "worker_checkpoints_accepted_input_check": {
+          "name": "worker_checkpoints_accepted_input_check",
+          "value": "accepted_input >= 0"
+        },
+        "worker_checkpoints_received_output_check": {
+          "name": "worker_checkpoints_received_output_check",
+          "value": "received_output >= 0"
+        },
+        "worker_checkpoints_emitted_output_check": {
+          "name": "worker_checkpoints_emitted_output_check",
+          "value": "emitted_output >= 0"
         }
       },
       "isRLSEnabled": false

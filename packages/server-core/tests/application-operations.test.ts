@@ -234,6 +234,31 @@ describe("ApplicationOperations typed views", () => {
     );
   });
 
+  it("accepts heartbeats only for an active unfenced reservation and job epoch", async () => {
+    const execute = mock(async (_statement: unknown) => ({ rows: [], rowCount: 0 }));
+    const operations = new DrizzleApplicationOperations({ execute } as never, {} as never, {
+      now: () => new Date("2026-01-01T00:00:00Z"),
+    });
+
+    await expect(
+      operations.heartbeat(
+        "00000000-0000-4000-8000-000000000021",
+        3,
+        "00000000-0000-4000-8000-000000000022",
+        2,
+      ),
+    ).resolves.toBe(false);
+
+    const statement = execute.mock.calls[0]?.[0];
+    const heartbeatSql = new PgDialect().sqlToQuery(statement as never).sql;
+    expect(heartbeatSql).toContain("consultation.state IN ('ready','active')");
+    expect(heartbeatSql).toContain("reservation.fenced_at IS NULL");
+    expect(heartbeatSql).toContain("reservation.released_at IS NULL");
+    expect(heartbeatSql).toContain("job.fenced_at IS NULL");
+    expect(heartbeatSql).toContain("job.terminal_at IS NULL");
+    expect(heartbeatSql).toContain("FOR UPDATE OF consultation,reservation,job");
+  });
+
   it("returns non-null proof arrays and scoped active hold details", async () => {
     const { operations } = createOperations([ARCHIVE_DETAIL_ROW]);
 
@@ -368,6 +393,81 @@ describe("ApplicationOperations typed views", () => {
       destinationParticipantId: "00000000-0000-4000-8000-000000000012",
       createdAt: new Date(1_700_000_000_000),
     });
+  });
+
+  it("continues an output-only chain from its unique structural head when input watermarks tie", async () => {
+    const outputOnly = createSequentialOperations([
+      { rows: [{ id: "00000000-0000-4000-8000-000000000032" }], rowCount: 1 },
+    ]);
+
+    await expect(
+      outputOnly.operations.checkpoint({
+        workerId: "00000000-0000-4000-8000-000000000022",
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        writeEpoch: 1,
+        objectKey: "v1/output-only-checkpoint.json",
+        checkpoint: {
+          checkpointId: "00000000-0000-4000-8000-000000000032",
+          workerEpoch: 2,
+          sourceParticipantId: "00000000-0000-4000-8000-000000000011",
+          destinationParticipantId: "00000000-0000-4000-8000-000000000012",
+          acceptedInputSequence: 8,
+          acceptedInput: 32_000,
+          receivedOutput: 28_000,
+          emittedOutput: 24_000,
+          previousCheckpointSha256: "d".repeat(64),
+          highWatermarkSha256: "e".repeat(64),
+          expectedObjectIds: [],
+          observedObjectIds: [],
+          gaps: [],
+          terminal: false,
+          occurredAtMs: 1_700_000_000_000,
+        },
+      }),
+    ).resolves.toBe(true);
+
+    const insertStatement = outputOnly.execute.mock.calls[0]?.[0];
+    const insertSql = new PgDialect().sqlToQuery(insertStatement as never).sql;
+    expect(insertSql).toContain("WITH chain_heads AS");
+    expect(insertSql).toContain("child.previous_hash=head.checkpoint_hash");
+    expect(insertSql).toContain("(SELECT count(*) FROM chain_heads) <= 1");
+    expect(insertSql).toContain("SELECT max(chain_heads.checkpoint_hash) FROM chain_heads");
+    expect(insertSql).not.toContain("ORDER BY head.accepted_input_sequence");
+  });
+
+  it("rejects a second child that no longer names the unique chain head", async () => {
+    const fork = createSequentialOperations([
+      { rows: [], rowCount: 0 },
+      { rows: [], rowCount: 0 },
+    ]);
+
+    await expect(
+      fork.operations.checkpoint({
+        workerId: "00000000-0000-4000-8000-000000000022",
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        writeEpoch: 1,
+        objectKey: "v1/forked-checkpoint.json",
+        checkpoint: {
+          checkpointId: "00000000-0000-4000-8000-000000000033",
+          workerEpoch: 2,
+          sourceParticipantId: "00000000-0000-4000-8000-000000000011",
+          destinationParticipantId: "00000000-0000-4000-8000-000000000012",
+          acceptedInputSequence: 8,
+          acceptedInput: 32_000,
+          receivedOutput: 28_000,
+          emittedOutput: 24_000,
+          previousCheckpointSha256: "d".repeat(64),
+          highWatermarkSha256: "f".repeat(64),
+          expectedObjectIds: [],
+          observedObjectIds: [],
+          gaps: [],
+          terminal: false,
+          occurredAtMs: 1_700_000_000_000,
+        },
+      }),
+    ).rejects.toThrow("CHECKPOINT_CONFLICT");
   });
 
   it("accepts terminal checkpoints in either direction and settles only after both exist", async () => {

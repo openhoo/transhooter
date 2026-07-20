@@ -69,8 +69,12 @@ class ControlClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def heartbeat(self, health: dict[str, Any], *, event_id: UUID | None = None) -> None:
-        await self._post("heartbeat", health, event_id=event_id)
+    async def heartbeat(self, health: dict[str, Any], *, event_id: UUID | None = None) -> bool:
+        response = await self._post("heartbeat", health, event_id=event_id)
+        accepted = response.json()
+        if not isinstance(accepted, bool):
+            raise ValueError("internal heartbeat returned a non-boolean response")
+        return accepted
 
     async def checkpoint(self, payload: dict[str, Any], *, event_id: UUID | None = None) -> None:
         await self._post("checkpoint", payload, event_id=event_id)
@@ -102,7 +106,7 @@ class ControlClient:
 
     async def _post(
         self, kind: str, payload: dict[str, Any], *, event_id: UUID | None = None
-    ) -> None:
+    ) -> httpx.Response:
         event_id = event_id or uuid4()
         body = json.dumps(
             {
@@ -169,10 +173,11 @@ class ControlClient:
                     ),
                 )
             if response.status_code // 100 == 2:
-                return
+                return response
             retryable = response.status_code in {408, 425, 429} or response.status_code >= 500
             if retryable and attempt < len(self._retry_delays):
                 await asyncio.sleep(self._retry_delays[attempt])
                 continue
             error_type = RetryableControlRequestError if retryable else PermanentControlRequestError
             raise error_type(f"internal {kind} rejected with HTTP {response.status_code}")
+        raise RuntimeError("internal request retry loop exhausted")

@@ -23,6 +23,9 @@ def secret(name: str) -> str:
 endpoint = os.environ["S3_ENDPOINT"]
 region = os.environ["S3_REGION"]
 bucket = os.environ["S3_BUCKET"]
+endpoint_compatibility = os.environ.get("S3_ENDPOINT_COMPATIBILITY", "auto")
+if endpoint_compatibility not in {"auto", "minio"}:
+    raise RuntimeError("S3_ENDPOINT_COMPATIBILITY must be 'auto' or 'minio'")
 s3 = boto3.client(
     "s3",
     endpoint_url=endpoint,
@@ -46,39 +49,48 @@ try:
 except ClientError as exc:
     if exc.response["Error"]["Code"] not in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
         raise
-ownership_mode = "BucketOwnerEnforced"
-try:
-    s3.put_bucket_ownership_controls(
-        Bucket=bucket,
-        OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
-    )
-except ClientError as exc:
-    error_code = exc.response["Error"]["Code"]
-    server = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get("server", "")
-    if error_code not in {"MalformedXML", "NotImplemented", "XNotImplemented"} or not server.lower().startswith(
-        "minio"
-    ):
-        raise
-    ownership_mode = "MinIOImplicitBucketOwner"
+aws_bucket_controls_supported = endpoint_compatibility != "minio"
+ownership_mode = "MinIOImplicitBucketOwner" if not aws_bucket_controls_supported else "BucketOwnerEnforced"
+if aws_bucket_controls_supported:
+    try:
+        s3.put_bucket_ownership_controls(
+            Bucket=bucket,
+            OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
+        )
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        server = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get("server", "")
+        if error_code not in {"MalformedXML", "NotImplemented", "XNotImplemented"} or not server.lower().startswith(
+            "minio"
+        ):
+            raise
+        ownership_mode = "MinIOImplicitBucketOwner"
+        aws_bucket_controls_supported = False
 
 s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
 s3.put_object_lock_configuration(
     Bucket=bucket,
     ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"},
 )
-try:
-    s3.put_public_access_block(
-        Bucket=bucket,
-        PublicAccessBlockConfiguration={
-            "BlockPublicAcls": True,
-            "IgnorePublicAcls": True,
-            "BlockPublicPolicy": True,
-            "RestrictPublicBuckets": True,
-        },
-    )
-except ClientError as exc:
-    if exc.response["Error"]["Code"] not in {"MalformedXML", "NotImplemented", "XNotImplemented"}:
-        raise
+if aws_bucket_controls_supported:
+    try:
+        s3.put_public_access_block(
+            Bucket=bucket,
+            PublicAccessBlockConfiguration={
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            },
+        )
+    except ClientError as exc:
+        error_code = exc.response["Error"]["Code"]
+        server = exc.response.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get("server", "")
+        if error_code not in {"MalformedXML", "NotImplemented", "XNotImplemented"} or not server.lower().startswith(
+            "minio"
+        ):
+            raise
+        aws_bucket_controls_supported = False
 
 anonymous_s3 = boto3.client(
     "s3",
@@ -126,6 +138,17 @@ else:
     grants = acl.get("Grants", [])
     if not grants or any(grant.get("Permission") != "FULL_CONTROL" for grant in grants):
         raise RuntimeError("MinIO bucket does not expose owner-only full-control semantics")
+if aws_bucket_controls_supported:
+    public_access_block = s3.get_public_access_block(Bucket=bucket).get(
+        "PublicAccessBlockConfiguration", {}
+    )
+    if public_access_block != {
+        "BlockPublicAcls": True,
+        "IgnorePublicAcls": True,
+        "BlockPublicPolicy": True,
+        "RestrictPublicBuckets": True,
+    }:
+        raise RuntimeError("bucket public access block is not fully enabled")
 
 versioning = s3.get_bucket_versioning(Bucket=bucket)
 lock = s3.get_object_lock_configuration(Bucket=bucket)

@@ -29,14 +29,71 @@ fi
 TEST_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/failure-wrapper-contract.XXXXXXXX")
 trap 'rm -rf -- "$TEST_DIRECTORY"' 0 HUP INT TERM
 mkdir "$TEST_DIRECTORY/bin"
+CONTRACT_SENTINEL_DIRECTORY="$TEST_DIRECTORY/contract-sentinel"
+mkdir "$CONTRACT_SENTINEL_DIRECTORY"
+printf '#!/bin/sh\nprintf "lightweight\\n" >> "$CONTRACT_CALLS"\n' > \
+  "$CONTRACT_SENTINEL_DIRECTORY/lightweight-contracts.test.sh"
+printf '#!/bin/sh\nprintf "integration\\n" >> "$CONTRACT_CALLS"\n' > \
+  "$CONTRACT_SENTINEL_DIRECTORY/postgres-integration.test.sh"
+chmod +x "$CONTRACT_SENTINEL_DIRECTORY/lightweight-contracts.test.sh" \
+  "$CONTRACT_SENTINEL_DIRECTORY/postgres-integration.test.sh"
+CONTRACT_SCRIPT_DIRECTORY="$CONTRACT_SENTINEL_DIRECTORY" \
+  "$ROOT/scripts/run-tests" --contract-discovery-only ||
+  fail 'registered lightweight and infrastructure-only contracts were not classified'
+CONTRACT_CALLS="$TEST_DIRECTORY/contract-calls"
+export CONTRACT_CALLS
+: > "$CONTRACT_CALLS"
+CONTRACT_SCRIPT_DIRECTORY="$CONTRACT_SENTINEL_DIRECTORY" \
+  "$ROOT/scripts/run-tests" --contract-scripts-only ||
+  fail 'registered lightweight contract execution failed'
+[ "$(cat "$CONTRACT_CALLS")" = lightweight ] ||
+  fail 'lightweight contracts did not execute exactly once or an integration contract ran'
+
+printf '#!/bin/sh\nexit 0\n' > "$CONTRACT_SENTINEL_DIRECTORY/forgotten-contract.test.sh"
+chmod +x "$CONTRACT_SENTINEL_DIRECTORY/forgotten-contract.test.sh"
+if CONTRACT_SCRIPT_DIRECTORY="$CONTRACT_SENTINEL_DIRECTORY" \
+  "$ROOT/scripts/run-tests" --contract-discovery-only \
+  > "$TEST_DIRECTORY/contract-discovery-output" 2>&1; then
+  fail 'an omitted contract script passed discovery'
+fi
+grep -F 'Contract script exists but is omitted from lightweight discovery' \
+  "$TEST_DIRECTORY/contract-discovery-output" >/dev/null ||
+  fail 'omitted contract script did not emit the discovery sentinel diagnostic'
+rm "$CONTRACT_SENTINEL_DIRECTORY/forgotten-contract.test.sh"
+
+printf '#!/bin/sh\nexit 0\n' > "$CONTRACT_SENTINEL_DIRECTORY/not-executable-contracts.test.sh"
+if CONTRACT_SCRIPT_DIRECTORY="$CONTRACT_SENTINEL_DIRECTORY" \
+  "$ROOT/scripts/run-tests" --contract-discovery-only \
+  > "$TEST_DIRECTORY/contract-executable-output" 2>&1; then
+  fail 'a non-executable lightweight contract passed discovery'
+fi
+grep -F 'Lightweight contract script is not executable' \
+  "$TEST_DIRECTORY/contract-executable-output" >/dev/null ||
+  fail 'non-executable contract did not emit the discovery sentinel diagnostic'
+rm "$CONTRACT_SENTINEL_DIRECTORY/not-executable-contracts.test.sh"
+
 CALLS="$TEST_DIRECTORY/calls"
 export CALLS
 cat > "$TEST_DIRECTORY/bin/docker" <<'MOCK'
 #!/bin/sh
-printf 'APP_ENV=%s SMTP_URL=%s RTC_ADVERTISED_IP=%s S3_PUBLIC_ENDPOINT=%s %s\n' \
-  "${APP_ENV:-}" "${SMTP_URL:-}" "${RTC_ADVERTISED_IP:-}" "${S3_PUBLIC_ENDPOINT:-}" "$*" >> "$CALLS"
+printf 'APP_ENV=%s SMTP_URL=%s RTC_ADVERTISED_IP=%s S3_PUBLIC_ENDPOINT=%s PUBLIC_BASE_URL=%s PUBLIC_LIVEKIT_URL=%s S3_KMS_KEY_ID=%s %s\n' \
+  "${APP_ENV:-}" "${SMTP_URL:-}" "${RTC_ADVERTISED_IP:-}" "${S3_PUBLIC_ENDPOINT:-}" "${PUBLIC_BASE_URL:-}" "${PUBLIC_LIVEKIT_URL:-}" "${S3_KMS_KEY_ID:-}" "$*" >> "$CALLS"
 case " $* " in
   *" compose version "*) exit 0 ;;
+esac
+case " $* " in
+  *" config --environment "*)
+    previous=
+    for argument do
+      if [ "$previous" = --env-file ]; then
+        cat "$argument"
+      fi
+      previous=$argument
+    done
+    [ -z "${PUBLIC_BASE_URL:-}" ] || printf 'PUBLIC_BASE_URL=%s\n' "$PUBLIC_BASE_URL"
+    [ -z "${PUBLIC_LIVEKIT_URL:-}" ] || printf 'PUBLIC_LIVEKIT_URL=%s\n' "$PUBLIC_LIVEKIT_URL"
+    exit 0
+    ;;
 esac
 case "${1:-}:${2:-}" in
   ps:*)
@@ -58,12 +115,12 @@ case " $* " in
       ambiguous) exit 7 ;;
     esac
     ;;
-  *" build egress-ready translation-worker web failure-smoke "*)
+  *" build minio egress-ready translation-worker web failure-smoke "*)
     if [ "${MOCK_MODE:-}" = deadline ]; then
       sleep 2
     fi
     ;;
-  *" build egress-ready translation-worker web e2e "*)
+  *" build minio egress-ready translation-worker web e2e "*)
     if [ "${MOCK_MODE:-}" = consultation-deadline ]; then
       sleep 2
     fi
@@ -164,13 +221,16 @@ if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
   timeout 15 "$ROOT/scripts/failure-smoke" > "$TEST_DIRECTORY/deadline-output" 2>&1; then
   fail 'deadline timing wrapper run failed'
 fi
+deadline_test_finished_ms=$(($(date +%s) * 1000))
 generated_deadline=$(
   grep -F 'failure-smoke.mjs' "$CALLS" |
     sed -n 's/.*--deadline-epoch-ms \([0-9][0-9]*\).*/\1/p'
 )
 [ -n "$generated_deadline" ] || fail 'generated scenario deadline was not forwarded'
-[ "$generated_deadline" -ge "$((deadline_test_started_ms + 2000))" ] ||
-  fail 'generated scenario deadline included setup/build elapsed time'
+[ "$generated_deadline" -ge "$((deadline_test_started_ms + 1000))" ] ||
+  fail 'generated scenario deadline was shorter than configured'
+[ "$generated_deadline" -le "$deadline_test_finished_ms" ] ||
+  fail 'generated scenario deadline excluded setup/build elapsed time'
 
 
 : > "$CALLS"
@@ -185,13 +245,16 @@ if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
     > "$TEST_DIRECTORY/consultation-deadline-output" 2>&1; then
   fail 'consultation smoke deadline timing wrapper run failed'
 fi
+consultation_finished_ms=$(($(date +%s) * 1000))
 consultation_deadline=$(
   grep -F 'smoke:consultation' "$CALLS" |
     sed -n 's/.*--deadline-epoch-ms \([0-9][0-9]*\).*/\1/p'
 )
 [ -n "$consultation_deadline" ] || fail 'consultation smoke generated deadline was not forwarded'
-[ "$consultation_deadline" -ge "$((consultation_started_ms + 2000))" ] ||
-  fail 'consultation smoke deadline included lock/setup/build elapsed time'
+[ "$consultation_deadline" -ge "$((consultation_started_ms + 1000))" ] ||
+  fail 'consultation smoke deadline was shorter than configured'
+[ "$consultation_deadline" -le "$consultation_finished_ms" ] ||
+  fail 'consultation smoke deadline excluded lock/setup/build elapsed time'
 
 : > "$CALLS"
 caller_deadline=4102444800000
@@ -221,7 +284,7 @@ if ! PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" --provider-prof
   > "$TEST_DIRECTORY/dev-up-fixture-output" 2>&1; then
   fail 'fixture dev-up local-default wrapper run failed'
 fi
-grep -F 'APP_ENV=test SMTP_URL= RTC_ADVERTISED_IP=10.254.231.10 S3_PUBLIC_ENDPOINT=http://localhost:9000' \
+grep -F 'APP_ENV=test SMTP_URL= RTC_ADVERTISED_IP=10.254.231.10 S3_PUBLIC_ENDPOINT=http://localhost:9000 PUBLIC_BASE_URL=http://app.localhost:3000 PUBLIC_LIVEKIT_URL=ws://rtc.localhost:7880 S3_KMS_KEY_ID=' \
   "$CALLS" >/dev/null || fail 'fixture dev-up did not export explicit local-only endpoint defaults'
 
 : > "$CALLS"
@@ -229,21 +292,45 @@ if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
   SMTP_URL=smtp://custom-mail:2525 \
   RTC_ADVERTISED_IP=192.0.2.44 \
   S3_PUBLIC_ENDPOINT=https://objects.dev.example \
+  PUBLIC_BASE_URL=https://app.dev.example \
+  PUBLIC_LIVEKIT_URL=wss://rtc.dev.example \
   "$DEV_ROOT/scripts/dev-up" > "$TEST_DIRECTORY/dev-up-custom-output" 2>&1; then
   fail 'dev-up configured-endpoint wrapper run failed'
 fi
-grep -F 'APP_ENV=development SMTP_URL=smtp://custom-mail:2525 RTC_ADVERTISED_IP=192.0.2.44 S3_PUBLIC_ENDPOINT=https://objects.dev.example' \
-  "$CALLS" >/dev/null || fail 'dev-up overwrote configured endpoints'
+grep -F 'APP_ENV=development SMTP_URL=smtp://custom-mail:2525 RTC_ADVERTISED_IP=192.0.2.44 S3_PUBLIC_ENDPOINT=https://objects.dev.example PUBLIC_BASE_URL=https://app.dev.example PUBLIC_LIVEKIT_URL=wss://rtc.dev.example S3_KMS_KEY_ID=' \
+  "$CALLS" >/dev/null || fail 'dev-up overwrote configured endpoints or required a KMS key for bundled MinIO'
+cat > "$DEV_ROOT/.env" <<'ENV'
+PUBLIC_BASE_URL=https://app.env.example
+PUBLIC_LIVEKIT_URL=wss://rtc.env.example
+ENV
+if ! PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" \
+  > "$TEST_DIRECTORY/dev-up-env-file-output" 2>&1; then
+  fail 'dev-up rejected production URLs loaded only from the repository .env'
+fi
+rm "$DEV_ROOT/.env"
+for invalid_case in base livekit; do
+  if [ "$invalid_case" = base ]; then
+    invalid_base=http://app.dev.example
+    invalid_livekit=wss://rtc.dev.example
+  else
+    invalid_base=https://app.dev.example
+    invalid_livekit=ws://rtc.dev.example
+  fi
+  if PATH="$TEST_DIRECTORY/bin:$PATH" \
+    PUBLIC_BASE_URL="$invalid_base" \
+    PUBLIC_LIVEKIT_URL="$invalid_livekit" \
+    "$DEV_ROOT/scripts/dev-up" > "$TEST_DIRECTORY/dev-up-invalid-$invalid_case-output" 2>&1; then
+    fail "dev-up accepted insecure production $invalid_case URL"
+  fi
+done
+
 
 EMPTY_ENV="$TEST_DIRECTORY/empty.env"
 : > "$EMPTY_ENV"
-if docker compose version >/dev/null 2>&1; then
-  config_compose() { docker compose "$@"; }
-elif docker-compose version >/dev/null 2>&1; then
-  config_compose() { docker-compose "$@"; }
-else
-  fail 'Docker Compose is required for production configuration contracts'
+if ! docker compose version >/dev/null 2>&1; then
+  fail 'Docker Compose plugin is required for production configuration contracts'
 fi
+config_compose() { docker compose "$@"; }
 
 render_google_config() (
   export PROVIDER_PROFILE=google-eu
@@ -253,13 +340,15 @@ render_google_config() (
   export SMTP_URL=smtp://smtp.example.test:2525
   export RTC_ADVERTISED_IP=203.0.113.10
   export S3_PUBLIC_ENDPOINT=https://objects.example.test
+  export PUBLIC_BASE_URL=https://app.example.test
+  export PUBLIC_LIVEKIT_URL=wss://rtc.example.test
   config_compose --env-file "$EMPTY_ENV" \
     -f "$ROOT/deploy/compose/compose.yml" \
     -f "$ROOT/deploy/compose/compose.google.yml" config "$@"
 )
 
 for overlay in compose.google.yml compose.providers.yml; do
-  for required in SMTP_URL RTC_ADVERTISED_IP S3_PUBLIC_ENDPOINT; do
+  for required in SMTP_URL RTC_ADVERTISED_IP S3_PUBLIC_ENDPOINT PUBLIC_BASE_URL PUBLIC_LIVEKIT_URL; do
     output="$TEST_DIRECTORY/${overlay}.${required}.output"
     if (
       export PROVIDER_PROFILE=deepgram-deepl-eu
@@ -273,6 +362,8 @@ for overlay in compose.google.yml compose.providers.yml; do
       export SMTP_URL=smtp://smtp.example.test:2525
       export RTC_ADVERTISED_IP=203.0.113.10
       export S3_PUBLIC_ENDPOINT=https://objects.example.test
+      export PUBLIC_BASE_URL=https://app.example.test
+      export PUBLIC_LIVEKIT_URL=wss://rtc.example.test
       unset "$required"
       config_compose --env-file "$EMPTY_ENV" \
         -f "$ROOT/deploy/compose/compose.yml" \
@@ -292,6 +383,25 @@ grep -F 'APP_ENV: production' "$TEST_DIRECTORY/production-config" >/dev/null ||
 grep -F 'S3_PUBLIC_ENDPOINT: https://objects.example.test' \
   "$TEST_DIRECTORY/production-config" >/dev/null ||
   fail 'configured external S3 endpoint did not propagate'
+grep -F 'ARCHIVE_REQUIRE_KMS: "false"' "$TEST_DIRECTORY/production-config" >/dev/null ||
+  fail 'production bundled MinIO archive did not explicitly disable unsupported KMS enforcement'
+if grep -F 'S3_KMS_KEY_ID:' "$TEST_DIRECTORY/production-config" >/dev/null; then
+  fail 'production bundled MinIO archive unexpectedly received a KMS key'
+fi
+grep -F 'PUBLIC_BASE_URL: https://app.example.test' "$TEST_DIRECTORY/production-config" >/dev/null ||
+  fail 'production public HTTPS URL did not propagate'
+grep -F 'PUBLIC_LIVEKIT_URL: wss://rtc.example.test' "$TEST_DIRECTORY/production-config" >/dev/null ||
+  fail 'production public WSS URL did not propagate'
+for role in migrator web control translation; do
+  grep -F "database-$role-url" "$TEST_DIRECTORY/production-config" >/dev/null ||
+    fail "distinct PostgreSQL $role URL was absent from production config"
+done
+for service in web control translation spool-drainer; do
+  grep -F "minio-$service-credentials" "$TEST_DIRECTORY/production-config" >/dev/null ||
+    fail "scoped MinIO $service credentials were absent from production config"
+done
+grep -F 'stop_grace_period: 1h0m0s' "$TEST_DIRECTORY/production-config" >/dev/null ||
+  fail 'Egress graceful stop window was not one hour'
 
 APP_ENV=development render_google_config > "$TEST_DIRECTORY/development-config"
 grep -F 'APP_ENV: development' "$TEST_DIRECTORY/development-config" >/dev/null ||

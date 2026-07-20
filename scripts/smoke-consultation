@@ -56,6 +56,10 @@ LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
 LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
 COMPOSE_PHASE_TIMEOUT_SECONDS=${COMPOSE_PHASE_TIMEOUT_SECONDS:-600}
 ACTIVE_PID=
+if ! $deadline_supplied; then
+  deadline_epoch_ms=$((($(date +%s) + ${CONSULTATION_SMOKE_DEADLINE_SECONDS:-900}) * 1000))
+  set -- "$@" --deadline-epoch-ms "$deadline_epoch_ms"
+fi
 
 terminate_active() {
   trap - HUP INT TERM
@@ -84,10 +88,7 @@ compose_bounded() {
   if [ -f "$ROOT/.env" ]; then
     set -- --env-file "$ROOT/.env" "$@"
   fi
-  case "$compose_implementation" in
-    plugin) run_bounded docker compose "$@" ;;
-    legacy) run_bounded docker-compose "$@" ;;
-  esac
+  run_bounded docker compose "$@"
 }
 
 exec 9>"$LOCK_FILE"
@@ -123,10 +124,6 @@ if [ "$STACK_CLASS" = reused-developer ]; then
   compose_bounded --profile e2e rm --force --stop e2e >/dev/null
 fi
 announce_phase "Building consultation application and smoke images from the current source tree"
-compose_bounded build egress-ready translation-worker web e2e
-if ! $deadline_supplied; then
-  deadline_epoch_ms=$((($(date +%s) + ${CONSULTATION_SMOKE_DEADLINE_SECONDS:-900}) * 1000))
-  set -- "$@" --deadline-epoch-ms "$deadline_epoch_ms"
-fi
+compose_bounded build minio egress-ready translation-worker web e2e
 announce_phase "Running consultation smoke for ${profile}"
 compose_bounded --profile e2e run --rm e2e bun run smoke:consultation -- "$@"

@@ -384,6 +384,61 @@ async def test_tts_health_runs_streaming_synthesis_and_validates_returned_format
     assert captured["voice"] == "de-DE-Chirp3-HD-Algenib"
 
 
+@pytest.mark.asyncio
+async def test_tts_health_reports_channel_setup_exception_without_masking_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SetupError(RuntimeError):
+        pass
+
+    def fail_channel_setup(*_: object) -> object:
+        raise SetupError("credentials unavailable")
+
+    monkeypatch.setattr(google_provider, "authenticated_channel", fail_channel_setup)
+    provider = google_provider.GoogleTtsProvider(
+        google_provider.GoogleConfig(
+            "project",
+            "quota",
+            UUID(int=2),
+            "credential",
+            probe_voice="de-DE-Chirp3-HD-Algenib",
+            probe_voice_locale="de-DE",
+        ),
+        Journal(),
+    )
+
+    health = await provider.health("snapshot")
+
+    assert not health.healthy
+    assert health.reason == "SetupError"
+    assert health.evidence is None
+
+
+@pytest.mark.asyncio
+async def test_google_tts_requests_reconstruct_multibyte_text_within_byte_limit() -> None:
+    text = "ä" * 2_499 + "€" + "🙂" * 1_251
+    attempt = object.__new__(google_provider.GoogleTtsAttempt)
+    attempt._utterance = SynthesisUtterance(
+        uuid4(),
+        uuid4(),
+        text,
+        "de-DE",
+        "voice",
+        SampleRange(0, 1),
+    )
+    attempt._language = "de-DE"
+    attempt._voice = "voice"
+
+    requests = [request async for request in attempt._requests()]
+    chunks = [request.input.text for request in requests[1:]]
+
+    assert requests[0].streaming_config.voice.language_code == "de-DE"
+    assert requests[0].streaming_config.voice.name == "voice"
+    assert "".join(chunks) == text
+    assert len(chunks) > 1
+    assert all(len(chunk.encode("utf-8")) <= 5_000 for chunk in chunks)
+
+
 def test_linear16_decoder_strips_split_wav_header_and_preserves_pcm() -> None:
     pcm = b"\x01\x00\x02\x00\x03\x00"
     encoded = io.BytesIO()

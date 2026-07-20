@@ -218,8 +218,8 @@ export const magicLinks = pgTable("magic_links", {
 	consumedAt: timestamp("consumed_at", { withTimezone: true, mode: 'date' }),
 	revokedAt: timestamp("revoked_at", { withTimezone: true, mode: 'date' }),
 	createdAt: timestamp("created_at", { withTimezone: true, mode: 'date' }).notNull(),
-	sealedRawToken: text("sealed_raw_token"),
-	sealedTokenKeyId: text("sealed_token_key_id"),
+	sealedRawToken: text("sealed_raw_token").notNull(),
+	sealedTokenKeyId: text("sealed_token_key_id").notNull(),
 }, (table) => [
 	foreignKey({
 			columns: [table.userId],
@@ -237,8 +237,14 @@ export const magicLinks = pgTable("magic_links", {
 			name: "magic_links_session_fk"
 		}),
 	unique("magic_links_token_hash_key").on(table.tokenHash),
+	uniqueIndex("magic_links_active_identity_unique").on(
+		sql`COALESCE(${table.userId}::text, '')`,
+		table.purpose,
+		sql`COALESCE(${table.consultationId}::text, '')`,
+		sql`COALESCE(${table.sessionId}::text, '')`,
+	).where(sql`${table.consumedAt} IS NULL AND ${table.revokedAt} IS NULL`),
 	check("magic_links_check", sql`(purpose <> 'archive_delete_reauth'::magic_link_purpose) OR ((user_id IS NOT NULL) AND (consultation_id IS NOT NULL) AND (session_id IS NOT NULL))`),
-	check("magic_links_sealed_token_pair_check", sql`(sealed_raw_token IS NULL) = (sealed_token_key_id IS NULL)`),
+	check("magic_links_sealed_token_nonempty_check", sql`length(sealed_raw_token) > 0 AND length(sealed_token_key_id) > 0`),
 ]);
 
 export const pendingExchanges = pgTable("pending_exchanges", {
@@ -256,6 +262,7 @@ export const pendingExchanges = pgTable("pending_exchanges", {
 			name: "pending_exchanges_magic_link_id_fkey"
 		}),
 	unique("pending_exchanges_nonce_hash_key").on(table.nonceHash),
+	uniqueIndex("pending_exchanges_live_magic_link_unique").on(table.magicLinkId).where(sql`${table.consumedAt} IS NULL`),
 ]);
 
 export const sessions = pgTable("sessions", {
@@ -297,6 +304,7 @@ export const magicLinkRequests = pgTable("magic_link_requests", {
 }, (table) => [
 	index("magic_link_email_rate_idx").using("btree", table.emailHash.asc().nullsLast().op("text_ops"), table.requestedAt.asc().nullsLast().op("timestamptz_ops")),
 	index("magic_link_ip_rate_idx").using("btree", table.ipHash.asc().nullsLast().op("text_ops"), table.requestedAt.asc().nullsLast().op("timestamptz_ops")),
+	index("magic_link_requested_at_idx").on(table.requestedAt),
 ]);
 
 export const workerLeases = pgTable("worker_leases", {
@@ -331,7 +339,7 @@ export const workerCheckpoints = pgTable("worker_checkpoints", {
 	destinationParticipantId: uuid("destination_participant_id").notNull(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	acceptedInputSequence: bigint("accepted_input_sequence", { mode: "number" }).notNull(),
-	acceptedInput: bigint("high_watermark", { mode: "number" }).notNull(),
+	acceptedInput: bigint("accepted_input", { mode: "number" }).notNull(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
 	receivedOutput: bigint("received_output", { mode: "number" }).notNull(),
 	// You can use { mode: "bigint" } if numbers are exceeding js number limitations
@@ -370,7 +378,7 @@ export const workerCheckpoints = pgTable("worker_checkpoints", {
 	unique("worker_checkpoints_checkpoint_hash_key").on(table.checkpointHash),
 	uniqueIndex("worker_checkpoints_terminal_direction_unique").using("btree", table.consultationId.asc().nullsLast().op("uuid_ops"), table.generation.asc().nullsLast().op("int4_ops"), table.workerId.asc().nullsLast().op("uuid_ops"), table.workerEpoch.asc().nullsLast().op("int8_ops"), table.sourceParticipantId.asc().nullsLast().op("uuid_ops"), table.destinationParticipantId.asc().nullsLast().op("uuid_ops")).where(sql`terminal`),
 	check("worker_checkpoints_accepted_input_sequence_check", sql`accepted_input_sequence >= 0`),
-	check("worker_checkpoints_accepted_input_check", sql`high_watermark >= 0`),
+	check("worker_checkpoints_accepted_input_check", sql`accepted_input >= 0`),
 	check("worker_checkpoints_received_output_check", sql`received_output >= 0`),
 	check("worker_checkpoints_emitted_output_check", sql`emitted_output >= 0`),
 ]);

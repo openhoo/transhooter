@@ -11,7 +11,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--drainer", action="store_true")
     args = parser.parse_args()
-    root = Path(os.environ.get("SPOOL_PATH", os.environ.get("SPOOL_DIR", "")))
+    root = Path(os.environ.get("SPOOL_PATH", ""))
     keyring_value = os.environ.get("SPOOL_KEYRING_FILE", "")
     if not root.is_dir() or not keyring_value:
         raise SystemExit("spool path/keyring unavailable")

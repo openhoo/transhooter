@@ -37,17 +37,38 @@ x-fixture-runtime-env: &fixture-runtime-env
   OTEL_TRACES_SAMPLER: parentbased_traceidratio
   OTEL_TRACES_SAMPLER_ARG: "1"
   OTEL_RESOURCE_ATTRIBUTES: service.namespace=transhooter,deployment.environment.name=test
+  ARCHIVE_REQUIRE_KMS: "false"
+
 
 services:
   secrets-init:
     volumes: !override
       - test-secrets:/secrets
       - ../scripts/init-secrets.sh:/usr/local/bin/init-secrets:ro
+      - test-migrator-secrets:/exports/migrator
+      - test-integration-migrator-secrets:/exports/integration-migrator
+      - test-web-secrets:/exports/web
+      - test-control-secrets:/exports/control
+      - test-translation-secrets:/exports/translation
+      - test-spool-drainer-secrets:/exports/spool-drainer
+      - test-capability-secrets:/exports/capability
 
   postgres:
     volumes: !override
       - postgres-data:/var/lib/postgresql/data
       - test-secrets:/run/secrets:ro
+
+  postgres-role-bootstrap:
+    environment:
+      POSTGRES_INTEGRATION_DATABASE: transhooter_integration
+    volumes: !override
+      - test-secrets:/run/secrets:ro
+      - ../scripts/postgres_bootstrap.sh:/usr/local/bin/postgres-bootstrap:ro
+
+  postgres-capability-bootstrap:
+    volumes: !override
+      - test-secrets:/run/secrets:ro
+      - ../scripts/postgres_bootstrap.sh:/usr/local/bin/postgres-bootstrap:ro
 
   redis:
     volumes: !override
@@ -57,6 +78,11 @@ services:
   minio-bootstrap:
     volumes: !override
       - test-secrets:/run/secrets:ro
+
+  minio-identity-bootstrap:
+    volumes: !override
+      - test-secrets:/run/secrets:ro
+      - ../scripts/minio_identities.sh:/usr/local/bin/minio-identities:ro
 
   egress-ready:
     volumes: !override
@@ -119,20 +145,22 @@ services:
       otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
+      DATABASE_URL_FILE: /run/capability-secrets/database-capability-url
       SMTP_URL: smtp://mailpit:1025
     volumes: !override
-      - test-secrets:/run/secrets:ro
+      - test-web-secrets:/run/secrets:ro
+      - test-capability-secrets:/run/capability-secrets:ro
 
   language-refresh:
     environment:
       <<: *provider-disabled-env
       APP_ENV: test
       PROVIDER_PROFILE: fixture
-      DATABASE_URL_FILE: /run/secrets/database-url
+      DATABASE_URL_FILE: /run/secrets/database-capability-url
       INTERNAL_TOKEN_FILE: /run/secrets/internal-translation-token
     command: [python, -m, transhooter_worker.providers, sync, --profile, fixture]
     volumes: !override
-      - test-secrets:/run/secrets:ro
+      - test-capability-secrets:/run/secrets:ro
 
   translation-worker:
     depends_on:
@@ -140,11 +168,11 @@ services:
     environment:
       <<: [*provider-disabled-env, *fixture-runtime-env]
       FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+      DATABASE_URL_FILE: /run/secrets/database-translation-url
       INTERNAL_TOKEN_FILE: /run/secrets/internal-translation-token
-      WORKER_INTERNAL_BEARER_FILE: /run/secrets/internal-translation-token
     volumes: !override
       - spool-data:/var/lib/transhooter/spool
-      - test-secrets:/run/secrets:ro
+      - test-translation-secrets:/run/secrets:ro
       - fault-control:/shared:ro
 
   spool-drainer:
@@ -156,14 +184,15 @@ services:
       INTERNAL_TOKEN_FILE: /run/secrets/internal-spool-drainer-token
     volumes: !override
       - spool-data:/var/lib/transhooter/spool
-      - test-secrets:/run/secrets:ro
+      - test-spool-drainer-secrets:/run/secrets:ro
       - fault-control:/shared:ro
 
   migrate:
     environment:
       APP_ENV: test
+      DATABASE_URL_FILE: /run/secrets/database-migrator-url
     volumes: !override
-      - test-secrets:/run/secrets:ro
+      - test-migrator-secrets:/run/secrets:ro
 
   bootstrap-admin:
     depends_on:
@@ -171,15 +200,15 @@ services:
       language-refresh: {condition: service_completed_successfully}
     environment:
       APP_ENV: test
-      DATABASE_URL_FILE: /run/secrets/database-url
+      DATABASE_URL_FILE: /run/secrets/database-web-url
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL}
       BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Test Administrator}
     command: [bun, run, admin:create-staff, --email, "${BOOTSTRAP_ADMIN_EMAIL}", --name, "${BOOTSTRAP_ADMIN_NAME:-Test Administrator}", --role, admin]
     volumes: !override
-      - test-secrets:/run/secrets:ro
+      - test-web-secrets:/run/secrets:ro
 
   fault-control-init:
-    image: alpine:3.22.1
+    image: alpine:3.22.5
     user: "0:0"
     restart: "no"
     networks: [backend]
@@ -189,6 +218,7 @@ services:
       - -ec
       - |
         mkdir -p /shared/releases /shared/failure-smoke-owners
+        chmod 0777 /shared
         chmod 0777 /shared/releases /shared/failure-smoke-owners
         if [ ! -e /shared/faults.json ] || ! grep -q '"consultations"' /shared/faults.json; then
           printf '{"consultations":{}}\n' > /shared/faults.json.tmp
@@ -208,11 +238,12 @@ services:
       otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
+      DATABASE_URL_FILE: /run/secrets/database-control-url
       TEST_FAULT_CONTROL_FILE: /shared/faults.json
       SMTP_URL: smtp://mailpit:1025
     volumes: !override
-      - test-secrets:/run/secrets:ro
-      - fault-control:/shared:ro
+      - test-control-secrets:/run/secrets:ro
+      - fault-control:/shared
 
   control-worker-2:
     depends_on:
@@ -221,11 +252,12 @@ services:
       otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
+      DATABASE_URL_FILE: /run/secrets/database-control-url
       TEST_FAULT_CONTROL_FILE: /shared/faults.json
       SMTP_URL: smtp://mailpit:1025
     volumes: !override
-      - test-secrets:/run/secrets:ro
-      - fault-control:/shared:ro
+      - test-control-secrets:/run/secrets:ro
+      - fault-control:/shared
 
   web:
     ports: !override []
@@ -242,14 +274,15 @@ services:
       otel-collector: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
+      DATABASE_URL_FILE: /run/secrets/database-web-url
       PUBLIC_BASE_URL: http://app.localhost:3000
       PUBLIC_LIVEKIT_URL: ws://rtc.localhost:7880
       SMTP_URL: smtp://mailpit:1025
     volumes: !override
-      - test-secrets:/run/secrets:ro
+      - test-web-secrets:/run/secrets:ro
 
   test-dependencies-ready:
-    image: alpine:3.22.1
+    image: alpine:3.22.5
     restart: "no"
     networks: [backend]
     depends_on:
@@ -277,11 +310,13 @@ services:
       mailpit: {condition: service_healthy}
     environment:
       <<: *fixture-runtime-env
-      DATABASE_URL_FILE: /run/secrets/database-url
+      DATABASE_URL_FILE: /run/secrets/database-web-url
+      POSTGRES_CONCURRENCY_DATABASE_URL_FILE: /run/integration-secrets/database-integration-migrator-url
       REDIS_URL_FILE: /run/secrets/redis-url
       TEST_GATE_PHASE_DEADLINE_SECONDS: ${TEST_GATE_PHASE_DEADLINE_SECONDS:-600}
     volumes: !override
-      - test-secrets:/run/secrets:ro
+      - test-web-secrets:/run/secrets:ro
+      - test-integration-migrator-secrets:/run/integration-secrets:ro
     tmpfs:
       - /tmp:size=536870912,mode=1777,uid=10001,gid=10001
 
@@ -290,7 +325,7 @@ services:
       <<: [*provider-disabled-env, *fixture-runtime-env]
     volumes: !override
       - ../../tests/fixtures:/workspace/tests/fixtures:ro
-      - test-secrets:/run/secrets:ro
+      - test-translation-secrets:/run/secrets:ro
 
   e2e:
     environment:
@@ -308,7 +343,7 @@ services:
     environment:
       <<: *fixture-runtime-env
       TARGET_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-transhooter}
-      DATABASE_URL_FILE: /run/secrets/database-url
+      DATABASE_URL_FILE: /run/secrets/database-web-url
       BASE_URL: http://app.localhost:3000
       LIVEKIT_URL: ws://rtc.localhost:7880
       MAILPIT_URL: http://mailpit:8025
@@ -318,7 +353,7 @@ services:
       WORKER_SCENARIO_FILE: /shared/worker-scenarios.json
       FAILURE_RELEASE_DIR: /shared/releases
     volumes: !override
-      - test-secrets:/run/secrets:ro
+      - test-web-secrets:/run/secrets:ro
       - fault-control:/shared
       - spool-data:/var/lib/transhooter/spool
       - /var/run/docker.sock:/var/run/docker.sock
@@ -329,4 +364,11 @@ networks:
 
 volumes:
   test-secrets:
+  test-migrator-secrets:
+  test-integration-migrator-secrets:
+  test-web-secrets:
+  test-control-secrets:
+  test-translation-secrets:
+  test-capability-secrets:
+  test-spool-drainer-secrets:
   fault-control:

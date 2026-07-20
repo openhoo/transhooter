@@ -135,6 +135,21 @@ def _change_queue_depth(amount: int) -> None:
         pass
 
 
+async def publish_complete_pcm_frames(
+    pending_pcm: bytearray,
+    sink: Callable[[bytes], Awaitable[None]],
+    frame_bytes: int,
+) -> int:
+    if frame_bytes <= 0:
+        raise ValueError("frame_bytes must be positive")
+    published_samples = 0
+    while len(pending_pcm) >= frame_bytes:
+        await sink(bytes(pending_pcm[:frame_bytes]))
+        del pending_pcm[:frame_bytes]
+        published_samples += frame_bytes // 2
+    return published_samples
+
+
 StageGate = Callable[[str, int], Awaitable[None]]
 EvidenceSink = Callable[[object], Awaitable[None]]
 ProviderTerminalSink = Callable[

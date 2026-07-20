@@ -17,7 +17,9 @@ spec:
       annotations:
         checksum/config: {{ include (print $root.Template.BasePath "/configmap.yaml") $root | sha256sum }}
         transhooter.io/runtime-secret-revision: {{ $root.Values.rollout.runtimeSecretRevision | quote }}
+        {{- if eq $component "translation-worker" }}
         transhooter.io/provider-secret-revision: {{ $root.Values.rollout.providerSecretRevision | quote }}
+        {{- end }}
         {{- with $root.Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -39,11 +41,25 @@ spec:
           {{- else }}
           command: [python, -m, transhooter_worker, start]
           {{- end }}
+          {{- if eq $component "spool-drainer" }}
+          env:
+            - {name: APP_ENV, value: {{ $root.Values.config.appEnv | quote }}}
+            - {name: S3_ENDPOINT, value: {{ $root.Values.config.s3Endpoint | quote }}}
+            - {name: S3_REGION, value: {{ $root.Values.config.s3Region | quote }}}
+            - {name: S3_BUCKET, value: {{ $root.Values.config.s3Bucket | quote }}}
+            - {name: S3_KMS_KEY_ID, value: {{ $root.Values.config.s3KmsKeyId | quote }}}
+            - {name: ARCHIVE_REQUIRE_KMS, value: {{ $root.Values.config.archiveRequireKms | quote }}}
+            - {name: S3_CREDENTIALS_FILE, value: /run/secrets/s3-credentials}
+            - {name: SPOOL_KEYRING_FILE, value: /run/secrets/spool-keyring}
+            - {name: CONTROL_INTERNAL_URL, value: {{ printf "http://%s-web:%v" (include "transhooter.fullname" $root) $root.Values.service.port | quote }}}
+            - {name: SPOOL_PATH, value: /var/lib/transhooter/spool}
+            - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
+          {{- else }}
           envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" $root }}}}]
           env:
-            - {name: INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
+            - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
             - {name: SPOOL_PATH, value: /var/lib/transhooter/spool}
-            - {name: WORKER_INTERNAL_BEARER_FILE, value: /var/run/secrets/transhooter/token}
+          {{- end }}
             {{- if $root.Values.telemetry.enabled }}
             - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ default (printf "http://%s-otel-collector:%v" (include "transhooter.fullname" $root) $root.Values.telemetry.collector.ports.otlpHttp) $root.Values.telemetry.endpoint | quote }}}
             - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
@@ -75,17 +91,24 @@ spec:
               - secret:
                   name: {{ $root.Values.existingSecret }}
                   items:
+                    {{- if eq $component "spool-drainer" }}
+                    - {key: s3-credentials, path: s3-credentials}
+                    - {key: spool-keyring, path: spool-keyring}
+                    {{- else }}
                     - {key: database-url, path: database-url}
                     - {key: redis-url, path: redis-url}
                     - {key: livekit-credentials, path: livekit-credentials}
                     - {key: s3-credentials, path: s3-credentials}
                     - {key: spool-keyring, path: spool-keyring}
+                    {{- end }}
+              {{- if eq $component "translation-worker" }}
               - secret:
                   name: {{ $root.Values.providerSecretName }}
                   items:
                     {{- range $root.Values.providerSecretKeys }}
                     - {key: {{ . | quote }}, path: {{ . | quote }}}
                     {{- end }}
+              {{- end }}
         - name: internal-token
           projected:
             sources:

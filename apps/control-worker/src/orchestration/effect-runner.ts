@@ -33,6 +33,8 @@ interface CanonicalEffectRequest {
 
 interface LeaseRenewal {
   timer: NodeJS.Timeout | undefined;
+  pending: Promise<void>;
+  requestedExpiryMs: number;
   lost: boolean;
   monitoring: boolean;
 }
@@ -195,24 +197,14 @@ export class EffectRunner {
   private startLeaseRenewal(effect: Effect): LeaseRenewal {
     const renewal: LeaseRenewal = {
       timer: undefined,
+      pending: Promise.resolve(),
+      requestedExpiryMs: effect.leaseExpiresAt?.getTime() ?? 0,
       lost: false,
       monitoring: true,
     };
     renewal.timer = setInterval(
       () => {
-        const leaseExpiresAt = new Date(this.clock.now().getTime() + this.options.leaseMs);
-        void this.store
-          .renewEffectLease(effect.id, this.options.owner, leaseExpiresAt)
-          .then((accepted) => {
-            if (renewal.monitoring && !accepted) {
-              renewal.lost = true;
-            }
-          })
-          .catch(() => {
-            if (renewal.monitoring) {
-              renewal.lost = true;
-            }
-          });
+        void this.renewLease(effect, renewal);
       },
       Math.max(100, Math.floor(this.options.leaseMs / 3)),
     );
@@ -220,12 +212,38 @@ export class EffectRunner {
     return renewal;
   }
 
+  private async renewLease(effect: Effect, renewal: LeaseRenewal): Promise<boolean> {
+    const requestedExpiryMs = Math.max(
+      renewal.requestedExpiryMs,
+      this.clock.now().getTime() + this.options.leaseMs,
+    );
+    renewal.requestedExpiryMs = requestedExpiryMs;
+    const attempt = renewal.pending.then(async () =>
+      this.store.renewEffectLease(effect.id, this.options.owner, new Date(requestedExpiryMs)),
+    );
+    renewal.pending = attempt.then(
+      () => undefined,
+      () => undefined,
+    );
+    try {
+      const accepted = await attempt;
+      if (renewal.monitoring && !accepted) {
+        renewal.lost = true;
+      }
+      return accepted;
+    } catch {
+      if (renewal.monitoring) {
+        renewal.lost = true;
+      }
+      return false;
+    }
+  }
+
   private async requireOwnership(effect: Effect, renewal: LeaseRenewal): Promise<void> {
     if (renewal.lost) {
       throw new LeaseLostError("effect lease lost");
     }
-    const leaseExpiresAt = new Date(this.clock.now().getTime() + this.options.leaseMs);
-    if (!(await this.store.renewEffectLease(effect.id, this.options.owner, leaseExpiresAt))) {
+    if (!(await this.renewLease(effect, renewal))) {
       renewal.lost = true;
       throw new LeaseLostError("effect lease lost");
     }
@@ -239,6 +257,7 @@ export class EffectRunner {
         return await this.applyAdoption(effect, adopted, renewal);
       }
       const result = await this.remote.execute(effect, effect.plan);
+      await this.faults.afterRemoteSuccess(effect.kind, effect.consultationId);
       await this.requireOwnership(effect, renewal);
       if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
         await this.store.markCompensating(
@@ -249,20 +268,16 @@ export class EffectRunner {
         await this.compensateOwned({ ...effect, remoteId: result.remoteId }, renewal);
         return "compensated";
       }
-      await this.store.markApplied(effect.id, this.options.owner, result.remoteId, result.result);
-      renewal.monitoring = false;
-      renewal.lost = false;
-      clearInterval(renewal.timer);
-      if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
-        await this.store.markCompensating(
-          effect.id,
-          this.options.owner,
-          "generation fenced during completion",
-        );
-        renewal.lost = false;
-        await this.compensateOwned({ ...effect, remoteId: result.remoteId }, renewal);
-        return "compensated";
+      const rejectedOutcome = await this.persistApplied(
+        effect,
+        result.remoteId,
+        result.result,
+        renewal,
+      );
+      if (rejectedOutcome !== null) {
+        return rejectedOutcome;
       }
+      await this.requireOwnership(effect, renewal);
       await this.store.markDone(effect.id, this.options.owner);
       return "done";
     } catch (error) {
@@ -319,27 +334,47 @@ export class EffectRunner {
       await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
       return "compensated";
     }
-    await this.store.markApplied(
-      effect.id,
-      this.options.owner,
+    const rejectedOutcome = await this.persistApplied(
+      effect,
       adoption.remoteId,
       adoption.result ?? { adopted: true, terminal: adoption.terminal },
+      renewal,
     );
-    renewal.monitoring = false;
-    renewal.lost = false;
-    clearInterval(renewal.timer);
+    if (rejectedOutcome !== null) {
+      return rejectedOutcome;
+    }
+    await this.requireOwnership(effect, renewal);
+    await this.store.markDone(effect.id, this.options.owner);
+    return "done";
+  }
+
+  private async persistApplied(
+    effect: Effect,
+    remoteId: string | null,
+    result: unknown,
+    renewal: LeaseRenewal,
+  ): Promise<EffectOutcome | null> {
+    const transition = await this.store.markApplied(
+      effect.id,
+      this.options.owner,
+      remoteId,
+      result,
+    );
+    if (transition === "applied") {
+      await this.faults.afterMarkApplied(effect.kind, effect.consultationId);
+      return null;
+    }
     if ((await this.store.currentGeneration(effect.consultationId)) !== effect.generation) {
+      await this.requireOwnership(effect, renewal);
       await this.store.markCompensating(
         effect.id,
         this.options.owner,
-        "generation fenced during adoption completion",
+        "generation fenced during applied transition",
       );
-      renewal.lost = false;
-      await this.compensateOwned({ ...effect, remoteId: adoption.remoteId }, renewal);
+      await this.compensateOwned({ ...effect, remoteId }, renewal);
       return "compensated";
     }
-    await this.store.markDone(effect.id, this.options.owner);
-    return "done";
+    return "not_owned";
   }
 
   private async compensateOwned(

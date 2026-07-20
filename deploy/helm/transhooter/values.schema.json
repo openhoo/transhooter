@@ -4,12 +4,14 @@
   "required": [
     "images",
     "existingSecret",
+    "migratorSecret",
     "magicLinkSealKeys",
     "providerSecretName",
     "spool",
     "config",
     "rollout",
-    "telemetry"
+    "telemetry",
+    "ingress"
   ],
   "oneOf": [
     {
@@ -58,8 +60,63 @@
       }
     }
   ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ingress": {
+            "properties": {
+              "trustedClientIp": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              }
+            },
+            "required": ["trustedClientIp"]
+          }
+        },
+        "required": ["ingress"]
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "trustedClientIpHeader": {
+                "type": "string",
+                "pattern": "^x-[a-z0-9-]+$",
+                "not": { "enum": ["x-forwarded-for", "x-real-ip"] }
+              }
+            },
+            "required": ["trustedClientIpHeader"]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "config": {
+            "properties": { "trustedClientIpHeader": { "const": "" } }
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "existingSecret": { "type": "string", "minLength": 1 },
+    "migratorSecret": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["existingSecret", "secretKey"],
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "minLength": 1
+        },
+        "secretKey": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        }
+      }
+    },
     "magicLinkSealKeys": {
       "type": "object",
       "additionalProperties": false,
@@ -223,8 +280,13 @@
         "publicLivekitUrl": { "type": "string", "pattern": "^wss://" },
         "trustedClientIpHeader": {
           "type": "string",
-          "pattern": "^x-[a-z0-9-]+$",
-          "not": { "enum": ["x-forwarded-for", "x-real-ip"] }
+          "anyOf": [
+            { "const": "" },
+            {
+              "pattern": "^x-[a-z0-9-]+$",
+              "not": { "enum": ["x-forwarded-for", "x-real-ip"] }
+            }
+          ]
         },
         "s3Endpoint": { "type": "string", "pattern": "^https://" },
         "s3PublicEndpoint": {
@@ -334,6 +396,154 @@
           }
         }
       }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "className", "annotations", "trustedClientIp", "hosts", "tls"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": {
+          "type": "object",
+          "propertyNames": {
+            "not": { "const": "nginx.ingress.kubernetes.io/configuration-snippet" }
+          },
+          "additionalProperties": { "type": "string" }
+        },
+        "trustedClientIp": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "controller",
+            "configurationSnippetEnabled",
+            "namespaceSelector",
+            "podSelector"
+          ],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "controller": { "const": "nginx" },
+            "configurationSnippetEnabled": { "type": "boolean" },
+            "namespaceSelector": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "matchLabels": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "additionalProperties": { "type": "string" }
+                },
+                "matchExpressions": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["key", "operator"],
+                    "properties": {
+                      "key": { "type": "string", "minLength": 1 },
+                      "operator": { "enum": ["In", "NotIn", "Exists", "DoesNotExist"] },
+                      "values": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "podSelector": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "matchLabels": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "additionalProperties": { "type": "string" }
+                },
+                "matchExpressions": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["key", "operator"],
+                    "properties": {
+                      "key": { "type": "string", "minLength": 1 },
+                      "operator": { "enum": ["In", "NotIn", "Exists", "DoesNotExist"] },
+                      "values": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              },
+              "then": {
+                "properties": {
+                  "configurationSnippetEnabled": { "const": true },
+                  "namespaceSelector": { "minProperties": 1 },
+                  "podSelector": { "minProperties": 1 }
+                }
+              }
+            }
+          ]
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host", "paths"],
+            "properties": {
+              "host": { "type": "string", "minLength": 1 },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path"],
+                  "properties": {
+                    "path": { "type": "string", "pattern": "^/" },
+                    "pathType": { "enum": ["Exact", "Prefix", "ImplementationSpecific"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": { "type": "array", "items": { "type": "object" } }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "trustedClientIp": {
+                "properties": { "enabled": { "const": true } },
+                "required": ["enabled"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enabled": { "const": true },
+              "className": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ]
     },
     "egress": {
       "type": "object",

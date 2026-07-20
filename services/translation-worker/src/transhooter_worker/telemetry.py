@@ -78,6 +78,8 @@ class TelemetryHandle:
             if self._closed:
                 return
             for provider in (self._tracer_provider, self._meter_provider):
+                if provider is None:
+                    continue
                 try:
                     provider.force_flush()
                 except Exception:
@@ -91,6 +93,8 @@ class TelemetryHandle:
                 return
             self._closed = True
             for provider in (self._meter_provider, self._tracer_provider):
+                if provider is None:
+                    continue
                 try:
                     provider.shutdown()
                 except Exception:
@@ -135,27 +139,15 @@ def configure_telemetry(
         if _handle is not None:
             return _handle
 
-        configured_endpoint = endpoint.strip() if endpoint is not None else None
-        endpoint_configured = (
-            bool(configured_endpoint)
-            if endpoint is not None
-            else any(
-                os.environ.get(name, "").strip()
-                for name in (
-                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-                    "OTEL_EXPORTER_OTLP_ENDPOINT",
-                )
-            )
-        )
-        if _sdk_disabled() or not endpoint_configured:
+        signal_endpoints = _configured_signal_endpoints(endpoint)
+        if _sdk_disabled() or not any(signal_endpoints):
             _handle = _disabled_handle(service_name)
             return _handle
 
         try:
             _handle = _enabled_handle(
                 service_name=service_name,
-                endpoint=configured_endpoint,
+                signal_endpoints=signal_endpoints,
                 environment=environment,
                 metric_export_interval_millis=metric_export_interval_millis,
             )
@@ -202,7 +194,7 @@ def _metric_views() -> list[Any]:
 def _enabled_handle(
     *,
     service_name: str,
-    endpoint: str | None,
+    signal_endpoints: tuple[str | None, str | None],
     environment: str | None,
     metric_export_interval_millis: int | None,
 ) -> TelemetryHandle:
@@ -223,7 +215,7 @@ def _enabled_handle(
     if environment and environment.strip():
         attributes["deployment.environment.name"] = environment.strip()
     resource = Resource.create(attributes)
-    signal_endpoints = _signal_endpoints(endpoint) if endpoint is not None else None
+    trace_endpoint, metric_endpoint = signal_endpoints
     export_interval = _metric_export_interval(metric_export_interval_millis)
 
     span_processor: Any = None
@@ -231,28 +223,36 @@ def _enabled_handle(
     metric_reader: Any = None
     meter_provider: Any = None
     try:
-        span_processor = BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=signal_endpoints[0] if signal_endpoints is not None else None)
-        )
-        tracer_provider = TracerProvider(resource=resource)
-        tracer_provider.add_span_processor(span_processor)
+        if trace_endpoint is not None:
+            span_processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=trace_endpoint))
+            tracer_provider = TracerProvider(resource=resource)
+            tracer_provider.add_span_processor(span_processor)
 
-        metric_reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(
-                endpoint=signal_endpoints[1] if signal_endpoints is not None else None
-            ),
-            export_interval_millis=export_interval,
-        )
-        meter_provider = MeterProvider(
-            resource=resource,
-            metric_readers=[metric_reader],
-            views=_metric_views(),
-        )
-        trace.set_tracer_provider(tracer_provider)
-        metrics.set_meter_provider(meter_provider)
+        if metric_endpoint is not None:
+            metric_reader = PeriodicExportingMetricReader(
+                OTLPMetricExporter(endpoint=metric_endpoint),
+                export_interval_millis=export_interval,
+            )
+            meter_provider = MeterProvider(
+                resource=resource,
+                metric_readers=[metric_reader],
+                views=_metric_views(),
+            )
+        if tracer_provider is not None:
+            trace.set_tracer_provider(tracer_provider)
+        if meter_provider is not None:
+            metrics.set_meter_provider(meter_provider)
         return TelemetryHandle(
-            tracer=tracer_provider.get_tracer(service_name, service_version),
-            meter=meter_provider.get_meter(service_name, service_version),
+            tracer=(
+                tracer_provider.get_tracer(service_name, service_version)
+                if tracer_provider is not None
+                else trace.NoOpTracerProvider().get_tracer(service_name, service_version)
+            ),
+            meter=(
+                meter_provider.get_meter(service_name, service_version)
+                if meter_provider is not None
+                else metrics.NoOpMeterProvider().get_meter(service_name, service_version)
+            ),
             enabled=True,
             tracer_provider=tracer_provider,
             meter_provider=meter_provider,
@@ -267,6 +267,25 @@ def _enabled_handle(
         elif span_processor is not None:
             _quiet_shutdown(span_processor)
         raise
+
+
+def _configured_signal_endpoints(
+    configured_common_endpoint: str | None,
+) -> tuple[str | None, str | None]:
+    common_endpoint = (
+        configured_common_endpoint.strip()
+        if configured_common_endpoint is not None
+        else os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    trace_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+    metric_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "").strip()
+    common_signal_endpoints = (
+        _signal_endpoints(common_endpoint) if common_endpoint else (None, None)
+    )
+    return (
+        trace_endpoint or common_signal_endpoints[0],
+        metric_endpoint or common_signal_endpoints[1],
+    )
 
 
 def _signal_endpoints(endpoint: str) -> tuple[str, str]:

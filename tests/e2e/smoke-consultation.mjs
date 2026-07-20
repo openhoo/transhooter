@@ -126,10 +126,7 @@ if (
 ) {
   throw new Error("--failure-harness-release-timeout-ms must be a positive integer");
 }
-const employeeEmail = requireValue(
-  process.env.E2E_EMPLOYEE_EMAIL ?? process.env.BOOTSTRAP_ADMIN_EMAIL,
-  "E2E_EMPLOYEE_EMAIL",
-);
+const employeeEmail = requireValue(process.env.E2E_EMPLOYEE_EMAIL, "E2E_EMPLOYEE_EMAIL");
 const configuredRunId = process.env.E2E_RUN_ID;
 const runId = configuredRunId === undefined ? randomUUID() : configuredRunId;
 if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(runId)) {

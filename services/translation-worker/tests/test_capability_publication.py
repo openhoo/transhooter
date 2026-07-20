@@ -61,10 +61,16 @@ def fixture_capabilities() -> tuple[StageCapabilities, ...]:
 
 
 class RecordingAsyncClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        status_code: int = 204,
+        response_body: object | None = None,
+    ) -> None:
         self.url: str | None = None
         self.headers: dict[str, str] | None = None
         self.payload: dict[str, object] | None = None
+        self.status_code = status_code
+        self.response_body = response_body
 
     async def __aenter__(self) -> RecordingAsyncClient:
         return self
@@ -82,7 +88,10 @@ class RecordingAsyncClient:
         self.url = url
         self.headers = headers
         self.payload = json
-        return httpx.Response(204, request=httpx.Request("POST", url))
+        request = httpx.Request("POST", url)
+        if self.response_body is None:
+            return httpx.Response(self.status_code, request=request)
+        return httpx.Response(self.status_code, request=request, json=self.response_body)
 
 
 def test_refresh_contains_complete_bidirectional_frozen_selection() -> None:
@@ -141,6 +150,49 @@ async def test_publish_uses_bearer_without_putting_token_in_payload(
     assert client.headers == {"authorization": f"Bearer {token}"}
     assert client.payload == payload
     assert token not in json.dumps(client.payload)
+
+
+@pytest.mark.asyncio
+async def test_publish_rejection_reports_only_bounded_status_and_server_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token = "private-control-token"
+    token_file = tmp_path / "token"
+    token_file.write_text(token)
+    client = RecordingAsyncClient(
+        400,
+        {
+            "code": "STALE_CAPABILITY_REFRESH",
+            "message": "sensitive server detail",
+            "payload": "sensitive request echo",
+            "issues": [
+                {
+                    "code": "invalid_type",
+                    "path": ["rows", 0, "snapshot"],
+                    "message": "sensitive validation detail",
+                }
+            ],
+        },
+    )
+    monkeypatch.setenv("CAPABILITY_PUBLISH_URL", "http://web/api/internal/capabilities")
+    monkeypatch.setenv("INTERNAL_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_: client)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^capability publication rejected with HTTP 400 "
+            r"\(STALE_CAPABILITY_REFRESH\) \[rows\.0\.snapshot:invalid_type\]$"
+        ),
+    ) as raised:
+        await _publish_capabilities({"profileName": "fixture"})
+
+    diagnostic = str(raised.value)
+    assert token not in diagnostic
+    assert "sensitive server detail" not in diagnostic
+    assert "sensitive request echo" not in diagnostic
+    assert "sensitive validation detail" not in diagnostic
+    assert "http://web" not in diagnostic
 
 
 def google_tts_capabilities(voices: tuple[str, ...]) -> StageCapabilities:

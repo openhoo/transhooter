@@ -359,7 +359,7 @@ test("an unknown UUID participant never starts capture Egress", async () => {
   assert.deepEqual(planned, []);
 });
 
-test("terminal worker cleanup cannot block room deletion", async () => {
+test("finalization broadcasts shutdown so worker terminal evidence unlocks cleanup", async () => {
   const planned = await run({
     id: "20000000-0000-4000-8000-000000000012",
     aggregateId: consultationId,
@@ -380,6 +380,7 @@ test("terminal worker cleanup cannot block room deletion", async () => {
     planned.map(({ kind }) => kind),
     ["STATUS_PACKET", "EGRESS_STOP", "PARTICIPANT_REMOVE", "DISPATCH_DELETE", "ROOM_DELETE"],
   );
+  assert.equal(Object.hasOwn(planned[0]?.plan ?? {}, "destinationIdentities"), false);
   for (const effect of planned.slice(1)) {
     assert.equal(effect.plan.notBeforeMs, 12_000);
   }

@@ -204,7 +204,13 @@ export const REFINEMENT_OVERRIDES: Readonly<Record<string, RefinementOverride>> 
     constraints: {
       if: { properties: { action: { const: "retry" } }, required: ["action"] },
       // biome-ignore lint/suspicious/noThenProperty: Draft 2020-12 requires the `then` keyword.
-      then: { properties: { retryAtMs: nonNull }, required: ["retryAtMs"] },
+      then: {
+        properties: {
+          retryAtMs: nonNull,
+          previousAttemptId: nonNull,
+        },
+        required: ["retryAtMs", "previousAttemptId"],
+      },
       else: { properties: { retryAtMs: { type: "null" } }, required: ["retryAtMs"] },
     },
   },

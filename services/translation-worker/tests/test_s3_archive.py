@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from botocore.exceptions import ClientError
 
-from transhooter_worker.adapters.s3_archive import S3Archive
+from transhooter_worker.adapters.s3_archive import ArchiveConflict, S3Archive
 
 
 class RecordingS3Client:
@@ -128,6 +128,32 @@ def sha256_hex(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
+def journal_upload(
+    archive: S3Archive,
+    key: str,
+    sha256: str,
+    upload_id: str,
+    updated_ms: int,
+    content_type: str = "audio/L16",
+) -> None:
+    assert archive._db is not None
+    archive._db.execute(
+        """
+        INSERT INTO multipart_uploads(
+            key, sha256, upload_id, state, updated_ms, content_type, owner_id
+        ) VALUES (?, ?, ?, 'uploading', ?, ?, ?)
+        """,
+        (
+            key,
+            sha256,
+            upload_id,
+            updated_ms,
+            content_type,
+            archive._multipart_owner(),
+        ),
+    )
+
+
 def no_such_upload(operation: str) -> ClientError:
     return ClientError(
         {
@@ -171,6 +197,9 @@ def test_archive_multipart_persists_parts_and_verifies(
     record = archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
     assert record.version_id == "v2"
     assert archive.verify(record)
+    assert client.multipart["Metadata"]["transhooter-multipart-owner"] == (
+        archive._multipart_owner()
+    )
     assert len(client.parts[key]) == 3
     assert archive._db is not None
     intended = archive._db.execute(
@@ -207,12 +236,12 @@ def test_archive_reuses_only_checksum_and_size_matched_remote_part(
     assert archive._db is not None
     body = b"abcdefghijklmnopq"
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/resume.pcm"
-    archive._db.execute(
-        """
-        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
-        VALUES (?, ?, 'resumed-upload', 'uploading', ?)
-        """,
-        (key, sha256_hex(body), archive._now_ms()),
+    journal_upload(
+        archive,
+        key,
+        sha256_hex(body),
+        "resumed-upload",
+        archive._now_ms(),
     )
     client.multipart = {
         "Metadata": {"sha256": sha256_hex(body)},
@@ -286,12 +315,12 @@ def test_archive_aborts_incompatible_remote_part_before_reuse(
     assert archive._db is not None
     body = b"a" * 17
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/mismatch.pcm"
-    archive._db.execute(
-        """
-        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
-        VALUES (?, ?, 'incompatible-upload', 'uploading', ?)
-        """,
-        (key, sha256_hex(body), archive._now_ms()),
+    journal_upload(
+        archive,
+        key,
+        sha256_hex(body),
+        "incompatible-upload",
+        archive._now_ms(),
     )
     client.parts[key] = {
         1: (
@@ -308,21 +337,66 @@ def test_archive_aborts_incompatible_remote_part_before_reuse(
     assert client.parts[key][1][0] == body[:6]
 
 
-def test_archive_startup_aborts_only_unjournaled_owned_prefix_uploads(
+def test_archive_does_not_abort_upload_owned_by_another_journal(
     tmp_path: Path,
 ) -> None:
     client = RecordingS3Client()
-    owned_key = f"v1/meetings/{uuid4()}/audio/stt-input/source/orphan.pcm"
-    foreign_key = "foreign/uploads/do-not-touch"
-    client.active_uploads = {
-        "owned-orphan": owned_key,
-        "foreign-orphan": foreign_key,
-    }
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/orphan.pcm"
+    first = S3Archive(client, "bucket", None, False, tmp_path / "first.sqlite3")
+    created = client.create_multipart_upload(
+        Bucket="bucket",
+        Key=key,
+        ContentType="audio/L16",
+        ChecksumAlgorithm="CRC64NVME",
+        Metadata={
+            "sha256": "a" * 64,
+            "transhooter-multipart-owner": first._multipart_owner(),
+        },
+    )
+    journal_upload(first, key, "a" * 64, created["UploadId"], 0)
 
-    S3Archive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
+    second = S3Archive(client, "bucket", None, False, tmp_path / "second.sqlite3")
 
-    assert client.aborted == ["owned-orphan"]
-    assert client.active_uploads == {"foreign-orphan": foreign_key}
+    assert second.abort_abandoned(second._now_ms()) == 0
+    assert client.aborted == []
+    assert client.active_uploads == {created["UploadId"]: key}
+
+
+def test_archive_rejects_completed_multipart_content_type_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    archive, client = archive_client(tmp_path)
+    body = b"durable multipart replay"
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/content-type.pcm"
+    archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    with pytest.raises(ArchiveConflict):
+        archive.put_create_once(key, body, "application/octet-stream", sha256_hex(body))
+
+    assert client.completion_calls == 1
+
+
+def test_archive_rejects_in_progress_multipart_content_type_replay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    archive, client = archive_client(tmp_path)
+    body = b"durable multipart replay"
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/in-progress.pcm"
+    journal_upload(
+        archive,
+        key,
+        sha256_hex(body),
+        "owned-in-progress",
+        archive._now_ms(),
+    )
+    client.parts[key] = {}
+
+    with pytest.raises(ArchiveConflict):
+        archive.put_create_once(key, body, "application/octet-stream", sha256_hex(body))
+
+    assert client.aborted == []
 
 
 def test_archive_recovers_completed_multipart_after_nosuchupload(
@@ -363,12 +437,12 @@ def test_archive_restarts_upload_with_unexpected_remote_part_superset(
     assert archive._db is not None
     body = b"a" * 17
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/extra.pcm"
-    archive._db.execute(
-        """
-        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
-        VALUES (?, ?, 'old-upload', 'uploading', ?)
-        """,
-        (key, sha256_hex(body), archive._now_ms()),
+    journal_upload(
+        archive,
+        key,
+        sha256_hex(body),
+        "old-upload",
+        archive._now_ms(),
     )
     client.parts[key] = {4: (b"unexpected", "etag-4", "part-crc")}
 
@@ -385,13 +459,7 @@ def test_archive_startup_reconciles_remote_part_superset_and_aborts_stale_upload
     archive, client = archive_client(tmp_path)
     assert archive._db is not None
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/002.pcm"
-    archive._db.execute(
-        """
-        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
-        VALUES (?, ?, ?, 'uploading', 0)
-        """,
-        (key, "a" * 64, "stale-upload"),
-    )
+    journal_upload(archive, key, "a" * 64, "stale-upload", 0)
     archive._db.execute(
         """
         INSERT INTO multipart_parts(key, part_number, etag, checksum, size)
@@ -423,13 +491,7 @@ def test_archive_startup_forgets_stale_upload_missing_during_reconcile(
     archive, client = archive_client(tmp_path)
     assert archive._db is not None
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/003.pcm"
-    archive._db.execute(
-        """
-        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
-        VALUES (?, ?, 'missing-upload', 'uploading', 0)
-        """,
-        (key, "b" * 64),
-    )
+    journal_upload(archive, key, "b" * 64, "missing-upload", 0)
     archive._db.execute(
         """
         INSERT INTO multipart_parts(key, part_number, etag, checksum, size)
@@ -460,13 +522,7 @@ def test_archive_startup_accepts_missing_upload_after_ambiguous_abort(
     archive, client = archive_client(tmp_path)
     assert archive._db is not None
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/004.pcm"
-    archive._db.execute(
-        """
-        INSERT INTO multipart_uploads(key, sha256, upload_id, state, updated_ms)
-        VALUES (?, ?, 'ambiguous-abort', 'uploading', 0)
-        """,
-        (key, "c" * 64),
-    )
+    journal_upload(archive, key, "c" * 64, "ambiguous-abort", 0)
     client.parts[key] = {1: (b"a" * 6, "etag-1", "part-crc")}
     archive._db.close()
 

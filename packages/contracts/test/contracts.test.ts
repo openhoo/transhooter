@@ -785,7 +785,7 @@ test("worker checkpoints require canonical direction and sample watermarks", () 
   assert.throws(() =>
     WorkerCheckpointSchema.parse({
       ...checkpoint,
-      compatibilityWatermark: 4000,
+      unknownWatermark: 4000,
     }),
   );
   assert.throws(() =>
@@ -977,9 +977,15 @@ test("generated schemas preserve representable refinements and disclose value co
     segmentEnd: null,
     reason: "unknown",
   } as const;
-  const retryWithoutTime = {
+  const retryWithoutLink = {
     action: "retry",
     reason: "safe replay",
+    retryAtMs: 250,
+    previousAttemptId: null,
+  } as const;
+  const stopWithoutLink = {
+    action: "do_not_retry",
+    reason: "cancelled",
     retryAtMs: null,
     previousAttemptId: null,
   } as const;
@@ -996,16 +1002,18 @@ test("generated schemas preserve representable refinements and disclose value co
   } as const;
 
   assert.throws(() => ArchiveGapSchema.parse(gapWithoutRange));
-  assert.throws(() => RetryDecisionSchema.parse(retryWithoutTime));
+  assert.throws(() => RetryDecisionSchema.parse(retryWithoutLink));
+  assert.deepEqual(RetryDecisionSchema.parse(stopWithoutLink), stopWithoutLink);
   assert.throws(() => OrderedHeaderSchema.parse(malformedHeader));
   assert.throws(() => ProviderAttemptTerminalSchema.parse(failedTerminalWithoutError));
   assertGeneratedRejects([
     ["ArchiveGap", gapWithoutRange],
-    ["RetryDecision", retryWithoutTime],
+    ["RetryDecision", retryWithoutLink],
     ["OrderedHeader", malformedHeader],
     ["ProviderAttemptTerminal", failedTerminalWithoutError],
     ["HttpProviderAttemptTerminal", failedTerminalWithoutError],
   ]);
+  assertGeneratedAccepts([["RetryDecision", stopWithoutLink]]);
 
   const retryLinkRefinements = [
     "successful and cancelled terminals cannot carry retryDecision actions other than do_not_retry",

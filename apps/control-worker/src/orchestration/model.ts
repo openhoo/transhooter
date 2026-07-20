@@ -183,6 +183,8 @@ export interface CapacityDimension {
 
 export type FinalizationAdmission = "admitted" | ConsultationState | null;
 
+export type AppliedTransition = "applied" | "rejected";
+
 export interface DurableStore {
   readiness(): Promise<void>;
 
@@ -202,7 +204,12 @@ export interface DurableStore {
     requestSha256: string,
   ): Promise<Effect | null>;
   renewEffectLease(effectId: Uuid, owner: Uuid, leaseExpiresAt: Date): Promise<boolean>;
-  markApplied(effectId: Uuid, owner: Uuid, remoteId: string | null, result: unknown): Promise<void>;
+  markApplied(
+    effectId: Uuid,
+    owner: Uuid,
+    remoteId: string | null,
+    result: unknown,
+  ): Promise<AppliedTransition>;
   markDone(effectId: Uuid, owner: Uuid): Promise<void>;
   markFailed(effectId: Uuid, owner: Uuid, error: string, retryAt: Date | null): Promise<void>;
   markCompensating(effectId: Uuid, owner: Uuid, reason: string): Promise<void>;

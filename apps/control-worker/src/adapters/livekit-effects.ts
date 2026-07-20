@@ -353,8 +353,9 @@ export class LiveKitEffects implements RemoteEffects {
   ): Promise<Adoption | null> {
     if (effect.kind === "ROOM_COMPOSITE_EGRESS" || effect.kind === "PARTICIPANT_EGRESS") {
       const roomName = roomNameFor(effect, request);
-      const found = (await this.egress.listEgress({ roomName })).find((candidate) =>
-        egressMatches(candidate, effect, request),
+      const found = (await this.egress.listEgress({ roomName })).find(
+        (candidate) =>
+          egressMatches(candidate, effect, request) && isViableEgressAdoption(candidate.status),
       );
       return found === undefined
         ? null
@@ -540,7 +541,10 @@ export class LiveKitEffects implements RemoteEffects {
         data: payload,
         kind: DataPacket_Kind.RELIABLE,
         destinationSids: [],
-        destinationIdentities: optionalStringArray(request.destinationIdentities),
+        destinationIdentities:
+          request.reasonCode === "SHUTDOWN"
+            ? []
+            : optionalStringArray(request.destinationIdentities),
         topic: requiredString(request, "topic"),
         nonce: createHash("sha256").update(effect.id).digest().subarray(0, 16),
       }),
@@ -667,6 +671,11 @@ export class LiveKitEffects implements RemoteEffects {
             { segments: output },
             { screenShare: false },
           );
+    if (!isViableEgressAdoption(started.status)) {
+      throw new Error(
+        `Egress start returned non-viable status ${egressStatusName(started.status)}`,
+      );
+    }
     return {
       remoteId: started.egressId,
       result: { egressId: started.egressId, status: egressStatusName(started.status) },
@@ -878,6 +887,10 @@ function isTerminalEgress(status: EgressStatus): boolean {
     status === EgressStatus.EGRESS_ABORTED ||
     status === EgressStatus.EGRESS_LIMIT_REACHED
   );
+}
+
+export function isViableEgressAdoption(status: EgressStatus): boolean {
+  return status === EgressStatus.EGRESS_STARTING || status === EgressStatus.EGRESS_ACTIVE;
 }
 
 function hasExactCaptureGrant(
