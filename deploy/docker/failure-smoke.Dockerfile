@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.55.0-noble
+FROM mcr.microsoft.com/playwright:v1.55.1-noble
 COPY --from=oven/bun:1.3.14-debian /usr/local/bin/bun /usr/local/bin/bun
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN groupadd --gid 10001 transhooter \
