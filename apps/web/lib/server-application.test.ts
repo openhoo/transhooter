@@ -24,7 +24,7 @@ const {
   workerFailureCommand,
 } = await import("./server-application");
 const { DomainError } = await import("@transhooter/server-core");
-const { trustedClientIp } = await import("./composition");
+const { trustedClientIp } = await import("./server/composition");
 const { POST: heartbeatPOST } = await import("../app/api/internal/heartbeat/route");
 const { createRoute } = await import("../app/api/_route");
 

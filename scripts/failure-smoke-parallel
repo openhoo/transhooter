@@ -2,55 +2,5 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-OUTPUT_DIRECTORY=${FAILURE_SMOKE_OUTPUT_DIR:-artifacts/failure-smoke}
-APP_IMAGE_NAMESPACE=${APP_IMAGE_NAMESPACE:-transhooter-harness}
-export APP_IMAGE_NAMESPACE
-
-mkdir -p -- "$OUTPUT_DIRECTORY"
-chmod 0700 "$OUTPUT_DIRECTORY"
-
-"$ROOT/scripts/failure-smoke" --build-only \
-  --metrics-file "$OUTPUT_DIRECTORY/build.metrics.jsonl"
-
-pids=
-terminate_children() {
-  trap - HUP INT TERM
-  for child_pid in $pids; do
-    kill -TERM "$child_pid" 2>/dev/null || true
-  done
-  for child_pid in $pids; do
-    wait "$child_pid" 2>/dev/null || true
-  done
-  exit 143
-}
-trap terminate_children HUP INT TERM
-
-start_shard() {
-  shard=$1
-  octet=$2
-  TEST_RTC_SUBNET="10.254.${octet}.0/24" \
-  TEST_RTC_NODE_IP="10.254.${octet}.250" \
-  COMPOSE_HARNESS_LOCK_FILE="$OUTPUT_DIRECTORY/$shard.lock" \
-    "$ROOT/scripts/failure-smoke" --no-build \
-      --proof-file "$OUTPUT_DIRECTORY/$shard.proof.json" \
-      --metrics-file "$OUTPUT_DIRECTORY/$shard.metrics.jsonl" \
-      --shard "$shard" &
-  pids="$pids $!"
-}
-
-start_shard control 233
-start_shard provider 234
-start_shard spool 235
-start_shard storage 236
-
-status=0
-for child_pid in $pids; do
-  if wait "$child_pid"; then
-    :
-  else
-    child_status=$?
-    [ "$status" -ne 0 ] || status=$child_status
-  fi
-done
-trap - HUP INT TERM
-exit "$status"
+export TRANSHOOTER_ROOT="$ROOT"
+exec "$ROOT/tests/failure-smoke/internal/failure-smoke-parallel" "$@"

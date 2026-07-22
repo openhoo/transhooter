@@ -219,7 +219,7 @@ Diese Grenzen sind vor allem in
 `apps/control-worker/src/orchestration/effect-runner.ts`,
 `apps/control-worker/src/adapters/postgres-store.ts`,
 `packages/server-core/src/consultations/service.ts`,
-`packages/contracts/src`, `apps/web/lib/composition.ts` und
+`packages/contracts/src`, `apps/web/lib/server/composition.ts` und
 `deploy/helm/transhooter` implementiert.
 
 

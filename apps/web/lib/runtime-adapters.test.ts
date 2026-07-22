@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import { createHash } from "node:crypto";
-import type { WebConfig } from "./config";
+import type { WebConfig } from "./server/config";
 
 mock.module("server-only", () => ({}));
 
@@ -73,8 +73,8 @@ mock.module("livekit-server-sdk", () => ({
 }));
 
 // These imports must follow the module mocks so the adapters capture the test clients.
-const { liveKitAdapters, S3ArchiveAdapter } = await import("./runtime-adapters");
-const { parseWebEnvironment } = await import("./config");
+const { liveKitAdapters, S3ArchiveAdapter } = await import("./server/runtime-adapters");
+const { parseWebEnvironment } = await import("./server/config");
 
 const config = {
   appEnv: "test",

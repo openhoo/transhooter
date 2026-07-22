@@ -2,7 +2,7 @@ import {
   initializeWebTelemetry,
   recordFrameworkRequestError,
   shutdownWebTelemetry,
-} from "./lib/telemetry";
+} from "./lib/server/telemetry";
 
 const REGISTRATION_KEY = Symbol.for("@transhooter/web.telemetry.shutdown-listeners");
 const SHUTDOWN_STARTED_KEY = Symbol.for("@transhooter/web.telemetry.shutdown-started");

@@ -1,8 +1,13 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { CaptionPacketSchema, StatusPacketSchema } from "@transhooter/contracts";
-import { durableConsultationDestination } from "./consultation-routing.ts";
-import { acceptsCaption, acceptsStatus, audioGains, releaseLocalTrack } from "./room-policy.ts";
+import {
+  acceptsCaption,
+  acceptsStatus,
+  audioGains,
+  releaseLocalTrack,
+} from "./browser/room-policy.ts";
+import { durableConsultationDestination } from "./shared/consultation-routing.ts";
 
 const consultationId = "10000000-0000-4000-8000-000000000001";
 const destinationParticipantId = "10000000-0000-4000-8000-000000000002";

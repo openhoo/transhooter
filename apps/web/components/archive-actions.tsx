@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { FormEvent, MouseEvent } from "react";
 import { useEffect, useId, useRef, useState } from "react";
-import { api } from "@/lib/browser-api";
+import { api } from "@/lib/browser/browser-api";
 
 type DownloadButtonProps = {
   archiveId: string;

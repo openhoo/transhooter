@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-import { api } from "@/lib/browser-api";
+import { api } from "@/lib/browser/browser-api";
 
 export function LogoutButton() {
   const [pending, setPending] = useState(false);

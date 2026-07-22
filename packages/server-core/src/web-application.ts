@@ -1,300 +1,33 @@
-import type {
-  ArchiveObjectRecord,
-  FinalInventory,
-  ProviderAttemptReport,
-  WorkerCheckpoint,
-} from "@transhooter/contracts";
-import type { ApplicationOperations, StaffPrincipal } from "./application-operations";
-import type { ArchiveService } from "./archives/service";
-import type { AuthService } from "./auth/service";
-import type { ConsultationService } from "./consultations/service";
 import { DomainError, type UUID } from "./domain/model";
-import type { CapabilityRefresh, LanguageService } from "./languages/service";
+import {
+  assertAdmin,
+  assertStaff,
+  authenticateForCommand,
+  executeAuthenticatedAuth,
+  executeUnauthenticatedAuth,
+  isAuthenticatedAuthCommand,
+  isUnauthenticatedAuthCommand,
+  requestIp,
+  staffPrincipal,
+} from "./web-authentication";
 import type {
-  InternalPrincipal,
-  InternalPrincipalVerifier,
-  SessionRecord,
-  UserRecord,
-} from "./ports/index";
+  AdminCommand,
+  ArchiveCommand,
+  Authenticated,
+  AuthenticatedCommand,
+  ConsultationCommand,
+  WebApplication,
+  WebApplicationConfig,
+  WebExecutionContext,
+} from "./web-command";
+import { executeVerifiedInternal, isInternalCommand } from "./web-internal";
 
-type AuthCommand =
-  | {
-      kind: "auth.requestMagicLink";
-      email: string;
-    }
-  | {
-      kind: "auth.beginExchange";
-      token: string;
-    }
-  | {
-      kind: "auth.verifyExchange";
-      nonce: string;
-    }
-  | {
-      kind: "auth.authenticate";
-    }
-  | {
-      kind: "auth.logout";
-    }
-  | {
-      kind: "auth.reauthenticate";
-      consultationId: UUID;
-    }
-  | {
-      kind: "auth.provisionCustomer";
-      email: string;
-      displayName: string;
-    };
-
-type ConsultationCommand =
-  | {
-      kind: "consultation.create";
-      customerUserId: UUID;
-      providerProfileId: string;
-      creationIdempotencyKey: UUID;
-    }
-  | {
-      kind: "consultation.createInvitation";
-      customerEmail: string;
-      customerName: string;
-      providerProfileId: string;
-      creationIdempotencyKey: UUID;
-    }
-  | {
-      kind: "consultation.get";
-      consultationId: UUID;
-    }
-  | {
-      kind: "consultation.list";
-    }
-  | {
-      kind: "consultation.preferences";
-      consultationId: UUID;
-      displayName: string;
-      language: string;
-    }
-  | {
-      kind: "consultation.consent";
-      consultationId: UUID;
-      snapshotHash: string;
-    }
-  | {
-      kind: "consultation.join";
-      consultationId: UUID;
-    }
-  | {
-      kind: "consultation.token";
-      consultationId: UUID;
-    }
-  | {
-      kind: "consultation.resend";
-      consultationId: UUID;
-    }
-  | {
-      kind: "consultation.options";
-      providerProfileId: string;
-    }
-  | {
-      kind: "consultation.room";
-      consultationId: UUID;
-    }
-  | {
-      kind: "consultation.end";
-      consultationId: UUID;
-    }
-  | {
-      kind: "consultation.cancel";
-      consultationId: UUID;
-    };
-
-type ArchiveCommand =
-  | {
-      kind: "archive.list";
-    }
-  | {
-      kind: "archive.get";
-      archiveId: UUID;
-    }
-  | {
-      kind: "archive.objects";
-      archiveId: UUID;
-      cursor: string | null;
-      limit: number;
-    }
-  | {
-      kind: "archive.download";
-      archiveId: UUID;
-      objectId: UUID;
-    }
-  | {
-      kind: "archive.hold";
-      consultationId: UUID;
-      reason: string;
-    }
-  | {
-      kind: "archive.releaseHold";
-      consultationId: UUID;
-      holdId: UUID;
-    }
-  | {
-      kind: "archive.delete";
-      consultationId: UUID;
-      reason: string;
-    };
-
-type AdminCommand =
-  | {
-      kind: "admin.failures";
-    }
-  | {
-      kind: "admin.languages";
-      providerProfileId: string;
-    }
-  | {
-      kind: "language.enable";
-      capabilityId: UUID;
-      profileId: UUID;
-      profileRevision: number;
-      enabled: boolean;
-    };
-
-type InternalCommand =
-  | {
-      kind: "internal.capability";
-      refresh: CapabilityRefresh;
-    }
-  | {
-      kind: "internal.heartbeat";
-      consultationId: UUID;
-      generation: number;
-      workerId: UUID;
-      epoch: number;
-    }
-  | {
-      kind: "internal.checkpoint";
-      workerId: UUID;
-      consultationId: UUID;
-      generation: number;
-      writeEpoch: number;
-      objectKey: string;
-      checkpoint: WorkerCheckpoint;
-    }
-  | {
-      kind: "internal.providerAttempt";
-      consultationId: UUID;
-      generation: number;
-      workerId: UUID;
-      epoch: number;
-      eventId: UUID;
-      report: ProviderAttemptReport;
-    }
-  | {
-      kind: "internal.failure";
-      consultationId: UUID;
-      generation: number;
-      workerId: UUID;
-      epoch: number;
-      eventId: UUID;
-      kindName: string;
-      message: string;
-      phase?: string;
-      snapshotHash?: string;
-      lastCheckpointHashes: Readonly<Record<UUID, string>>;
-    }
-  | {
-      kind: "internal.archiveObject";
-      consultationId: UUID;
-      generation?: number;
-      workerId?: UUID;
-      workerEpoch?: number;
-      writerEpoch?: number;
-      causalKey: string;
-      object: ArchiveObjectRecord;
-    }
-  | {
-      kind: "internal.finalize";
-      consultationId: UUID;
-      inventory: FinalInventory;
-    }
-  | {
-      kind: "internal.egressLayout";
-      consultationId: UUID;
-      generation: number;
-    }
-  | {
-      kind: "internal.archiveRecording";
-      consultationId: UUID;
-    }
-  | {
-      kind: "internal.deleteDrain";
-      consultationId: UUID;
-      reason: string;
-      writeEpoch: number;
-    };
-
-export type WebCommand =
-  | AuthCommand
-  | ConsultationCommand
-  | ArchiveCommand
-  | AdminCommand
-  | InternalCommand;
-
-export interface WebExecutionContext {
-  sessionToken?: string;
-  csrfToken?: string;
-  request?: Request;
-  internalHeaders?: Readonly<Record<string, string | undefined>>;
-}
-
-export interface WebApplicationConfig {
-  auth: AuthService;
-  consultations: ConsultationService;
-  archives: ArchiveService;
-  languages: LanguageService;
-  operations: ApplicationOperations;
-  internalPrincipalVerifier: InternalPrincipalVerifier;
-  publicBaseUrl: string;
-  clientIp: (request: Request) => string;
-  ready: () => Promise<boolean>;
-}
-
-export interface WebApplication {
-  ready(): Promise<boolean>;
-  execute(command: WebCommand, context: WebExecutionContext): Promise<unknown>;
-}
-
-interface Authenticated {
-  session: SessionRecord;
-  user: UserRecord;
-}
-type UnauthenticatedAuthCommand = Extract<
-  AuthCommand,
-  {
-    kind: "auth.requestMagicLink" | "auth.beginExchange" | "auth.verifyExchange";
-  }
->;
-type AuthenticatedCommand = Exclude<
+export type {
+  WebApplication,
+  WebApplicationConfig,
   WebCommand,
-  | InternalCommand
-  | { kind: "auth.requestMagicLink" }
-  | { kind: "auth.beginExchange" }
-  | { kind: "auth.verifyExchange" }
->;
-type AuthenticatedAuthCommand = Extract<AuthenticatedCommand, { kind: `auth.${string}` }>;
-
-const readCommandKinds: readonly WebCommand["kind"][] = [
-  "auth.authenticate",
-  "consultation.get",
-  "consultation.list",
-  "consultation.options",
-  "consultation.room",
-  "archive.list",
-  "archive.get",
-  "archive.objects",
-  "archive.download",
-  "admin.failures",
-  "admin.languages",
-];
+  WebExecutionContext,
+} from "./web-command";
 
 export function createWebApplication(config: WebApplicationConfig): WebApplication {
   return {
@@ -312,66 +45,6 @@ export function createWebApplication(config: WebApplicationConfig): WebApplicati
       return executeAuthenticated(config, command, context, authenticated);
     },
   };
-}
-
-async function executeVerifiedInternal(
-  config: WebApplicationConfig,
-  command: InternalCommand,
-  context: WebExecutionContext,
-): Promise<unknown> {
-  if (!context.internalHeaders) {
-    throw new DomainError("UNAUTHENTICATED_INTERNAL");
-  }
-  const principal = await config.internalPrincipalVerifier.verify(context.internalHeaders);
-  return executeInternal(config, command, principal);
-}
-
-async function executeUnauthenticatedAuth(
-  config: WebApplicationConfig,
-  command: UnauthenticatedAuthCommand,
-  context: WebExecutionContext,
-): Promise<unknown> {
-  switch (command.kind) {
-    case "auth.requestMagicLink":
-      return config.auth.requestMagicLink({
-        email: command.email,
-        ip: requestIp(config, context),
-        purpose: "sign_in",
-        publicBaseUrl: config.publicBaseUrl,
-      });
-    case "auth.beginExchange":
-      return config.auth.beginExchange(command.token);
-    case "auth.verifyExchange": {
-      if (!context.request || !context.csrfToken) {
-        throw new DomainError("REQUEST_CONTEXT_REQUIRED");
-      }
-      const ip = requestIp(config, context);
-      return config.auth.verifyExchange(command.nonce, {
-        csrfToken: context.csrfToken,
-        origin: context.request.headers.get("origin") ?? "",
-        publicBaseUrl: config.publicBaseUrl,
-        requestIp: ip,
-        sessionToken: context.sessionToken ?? null,
-      });
-    }
-    default:
-      return assertNever(command);
-  }
-}
-
-async function authenticateForCommand(
-  config: WebApplicationConfig,
-  command: AuthenticatedCommand,
-  context: WebExecutionContext,
-): Promise<Authenticated> {
-  const sessionToken = context.sessionToken;
-  if (!sessionToken) {
-    throw new DomainError("UNAUTHENTICATED");
-  }
-  if (isMutation(command)) {
-    return config.auth.authenticateMutation(sessionToken, context.csrfToken ?? "");
-  }
-  return config.auth.authenticate(sessionToken);
 }
 
 async function executeAuthenticated(
@@ -393,34 +66,6 @@ async function executeAuthenticated(
     return executeAdmin(config, command, authenticated);
   }
   return assertNever(command);
-}
-
-async function executeAuthenticatedAuth(
-  config: WebApplicationConfig,
-  command: AuthenticatedAuthCommand,
-  context: WebExecutionContext,
-  authenticated: Authenticated,
-): Promise<unknown> {
-  const userId = authenticated.user.id;
-  switch (command.kind) {
-    case "auth.authenticate":
-      return authenticated;
-    case "auth.logout":
-      return config.operations.logout(authenticated.session.id, userId);
-    case "auth.reauthenticate":
-      assertAdmin(authenticated.user);
-      return config.auth.requestArchiveDeleteReauth(
-        context.sessionToken as string,
-        command.consultationId,
-        requestIp(config, context),
-        config.publicBaseUrl,
-      );
-    case "auth.provisionCustomer":
-      assertAdmin(authenticated.user);
-      return config.auth.provisionCustomer(command.email, command.displayName);
-    default:
-      return assertNever(command);
-  }
 }
 
 async function executeConsultation(
@@ -588,23 +233,6 @@ async function executeAdmin(
   }
 }
 
-function isInternalCommand(command: WebCommand): command is InternalCommand {
-  return command.kind.startsWith("internal.");
-}
-function isUnauthenticatedAuthCommand(command: WebCommand): command is UnauthenticatedAuthCommand {
-  return (
-    command.kind === "auth.requestMagicLink" ||
-    command.kind === "auth.beginExchange" ||
-    command.kind === "auth.verifyExchange"
-  );
-}
-
-function isAuthenticatedAuthCommand(
-  command: AuthenticatedCommand,
-): command is AuthenticatedAuthCommand {
-  return command.kind.startsWith("auth.");
-}
-
 function isConsultationCommand(command: AuthenticatedCommand): command is ConsultationCommand {
   return command.kind.startsWith("consultation.");
 }
@@ -615,123 +243,6 @@ function isArchiveCommand(command: AuthenticatedCommand): command is ArchiveComm
 
 function isAdminCommand(command: AuthenticatedCommand): command is AdminCommand {
   return command.kind.startsWith("admin.") || command.kind === "language.enable";
-}
-
-async function executeInternal(
-  config: WebApplicationConfig,
-  command: InternalCommand,
-  principal: InternalPrincipal,
-): Promise<unknown> {
-  switch (command.kind) {
-    case "internal.capability":
-      authorizeInternal(principal, "capability:write", ["translation-worker", "language-refresh"]);
-      return config.languages.publishRevision(command.refresh);
-    case "internal.heartbeat":
-      authorizeInternal(principal, "heartbeat:write", ["translation-worker"]);
-      return config.operations.heartbeat(
-        command.consultationId,
-        command.generation,
-        command.workerId,
-        command.epoch,
-      );
-    case "internal.checkpoint":
-      authorizeInternal(principal, "checkpoint:write", ["translation-worker"]);
-      return config.operations.checkpoint(command);
-    case "internal.providerAttempt":
-      authorizeInternal(principal, "checkpoint:write", ["translation-worker"]);
-      return config.operations.providerAttempt(command);
-    case "internal.failure":
-      authorizeInternal(principal, "failure:write", ["translation-worker"]);
-      return config.operations.workerFailure(command);
-    case "internal.archiveObject":
-      authorizeInternal(principal, "checkpoint:write", ["translation-worker", "spool-drainer"]);
-      if (principal.service === "translation-worker") {
-        if (
-          command.generation === undefined ||
-          command.workerId === undefined ||
-          command.workerEpoch === undefined ||
-          command.writerEpoch === undefined
-        ) {
-          throw new DomainError("INVALID_WORKER_ARCHIVE_OBJECT");
-        }
-        return config.archives.recordWorkerObject(
-          command.consultationId,
-          {
-            generation: command.generation,
-            workerId: command.workerId,
-            workerEpoch: command.workerEpoch,
-          },
-          command.writerEpoch,
-          command.causalKey,
-          command.object,
-        );
-      }
-      return config.archives.recordDrainerObject(
-        command.consultationId,
-        command.causalKey,
-        command.object,
-      );
-    case "internal.finalize":
-      authorizeInternal(principal, "archive:finalize", ["translation-worker", "control-worker"]);
-      return config.archives.finalizeInventory(command.consultationId, command.inventory);
-    case "internal.egressLayout":
-      authorizeInternal(principal, "egress-layout:read", ["control-worker"]);
-      return config.operations.egressLayout(command.consultationId, command.generation);
-    case "internal.archiveRecording":
-      authorizeInternal(principal, "archive:recording", ["control-worker"]);
-      return config.archives.adoptCompositeRecording(command.consultationId);
-    case "internal.deleteDrain":
-      authorizeInternal(principal, "delete:drain", ["control-worker"]);
-      return config.archives.drainDeletion(
-        command.consultationId,
-        command.writeEpoch,
-        command.reason,
-      );
-    default:
-      return assertNever(command);
-  }
-}
-
-function isMutation(command: AuthenticatedCommand): boolean {
-  return !readCommandKinds.includes(command.kind);
-}
-
-function staffPrincipal(user: UserRecord): StaffPrincipal {
-  if (user.staffRole !== "employee" && user.staffRole !== "admin") {
-    throw new DomainError("FORBIDDEN");
-  }
-  return { userId: user.id, role: user.staffRole };
-}
-
-function assertStaff(user: UserRecord): void {
-  staffPrincipal(user);
-}
-
-function assertAdmin(user: UserRecord): void {
-  if (user.staffRole !== "admin") {
-    throw new DomainError("FORBIDDEN");
-  }
-}
-
-function authorizeInternal(
-  principal: InternalPrincipal,
-  permission: string,
-  services: readonly InternalPrincipal["service"][],
-): void {
-  if (!services.includes(principal.service) || !principal.permissions.includes(permission)) {
-    throw new DomainError("FORBIDDEN_INTERNAL");
-  }
-}
-
-function requestIp(config: WebApplicationConfig, context: WebExecutionContext): string {
-  if (!context.request) {
-    throw new DomainError("REQUEST_CONTEXT_REQUIRED");
-  }
-  const origin = context.request.headers.get("origin");
-  if (origin !== new URL(config.publicBaseUrl).origin) {
-    throw new DomainError("ORIGIN_INVALID");
-  }
-  return config.clientIp(context.request);
 }
 
 function assertNever(value: never): never {

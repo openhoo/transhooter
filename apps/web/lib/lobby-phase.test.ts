@@ -4,7 +4,7 @@ import {
   type LobbyPhase,
   LobbyPreviewFence,
   type PreviewStream,
-} from "./lobby-phase";
+} from "./browser/lobby-phase";
 
 describe("lobby phase descriptors", () => {
   const cases: ReadonlyArray<

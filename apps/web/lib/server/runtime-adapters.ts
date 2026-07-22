@@ -44,8 +44,11 @@ import {
 } from "livekit-server-sdk";
 import nodemailer from "nodemailer";
 import { z } from "zod";
+import {
+  normalizedEgressWebhookKind,
+  normalizeEgressRequestSource,
+} from "../shared/livekit-webhook";
 import type { WebConfig } from "./config";
-import { normalizedEgressWebhookKind, normalizeEgressRequestSource } from "./livekit-webhook";
 
 function magicLinkTokenAad(record: MagicLinkRecord): Buffer {
   return Buffer.from(

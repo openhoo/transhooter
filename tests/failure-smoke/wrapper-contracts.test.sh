@@ -377,7 +377,7 @@ cat > "$DEV_ROOT/.env" <<'ENV'
 PUBLIC_BASE_URL=https://app.env.example
 PUBLIC_LIVEKIT_URL=wss://rtc.env.example
 ENV
-if ! PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" \
+if ! env -u PUBLIC_BASE_URL -u PUBLIC_LIVEKIT_URL PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" \
   > "$TEST_DIRECTORY/dev-up-env-file-output" 2>&1; then
   fail 'dev-up rejected production URLs loaded only from the repository .env'
 fi

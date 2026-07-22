@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { api } from "@/lib/browser-api";
+import { api } from "@/lib/browser/browser-api";
 import { createExclusiveActionGate } from "./interface-state";
 
 type Direction = {

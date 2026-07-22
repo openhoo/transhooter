@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import sqlite3
@@ -10,15 +9,41 @@ import time
 from base64 import b64decode, b64encode
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Concatenate, Protocol, cast
+from typing import Any, Concatenate, cast
 from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from transhooter_worker.adapters.spool_crypto import (
+    decrypt_aesgcm,
+    encrypt_aesgcm,
+    fsync_directory,
+    header_aad,
+    pack_envelope,
+    sha256_hex,
+    unpack_envelope,
+    write_fsync,
+)
+from transhooter_worker.adapters.spool_models import (
+    CapacityProbe as CapacityProbe,
+)
+from transhooter_worker.adapters.spool_models import (
+    SpoolCapacity as SpoolCapacity,
+)
+from transhooter_worker.adapters.spool_models import (
+    SpoolCheckpointDelivery as SpoolCheckpointDelivery,
+)
+from transhooter_worker.adapters.spool_models import (
+    SpoolUnavailable as SpoolUnavailable,
+)
+from transhooter_worker.adapters.spool_models import (
+    deterministic_roomy_capacity as deterministic_roomy_capacity,
+)
+from transhooter_worker.adapters.spool_models import (
+    statvfs_capacity as statvfs_capacity,
+)
 from transhooter_worker.domain.models import RawRef, SampleRange
 
 _SPOOL_SCHEMA = """
@@ -65,45 +90,6 @@ CREATE TABLE IF NOT EXISTS compacted_envelopes (
     compacted_at INTEGER NOT NULL
 );
 """
-
-
-@dataclass(frozen=True, slots=True)
-class SpoolCheckpointDelivery:
-    checkpoint_id: UUID
-    meeting_id: UUID
-    source_id: UUID
-    worker_epoch: int
-    checkpoint_hash: str
-    previous_hash: str | None
-    control_event_id: UUID
-    acknowledged: bool
-    body: bytes
-    raw_ref: RawRef
-
-
-@dataclass(frozen=True, slots=True)
-class SpoolCapacity:
-    total_bytes: int
-    used_bytes: int
-
-
-class CapacityProbe(Protocol):
-    def __call__(self, path: Path, /) -> SpoolCapacity: ...
-
-
-def statvfs_capacity(path: Path) -> SpoolCapacity:
-    stats = os.statvfs(path)
-    total = stats.f_blocks * stats.f_frsize
-    used = total - stats.f_bavail * stats.f_frsize
-    return SpoolCapacity(total_bytes=total, used_bytes=used)
-
-
-def deterministic_roomy_capacity(_path: Path) -> SpoolCapacity:
-    return SpoolCapacity(total_bytes=1 << 40, used_bytes=0)
-
-
-class SpoolUnavailable(RuntimeError):
-    pass
 
 
 def _locked[**P, R](
@@ -214,7 +200,7 @@ class EncryptedSpool:
         object_id = object_id or uuid4()
         key_id = self._active_key_id
         nonce = os.urandom(12)
-        plaintext_hash = hashlib.sha256(payload).hexdigest()
+        plaintext_hash = sha256_hex(payload)
         header = self._build_header(
             object_id=object_id,
             attempt_id=attempt_id,
@@ -231,8 +217,8 @@ class EncryptedSpool:
             sample_range=sample_range,
             metadata=metadata,
         )
-        encrypted = AESGCM(self._keys[key_id]).encrypt(nonce, payload, self._header_aad(header))
-        ciphertext_hash = hashlib.sha256(encrypted).hexdigest()
+        encrypted = encrypt_aesgcm(self._keys[key_id], nonce, payload, self._header_aad(header))
+        ciphertext_hash = sha256_hex(encrypted)
         header["ciphertext_sha256"] = ciphertext_hash
         final_path = self._root / f"{object_id}.wal"
         temp_path = self._root / f".{object_id}.tmp"
@@ -279,7 +265,7 @@ class EncryptedSpool:
         ).fetchone()
         if row is None:
             return None
-        payload_hash = hashlib.sha256(payload).hexdigest()
+        payload_hash = sha256_hex(payload)
         if row[16] not in {"committed", "uploaded"}:
             raise SpoolUnavailable("deterministic spool evidence is not reusable")
         if (
@@ -389,17 +375,6 @@ class EncryptedSpool:
             "metadata": metadata,
             "context": self._context,
         }
-
-    @staticmethod
-    def _header_aad(header: dict[str, Any]) -> bytes:
-        if int(header.get("aad_version", 0)) != 3:
-            raise ValueError("unsupported full-header AAD version")
-        authenticated = {key: value for key, value in header.items() if key != "ciphertext_sha256"}
-        return json.dumps(
-            authenticated,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
 
     def _commit_envelope(
         self,
@@ -839,20 +814,17 @@ class EncryptedSpool:
             header, encrypted = self._unpack(Path(row[3]).read_bytes())
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise SpoolUnavailable("invalid spool envelope") from exc
-        if (
-            header.get("object_id") != str(object_id)
-            or hashlib.sha256(encrypted).hexdigest() != row[7]
-        ):
+        if header.get("object_id") != str(object_id) or sha256_hex(encrypted) != row[7]:
             raise SpoolUnavailable("ciphertext authentication hash mismatch")
         try:
             aad = self._header_aad(header)
         except (KeyError, TypeError, ValueError) as exc:
             raise SpoolUnavailable("invalid authenticated spool header") from exc
         try:
-            plain = AESGCM(self._keys[row[4]]).decrypt(row[5], encrypted, aad)
+            plain = decrypt_aesgcm(self._keys[row[4]], row[5], encrypted, aad)
         except (InvalidTag, KeyError, ValueError) as exc:
             raise SpoolUnavailable("spool key missing or authentication failed") from exc
-        if hashlib.sha256(plain).hexdigest() != row[6]:
+        if sha256_hex(plain) != row[6]:
             raise SpoolUnavailable("plaintext hash mismatch")
         return plain
 
@@ -1167,15 +1139,15 @@ class EncryptedSpool:
         key_id = str(header["key_id"])
         nonce = b64decode(str(header["nonce"]), validate=True)
         ciphertext_hash = str(header["ciphertext_sha256"])
-        if final.stem != str(object_id) or hashlib.sha256(encrypted).hexdigest() != ciphertext_hash:
+        if final.stem != str(object_id) or sha256_hex(encrypted) != ciphertext_hash:
             raise ValueError("orphan ciphertext hash mismatch")
         try:
             aad = self._header_aad(header)
-            plain = AESGCM(self._keys[key_id]).decrypt(nonce, encrypted, aad)
+            plain = decrypt_aesgcm(self._keys[key_id], nonce, encrypted, aad)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("orphan authenticated header is invalid") from exc
         plaintext_hash = str(header["plaintext_sha256"])
-        if hashlib.sha256(plain).hexdigest() != plaintext_hash or len(plain) != int(header["size"]):
+        if sha256_hex(plain) != plaintext_hash or len(plain) != int(header["size"]):
             raise ValueError("orphan plaintext mismatch")
         self._db.execute("BEGIN IMMEDIATE")
         try:
@@ -1341,21 +1313,23 @@ class EncryptedSpool:
         )
 
     @staticmethod
+    def _header_aad(header: dict[str, Any]) -> bytes:
+        return header_aad(header)
+
+    @staticmethod
     def _pack(header: dict[str, Any], encrypted: bytes) -> bytes:
-        encoded = json.dumps(header, separators=(",", ":"), sort_keys=True).encode()
-        return b"TSW1" + f"{len(encoded):08x}".encode() + encoded + encrypted
+        return pack_envelope(header, encrypted)
 
     @staticmethod
     def _unpack(envelope: bytes) -> tuple[dict[str, Any], bytes]:
-        if len(envelope) < 12 or envelope[:4] != b"TSW1":
-            raise ValueError("invalid spool magic")
-        length = int(envelope[4:12], 16)
-        if length <= 0 or 12 + length >= len(envelope):
-            raise ValueError("invalid spool header length")
-        header = json.loads(envelope[12 : 12 + length])
-        if not isinstance(header, dict):
-            raise ValueError("invalid spool header")
-        return header, envelope[12 + length :]
+        return unpack_envelope(envelope)
+
+    @staticmethod
+    def _write_fsync(path: Path, body: bytes) -> None:
+        write_fsync(path, body)
+
+    def _fsync_directory(self) -> None:
+        fsync_directory(self._root)
 
     @staticmethod
     def _fixture_faults(meeting_id: UUID) -> dict[str, Any]:
@@ -1378,22 +1352,3 @@ class EncryptedSpool:
         if not isinstance(section, dict):
             raise SpoolUnavailable("fixture spool scenario must be an object")
         return section
-
-    @staticmethod
-    def _write_fsync(path: Path, body: bytes) -> None:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            view = memoryview(body)
-            while view:
-                written = os.write(fd, view)
-                view = view[written:]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-    def _fsync_directory(self) -> None:
-        fd = os.open(self._root, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)

@@ -2,7 +2,7 @@
 
 import type { FormEvent } from "react";
 import { useState } from "react";
-import { api } from "@/lib/browser-api";
+import { api } from "@/lib/browser/browser-api";
 
 type MagicLinkState = "idle" | "sending" | "sent" | "error";
 type VerifyState = "idle" | "verifying" | "error";

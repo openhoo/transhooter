@@ -16,6 +16,9 @@ from transhooter_worker.application.pipeline import (
     upsert_final_span,
 )
 from transhooter_worker.application.retry import FrozenRetryPolicy
+from transhooter_worker.application.session_audio import (
+    _audio_after_watermark as _audio_after_watermark,
+)
 from transhooter_worker.domain.models import (
     AudioChunk,
     AudioEvent,
@@ -47,28 +50,6 @@ AudioSink = Callable[[bytes], Awaitable[None]]
 CheckpointSink = Callable[[int, int, bool], Awaitable[None]]
 NormalizedSink = Callable[[object], Awaitable[None]]
 StageGate = Callable[[str, int], Awaitable[None]]
-
-
-def _audio_after_watermark(chunk: AudioChunk, watermark: int) -> AudioChunk | None:
-    if chunk.samples.end <= watermark:
-        return None
-    if chunk.samples.start >= watermark:
-        return chunk
-    if len(chunk.pcm) % chunk.samples.length:
-        raise ValueError("audio chunk PCM length does not match its sample range")
-    bytes_per_sample = len(chunk.pcm) // chunk.samples.length
-    if bytes_per_sample <= 0:
-        raise ValueError("audio chunk has no PCM sample data")
-    offset = (watermark - chunk.samples.start) * bytes_per_sample
-    return AudioChunk(
-        operation_id=chunk.operation_id,
-        sequence=chunk.sequence,
-        samples=SampleRange(watermark, chunk.samples.end),
-        pcm=chunk.pcm[offset:],
-        sample_rate=chunk.sample_rate,
-        channels=chunk.channels,
-        encoding=chunk.encoding,
-    )
 
 
 @dataclass(frozen=True, slots=True)

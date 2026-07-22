@@ -1,0 +1,364 @@
+#!/bin/sh
+set -eu
+
+if [ -n "${TRANSHOOTER_ROOT:-}" ] &&
+  [ -d "$TRANSHOOTER_ROOT" ] &&
+  [ -f "$TRANSHOOTER_ROOT/deploy/scripts/compose-lib.sh" ] &&
+  [ -d "$TRANSHOOTER_ROOT/tests/failure-smoke" ]; then
+  ROOT=$(CDPATH= cd -- "$TRANSHOOTER_ROOT" && pwd)
+else
+  ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+fi
+REPOSITORY_ROOT=$ROOT
+. "$REPOSITORY_ROOT/deploy/scripts/compose-lib.sh"
+ROOT=$REPOSITORY_ROOT
+STATE_FILE="$ROOT/.secrets/compose-state"
+BASE_FILE="$ROOT/deploy/compose/compose.yml"
+
+BUILD_ONLY=false
+NO_BUILD=false
+HOST_PROOF_FILE=
+HOST_METRICS_FILE=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --build-only)
+      BUILD_ONLY=true
+      shift
+      ;;
+    --no-build)
+      NO_BUILD=true
+      shift
+      ;;
+    --proof-file | --metrics-file)
+      option=$1
+      [ "$#" -ge 2 ] || {
+        printf '%s requires a path.\n' "$option" >&2
+        exit 2
+      }
+      case "$option" in
+        --proof-file) HOST_PROOF_FILE=$2 ;;
+        --metrics-file) HOST_METRICS_FILE=$2 ;;
+      esac
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *) break ;;
+  esac
+done
+if $BUILD_ONLY && $NO_BUILD; then
+  printf '%s\n' '--build-only and --no-build cannot be combined.' >&2
+  exit 2
+fi
+case "${1:-}" in
+  "" | -*) ;;
+  *)
+    printf 'Unexpected wrapper positional argument: %s\n' "$1" >&2
+    exit 2
+    ;;
+esac
+
+PROJECT_NAME="transhooter-failure-$$-$(date +%s%N)"
+FAILURE_SMOKE_OWNED_PROJECT_NAME=$PROJECT_NAME
+export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+export APP_IMAGE_NAMESPACE="${APP_IMAGE_NAMESPACE:-transhooter-harness}"
+OVERLAY_FILE="$ROOT/deploy/compose/compose.test.yml"
+export APP_ENV=test
+export PROVIDER_PROFILE=fixture
+export BOOTSTRAP_ADMIN_EMAIL="${BOOTSTRAP_ADMIN_EMAIL:-admin@example.test}"
+export BOOTSTRAP_ADMIN_NAME="${BOOTSTRAP_ADMIN_NAME:-Test Administrator}"
+export RTC_SUBNET="${TEST_RTC_SUBNET:-10.254.232.0/24}"
+export RTC_NODE_IP="${TEST_RTC_NODE_IP:-10.254.232.250}"
+printf 'Stack proof classification: clean harness-owned stack (project=%s, label=com.docker.compose.project=%s).\n' \
+  "$PROJECT_NAME" "$PROJECT_NAME" >&2
+
+deadline_supplied=false
+for argument do
+  if [ "$argument" = "--deadline-epoch-ms" ]; then
+    deadline_supplied=true
+  fi
+done
+
+LOCK_FILE=${COMPOSE_HARNESS_LOCK_FILE:-"${TMPDIR:-/tmp}/transhooter-compose-harness.lock"}
+LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
+DEFAULT_PHASE_TIMEOUT_SECONDS=${COMPOSE_PHASE_TIMEOUT_SECONDS:-900}
+COMPOSE_DETECTION_TIMEOUT_SECONDS=${COMPOSE_DETECTION_TIMEOUT_SECONDS:-15}
+COMPOSE_SETUP_TIMEOUT_SECONDS=${COMPOSE_SETUP_TIMEOUT_SECONDS:-$DEFAULT_PHASE_TIMEOUT_SECONDS}
+COMPOSE_BUILD_TIMEOUT_SECONDS=${COMPOSE_BUILD_TIMEOUT_SECONDS:-$DEFAULT_PHASE_TIMEOUT_SECONDS}
+COMPOSE_SCENARIO_TIMEOUT_SECONDS=${COMPOSE_SCENARIO_TIMEOUT_SECONDS:-${FAILURE_SMOKE_DEADLINE_SECONDS:-3600}}
+COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS=${COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS:-120}
+COMPOSE_OWNERSHIP_TIMEOUT_SECONDS=${COMPOSE_OWNERSHIP_TIMEOUT_SECONDS:-60}
+COMPOSE_CLEANUP_TIMEOUT_SECONDS=${COMPOSE_CLEANUP_TIMEOUT_SECONDS:-300}
+ACTIVE_PID=
+LOCK_HELD=false
+
+RUN_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/transhooter-failure-smoke.XXXXXXXX")
+chmod 0700 "$RUN_DIRECTORY"
+RESOURCE_PROOF_FILE="$RUN_DIRECTORY/compose-resources"
+PROOF_DIRECTORY="$RUN_DIRECTORY/proof"
+mkdir "$PROOF_DIRECTORY"
+chmod 0777 "$PROOF_DIRECTORY"
+METRICS_FILE="$RUN_DIRECTORY/wrapper-metrics.jsonl"
+PROOF_FILE="$PROOF_DIRECTORY/proof.json"
+: > "$METRICS_FILE"
+
+require_positive_seconds() {
+  name=$1
+  value=$2
+  case "$value" in
+    "" | *[!0-9]* | 0)
+      printf '%s must be a positive integer, got %s.\n' "$name" "$value" >&2
+      exit 2
+      ;;
+  esac
+}
+
+require_positive_seconds COMPOSE_HARNESS_LOCK_WAIT_SECONDS "$LOCK_WAIT_SECONDS"
+require_positive_seconds COMPOSE_DETECTION_TIMEOUT_SECONDS "$COMPOSE_DETECTION_TIMEOUT_SECONDS"
+require_positive_seconds COMPOSE_SETUP_TIMEOUT_SECONDS "$COMPOSE_SETUP_TIMEOUT_SECONDS"
+require_positive_seconds COMPOSE_BUILD_TIMEOUT_SECONDS "$COMPOSE_BUILD_TIMEOUT_SECONDS"
+require_positive_seconds COMPOSE_SCENARIO_TIMEOUT_SECONDS "$COMPOSE_SCENARIO_TIMEOUT_SECONDS"
+require_positive_seconds COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS"
+require_positive_seconds COMPOSE_OWNERSHIP_TIMEOUT_SECONDS "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS"
+require_positive_seconds COMPOSE_CLEANUP_TIMEOUT_SECONDS "$COMPOSE_CLEANUP_TIMEOUT_SECONDS"
+if ! $BUILD_ONLY && ! $deadline_supplied; then
+  deadline_epoch_ms=$((($(date +%s) + ${FAILURE_SMOKE_DEADLINE_SECONDS:-3600}) * 1000))
+  set -- "$@" --deadline-epoch-ms "$deadline_epoch_ms"
+fi
+
+record_metric() {
+  metric_name=$1
+  metric_started_ns=$2
+  metric_status=$3
+  metric_finished_ns=$(date +%s%N)
+  metric_duration_ms=$(((metric_finished_ns - metric_started_ns) / 1000000))
+  printf '{"name":"%s","durationMs":%s,"status":"%s"}\n' \
+    "$metric_name" "$metric_duration_ms" "$metric_status" >> "$METRICS_FILE"
+}
+
+terminate_active() {
+  signal_status=$1
+  trap - HUP INT TERM
+  if [ -n "$ACTIVE_PID" ]; then
+    kill -TERM -- "-$ACTIVE_PID" 2>/dev/null || true
+    wait "$ACTIVE_PID" 2>/dev/null || true
+    ACTIVE_PID=
+  fi
+  exit "$signal_status"
+}
+
+run_bounded() {
+  phase=$1
+  phase_timeout=$2
+  shift 2
+  phase_started_ns=$(date +%s%N)
+  announce_phase "$phase (deadline: ${phase_timeout}s)"
+  setsid timeout --signal=TERM --kill-after=10s "${phase_timeout}s" "$@" &
+  ACTIVE_PID=$!
+  if wait "$ACTIVE_PID"; then
+    result=0
+  else
+    result=$?
+  fi
+  ACTIVE_PID=
+  if [ "$result" -eq 0 ]; then
+    metric_status=success
+  else
+    metric_status=failure
+  fi
+  record_metric "$phase" "$phase_started_ns" "$metric_status"
+  case "$result" in
+    124 | 137)
+      printf 'Phase "%s" exceeded its absolute %ss deadline; its process group was terminated.\n' \
+        "$phase" "$phase_timeout" >&2
+      ;;
+    0) ;;
+    *)
+      printf 'Phase "%s" failed with status %s.\n' "$phase" "$result" >&2
+      ;;
+  esac
+  return "$result"
+}
+
+select_compose_command_bounded() {
+  if ! run_bounded "Detecting Docker Compose plugin" "$COMPOSE_DETECTION_TIMEOUT_SECONDS" \
+    docker compose version >/dev/null 2>&1; then
+    printf 'Docker Compose plugin is required.\n' >&2
+    return 127
+  fi
+}
+
+compose_bounded() {
+  phase=$1
+  phase_timeout=$2
+  shift 2
+  set -- -p "$PROJECT_NAME" -f "$BASE_FILE" -f "$OVERLAY_FILE" "$@"
+  if [ -f "$ROOT/.env" ]; then
+    set -- --env-file "$ROOT/.env" "$@"
+  fi
+  run_bounded "$phase" "$phase_timeout" docker compose "$@"
+}
+
+verify_failure_smoke_stack_ownership() {
+  if ! failure_smoke_project_is_owned "$PROJECT_NAME" "$FAILURE_SMOKE_OWNED_PROJECT_NAME"; then
+    printf 'Refusing cleanup: project %s is not the harness-owned failure-smoke stack.\n' \
+      "$PROJECT_NAME" >&2
+    return 1
+  fi
+
+  : > "$RESOURCE_PROOF_FILE"
+  run_bounded "Classifying owned failure-smoke containers" "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS" \
+    docker ps --all --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+      --format 'container|{{.ID}}|{{.Label "com.docker.compose.project"}}' >> "$RESOURCE_PROOF_FILE" ||
+    return $?
+  run_bounded "Classifying owned failure-smoke networks" "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS" \
+    docker network ls --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+      --format 'network|{{.ID}}|{{.Label "com.docker.compose.project"}}' >> "$RESOURCE_PROOF_FILE" ||
+    return $?
+  run_bounded "Classifying owned failure-smoke volumes" "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS" \
+    docker volume ls --filter "label=com.docker.compose.project=$PROJECT_NAME" \
+      --format 'volume|{{.Name}}|{{.Label "com.docker.compose.project"}}' >> "$RESOURCE_PROOF_FILE" ||
+    return $?
+
+  while IFS='|' read -r resource_kind resource_id resource_project_label; do
+    [ -n "$resource_kind$resource_id$resource_project_label" ] || continue
+    case "$resource_kind:$resource_id" in
+      container:?* | network:?* | volume:?*) ;;
+      *)
+        printf 'Refusing cleanup: ambiguous Compose resource record %s/%s.\n' \
+          "$resource_kind" "$resource_id" >&2
+        return 1
+        ;;
+    esac
+    if ! failure_smoke_resource_is_owned \
+      "$PROJECT_NAME" "$FAILURE_SMOKE_OWNED_PROJECT_NAME" "$resource_project_label"; then
+      printf 'Refusing cleanup: %s %s has external or ambiguous project label %s.\n' \
+        "$resource_kind" "$resource_id" "${resource_project_label:-<missing>}" >&2
+      return 1
+    fi
+  done < "$RESOURCE_PROOF_FILE"
+}
+
+copy_artifact() {
+  source_file=$1
+  destination_file=$2
+  [ -n "$destination_file" ] || return 0
+  [ -f "$source_file" ] || return 0
+  destination_directory=$(dirname -- "$destination_file")
+  mkdir -p -- "$destination_directory"
+  cp -- "$source_file" "$destination_file"
+  chmod 0644 "$destination_file"
+}
+
+early_cleanup() {
+  status=$?
+  trap - 0 HUP INT TERM
+  copy_artifact "$METRICS_FILE" "$HOST_METRICS_FILE" || true
+  rm -rf -- "$RUN_DIRECTORY"
+  exit "$status"
+}
+
+trap early_cleanup 0
+trap 'terminate_active 129' HUP
+trap 'terminate_active 130' INT
+trap 'terminate_active 143' TERM
+
+select_compose_command_bounded
+exec 9>"$LOCK_FILE"
+lock_started_ns=$(date +%s%N)
+announce_phase "Waiting for the compose harness lock (deadline: ${LOCK_WAIT_SECONDS}s)"
+if flock -w "$LOCK_WAIT_SECONDS" 9; then
+  LOCK_HELD=true
+  record_metric "Waiting for the compose harness lock" "$lock_started_ns" success
+else
+  record_metric "Waiting for the compose harness lock" "$lock_started_ns" failure
+  printf 'Phase "Waiting for the compose harness lock" exceeded its absolute %ss deadline.\n' \
+    "$LOCK_WAIT_SECONDS" >&2
+  copy_artifact "$METRICS_FILE" "$HOST_METRICS_FILE"
+  rm -rf -- "$RUN_DIRECTORY"
+  exit 1
+fi
+trap - 0
+
+capture_database_diagnostic() {
+  phase=$1
+  statement=$2
+  compose_bounded "$phase" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
+    run --rm --no-deps --workdir /workspace/tests/failure-smoke \
+      -e "FAILURE_DIAGNOSTIC_SQL=$statement" failure-smoke bun --eval '
+      import postgres from "postgres";
+      const connectionString = (await Bun.file(process.env.DATABASE_URL_FILE).text()).trim();
+      const database = postgres(connectionString, {
+        max: 1,
+        prepare: false,
+        connect_timeout: 10,
+      });
+      try {
+        const rows = await database.unsafe(process.env.FAILURE_DIAGNOSTIC_SQL);
+        for (const row of rows) console.log(JSON.stringify(row));
+      } finally {
+        await database.end({ timeout: 1 });
+      }
+    '
+}
+
+cleanup() {
+  status=$?
+  trap - 0 HUP INT TERM
+  if [ "$status" -ne 0 ] && ! $BUILD_ONLY; then
+    compose_bounded "Capturing failure-smoke service status" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" ps || true
+    compose_bounded "Capturing failure-smoke logs" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
+      logs --no-color --tail=80 web translation-worker spool-drainer control-worker-1 control-worker-2 capability-publisher language-refresh postgres-role-bootstrap postgres-capability-bootstrap migrate livekit egress minio || true
+    capture_database_diagnostic "Capturing consultation diagnostics" \
+      "SELECT state, generation, room_name IS NOT NULL AS room_name_set, room_sid IS NOT NULL AS room_sid_set, dispatch_id IS NOT NULL AS dispatch_id_set, composite_egress_id IS NOT NULL AS composite_egress_id_set FROM consultations ORDER BY created_at DESC LIMIT 3" || true
+    capture_database_diagnostic "Capturing external-effect diagnostics" \
+      "SELECT generation, effect_kind, state, attempts, result ? 'error' AS has_error, max(result->>'error') AS latest_error, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, result ? 'error' ORDER BY generation, effect_kind, state, attempts, has_error" || true
+    capture_database_diagnostic "Capturing archive recovery diagnostics" \
+      "SELECT a.state, a.final_inventory_hash IS NOT NULL AS inventory_hashed, count(DISTINCT o.id) AS objects, count(DISTINCT m.id) FILTER (WHERE m.state IN ('open','completing')) AS pending_multipart FROM archives a LEFT JOIN archive_objects o ON o.archive_id=a.id LEFT JOIN multipart_uploads m ON m.archive_id=a.id GROUP BY a.id, a.state, a.final_inventory_hash ORDER BY a.created_at DESC LIMIT 3" || true
+    capture_database_diagnostic "Capturing outbox diagnostics" \
+      "SELECT topic, generation, delivered_at IS NOT NULL AS delivered, attempts, payload ? 'lastDispatchError' AS has_last_dispatch_error, count(*) FROM outbox GROUP BY topic, generation, delivered_at IS NOT NULL, attempts, payload ? 'lastDispatchError' ORDER BY topic, generation, delivered, attempts, has_last_dispatch_error" || true
+  fi
+  if verify_failure_smoke_stack_ownership; then
+    if ! compose_bounded "Cleaning owned failure-smoke stack $PROJECT_NAME" \
+      "$COMPOSE_CLEANUP_TIMEOUT_SECONDS" down --volumes --remove-orphans; then
+      [ "$status" -ne 0 ] || status=1
+    fi
+  else
+    [ "$status" -ne 0 ] || status=1
+    printf 'Owned failure-smoke stack classification failed; no cleanup command was run.\n' >&2
+  fi
+  copy_artifact "$PROOF_FILE" "$HOST_PROOF_FILE" || {
+    [ "$status" -ne 0 ] || status=1
+  }
+  copy_artifact "$METRICS_FILE" "$HOST_METRICS_FILE" || {
+    [ "$status" -ne 0 ] || status=1
+  }
+  rm -rf -- "$RUN_DIRECTORY"
+  if $LOCK_HELD; then
+    flock -u 9
+  fi
+  exit "$status"
+}
+
+trap cleanup 0
+trap 'terminate_active 129' HUP
+trap 'terminate_active 130' INT
+trap 'terminate_active 143' TERM
+
+if $BUILD_ONLY; then
+  compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
+    build minio egress-ready translation-worker web failure-smoke
+  exit 0
+fi
+
+compose_bounded "Initializing failure-smoke runtime secrets" "$COMPOSE_SETUP_TIMEOUT_SECONDS" \
+  run --rm --no-deps secrets-init
+if ! $NO_BUILD; then
+  compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
+    build minio egress-ready translation-worker web failure-smoke
+fi
+compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIMEOUT_SECONDS" \
+  run --rm -v "$PROOF_DIRECTORY:/proof" -e FAILURE_SMOKE_PROOF_FILE=/proof/proof.json \
+    failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@"

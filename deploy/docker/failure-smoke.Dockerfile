@@ -17,9 +17,13 @@ RUN --mount=type=cache,id=bun-harness-v1,target=/root/.bun/install/cache \
       --filter @transhooter/failure-smoke \
       --filter @transhooter/e2e
 COPY --chown=transhooter:transhooter tests/e2e/smoke-consultation.mjs tests/e2e/smoke-consultation.mjs
+COPY --chown=transhooter:transhooter tests/e2e/consultation-harness.mjs tests/e2e/consultation-harness.mjs
+COPY --chown=transhooter:transhooter tests/e2e/consultation-scenario.mjs tests/e2e/consultation-scenario.mjs
+COPY --chown=transhooter:transhooter tests/e2e/consultation-archive-proof.mjs tests/e2e/consultation-archive-proof.mjs
 COPY --chown=transhooter:transhooter tests/e2e/harness-contracts.mjs tests/e2e/harness-contracts.mjs
 COPY --chown=transhooter:transhooter tests/e2e/harness-contracts.test.mjs tests/e2e/harness-contracts.test.mjs
 COPY --chown=transhooter:transhooter tests/failure-smoke/failure-smoke.mjs tests/failure-smoke/failure-smoke.mjs
+COPY --chown=transhooter:transhooter tests/failure-smoke/harness tests/failure-smoke/harness
 COPY --chown=transhooter:transhooter tests/failure-smoke/harness-contracts.mjs tests/failure-smoke/harness-contracts.mjs
 COPY --chown=transhooter:transhooter tests/failure-smoke/harness-contracts.test.mjs tests/failure-smoke/harness-contracts.test.mjs
 COPY --chown=transhooter:transhooter tests/fixtures tests/fixtures

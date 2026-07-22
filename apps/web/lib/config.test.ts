@@ -3,7 +3,7 @@ import { expect, mock, test } from "bun:test";
 mock.module("server-only", () => ({}));
 
 // Import after replacing Next's server-only guard so the pure environment parser can run in Bun.
-const { parseMagicLinkSealKeyring, parseWebEnvironment } = await import("./config");
+const { parseMagicLinkSealKeyring, parseWebEnvironment } = await import("./server/config");
 
 const baseEnvironment: NodeJS.ProcessEnv = {
   NODE_ENV: "production",

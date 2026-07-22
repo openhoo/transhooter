@@ -24,14 +24,14 @@ import {
 } from "livekit-client";
 import type { MutableRefObject, RefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "@/lib/browser-api";
+import { api } from "@/lib/browser/browser-api";
 import {
   type AudioMode,
   acceptsCaption,
   acceptsStatus,
   audioGains,
   releaseLocalTrack,
-} from "@/lib/room-policy";
+} from "@/lib/browser/room-policy";
 import {
   createWithDeviceFallback,
   persistDevicePreference,

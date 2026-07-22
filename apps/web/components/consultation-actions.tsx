@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { FormEvent, ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
-import { api } from "@/lib/browser-api";
+import { api } from "@/lib/browser/browser-api";
 
 type ProviderProfileOption = {
   id: string;

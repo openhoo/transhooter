@@ -15,10 +15,10 @@ import { DomainError, type UUID, type WebCommand } from "@transhooter/server-cor
 import { cookies, headers } from "next/headers";
 import { notFound, redirect } from "next/navigation";
 import { z } from "zod";
-import { configuredApplication } from "./composition";
-import { webConfig } from "./config";
-import { durableConsultationDestination } from "./consultation-routing";
-import { withWebOperation } from "./telemetry";
+import { configuredApplication } from "./server/composition";
+import { webConfig } from "./server/config";
+import { withWebOperation } from "./server/telemetry";
+import { durableConsultationDestination } from "./shared/consultation-routing";
 
 const UuidSchema = z.uuid();
 const ObjectSchema = z.record(z.string(), z.unknown());

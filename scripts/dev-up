@@ -15,6 +15,15 @@ if [ "$profile" = fixture ] && [ -z "${COMPOSE_PROJECT_NAME:-}" ]; then
   PROJECT_NAME=transhooter-fixture
   export COMPOSE_PROJECT_NAME=$PROJECT_NAME
 fi
+# The fixture overlay and its browser harness use these canonical in-network
+# hostnames. Do not let unrelated URLs inherited from a provider-profile shell
+# silently redirect the fixture lifecycle.
+if [ "$profile" = fixture ]; then
+  export PUBLIC_BASE_URL=http://app.localhost:3000
+  export PUBLIC_LIVEKIT_URL=ws://rtc.localhost:7880
+fi
+export RTC_ADVERTISED_IP="${RTC_ADVERTISED_IP:-${RTC_BRIDGE_IP:-10.254.231.10}}"
+export S3_PUBLIC_ENDPOINT="${S3_PUBLIC_ENDPOINT:-http://localhost:9000}"
 
 mkdir -p "$ROOT/.secrets"
 
@@ -30,16 +39,6 @@ case "$profile" in
 esac
 validate_profile_configuration "$(compose config --environment)"
 
-
-# These defaults only apply to the local fixture lifecycle. Production provider
-# profiles require explicit browser-facing TLS endpoints and never receive
-# loopback browser URL defaults.
-if [ "$profile" = fixture ]; then
-  export PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-http://app.localhost:3000}"
-  export PUBLIC_LIVEKIT_URL="${PUBLIC_LIVEKIT_URL:-ws://rtc.localhost:7880}"
-fi
-export RTC_ADVERTISED_IP="${RTC_ADVERTISED_IP:-${RTC_BRIDGE_IP:-10.254.231.10}}"
-export S3_PUBLIC_ENDPOINT="${S3_PUBLIC_ENDPOINT:-http://localhost:9000}"
 
 export OTEL_SDK_DISABLED=false
 

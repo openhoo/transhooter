@@ -6,7 +6,10 @@ import {
   RoomCompositeEgressRequest,
   WebEgressRequest,
 } from "@livekit/protocol";
-import { normalizedEgressWebhookKind, normalizeEgressRequestSource } from "./livekit-webhook.ts";
+import {
+  normalizedEgressWebhookKind,
+  normalizeEgressRequestSource,
+} from "./shared/livekit-webhook.ts";
 
 void test("normalizes supported nested Egress request sources", () => {
   assert.deepEqual(

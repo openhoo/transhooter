@@ -3,8 +3,8 @@
 import { Room } from "livekit-client";
 import type { FormEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, api } from "@/lib/browser-api";
-import { describeLobbyPhase, type LobbyPhase, LobbyPreviewFence } from "@/lib/lobby-phase";
+import { ApiError, api } from "@/lib/browser/browser-api";
+import { describeLobbyPhase, type LobbyPhase, LobbyPreviewFence } from "@/lib/browser/lobby-phase";
 import { persistDevicePreference } from "./interface-state";
 import styles from "./lobby.module.css";
 
