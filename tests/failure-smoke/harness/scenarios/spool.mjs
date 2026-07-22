@@ -11,9 +11,6 @@ export async function runSpoolScenarios(ctx, proof) {
     waitFor,
     shouldRunScenario,
     checkpointScenario,
-    selectedScenarios,
-    resumeRequested,
-    completedScenarios,
     setWorkerScenario,
     runConsultation,
     assertServiceHealthy,
@@ -25,10 +22,8 @@ export async function runSpoolScenarios(ctx, proof) {
     sql,
   } = ctx;
   const preservationFenceSelected = shouldRunScenario("preservation-fence");
-  const spoolRecoveryPending =
-    selectedScenarios.has("spool-durable-recovery") &&
-    !(resumeRequested && completedScenarios.has("spool-durable-recovery"));
-  if (!preservationFenceSelected && !spoolRecoveryPending) return;
+  const spoolRecoverySelected = shouldRunScenario("spool-durable-recovery");
+  if (!preservationFenceSelected && !spoolRecoverySelected) return;
 
   const workerBefore = await onlyContainer("translation-worker");
   const drainerBefore = await onlyContainer("spool-drainer");
@@ -37,7 +32,7 @@ export async function runSpoolScenarios(ctx, proof) {
     inspect(drainerBefore.Id),
   ]);
   const workerRestartBaseline = workerBeforeState.RestartCount;
-  if (spoolRecoveryPending) await stop("spool-drainer");
+  if (spoolRecoverySelected) await stop("spool-drainer");
   await resetAuthenticationThrottle();
   const preservationRun = await runConsultation({
     workerScenario: {
@@ -147,7 +142,6 @@ export async function runSpoolScenarios(ctx, proof) {
     },
     30_000,
   );
-  const spoolRecoverySelected = spoolRecoveryPending && shouldRunScenario("spool-durable-recovery");
   const pendingCheckpointDeliveries = spoolRecoverySelected
     ? await waitFor(
         "durable checkpoint delivery before drainer restart",
@@ -232,16 +226,11 @@ export async function runSpoolScenarios(ctx, proof) {
     pendingDelivery: settled.pending_outbox,
     cleanSettlement: true,
   };
-  if (preservationFenceSelected) {
-    proof.scenarios.push({ name: "preservation-fence", ...sharedEvidence });
-    await checkpointScenario("preservation-fence");
-  }
-  if (spoolRecoverySelected) {
-    proof.scenarios.push({
-      name: "spool-durable-recovery",
-      ...sharedEvidence,
-      replayedCheckpointIds: pendingCheckpointDeliveries.map((delivery) => delivery.checkpointId),
-    });
-    await checkpointScenario("spool-durable-recovery");
-  }
+  proof.scenarios.push({
+    name: spoolRecoverySelected ? "spool-durable-recovery" : "preservation-fence",
+    ...sharedEvidence,
+    replayedCheckpointIds: pendingCheckpointDeliveries.map((delivery) => delivery.checkpointId),
+  });
+  if (preservationFenceSelected) await checkpointScenario("preservation-fence");
+  if (spoolRecoverySelected) await checkpointScenario("spool-durable-recovery");
 }
