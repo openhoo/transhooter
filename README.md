@@ -161,7 +161,9 @@ kompensiert.
 
 ### Übersetzungspipeline
 
-`services/translation-worker` ist als Ports-and-Adapters-Anwendung aufgebaut:
+`apps/translation-worker` und `apps/spool-drainer` sind getrennte ausführbare
+Anwendungen. Beide verwenden `packages/translation-runtime`, eine gemeinsame
+Python-Ports-and-Adapters-Bibliothek:
 
 - `domain`: reine Domänenmodelle ohne ausgehende Schichtabhängigkeiten,
 - `application`: Sitzungen, geordnete Stages, Retry und Caption-Assembly,
@@ -169,8 +171,11 @@ kompensiert.
 - `adapters`: Google, Deepgram, DeepL, Fixture, S3 und verschlüsselter Spool,
 - `runtime`: LiveKit, interne Control-API, Quotas, Health und Prozess-Lifecycle.
 
-Import-Linter-Verträge verhindern Abhängigkeiten von `domain`, `application`
-oder `ports` zurück in Adapter und Runtime.
+Der Translation-Worker führt LiveKit-Jobs aus. Der Spool Drainer lädt bereits
+persistierte Objekte hoch und registriert sie bei der Control-API. Getrennte
+Entrypoints, Identitäten und Deployments verhindern, dass ein Rollenwechsel nur
+über undurchsichtige Modulargumente erfolgt. Import-Linter-Verträge schützen die
+gemeinsamen Schichtgrenzen.
 
 ### Sprachübergreifende Verträge
 
@@ -229,13 +234,14 @@ Diese Grenzen sind vor allem in
 .
 ├── apps/
 │   ├── web/                    # Next.js UI, APIs, Auth und Kompositionswurzel
-│   └── control-worker/         # Dauerhafte Orchestrierung und Remote-Effekte
+│   ├── control-worker/         # Dauerhafte Orchestrierung und Remote-Effekte
+│   ├── translation-worker/     # LiveKit-Übersetzungsprozess
+│   └── spool-drainer/          # Upload und Registrierung persistierter Spoolobjekte
 ├── packages/
 │   ├── contracts/              # Zod-Verträge und generiertes JSON Schema
 │   ├── server-core/            # Domäne, Use-Cases, Ports und Drizzle-Schema
-│   └── telemetry/              # Gemeinsame TypeScript-OTel-Instrumentierung
-├── services/
-│   └── translation-worker/     # Providerneutraler Python-Worker
+│   ├── telemetry/              # Gemeinsame TypeScript-OTel-Instrumentierung
+│   └── translation-runtime/    # Gemeinsame Python-Domäne, Ports und Adapter
 ├── deploy/
 │   ├── compose/                # Basisstack und Provider-/Test-Overlays
 │   ├── docker/                 # Reproduzierbare Runtime- und Harness-Images
@@ -289,7 +295,7 @@ Diese Grenzen sind vor allem in
   Translation-Worker und Spool Drainer gleichzeitig mounten können
 
 Versionen sind in `package.json`, `bun.lock`,
-`services/translation-worker/pyproject.toml`, den Dockerfiles und im Helm-Chart
+`packages/translation-runtime/pyproject.toml`, den Dockerfiles und im Helm-Chart
 festgelegt. Bei reproduzierbaren Builds die Lockfiles nicht umgehen.
 
 ## Installation

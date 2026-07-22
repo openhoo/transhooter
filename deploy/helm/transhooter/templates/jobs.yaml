@@ -191,7 +191,7 @@ spec:
               PY
               }
               trap cleanup EXIT
-              python -m transhooter_worker.providers sync
+              transhooter-provider sync
           envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" . }}}}]
           env:
             - name: CAPABILITY_PUBLISH_URL

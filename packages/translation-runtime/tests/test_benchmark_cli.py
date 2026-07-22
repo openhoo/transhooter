@@ -35,10 +35,7 @@ def test_benchmark_cli_accepts_versioned_language_manifest(tmp_path: Path) -> No
         SPOOL_KEY_B64=base64.b64encode(b"k" * 32).decode(),
     )
     command = [
-        sys.executable,
-        "-m",
-        "transhooter_worker",
-        "providers",
+        str(Path(sys.executable).with_name("transhooter-provider")),
         "benchmark",
         "--profiles",
         "fixture",

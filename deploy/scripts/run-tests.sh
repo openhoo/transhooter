@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 workspace=/workspace
-translation_worker_directory="$workspace/services/translation-worker"
+translation_runtime_directory="$workspace/packages/translation-runtime"
 phase_deadline_seconds=${TEST_GATE_PHASE_DEADLINE_SECONDS:-600}
 case "$phase_deadline_seconds" in
   "" | *[!0-9]* | 0)
@@ -61,11 +61,11 @@ run_infrastructure_contracts() {
 }
 
 run_python_gates() {
-  cd "$translation_worker_directory"
-  run_phase "Type-checking the translation worker" mypy src
-  run_phase "Linting the translation worker" ruff check
-  run_phase "Checking translation-worker import boundaries" lint-imports
-  run_phase "Running translation-worker tests" pytest
+  cd "$translation_runtime_directory"
+  run_phase "Type-checking the translation runtime" mypy src
+  run_phase "Linting the translation runtime" ruff check
+  run_phase "Checking translation runtime import boundaries" lint-imports
+  run_phase "Running translation runtime tests" pytest
 }
 
 main() {

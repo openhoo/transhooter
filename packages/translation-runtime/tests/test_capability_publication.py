@@ -7,7 +7,8 @@ from uuid import UUID
 import httpx
 import pytest
 
-from transhooter_worker.__main__ import (
+from transhooter_worker.domain.models import RawRef, StageCapabilities
+from transhooter_worker.provider_cli import (
     _approved_voice,
     _capability_refresh,
     _configure_journal_context,
@@ -16,7 +17,6 @@ from transhooter_worker.__main__ import (
     _profile_voice,
     _publish_capabilities,
 )
-from transhooter_worker.domain.models import RawRef, StageCapabilities
 from transhooter_worker.runtime.provider_registry import (
     FixtureProfile,
     GoogleProfile,

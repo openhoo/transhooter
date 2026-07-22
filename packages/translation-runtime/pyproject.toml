@@ -1,7 +1,7 @@
 [project]
-name = "transhooter-worker"
+name = "transhooter-translation-runtime"
 version = "0.1.0"
-description = "Provider-neutral translation and archival worker"
+description = "Shared Python runtime for Transhooter translation services"
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "boto3==1.40.4",
@@ -33,7 +33,11 @@ dev = [
 ]
 
 [project.scripts]
-transhooter-worker = "transhooter_worker.__main__:main"
+transhooter-translation-worker = "transhooter_worker.runtime.worker:main"
+transhooter-spool-drainer = "transhooter_worker.runtime.spool_drainer:main"
+transhooter-provider = "transhooter_worker.provider_cli:main"
+transhooter-worker-healthcheck = "transhooter_worker.runtime.healthcheck:worker_main"
+transhooter-spool-drainer-healthcheck = "transhooter_worker.runtime.healthcheck:drainer_main"
 
 [build-system]
 requires = ["hatchling==1.27.0"]

@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import argparse
 import os
+import sys
 from pathlib import Path
 
 from transhooter_worker.adapters.spool import EncryptedSpool
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--drainer", action="store_true")
-    args = parser.parse_args()
+def _main(*, drainer: bool) -> None:
     root = Path(os.environ.get("SPOOL_PATH", ""))
     keyring_value = os.environ.get("SPOOL_KEYRING_FILE", "")
     if not root.is_dir() or not keyring_value:
@@ -20,8 +17,8 @@ def main() -> None:
         Path(os.environ.get("SPOOL_DATABASE", str(root / "journal.sqlite3"))),
         Path(keyring_value),
     )
-    threshold_name = "SPOOL_DRAINER_HEALTH_RATIO" if args.drainer else "SPOOL_WORKER_HEALTH_RATIO"
-    threshold = float(os.environ.get(threshold_name, "0.8" if args.drainer else "0.7"))
+    threshold_name = "SPOOL_DRAINER_HEALTH_RATIO" if drainer else "SPOOL_WORKER_HEALTH_RATIO"
+    threshold = float(os.environ.get(threshold_name, "0.8" if drainer else "0.7"))
     if not 0 < threshold < 1:
         raise SystemExit(f"{threshold_name} must be between zero and one")
     if spool.usage_ratio() >= threshold:
@@ -29,6 +26,20 @@ def main() -> None:
     for ref, _ in spool.committed():
         spool.read(ref.object_id)
     print("healthy")
+
+
+def worker_main() -> None:
+    _main(drainer=False)
+
+
+def drainer_main() -> None:
+    _main(drainer=True)
+
+
+def main() -> None:
+    if len(sys.argv) != 1:
+        raise SystemExit("use the role-specific healthcheck executable")
+    worker_main()
 
 
 if __name__ == "__main__":

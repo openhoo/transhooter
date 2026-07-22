@@ -16,6 +16,7 @@ from livekit import agents, rtc
 from opentelemetry import metrics, trace
 from opentelemetry.trace import Status, StatusCode
 
+from transhooter_worker.adapters.archive_delivery import build_archive
 from transhooter_worker.adapters.scoped_journal import ScopedExchangeJournal
 from transhooter_worker.adapters.spool import (
     EncryptedSpool,
@@ -101,7 +102,6 @@ from transhooter_worker.runtime.publisher import (
     publish_private_interpretation_tracks,
 )
 from transhooter_worker.runtime.redis_quota import RedisQuotaGate
-from transhooter_worker.runtime.spool_drainer import build_archive
 from transhooter_worker.telemetry import bounded_error_kind
 
 _tracer = trace.get_tracer(__name__)

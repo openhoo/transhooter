@@ -13,7 +13,6 @@ from google.cloud.location import locations_pb2
 from google.cloud.speech_v2.types import locations_metadata
 from google.protobuf.any_pb2 import Any as ProtobufAny
 
-from transhooter_worker.__main__ import _capability_refresh
 from transhooter_worker.adapters.google import provider as google_provider
 from transhooter_worker.domain.models import (
     AudioEvent,
@@ -33,6 +32,7 @@ from transhooter_worker.domain.models import (
     TranslationRequest,
     Transport,
 )
+from transhooter_worker.provider_cli import _capability_refresh
 from transhooter_worker.runtime.provider_registry import FixtureProfile
 
 

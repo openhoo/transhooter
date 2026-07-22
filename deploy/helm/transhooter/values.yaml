@@ -15,6 +15,10 @@ images:
     repository: ghcr.io/transhooter/translation-worker
     tag: "0.1.0"
     pullPolicy: IfNotPresent
+  spoolDrainer:
+    repository: ghcr.io/transhooter/spool-drainer
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
   egress:
     repository: livekit/egress
     tag: "v1.12.0"

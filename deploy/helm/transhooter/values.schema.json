@@ -156,7 +156,7 @@
     },
     "images": {
       "propertyNames": {
-        "enum": ["web", "controlWorker", "translationWorker", "egress"]
+        "enum": ["web", "controlWorker", "translationWorker", "spoolDrainer", "egress"]
       },
       "type": "object",
       "additionalProperties": {

@@ -462,7 +462,7 @@ services:
     image: *translation-runtime-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-worker.Dockerfile
+      dockerfile: deploy/docker/translation-runtime.Dockerfile
     restart: "no"
     environment:
       APP_ENV: ${APP_ENV:-development}
@@ -471,7 +471,7 @@ services:
       SPOOL_PATH: /tmp/transhooter-spool
     volumes:
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
-    command: [python, -m, transhooter_worker.providers, preflight]
+    command: [transhooter-provider, preflight]
 
   capability-publisher:
     <<: *app-base
@@ -503,7 +503,7 @@ services:
     image: *translation-runtime-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-worker.Dockerfile
+      dockerfile: deploy/docker/translation-runtime.Dockerfile
     restart: "no"
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -521,14 +521,14 @@ services:
       - ../../.secrets/database-capability-url:/run/secrets/database-capability-url:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
-    command: [python, -m, transhooter_worker.providers, sync]
+    command: [transhooter-provider, sync]
 
   translation-worker:
     <<: *app-base
     image: *translation-runtime-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-worker.Dockerfile
+      dockerfile: deploy/docker/translation-runtime.Dockerfile
     depends_on:
       migrate: {condition: service_completed_successfully}
       language-refresh: {condition: service_completed_successfully}
@@ -563,9 +563,9 @@ services:
       - ../../.secrets/minio-translation-credentials:/run/secrets/minio-translation-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
-    command: [python, -m, transhooter_worker, start]
+    command: [python, apps/translation-worker/main.py]
     healthcheck:
-      test: [CMD, python, -m, transhooter_worker.runtime.healthcheck]
+      test: [CMD, transhooter-worker-healthcheck]
       interval: 10s
       timeout: 5s
       retries: 20
@@ -576,7 +576,7 @@ services:
     image: *translation-runtime-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-worker.Dockerfile
+      dockerfile: deploy/docker/translation-runtime.Dockerfile
     depends_on:
       spool-init: {condition: service_completed_successfully}
       minio-identity-bootstrap: {condition: service_completed_successfully}
@@ -598,9 +598,9 @@ services:
       - ../../.secrets/minio-spool-drainer-credentials:/run/secrets/minio-spool-drainer-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-spool-drainer-token:/run/secrets/internal-token:ro
-    command: [python, -m, transhooter_worker.runtime.spool_drainer]
+    command: [python, apps/spool-drainer/main.py]
     healthcheck:
-      test: [CMD, python, -m, transhooter_worker.runtime.healthcheck, --drainer]
+      test: [CMD, transhooter-spool-drainer-healthcheck]
       interval: 10s
       timeout: 5s
       retries: 20
@@ -677,7 +677,7 @@ services:
     image: *translation-runtime-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-worker.Dockerfile
+      dockerfile: deploy/docker/translation-runtime.Dockerfile
     restart: "no"
     depends_on:
       minio-identity-bootstrap: {condition: service_completed_successfully}
@@ -693,7 +693,7 @@ services:
       - ../../tests/fixtures:/workspace/tests/fixtures:ro
       - ../../.secrets/minio-translation-credentials:/run/secrets/minio-translation-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
-    command: [python, -m, transhooter_worker.providers, benchmark]
+    command: [transhooter-provider, benchmark]
 
   e2e:
     profiles: [e2e]

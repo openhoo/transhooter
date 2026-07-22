@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from uuid import UUID, uuid4, uuid5
 
+from transhooter_worker.adapters.archive_delivery import upload_committed_objects_async
 from transhooter_worker.adapters.s3_archive import S3Archive
 from transhooter_worker.adapters.spool import EncryptedSpool, SpoolCheckpointDelivery
 from transhooter_worker.application.compactor import CompactedPcm, PcmCompactor
@@ -15,7 +16,6 @@ from transhooter_worker.runtime.consultation import SourceTrackTimeline
 from transhooter_worker.runtime.control_client import ControlClient
 from transhooter_worker.runtime.job_metadata import JobMetadata
 from transhooter_worker.runtime.publisher import PreservedAudioPublisher
-from transhooter_worker.runtime.spool_drainer import upload_committed_objects_async
 
 
 @dataclass(frozen=True, slots=True)

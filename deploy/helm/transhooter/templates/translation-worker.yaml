@@ -34,12 +34,12 @@ spec:
       securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: {{ $component }}
-          image: {{ include "transhooter.image" $root.Values.images.translationWorker | quote }}
-          imagePullPolicy: {{ $root.Values.images.translationWorker.pullPolicy }}
+          image: {{ include "transhooter.image" (ternary $root.Values.images.spoolDrainer $root.Values.images.translationWorker (eq $component "spool-drainer")) | quote }}
+          imagePullPolicy: {{ (ternary $root.Values.images.spoolDrainer $root.Values.images.translationWorker (eq $component "spool-drainer")).pullPolicy }}
           {{- if eq $component "spool-drainer" }}
-          command: [python, -m, transhooter_worker.runtime.spool_drainer]
+          command: [python, apps/spool-drainer/main.py]
           {{- else }}
-          command: [python, -m, transhooter_worker, start]
+          command: [python, apps/translation-worker/main.py]
           {{- end }}
           {{- if eq $component "spool-drainer" }}
           env:
@@ -70,11 +70,11 @@ spec:
             - {name: OTEL_SERVICE_NAME, value: {{ printf "transhooter-%s" $component | quote }}}
             {{- end }}
           {{- if eq $component "spool-drainer" }}
-          readinessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck, --drainer]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
-          livenessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck, --drainer]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          readinessProbe: {exec: {command: [transhooter-spool-drainer-healthcheck]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {exec: {command: [transhooter-spool-drainer-healthcheck]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
           {{- else }}
-          readinessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
-          livenessProbe: {exec: {command: [python, -m, transhooter_worker.runtime.healthcheck]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          readinessProbe: {exec: {command: [transhooter-worker-healthcheck]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {exec: {command: [transhooter-worker-healthcheck]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
           {{- end }}
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
           resources:

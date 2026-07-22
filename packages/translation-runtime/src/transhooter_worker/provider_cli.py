@@ -52,11 +52,10 @@ def _add_provider_command_arguments(command: argparse.ArgumentParser) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="transhooter-worker")
-    commands = root.add_subparsers(dest="group", required=True)
-    providers = commands.add_parser("providers").add_subparsers(dest="command", required=True)
+    root = argparse.ArgumentParser(prog="transhooter-provider")
+    commands = root.add_subparsers(dest="command", required=True)
     for command_name in ("preflight", "sync", "probe", "benchmark"):
-        _add_provider_command_arguments(providers.add_parser(command_name))
+        _add_provider_command_arguments(commands.add_parser(command_name))
     return root
 
 
@@ -899,6 +898,15 @@ async def _run_benchmark(args: argparse.Namespace) -> dict[str, object]:
                 )
             )
     return _benchmark_summary(profile_names, rows)
+
+
+def main() -> None:
+    args = parser().parse_args()
+    try:
+        result = asyncio.run(run(args))
+    except Exception as exc:
+        raise SystemExit(f"provider command failed: {exc}") from exc
+    print(json.dumps(result, separators=(",", ":"), sort_keys=True))
 
 
 async def run(args: argparse.Namespace) -> dict[str, object]:

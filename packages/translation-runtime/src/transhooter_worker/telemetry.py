@@ -319,7 +319,7 @@ def _metric_export_interval(configured: int | None) -> int:
 
 def _service_version() -> str:
     try:
-        return version("transhooter-worker")
+        return version("transhooter-translation-runtime")
     except PackageNotFoundError:
         return "0.1.0"
 

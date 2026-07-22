@@ -13,6 +13,13 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
+from transhooter_worker.adapters.archive_delivery import (
+    ArchiveObjectRegistrationClient,
+    PermanentRegistrationError,
+    RetryableRegistrationError,
+    upload_committed_objects,
+    upload_committed_objects_async,
+)
 from transhooter_worker.adapters.spool import (
     CapacityProbe,
     EncryptedSpool,
@@ -25,13 +32,6 @@ from transhooter_worker.domain.models import SampleRange
 from transhooter_worker.ports.archive import ObjectRecord
 from transhooter_worker.runtime import spool_drainer
 from transhooter_worker.runtime.control_client import PermanentControlRequestError
-from transhooter_worker.runtime.spool_drainer import (
-    ArchiveObjectRegistrationClient,
-    PermanentRegistrationError,
-    RetryableRegistrationError,
-    upload_committed_objects,
-    upload_committed_objects_async,
-)
 
 TEST_KEYRING = {"v1": b"k" * 32}
 
