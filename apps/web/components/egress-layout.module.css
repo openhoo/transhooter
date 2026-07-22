@@ -4,7 +4,7 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   grid-template-rows: minmax(0, 1fr);
-  background: var(--ink);
+  background: #17233c;
   overflow: hidden;
 }
 
@@ -25,7 +25,7 @@
   width: 100%;
   height: 100%;
   object-fit: cover;
-  background: var(--ink);
+  background: #17233c;
 }
 
 .pane span {
@@ -35,9 +35,9 @@
   max-inline-size: calc(100% - var(--space-8));
   overflow-wrap: anywhere;
   padding: var(--space-2) var(--space-3);
-  border-inline-start: 4px solid var(--cobalt);
-  background: var(--ink);
-  color: var(--cloud);
+  border-inline-start: 4px solid #d9e1ee;
+  background: rgba(23, 35, 60, 0.9);
+  color: #faf9f5;
   font:
     600 0.875rem / 1.25 "Sora",
     sans-serif;
@@ -48,8 +48,8 @@
   inset: var(--space-4);
   display: grid;
   place-items: center;
-  background: var(--ink);
-  color: var(--cloud);
+  background: #17233c;
+  color: #faf9f5;
   font:
     600 1rem / 1.4 "Sora",
     sans-serif;

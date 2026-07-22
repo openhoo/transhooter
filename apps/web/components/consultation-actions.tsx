@@ -4,18 +4,23 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { FormEvent, ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import { AlertCircle, Ban, Loader2, Lock, MailCheck, MailPlus } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { api } from "@/lib/browser/browser-api";
 
-type ProviderProfileOption = {
-  id: string;
-  name: string;
-  revision: number;
-};
-
-type NewConsultationFormProps = {
-  profiles: ReadonlyArray<ProviderProfileOption>;
-};
-
+type ProviderProfileOption = { id: string; name: string; revision: number };
+type NewConsultationFormProps = { profiles: ReadonlyArray<ProviderProfileOption> };
 type ConsultationActionProps = {
   id: string;
   action: "cancel" | "resend";
@@ -32,22 +37,28 @@ export function NewConsultationForm({ profiles }: NewConsultationFormProps) {
 
   if (profiles.length === 0) {
     return (
-      <section className="stack panel" aria-labelledby="no-provider-profiles">
-        <h2 id="no-provider-profiles">No provider profiles are available</h2>
-        <p className="muted">
-          Review the language catalog and refresh provider capabilities before inviting a customer.
-        </p>
-        <Link className="button secondary" href="/admin/languages">
-          Review provider languages
-        </Link>
-      </section>
+      <Card aria-labelledby="no-provider-profiles">
+        <CardHeader>
+          <CardTitle id="no-provider-profiles" className="font-serif text-xl">
+            No provider profiles are available
+          </CardTitle>
+          <CardDescription className="leading-relaxed">
+            Review the language catalog and refresh provider capabilities before inviting a customer.
+          </CardDescription>
+        </CardHeader>
+        <CardFooter>
+          <Button render={<Link href="/admin/languages" />} variant="outline">
+            Review provider languages
+          </Button>
+        </CardFooter>
+      </Card>
     );
   }
+
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
     setError("");
-
     const values = new FormData(event.currentTarget);
     const payload = {
       customerEmail: String(values.get("email") ?? ""),
@@ -64,10 +75,7 @@ export function NewConsultationForm({ profiles }: NewConsultationFormProps) {
     try {
       const result = await api<{ id: string }>("/api/consultations", {
         method: "POST",
-        body: JSON.stringify({
-          ...payload,
-          creationIdempotencyKey: pending.key,
-        }),
+        body: JSON.stringify({ ...payload, creationIdempotencyKey: pending.key }),
       });
       pendingSubmission.current = null;
       router.push(`/consultations/${result.id}/lobby`);
@@ -78,89 +86,90 @@ export function NewConsultationForm({ profiles }: NewConsultationFormProps) {
   }
 
   return (
-    <form
-      className="stack panel"
-      onSubmit={(event) => {
-        void submit(event);
-      }}
-    >
-      <div className="field">
-        <label htmlFor="name">Customer name</label>
-        <input id="name" name="name" autoComplete="name" required />
-      </div>
-      <div className="field">
-        <label htmlFor="email">Customer email</label>
-        <input id="email" name="email" type="email" autoComplete="email" required />
-      </div>
-      <div className="field">
-        <label htmlFor="profile">Translation provider profile</label>
-        <select id="profile" name="profile" required>
-          {profiles.map((profile) => (
-            <option key={`${profile.id}:${String(profile.revision)}`} value={profile.id}>
-              {profile.name} · revision {profile.revision}
-            </option>
-          ))}
-        </select>
-      </div>
-      <p className="meta">
-        The chosen revision is frozen for this consultation and shown to both participants before
-        consent.
-      </p>
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
-      <button className="button" disabled={busy} type="submit">
-        {busy ? "Creating…" : "Create and send invitation"}
-      </button>
-    </form>
+    <Card>
+      <CardHeader>
+        <CardTitle className="font-serif text-xl">Consultation details</CardTitle>
+        <CardDescription className="leading-relaxed">
+          The customer receives an email invitation with a secure sign-in link.
+        </CardDescription>
+      </CardHeader>
+      <form onSubmit={(event) => void submit(event)}>
+        <CardContent className="flex flex-col gap-5">
+          {error && (
+            <Alert variant="destructive">
+              <AlertCircle className="size-4" aria-hidden="true" />
+              <AlertTitle>Consultation could not be created</AlertTitle>
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="name">Customer name</Label>
+            <Input id="name" name="name" autoComplete="name" placeholder="Full name" required disabled={busy} />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="email">Customer email</Label>
+            <Input id="email" name="email" type="email" autoComplete="email" placeholder="customer@example.com" required disabled={busy} />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="profile">Translation provider profile</Label>
+            <select
+              id="profile"
+              name="profile"
+              required
+              disabled={busy}
+              className="h-9 w-full rounded-lg border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {profiles.map((profile) => (
+                <option key={`${profile.id}:${String(profile.revision)}`} value={profile.id}>
+                  {profile.name} · revision {profile.revision}
+                </option>
+              ))}
+            </select>
+            <p className="flex items-start gap-1.5 text-xs leading-relaxed text-muted-foreground">
+              <Lock className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+              The chosen revision is frozen for this consultation and shown to both participants before consent.
+            </p>
+          </div>
+        </CardContent>
+        <CardFooter className="flex-col items-stretch gap-2 pt-4">
+          <Button className="w-full" disabled={busy} type="submit">
+            {busy ? <><Loader2 className="size-4 animate-spin" aria-hidden="true" />Creating consultation…</> : "Create and send invitation"}
+          </Button>
+          <p className="text-center text-xs text-muted-foreground">
+            Retrying the same details will not create a duplicate consultation.
+          </p>
+        </CardFooter>
+      </form>
+    </Card>
   );
 }
 
-export function ConsultationAction({
-  id,
-  action,
-  children,
-  contextLabel,
-  danger = false,
-}: ConsultationActionProps) {
+export function ConsultationAction({ id, action, children, contextLabel, danger = false }: ConsultationActionProps) {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  const cancelConfirmationRef = useRef<HTMLButtonElement>(null);
-  const cancelTriggerRef = useRef<HTMLButtonElement>(null);
-  const restoreCancelTrigger = useRef(false);
+  const confirmationRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const restoreTrigger = useRef(false);
 
   useEffect(() => {
-    if (confirming) {
-      cancelConfirmationRef.current?.focus();
-      return;
-    }
-
-    if (restoreCancelTrigger.current) {
-      restoreCancelTrigger.current = false;
-      cancelTriggerRef.current?.focus();
+    if (confirming) confirmationRef.current?.focus();
+    else if (restoreTrigger.current) {
+      restoreTrigger.current = false;
+      triggerRef.current?.focus();
     }
   }, [confirming]);
+
   async function run() {
     setBusy(true);
     setError("");
     setSuccess("");
-
     try {
-      await api(`/api/consultations/${id}/${action}`, {
-        method: "POST",
-        body: "{}",
-      });
+      await api(`/api/consultations/${id}/${action}`, { method: "POST", body: "{}" });
       setConfirming(false);
-      setSuccess(
-        action === "resend"
-          ? `Invitation resent for ${contextLabel}.`
-          : `Consultation with ${contextLabel} cancelled.`,
-      );
+      setSuccess(action === "resend" ? `Invitation resent for ${contextLabel}.` : `Consultation with ${contextLabel} cancelled.`);
       router.refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Action failed");
@@ -171,74 +180,42 @@ export function ConsultationAction({
 
   if (confirming) {
     return (
-      <div className="inlineConfirmation">
-        <p id={`cancel-confirmation-${id}`}>
+      <div className="min-w-64 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+        <p id={`cancel-confirmation-${id}`} className="text-sm leading-relaxed">
           Cancel the consultation with {contextLabel}? Its invitation will stop working.
         </p>
-        <div className="actions">
-          <button
-            ref={cancelConfirmationRef}
-            className="button secondary"
-            disabled={busy}
-            type="button"
-            onClick={() => {
-              restoreCancelTrigger.current = true;
-              setConfirming(false);
-            }}
-          >
+        <div className="mt-3 flex flex-wrap justify-end gap-2">
+          <Button ref={confirmationRef} variant="outline" disabled={busy} type="button" onClick={() => { restoreTrigger.current = true; setConfirming(false); }}>
             Keep consultation
-          </button>
-          <button
-            aria-describedby={`cancel-confirmation-${id}`}
-            className="button danger"
-            disabled={busy}
-            type="button"
-            onClick={() => {
-              void run();
-            }}
-          >
-            {busy ? "Cancelling…" : `Confirm cancellation for ${contextLabel}`}
-          </button>
+          </Button>
+          <Button aria-describedby={`cancel-confirmation-${id}`} variant="destructive" disabled={busy} type="button" onClick={() => void run()}>
+            {busy ? <><Loader2 className="size-4 animate-spin" aria-hidden="true" />Cancelling…</> : <><Ban className="size-4" aria-hidden="true" />Confirm cancellation</>}
+          </Button>
         </div>
-        {error && (
-          <p className="error" role="alert">
-            {error}
-          </p>
-        )}
+        {error && <p className="mt-2 text-sm text-destructive" role="alert">{error}</p>}
       </div>
     );
   }
 
   return (
     <div>
-      <button
-        ref={cancelTriggerRef}
+      <Button
+        ref={triggerRef}
         aria-label={`${action === "cancel" ? "Cancel" : "Resend invitation for"} ${contextLabel}`}
-        className={`button ${danger ? "danger" : "secondary"}`}
+        variant={danger ? "destructive" : "ghost"}
+        size="sm"
         disabled={busy}
         type="button"
         onClick={() => {
-          if (action === "cancel") {
-            setConfirming(true);
-            setError("");
-            setSuccess("");
-          } else {
-            void run();
-          }
+          if (action === "cancel") { setConfirming(true); setError(""); setSuccess(""); }
+          else void run();
         }}
       >
+        {busy ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : action === "resend" ? <MailPlus className="size-4" aria-hidden="true" /> : null}
         {busy ? "Working…" : children}
-      </button>
-      {success && (
-        <p className="notice" role="status">
-          {success}
-        </p>
-      )}
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
+      </Button>
+      {success && <p className="mt-1 text-xs text-verified" role="status"><MailCheck className="mr-1 inline size-3" aria-hidden="true" />{success}</p>}
+      {error && <p className="mt-1 text-xs text-destructive" role="alert">{error}</p>}
     </div>
   );
 }

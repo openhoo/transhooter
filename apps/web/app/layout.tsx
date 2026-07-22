@@ -1,7 +1,8 @@
-import type { Metadata } from "next";
-import Link from "next/link";
-import { LogoutButton } from "@/components/logout-button";
+import type { Metadata, Viewport } from "next";
+
+import { AppShell } from "@/components/app-shell";
 import { optionalPageViewer } from "@/lib/server-application";
+
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -11,25 +12,18 @@ export const metadata: Metadata = {
   referrer: "no-referrer",
 };
 
+export const viewport: Viewport = {
+  colorScheme: "light",
+  themeColor: "#294b73",
+};
+
 export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const viewer = await optionalPageViewer();
+
   return (
-    <html lang="en">
+    <html lang="en" className="bg-background">
       <body>
-        <header className="shell topbar">
-          <Link className="brand" href={viewer ? "/consultations" : "/sign-in"}>
-            Transhooter
-          </Link>
-          {viewer && (
-            <nav className="nav" aria-label="Primary">
-              <Link href="/consultations">Consultations</Link>
-              {viewer.staffRole && <Link href="/admin/languages">Languages</Link>}
-              {viewer.staffRole && <Link href="/admin/failures">Failures</Link>}
-              <LogoutButton />
-            </nav>
-          )}
-        </header>
-        <main className="shell main">{children}</main>
+        <AppShell viewer={viewer}>{children}</AppShell>
       </body>
     </html>
   );

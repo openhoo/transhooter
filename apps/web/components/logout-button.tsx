@@ -3,6 +3,7 @@
 import { useState } from "react";
 
 import { api } from "@/lib/browser/browser-api";
+import { Button } from "@/components/ui/button";
 
 export function LogoutButton() {
   const [pending, setPending] = useState(false);
@@ -19,20 +20,20 @@ export function LogoutButton() {
     }
   }
   return (
-    <div className="logoutControl">
-      <button
+    <div className="logoutControl shrink-0 pb-1.5">
+      <Button
         aria-busy={pending}
-        className="button secondary"
         disabled={pending}
         type="button"
+        variant="ghost"
         onClick={() => {
           void logout();
         }}
       >
         {pending ? "Signing out…" : "Sign out"}
-      </button>
+      </Button>
       {error && (
-        <span className="error" role="alert">
+        <span className="error max-w-72 text-right text-xs" role="alert">
           {error}
         </span>
       )}

@@ -625,13 +625,22 @@ function JoinPanel({
   onConnect: () => Promise<void>;
 }) {
   return (
-    <section className={styles.join} aria-labelledby="room-join-title">
-      <p className="eyebrow">Recording is prepared</p>
-      <h1 id="room-join-title">Enter the consultation.</h1>
-      <p>
-        Camera and microphone publication stays blocked until the server confirms your isolated
-        recording is active.
-      </p>
+    <section className={styles.gate} aria-labelledby="room-join-title">
+      <div className={styles.gateIcon} aria-hidden="true">◇</div>
+      <div>
+        <p className="eyebrow">Recording is prepared</p>
+        <h1 id="room-join-title">The consultation room is ready</h1>
+        <p>
+          You remain disconnected until you choose to enter. Camera and microphone publication stays
+          blocked until the server confirms your isolated recording is active.
+        </p>
+      </div>
+      {connecting && (
+        <output className={styles.connectingStatus} aria-live="polite">
+          <span className={styles.spinner} aria-hidden="true" />
+          Establishing the secure room connection. Your media is still off.
+        </output>
+      )}
       {error && (
         <p className={`error ${styles.error}`} role="alert">
           {error}
@@ -648,16 +657,23 @@ function JoinPanel({
       >
         {connecting ? "Connecting…" : "Enter room"}
       </button>
+      <p className={styles.gateFootnote}>Media is published only after validated capture readiness.</p>
     </section>
   );
 }
 
 function LeftPanel({ consultationId }: { consultationId: string }) {
   return (
-    <section className={styles.join} aria-labelledby="room-left-title">
-      <p className="eyebrow">Left locally</p>
-      <h1 id="room-left-title">You have left the consultation.</h1>
-      <p>Your camera and microphone are off. The employee’s consultation continues without you.</p>
+    <section className={styles.gate} aria-labelledby="room-left-title">
+      <div className={styles.gateIcon} aria-hidden="true">✓</div>
+      <div>
+        <p className="eyebrow">Left locally</p>
+        <h1 id="room-left-title">You have left the consultation</h1>
+        <p>
+          Your camera and microphone are off and the room connection is closed. The employee’s
+          consultation continues without you.
+        </p>
+      </div>
       <a className="button secondary" href={`/consultations/${consultationId}/room`}>
         Rejoin safely
       </a>
@@ -685,6 +701,13 @@ function RecordingStatus({
 
   return (
     <header className={styles.chrome}>
+      <div className={styles.roomIdentity}>
+        <span className={styles.roomMark} aria-hidden="true">↔</span>
+        <div>
+          <strong>Live consultation</strong>
+          <span>{captureReady ? "Media enabled" : "Waiting for capture readiness"}</span>
+        </div>
+      </div>
       <output
         aria-label="Recording and storage status"
         className={`${styles.recording ?? ""} ${
@@ -695,7 +718,6 @@ function RecordingStatus({
       >
         {recordingMessage}
       </output>
-      <span className="meta">{captureReady ? "Media enabled" : "Waiting for capture"}</span>
     </header>
   );
 }
@@ -717,19 +739,7 @@ function VideoGrid({
         Participant video
       </h2>
       <div className={styles.videos}>
-        <div className={styles.pane}>
-          <video
-            ref={localVideo}
-            aria-label={`${displayName} self-view`}
-            autoPlay
-            muted
-            playsInline
-          />
-          <bdi className={styles.person} dir="auto">
-            {displayName} · you
-          </bdi>
-        </div>
-        <div className={styles.pane}>
+        <div className={`${styles.pane ?? ""} ${styles.remotePane ?? ""}`}>
           {/* biome-ignore lint/a11y/useMediaCaption: This is a live remote WebRTC stream with no prerecorded caption track; translated captions render in the room ribbon. */}
           <video
             ref={remoteVideo}
@@ -739,6 +749,18 @@ function VideoGrid({
           />
           <bdi className={styles.person} dir="auto">
             {otherDisplayName}
+          </bdi>
+        </div>
+        <div className={`${styles.pane ?? ""} ${styles.localPane ?? ""}`}>
+          <video
+            ref={localVideo}
+            aria-label={`${displayName} self-view`}
+            autoPlay
+            muted
+            playsInline
+          />
+          <bdi className={styles.person} dir="auto">
+            {displayName} · you
           </bdi>
         </div>
       </div>
@@ -755,22 +777,24 @@ function TranslationRibbon({
 }) {
   return (
     <section className={styles.ribbon} aria-labelledby="translation-title">
-      <h2 className="srOnly" id="translation-title">
-        Live translation
-      </h2>
-      <div className={styles.speaker}>
-        {caption ? (
-          <>
-            <strong>
-              <bdi dir="auto">{otherDisplayName}</bdi>
-            </strong>
-            <br />
-            {caption.sourceLanguage}
-          </>
-        ) : (
-          "Translation desk"
-        )}
-      </div>
+      <header className={styles.captionHeading}>
+        <div>
+          <p className={styles.captionEyebrow}>Live interpretation</p>
+          <h2 id="translation-title">Captions</h2>
+        </div>
+        <div className={styles.speaker}>
+          {caption ? (
+            <>
+              <strong>
+                <bdi dir="auto">{otherDisplayName}</bdi>
+              </strong>
+              <span>{caption.sourceLanguage} → {caption.targetLanguage}</span>
+            </>
+          ) : (
+            <span>Listening for the other speaker</span>
+          )}
+        </div>
+      </header>
       <section
         className={styles.caption}
         aria-label="Current translated and source caption. Scroll for longer captions."
@@ -853,53 +877,71 @@ function RoomControls({
       <h2 className="srOnly" id="listening-controls-title">
         Listening controls
       </h2>
-      <fieldset className={styles.audioModeGroup}>
-        <legend className={styles.controlLabel}>Audio mode</legend>
-        <div className={styles.modes}>
-          {choices.map((choice) => (
-            <button
-              type="button"
-              className={`${styles.mode ?? ""} ${mode === choice ? (styles.selected ?? "") : ""}`}
-              disabled={seconds !== null}
-              aria-pressed={mode === choice}
-              key={choice}
-              onClick={() => {
-                onModeChange(choice);
-              }}
-            >
-              {choice === "interpreted"
-                ? "Interpreted"
-                : choice === "overlay"
-                  ? "Overlay"
-                  : "Original"}
-            </button>
-          ))}
+      <div className={styles.audioCard}>
+        <div>
+          <p className={styles.controlLabel}>Audio mode</p>
+          <p className={styles.controlHint}>Choose how original and interpreted audio are mixed.</p>
         </div>
-      </fieldset>
-      {role === "employee" && (
-        <button
-          type="button"
-          className="button danger"
-          disabled={callState !== "active" || seconds !== null}
-          onClick={() => {
-            void onEnd();
-          }}
-        >
-          End consultation
-        </button>
-      )}
-      {role === "customer" && (
-        <button
-          type="button"
-          className="button secondary"
-          disabled={seconds !== null}
-          onClick={() => {
-            void onLeave();
-          }}
-        >
-          Leave locally
-        </button>
-      )}
+        <fieldset className={styles.audioModeGroup}>
+          <legend className="srOnly">Audio mode</legend>
+          <div className={styles.modes}>
+            {choices.map((choice) => (
+              <button
+                type="button"
+                className={`${styles.mode ?? ""} ${mode === choice ? (styles.selected ?? "") : ""}`}
+                disabled={seconds !== null}
+                aria-pressed={mode === choice}
+                key={choice}
+                onClick={() => {
+                  onModeChange(choice);
+                }}
+              >
+                {choice === "interpreted"
+                  ? "Interpreted"
+                  : choice === "overlay"
+                    ? "Overlay"
+                    : "Original"}
+              </button>
+            ))}
+          </div>
+        </fieldset>
+      </div>
+      <div className={styles.roomActions}>
+        {role === "employee" && (
+          <button
+            type="button"
+            className="button danger"
+            disabled={callState !== "active" || seconds !== null}
+            onClick={() => {
+              if (
+                window.confirm(
+                  "End this consultation for both participants and begin archive finalization? This cannot be undone.",
+                )
+              ) {
+                void onEnd();
+              }
+            }}
+          >
+            End consultation
+          </button>
+        )}
+        {role === "customer" && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={seconds !== null}
+            onClick={() => {
+              void onLeave();
+            }}
+          >
+            Leave locally
+          </button>
+        )}
+      </div>
+      <footer className={styles.securityFooter}>
+        <span aria-hidden="true">◇</span>
+        Encrypted in transit · recorded with consent · media access remains server-gated
+      </footer>
     </section>
   );
 }
@@ -995,23 +1037,25 @@ export function ConsultationRoom({ initial }: ConsultationRoomProps) {
         callState={callState}
         captureReady={captureReady}
       />
-      <VideoGrid
-        displayName={initial.displayName}
-        localVideo={localVideo}
-        otherDisplayName={initial.otherDisplayName}
-        remoteVideo={remoteVideo}
-      />
-      <TranslationRibbon caption={caption} otherDisplayName={initial.otherDisplayName} />
-      <RecoveryStatus fallback={fallback} sameLanguage={sameLanguage} seconds={seconds} />
-      <RoomControls
-        callState={callState}
-        mode={mode}
-        onEnd={endConsultation}
-        onLeave={leaveConsultationLocally}
-        onModeChange={setMode}
-        role={initial.role}
-        seconds={seconds}
-      />
+      <main className={styles.roomBody}>
+        <VideoGrid
+          displayName={initial.displayName}
+          localVideo={localVideo}
+          otherDisplayName={initial.otherDisplayName}
+          remoteVideo={remoteVideo}
+        />
+        <TranslationRibbon caption={caption} otherDisplayName={initial.otherDisplayName} />
+        <RecoveryStatus fallback={fallback} sameLanguage={sameLanguage} seconds={seconds} />
+        <RoomControls
+          callState={callState}
+          mode={mode}
+          onEnd={endConsultation}
+          onLeave={leaveConsultationLocally}
+          onModeChange={setMode}
+          role={initial.role}
+          seconds={seconds}
+        />
+      </main>
       {/* biome-ignore lint/a11y/useMediaCaption: This element plays the other participant's live WebRTC microphone; translated captions render in the room ribbon. */}
       <audio className={styles.hiddenMedia} ref={originalAudio} autoPlay />
       {/* biome-ignore lint/a11y/useMediaCaption: This element plays live synthesized interpretation audio; translated captions render in the room ribbon. */}

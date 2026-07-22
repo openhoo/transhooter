@@ -1,6 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { ArrowRight, CalendarClock, Plus } from "lucide-react";
 import { ConsultationAction } from "@/components/consultation-actions";
+import { StatusBadge } from "@/components/status-badge";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { requirePageData, requirePageViewer } from "@/lib/server-application";
 
 export const metadata: Metadata = { title: "Consultations" };
@@ -15,105 +20,74 @@ type Consultation = {
   canCancel: boolean;
   canResend: boolean;
 };
-
-type ConsultationsPageData = {
-  consultations: Consultation[];
-};
-
-const consultationDateFormatter = new Intl.DateTimeFormat("en", {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
+type ConsultationsPageData = { consultations: Consultation[] };
+const consultationDateFormatter = new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short" });
 
 function EmptyConsultations({ canCreate }: { canCreate: boolean }) {
   return (
-    <section className="empty flat">
-      <h2>{canCreate ? "No consultations scheduled" : "No consultations yet"}</h2>
-      <p className="muted">
-        {canCreate
-          ? "Create one to invite a customer and choose its provider profile."
-          : "Your invitations and recorded consultations will appear here."}
-      </p>
-      {canCreate && (
-        <Link className="button" href="/consultations/new">
-          Create consultation
-        </Link>
-      )}
-    </section>
-  );
-}
-
-function ConsultationRow({
-  canManage,
-  consultation,
-}: {
-  canManage: boolean;
-  consultation: Consultation;
-}) {
-  return (
-    <article className="flat row">
+    <Card className="flex flex-col items-center gap-4 py-16 text-center">
+      <div className="flex size-12 items-center justify-center rounded-full bg-muted">
+        <CalendarClock className="size-6 text-muted-foreground" aria-hidden="true" />
+      </div>
       <div>
-        <h2>
-          <Link href={{ pathname: consultation.href }}>{consultation.customerName}</Link>
-        </h2>
-        <span className={`status ${consultation.status === "finalizing" ? "warning" : ""}`}>
-          {consultation.status}
-        </span>
-        {consultation.startsAt && (
-          <p className="meta">
-            {consultationDateFormatter.format(new Date(consultation.startsAt))}
-          </p>
-        )}
+        <h2 className="font-serif text-xl">{canCreate ? "No consultations scheduled" : "No consultations yet"}</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {canCreate ? "Create one to invite a customer and choose its provider profile." : "Your invitations and recorded consultations will appear here."}
+        </p>
       </div>
-      <div className="actions">
-        <Link
-          aria-label={`Open consultation with ${consultation.customerName}`}
-          className="button secondary"
-          href={{ pathname: consultation.href }}
-        >
-          Open
-        </Link>
-        {canManage && consultation.canResend && (
-          <ConsultationAction
-            contextLabel={consultation.customerName}
-            id={consultation.id}
-            action="resend"
-          >
-            Resend invite
-          </ConsultationAction>
-        )}
-        {consultation.canCancel && (
-          <ConsultationAction
-            contextLabel={consultation.customerName}
-            id={consultation.id}
-            action="cancel"
-            danger
-          >
-            Cancel
-          </ConsultationAction>
-        )}
-      </div>
-    </article>
+      {canCreate && (
+        <Button render={<Link href="/consultations/new" />}>
+          <Plus className="size-4" aria-hidden="true" />New consultation
+        </Button>
+      )}
+    </Card>
   );
 }
 
-function ConsultationList({
-  canManage,
-  consultations,
-}: {
-  canManage: boolean;
-  consultations: Consultation[];
-}) {
-  if (consultations.length === 0) {
-    return <EmptyConsultations canCreate={canManage} />;
-  }
+function ConsultationList({ canManage, consultations }: { canManage: boolean; consultations: Consultation[] }) {
+  if (consultations.length === 0) return <EmptyConsultations canCreate={canManage} />;
 
   return (
-    <div>
-      {consultations.map((consultation) => (
-        <ConsultationRow canManage={canManage} consultation={consultation} key={consultation.id} />
-      ))}
-    </div>
+    <Card className="overflow-hidden p-0">
+      <Table>
+        <TableHeader>
+          <TableRow className="bg-muted/50 hover:bg-muted/50">
+            <TableHead>Customer</TableHead>
+            <TableHead>Status</TableHead>
+            <TableHead className="hidden sm:table-cell">Date and time</TableHead>
+            <TableHead className="text-right">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {consultations.map((consultation) => (
+            <TableRow key={consultation.id}>
+              <TableCell className="font-medium">
+                <Link className="hover:underline hover:underline-offset-2" href={{ pathname: consultation.href }}>
+                  {consultation.customerName}
+                </Link>
+              </TableCell>
+              <TableCell><StatusBadge status={consultation.status} /></TableCell>
+              <TableCell className="hidden text-sm text-muted-foreground sm:table-cell">
+                {consultation.startsAt ? consultationDateFormatter.format(new Date(consultation.startsAt)) : "Not scheduled"}
+              </TableCell>
+              <TableCell>
+                <div className="flex flex-wrap items-start justify-end gap-1">
+                  {canManage && consultation.canResend && (
+                    <ConsultationAction contextLabel={consultation.customerName} id={consultation.id} action="resend">Resend</ConsultationAction>
+                  )}
+                  {consultation.canCancel && (
+                    <ConsultationAction contextLabel={consultation.customerName} id={consultation.id} action="cancel" danger>Cancel</ConsultationAction>
+                  )}
+                  <Button render={<Link aria-label={`Open consultation with ${consultation.customerName}`} href={{ pathname: consultation.href }} />} variant="outline" size="sm">
+                    Open<ArrowRight className="size-3.5" aria-hidden="true" />
+                  </Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
   );
 }
 
@@ -123,16 +97,17 @@ export default async function ConsultationsPage() {
   const canManage = viewer.staffRole !== null;
 
   return (
-    <div className="stack">
-      <div className="row">
+    <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="eyebrow">{canManage ? "Employee workspace" : "Your workspace"}</p>
-          <h1>Consultations</h1>
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">{canManage ? "Employee workspace" : "Your workspace"}</p>
+          <h1 className="mt-2 text-2xl font-semibold tracking-tight md:text-3xl">Consultations</h1>
+          <p className="mt-1 leading-relaxed text-muted-foreground">Your interpreted video consultations, past and upcoming.</p>
         </div>
         {canManage && (
-          <Link className="button" href="/consultations/new">
-            New consultation
-          </Link>
+          <Button className="w-fit" render={<Link href="/consultations/new" />}>
+            <Plus className="size-4" aria-hidden="true" />New consultation
+          </Button>
         )}
       </div>
       <ConsultationList canManage={canManage} consultations={consultations} />

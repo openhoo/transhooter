@@ -256,15 +256,39 @@ function useLocalDevicePreview(setError: (message: string) => void) {
 }
 
 function LobbySteps({ stage }: { stage: 1 | 2 | null }) {
+  const steps = [
+    { number: 1, title: "Devices and language" },
+    { number: 2, title: "Providers and consent" },
+  ] as const;
+
   return (
     <nav className={styles.steps} aria-label="Consultation preparation">
       <ol>
-        <li className={`${styles.step ?? ""} ${stage === 1 ? (styles.current ?? "") : ""}`}>
-          <span aria-current={stage === 1 ? "step" : undefined}>1 · Devices and language</span>
-        </li>
-        <li className={`${styles.step ?? ""} ${stage === 2 ? (styles.current ?? "") : ""}`}>
-          <span aria-current={stage === 2 ? "step" : undefined}>2 · Providers and consent</span>
-        </li>
+        {steps.map((step, index) => {
+          const current = stage === step.number;
+          const complete = stage !== null && stage > step.number;
+          return (
+            <li className={styles.step} key={step.number}>
+              <span
+                className={`${styles.stepMarker ?? ""} ${
+                  current ? (styles.currentMarker ?? "") : ""
+                } ${complete ? (styles.completeMarker ?? "") : ""}`}
+                aria-hidden="true"
+              >
+                {complete ? "✓" : step.number}
+              </span>
+              <span
+                className={`${styles.stepTitle ?? ""} ${
+                  current ? (styles.currentTitle ?? "") : ""
+                }`}
+                aria-current={current ? "step" : undefined}
+              >
+                {step.title}
+              </span>
+              {index < steps.length - 1 && <span className={styles.stepLine} aria-hidden="true" />}
+            </li>
+          );
+        })}
       </ol>
     </nav>
   );
@@ -290,16 +314,23 @@ function PreferencesForm({
         void onSubmit(event);
       }}
     >
-      <fieldset className={`${styles.preferenceGroup ?? ""} stack`} disabled={busy}>
+      <fieldset className={`${styles.preferenceGroup ?? ""} ${styles.previewCard ?? ""}`} disabled={busy}>
         <legend className="srOnly">Media preview</legend>
-        <video
-          className={styles.preview}
-          ref={videoRef}
-          autoPlay
-          muted
-          playsInline
-          aria-label="Local camera preview"
-        />
+        <div className={styles.previewFrame}>
+          <video
+            className={styles.preview}
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            aria-label="Local camera preview"
+          />
+          <span className={styles.previewLabel}>Local preview only</span>
+        </div>
+        <div className={styles.previewCopy}>
+          <h2>Check your camera and microphone</h2>
+          <p>Your preview stays on this device and is never sent from the lobby.</p>
+        </div>
         <button
           className="button secondary"
           type="button"
@@ -311,7 +342,7 @@ function PreferencesForm({
         </button>
       </fieldset>
       <fieldset
-        className={`${styles.preferenceGroup ?? ""} stack panel`}
+        className={`${styles.preferenceGroup ?? ""} ${styles.settingsCard ?? ""} stack panel`}
         disabled={busy || languages.length === 0}
       >
         <legend className="srOnly">Consultation preferences</legend>
@@ -371,32 +402,49 @@ function PreferencesForm({
 
 function WaitingPanel() {
   return (
-    <section className="panel">
-      <span className="status warning">Waiting for the other participant’s preferences</span>
-      <p>You can leave this page open. The provider details will appear here automatically.</p>
+    <section className={styles.stateCard} aria-labelledby="preferences-waiting-title">
+      <span className={styles.stateIcon} aria-hidden="true">…</span>
+      <div>
+        <p className="eyebrow">Preferences saved</p>
+        <h2 id="preferences-waiting-title">Waiting for the other participant</h2>
+        <p className="muted">
+          You can leave this page open. The frozen provider details will appear automatically when
+          both language choices are available.
+        </p>
+      </div>
+      <span className="status warning">Waiting for preferences</span>
     </section>
   );
 }
 
 function ConsentWaitingPanel() {
   return (
-    <section className="panel">
-      <span className="status warning">Waiting for the other participant’s consent</span>
-      <p>
-        Your consent is recorded. Recording preparation begins only after both participants agree to
-        the same frozen provider profile.
-      </p>
+    <section className={styles.stateCard} aria-labelledby="consent-waiting-title">
+      <span className={styles.stateIcon} aria-hidden="true">✓</span>
+      <div>
+        <p className="eyebrow">Consent recorded</p>
+        <h2 id="consent-waiting-title">Waiting for matching consent</h2>
+        <p className="muted">
+          Recording preparation begins only after both participants agree to the same frozen
+          provider profile.
+        </p>
+      </div>
+      <span className="status warning">Waiting for the other participant</span>
     </section>
   );
 }
 
 function TerminalPanel() {
   return (
-    <section className="empty flat">
-      <h2>This consultation is closed.</h2>
-      <p className="muted">
-        It can no longer be joined. Contact the employee if you need another invitation.
-      </p>
+    <section className={styles.stateCard} aria-labelledby="consultation-closed-title">
+      <span className={styles.stateIcon} aria-hidden="true">×</span>
+      <div>
+        <p className="eyebrow">Consultation unavailable</p>
+        <h2 id="consultation-closed-title">This consultation is closed</h2>
+        <p className="muted">
+          It can no longer be joined. Contact the employee if you need another invitation.
+        </p>
+      </div>
     </section>
   );
 }
@@ -406,20 +454,23 @@ function ProviderConsentForm({ busy, data, onSubmit }: ProviderConsentFormProps)
     <form
       aria-busy={busy}
       aria-describedby="lobby-feedback"
-      className="stack"
+      className={styles.consentForm}
       onSubmit={(event) => {
         void onSubmit(event);
       }}
     >
-      <section className="panel">
-        <div className="row">
+      <section className={`${styles.providerCard ?? ""} panel`}>
+        <div className={styles.providerHeading}>
           <div>
             <p className="eyebrow">Frozen provider profile</p>
             <h2>{data.profileName}</h2>
+            <p className="muted">
+              These providers and processing regions are fixed for this consultation.
+            </p>
           </div>
-          <span className="meta">Revision {data.profileRevision}</span>
+          <span className={styles.revisionBadge}>Revision {data.profileRevision}</span>
         </div>
-        <section aria-label="Frozen provider direction details">
+        <section className={styles.providerTableWrap} aria-label="Frozen provider direction details">
           <table className={styles.providerTable}>
             <caption className="srOnly">
               Speech, translation, voice, and processing region for each language direction
@@ -438,7 +489,7 @@ function ProviderConsentForm({ busy, data, onSubmit }: ProviderConsentFormProps)
                 <tr key={`${direction.sourceLabel}:${direction.destinationLabel}`}>
                   <td>
                     <span className={styles.mobileFieldLabel}>Direction</span>
-                    {direction.sourceLabel} → {direction.destinationLabel}
+                    <strong>{direction.sourceLabel} → {direction.destinationLabel}</strong>
                   </td>
                   <td>
                     <span className={styles.mobileFieldLabel}>Speech</span>
@@ -463,7 +514,8 @@ function ProviderConsentForm({ busy, data, onSubmit }: ProviderConsentFormProps)
         </section>
       </section>
       <section aria-label="Recording and provider consent, version 1" className={styles.consent}>
-        <strong>Recording and provider consent · version 1</strong>
+        <p className="eyebrow">Recording and provider consent · version 1</p>
+        <h2>Review before entering</h2>
         <p>{CONSENT_COPY}</p>
       </section>
       <label className={styles.check}>
@@ -644,18 +696,21 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
   }
 
   return (
-    <div className="stack">
-      <div>
-        <p className="eyebrow">Consultation lobby</p>
-        <h1>Prepare before joining.</h1>
-        <p className="lede">
-          This lobby is disconnected from the meeting. Your camera and microphone remain local until
-          recording is ready and the server grants publication.
-        </p>
-      </div>
+    <div className={styles.lobby}>
+      <header className={styles.hero}>
+        <div>
+          <p className="eyebrow">Consultation lobby</p>
+          <h1>Prepare before joining</h1>
+          <p className="lede">
+            Check your devices, choose your language, and review the exact provider profile before
+            you consent.
+          </p>
+        </div>
+        <span className={styles.lobbyBadge}>Not connected</span>
+      </header>
       <LobbySteps stage={phaseDescriptor.stage} />
       <p
-        className={styles.feedback}
+        className={styles.phaseStatus}
         ref={phaseStatusRef}
         role="status"
         aria-live="polite"
@@ -665,6 +720,13 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
         {phaseDescriptor.announcement}
       </p>
       {phaseContent}
+      <aside className={styles.privacyNote} aria-label="Lobby privacy">
+        <span className={styles.privacyIcon} aria-hidden="true">◇</span>
+        <p>
+          <strong>Your lobby preview stays private.</strong> Camera and microphone media remain local
+          until recording is ready and the server grants publication after you enter the room.
+        </p>
+      </aside>
       <div id="lobby-feedback" className={styles.feedback}>
         {pollError && (
           <p className="notice" role="alert">

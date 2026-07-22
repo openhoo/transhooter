@@ -34,12 +34,12 @@ export function DownloadButton({ archiveId, label, objectId }: DownloadButtonPro
   }
 
   return (
-    <div className="archiveDownload">
+    <div className="grid min-w-0 gap-2">
       <button
         aria-label={`Download ${label}`}
         aria-describedby={error ? errorId : undefined}
         aria-busy={busy}
-        className="button secondary"
+        className="inline-flex min-h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
         disabled={busy}
         type="button"
         onClick={() => {
@@ -49,7 +49,7 @@ export function DownloadButton({ archiveId, label, objectId }: DownloadButtonPro
         {busy ? "Preparing…" : "Download"}
       </button>
       {error && (
-        <p className="error" id={errorId} role="alert">
+        <p className="text-xs text-destructive" id={errorId} role="alert">
           {error}
         </p>
       )}
@@ -65,7 +65,7 @@ export function RefreshArchiveStatus() {
   return (
     <button
       aria-busy={refreshing}
-      className="button secondary"
+      className="inline-flex min-h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium text-foreground transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
       disabled={refreshing}
       type="button"
       onClick={() => {
@@ -367,18 +367,18 @@ export function ArchiveAdminActions({
     <section
       aria-busy={busyAction !== null}
       aria-describedby={feedback ? "archive-action-feedback" : undefined}
-      className="stack panel archiveActions"
+      className="flex flex-col gap-5 rounded-md border border-border bg-card p-5"
     >
-      <div>
-        <p className="eyebrow">Restricted archive controls</p>
-        <h2>Hold or delete</h2>
-        <p className="muted">
-          Both actions require a fresh, consultation-bound administrator sign-in.
+      <div className="border-b border-border pb-4">
+        <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">Restricted archive controls</p>
+        <h2 className="mt-1 font-serif text-lg font-semibold">Hold or delete</h2>
+        <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+          Both actions require a fresh, consultation-bound administrator sign-in and are recorded in the audit register.
         </p>
       </div>
 
       <button
-        className="button secondary"
+        className="inline-flex min-h-9 w-fit items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
         disabled={busyAction !== null}
         type="button"
         onClick={() => {
@@ -390,26 +390,26 @@ export function ArchiveAdminActions({
 
       <form
         aria-busy={busyAction === "hold"}
-        className="stack"
+        className="grid gap-3 rounded-md border border-border p-4"
         onSubmit={(event) => {
           void mutate(event, "hold");
         }}
       >
-        <div className="field">
-          <label htmlFor="hold-reason">Legal hold reason</label>
-          <input id="hold-reason" name="reason" required />
+        <div className="grid gap-2">
+          <label className="text-sm font-medium" htmlFor="hold-reason">Legal hold reason</label>
+          <input className="min-h-10 rounded-md border border-input bg-background px-3 text-sm" id="hold-reason" name="reason" required />
         </div>
-        <button className="button secondary" disabled={busyAction !== null} type="submit">
+        <button className="inline-flex min-h-9 w-fit items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50" disabled={busyAction !== null} type="submit">
           {busyAction === "hold" ? "Applying…" : "Apply legal hold"}
         </button>
       </form>
 
       {activeHolds.length > 0 && (
-        <div className="stack">
-          <h3>Release an active hold</h3>
+        <div className="grid gap-3 rounded-md border border-attention/70 bg-attention/20 p-4">
+          <h3 className="font-serif text-base font-semibold">Release an active hold</h3>
           {activeHolds.map((hold) => (
-            <div className="archiveHoldRow" key={hold.id}>
-              <div className="row">
+            <div className="grid gap-3 border-t border-border pt-3 first:border-0 first:pt-0" key={hold.id}>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <span className="archiveHoldReason">{hold.reason}</span>
                 {confirmingHoldId !== hold.id && (
                   <button
@@ -421,7 +421,7 @@ export function ArchiveAdminActions({
                       }
                     }}
                     aria-label={`Release legal hold: ${hold.reason}`}
-                    className="button secondary"
+                    className="inline-flex min-h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium transition-colors hover:bg-secondary disabled:opacity-50"
                     disabled={busyAction !== null}
                     type="button"
                     onClick={() => {
@@ -433,15 +433,15 @@ export function ArchiveAdminActions({
                 )}
               </div>
               {confirmingHoldId === hold.id && (
-                <div className="inlineConfirmation">
+                <div className="grid gap-3 rounded-md border border-attention bg-attention/30 p-3">
                   <p id={`release-hold-${hold.id}`}>
                     Release the legal hold “{hold.reason}”? Protected versions may then become
                     eligible for deletion.
                   </p>
-                  <div className="actions">
+                  <div className="flex flex-wrap gap-2">
                     <button
                       ref={keepHoldRef}
-                      className="button secondary"
+                      className="inline-flex min-h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-secondary disabled:opacity-50"
                       disabled={busyAction !== null}
                       type="button"
                       onClick={() => {
@@ -453,7 +453,7 @@ export function ArchiveAdminActions({
                     </button>
                     <button
                       aria-describedby={`release-hold-${hold.id}`}
-                      className="button danger"
+                      className="inline-flex min-h-9 items-center justify-center rounded-md bg-destructive px-3 text-sm font-medium text-destructive-foreground disabled:opacity-50"
                       disabled={busyAction !== null}
                       type="button"
                       onClick={() => {
@@ -472,13 +472,13 @@ export function ArchiveAdminActions({
 
       <form
         aria-busy={busyAction === "delete"}
-        className="stack"
+        className="grid gap-3 rounded-md border border-destructive/30 bg-destructive/5 p-4"
         onSubmit={(event) => {
           void mutate(event, "delete");
         }}
       >
-        <div className="field">
-          <label htmlFor="delete-reason">Deletion reason</label>
+        <div className="grid gap-2">
+          <label className="text-sm font-medium" htmlFor="delete-reason">Deletion reason</label>
           <input
             id="delete-reason"
             name="reason"
@@ -487,17 +487,18 @@ export function ArchiveAdminActions({
             onChange={(event) => {
               setDeleteReason(event.currentTarget.value);
             }}
+            className="min-h-10 rounded-md border border-input bg-background px-3 text-sm"
           />
         </div>
-        <p className="muted" id="delete-scope">
+        <p className="text-sm text-muted-foreground" id="delete-scope">
           This requests irreversible deletion of every stored object version.
         </p>
         {deletionBlockedByHold && (
-          <p className="notice warning" id="delete-hold-block">
+          <p className="rounded-md border border-attention bg-attention/30 p-3 text-sm text-attention-foreground" id="delete-hold-block">
             Release and verify every active legal hold before requesting deletion.
           </p>
         )}
-        <label className="archiveDeleteConfirmation">
+        <label className="grid min-h-11 cursor-pointer grid-cols-[auto_minmax(0,1fr)] items-start gap-3 text-sm">
           <input
             checked={deleteAcknowledged}
             disabled={busyAction !== null || deletionBlockedByHold}
@@ -511,7 +512,7 @@ export function ArchiveAdminActions({
         </label>
         <button
           aria-describedby={`delete-scope${deletionBlockedByHold ? " delete-hold-block" : ""}`}
-          className="button danger"
+          className="inline-flex min-h-10 w-fit items-center justify-center rounded-md bg-destructive px-4 text-sm font-semibold text-destructive-foreground disabled:cursor-not-allowed disabled:opacity-50"
           disabled={
             busyAction !== null ||
             deletionBlockedByHold ||
@@ -528,7 +529,7 @@ export function ArchiveAdminActions({
         <div
           ref={feedbackRef}
           tabIndex={-1}
-          className={feedback.kind === "error" ? "error" : "notice"}
+          className={feedback.kind === "error" ? "rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive" : "rounded-md border border-verified/40 bg-verified/5 p-3 text-sm text-foreground"}
           id="archive-action-feedback"
           role={feedback.kind === "error" ? "alert" : "status"}
         >

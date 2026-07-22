@@ -10,7 +10,7 @@ type GlobalErrorProps = {
 export default function GlobalError(props: GlobalErrorProps) {
   return (
     <html lang="en">
-      <body>
+      <body className="min-h-screen bg-background p-4 text-foreground sm:p-8">
         <ErrorRecovery {...props} />
       </body>
     </html>

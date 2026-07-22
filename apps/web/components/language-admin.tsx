@@ -26,6 +26,28 @@ const refreshedAtFormatter = new Intl.DateTimeFormat("en", {
   timeStyle: "short",
 });
 
+function formatProviderStages(value: string): string {
+  try {
+    const snapshot = JSON.parse(value) as Record<string, unknown>;
+    const labels: string[] = [];
+    for (const [stage, details] of Object.entries(snapshot)) {
+      if (!details || typeof details !== "object") continue;
+      const provider = Reflect.get(details, "provider");
+      const model = Reflect.get(details, "model");
+      const bypass = Reflect.get(details, "bypass");
+      if (bypass === true) {
+        labels.push(`${stage.toUpperCase()}: bypass`);
+      } else if (typeof provider === "string") {
+        labels.push(
+          `${stage.toUpperCase()}: ${provider}${typeof model === "string" ? ` · ${model}` : ""}`,
+        );
+      }
+    }
+    return labels.length > 0 ? labels.join("\n") : "Configured provider stages";
+  } catch {
+    return value;
+  }
+}
 export function LanguageAdmin({ directions }: LanguageAdminProps) {
   const [items, setItems] = useState(directions);
   const [error, setError] = useState("");
@@ -63,48 +85,57 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
   }
 
   return (
-    <div className="stack" aria-busy={busy !== null}>
-      <div className="tableWrap">
-        <table>
-          <thead>
+    <div className="flex flex-col gap-4" aria-busy={busy !== null}>
+      <div className="overflow-x-auto rounded-md border border-border bg-card">
+        <table className="w-full text-sm">
+          <thead className="bg-secondary">
             <tr>
-              <th>Profile</th>
-              <th>Direction</th>
-              <th>Stages</th>
-              <th>Region / refreshed</th>
-              <th>Status</th>
+              <th className="font-semibold text-foreground">Profile</th>
+              <th className="font-semibold text-foreground">Direction</th>
+              <th className="font-semibold text-foreground">Provider stages</th>
+              <th className="font-semibold text-foreground">Region / last verified</th>
+              <th className="text-right font-semibold text-foreground">Offered</th>
             </tr>
           </thead>
           <tbody>
             {items.map((item) => (
-              <tr key={item.id}>
+              <tr className={item.enabled ? "" : "opacity-60"} key={item.id}>
                 <td>
-                  {item.profile}
+                  <span className="font-medium">{item.profile}</span>
                   <br />
-                  <span className="meta">Revision {item.revision}</span>
+                  <span className="font-mono text-xs text-muted-foreground">
+                    Revision {item.revision}
+                  </span>
                 </td>
-                <td>
+                <td className="font-medium">
                   {item.source} → {item.target}
                 </td>
-                <td>{item.providers}</td>
                 <td>
-                  {item.region}
-                  <br />
-                  <span className="meta">
-                    {refreshedAtFormatter.format(new Date(item.freshAt))}
+                  <span className="whitespace-pre-line text-xs leading-relaxed text-muted-foreground">
+                    {formatProviderStages(item.providers)}
                   </span>
                 </td>
                 <td>
+                  <span className="inline-flex rounded-full border border-border px-2 py-0.5 font-mono text-xs">
+                    {item.region}
+                  </span>
+                  <br />
+                  <span className="mt-1 inline-block text-xs text-muted-foreground">
+                    {refreshedAtFormatter.format(new Date(item.freshAt))}
+                  </span>
+                </td>
+                <td className="text-right">
                   <button
                     aria-label={`${item.enabled ? "Disable" : "Enable"} ${item.source} to ${item.target} for ${item.profile}`}
-                    className={`button ${item.enabled ? "secondary" : ""}`}
+                    aria-pressed={item.enabled}
+                    className={`inline-flex min-h-9 min-w-20 items-center justify-center rounded-md px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${item.enabled ? "bg-primary text-primary-foreground" : "border border-border bg-background text-foreground hover:bg-secondary"}`}
                     disabled={busy !== null}
                     type="button"
                     onClick={() => {
                       void toggle(item);
                     }}
                   >
-                    {busy === item.id ? "Updating…" : item.enabled ? "Disable" : "Enable"}
+                    {busy === item.id ? "Updating…" : item.enabled ? "Enabled" : "Enable"}
                   </button>
                 </td>
               </tr>
@@ -114,11 +145,13 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
       </div>
 
       {items.length === 0 && (
-        <section className="empty flat">
-          <h2>No complete provider directions</h2>
-          <p>Refresh provider capabilities, then reload this catalog before enabling a language.</p>
+        <section className="rounded-md border border-border bg-card p-6">
+          <h2 className="font-serif text-lg font-semibold">No complete provider directions</h2>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Refresh provider capabilities, then reload this catalog before enabling a language.
+          </p>
           <button
-            className="button secondary"
+            className="mt-4 inline-flex min-h-9 items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-secondary"
             type="button"
             onClick={() => {
               window.location.reload();
@@ -130,7 +163,10 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
       )}
 
       {error && (
-        <p className="error" role="alert">
+        <p
+          className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
+          role="alert"
+        >
           {error}
         </p>
       )}
