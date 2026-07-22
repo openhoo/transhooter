@@ -32,6 +32,8 @@ const snapshot: ReconciliationSnapshot = {
   workerTerminal: { terminal: true },
   egressResults: [{ terminal: true, outputPrefix: `v1/meetings/${consultationId}/audio` }],
   providerGaps: [],
+  directions: [],
+  providerAttempts: [],
   expectations: [
     {
       id: "40000000-0000-4000-8000-000000000004",
@@ -568,4 +570,108 @@ test("redundant reconciliation completes after the archive is already terminal",
   await runner.tick();
 
   assert.deepEqual(calls, ["done"]);
+});
+
+test("reconciliation waits for translated interpretation PCM evidence", async () => {
+  const calls: string[] = [];
+  const translatedSnapshot: ReconciliationSnapshot = {
+    ...snapshot,
+    directions: [
+      {
+        mode: "translated",
+        destinationParticipantId: "40000000-0000-4000-8000-000000000006",
+        emittedOutput: 48_000,
+      },
+    ],
+  };
+  const store = {
+    claimEffects: async () => [{ ...effect, plan: { resourceGeneration: 2 } }],
+    currentGeneration: async () => 3,
+    persistCalling: async () => ({
+      ...effect,
+      plan: { resourceGeneration: 2 },
+      state: "calling" as const,
+      requestBytes: new Uint8Array(),
+      requestSha256: "a".repeat(64),
+    }),
+    renewEffectLease: async () => true,
+    reconciliationSnapshot: async () => translatedSnapshot,
+    completeReconciliation: async () => {
+      calls.push("complete");
+      return true;
+    },
+    markDone: async () => calls.push("done"),
+    markFailed: async (_id: string, _owner: string, message: string) => calls.push(message),
+  } as unknown as DurableStore;
+  const remote = {
+    discoverArchiveObjects: async () => [],
+    verifyArchiveObject: async () => true,
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "40000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.equal(calls.includes("complete"), false);
+  assert.match(calls[0] ?? "", /tts_output_pcm/);
+  assert.match(calls[0] ?? "", /livekit_output_pcm/);
+});
+
+test("reconciliation does not require interpretation PCM for same-language bypass", async () => {
+  const calls: string[] = [];
+  const sameLanguageSnapshot: ReconciliationSnapshot = {
+    ...snapshot,
+    directions: [
+      {
+        mode: "same_language",
+        destinationParticipantId: "40000000-0000-4000-8000-000000000006",
+        emittedOutput: 0,
+      },
+    ],
+  };
+  const store = {
+    claimEffects: async () => [effect],
+    currentGeneration: async () => effect.generation,
+    persistCalling: async () => ({
+      ...effect,
+      state: "calling" as const,
+      requestBytes: new Uint8Array(),
+      requestSha256: "a".repeat(64),
+    }),
+    renewEffectLease: async () => true,
+    reconciliationSnapshot: async () => sameLanguageSnapshot,
+    completeReconciliation: async () => {
+      calls.push("complete");
+      return true;
+    },
+    markDone: async () => calls.push("done"),
+    markFailed: async () => calls.push("failed"),
+  } as unknown as DurableStore;
+  const remote = {
+    discoverArchiveObjects: async () => [],
+    verifyArchiveObject: async () => true,
+    putArchiveObject: async () => ({ versionId: "v1", size: 1, checksum: "crc" }),
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "40000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  await runner.tick();
+
+  assert.deepEqual(calls, ["complete"]);
 });

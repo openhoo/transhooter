@@ -15,6 +15,7 @@ COPY --chown=transhooter:transhooter tests/failure-smoke/package.json tests/fail
 RUN --mount=type=cache,id=bun-harness-v1,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --filter @transhooter/e2e
 COPY --chown=transhooter:transhooter tests/e2e/smoke-consultation.mjs tests/e2e/smoke-consultation.mjs
+COPY --chown=transhooter:transhooter tests/e2e/consultation-browser-workflow.mjs tests/e2e/consultation-browser-workflow.mjs
 COPY --chown=transhooter:transhooter tests/e2e/consultation-harness.mjs tests/e2e/consultation-harness.mjs
 COPY --chown=transhooter:transhooter tests/e2e/consultation-scenario.mjs tests/e2e/consultation-scenario.mjs
 COPY --chown=transhooter:transhooter tests/e2e/consultation-archive-proof.mjs tests/e2e/consultation-archive-proof.mjs

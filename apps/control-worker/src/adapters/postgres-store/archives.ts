@@ -22,6 +22,8 @@ import {
   type IdRow,
   nullableString,
   type ProviderGapRow,
+  type ReconciliationProviderAttemptRow,
+  type ReconciliationDirectionRow,
   type ReconciliationArchiveRow,
   type ReconciliationEgressResult,
 } from "./shared";
@@ -91,7 +93,16 @@ export async function reconciliationSnapshot(
           AND checkpoint.generation=${resourceGeneration} AND checkpoint.worker_id=reservation.worker_id
           AND checkpoint.worker_epoch=reservation.epoch AND checkpoint.terminal=true)`;
     const archiveId = archive.id;
-    const [expectations, objects, checkpoints, egress, drains, providerGaps] = await Promise.all([
+    const [
+      expectations,
+      objects,
+      checkpoints,
+      egress,
+      drains,
+      providerAttempts,
+      providerGaps,
+      directions,
+    ] = await Promise.all([
       transaction<
         ExpectationRow[]
       >`SELECT id,object_class,causal_key,sample_start,sample_end,fulfilled_object_id
@@ -112,6 +123,10 @@ export async function reconciliationSnapshot(
         DrainResultRow[]
       >`SELECT result FROM external_effects WHERE consultation_id=${consultationId} AND generation=${cleanupGeneration}
         AND effect_kind='ROOM_DELETE' AND state='done' ORDER BY updated_at DESC LIMIT 1`,
+      transaction<ReconciliationProviderAttemptRow[]>`SELECT id AS attempt_id,stage
+          FROM provider_attempts
+          WHERE consultation_id=${consultationId} AND terminal_at IS NOT NULL AND outcome='succeeded'
+          ORDER BY stage,id`,
       transaction<ProviderGapRow[]>`SELECT attempt.id AS attempt_id,attempt.stage,attempt.provider,
         attempt.direction_id,attempt.operation_id,attempt.attempt_number,attempt.outcome,attempt.error_kind,
         attempt.accepted_input_watermark,attempt.received_output_watermark,attempt.emitted_output_watermark,
@@ -125,7 +140,19 @@ export async function reconciliationSnapshot(
           AND COALESCE(attempt.emitted_output_watermark,0)=0)
         AND NOT EXISTS (SELECT 1 FROM provider_attempts retry WHERE retry.retry_of=attempt.id)
         ORDER BY attempt.stage,attempt.direction_id,attempt.operation_id,attempt.attempt_number`,
+      transaction<ReconciliationDirectionRow[]>`SELECT direction->>'mode' AS mode,
+          (direction->>'destinationParticipantId')::uuid AS destination_participant_id,
+          COALESCE((SELECT checkpoint.emitted_output FROM worker_checkpoints checkpoint
+            WHERE checkpoint.consultation_id=${consultationId} AND checkpoint.generation=${resourceGeneration}
+              AND checkpoint.destination_participant_id=(direction->>'destinationParticipantId')::uuid
+              AND checkpoint.terminal=true
+            ORDER BY checkpoint.accepted_input DESC,checkpoint.created_at DESC LIMIT 1),0) AS emitted_output
+          FROM room_provider_selections selection
+          CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
+          WHERE selection.consultation_id=${consultationId}
+          ORDER BY destination_participant_id`,
     ]);
+
     return mapReconciliationSnapshot(
       archiveId,
       archive.reconciliationDeadlineAt,
@@ -133,8 +160,10 @@ export async function reconciliationSnapshot(
       objects,
       checkpoints,
       egress,
+      providerAttempts,
       drains,
       providerGaps,
+      directions,
     );
   });
 }
@@ -302,8 +331,10 @@ function mapReconciliationSnapshot(
   objects: readonly ArchiveObjectRow[],
   checkpoints: readonly CheckpointRow[],
   egress: readonly EgressResultRow[],
+  providerAttempts: readonly ReconciliationProviderAttemptRow[],
   drains: readonly DrainResultRow[],
   providerGaps: readonly ProviderGapRow[],
+  directions: readonly ReconciliationDirectionRow[],
 ): ReconciliationSnapshot {
   return {
     archiveId,
@@ -315,6 +346,10 @@ function mapReconciliationSnapshot(
       checkpoints[0] === undefined
         ? { terminal: false, gaps: [{ reason: "worker_terminal_missing" }] }
         : { terminal: true, checkpoint: checkpoints[0].checkpoint },
+    providerAttempts: providerAttempts.map((attempt) => ({
+      attemptId: attempt.attempt_id,
+      stage: attempt.stage,
+    })),
     egressResults: egress.map(mapReconciliationEgress),
     providerGaps: providerGaps.map((gap) => ({
       attemptId: gap.attempt_id,
@@ -329,6 +364,11 @@ function mapReconciliationSnapshot(
       receivedOutputWatermark: gap.received_output_watermark,
       emittedOutputWatermark: gap.emitted_output_watermark,
       retryDecision: gap.retry_decision,
+    })),
+    directions: directions.map((direction) => ({
+      mode: direction.mode === "translated" ? "translated" : "same_language",
+      destinationParticipantId: direction.destination_participant_id,
+      emittedOutput: Number(direction.emitted_output),
     })),
     expectations: expectations.map(mapReconciliationExpectation),
     objects: objects.map(mapArchiveObject),

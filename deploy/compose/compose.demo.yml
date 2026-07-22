@@ -1,0 +1,43 @@
+services:
+  minio:
+    ports: !override
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+
+  mailpit:
+    ports: !override
+      - "127.0.0.1:8025:8025"
+
+  livekit:
+    networks:
+      backend:
+        ipv4_address: ${RTC_NODE_IP:-10.254.232.250}
+      edge: {}
+    environment:
+      RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:-${RTC_NODE_IP:-10.254.232.250}}
+      RTC_UDP_PORT_START: "50000"
+      RTC_UDP_PORT_END: "50100"
+    ports: !override
+      - "127.0.0.1:7880:7880"
+      - "127.0.0.1:7881:7881"
+      - "50000-50100:50000-50100/udp"
+
+  egress:
+    environment:
+      RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:-${RTC_NODE_IP:-10.254.232.250}}
+      RTC_UDP_PORT_START: "50000"
+      RTC_UDP_PORT_END: "50100"
+
+  web:
+    ports: !override
+      - "127.0.0.1:3000:3000"
+    environment:
+      PUBLIC_BASE_URL: http://localhost:3000
+      PUBLIC_LIVEKIT_URL: ws://localhost:7880
+      LIVEKIT_BROWSER_URL: ws://localhost:7880
+
+networks:
+  backend:
+    ipam:
+      config: !override
+        - subnet: ${RTC_SUBNET:-10.254.232.0/24}

@@ -241,11 +241,7 @@ export class ArchiveService {
   ): Promise<void> {
     await this.archives.transaction(async (tx) => {
       const archive = await this.required(consultationId, tx);
-      if (
-        archive.state !== "pending" &&
-        archive.state !== "recording" &&
-        archive.state !== "reconciling"
-      ) {
+      if (archive.state !== "pending" && archive.state !== "recording") {
         throw new DomainError("ARCHIVE_WRITER_FENCED");
       }
       await this.recordProtectedObject(
@@ -1610,6 +1606,8 @@ export class ArchiveService {
     const archive = lockedArchive ?? (await this.required(object.consultationId, tx));
     if (
       archive.writeEpoch !== object.writerEpoch ||
+      archive.state === "complete" ||
+      archive.state === "incomplete" ||
       archive.state === "deleting" ||
       archive.state === "deleted"
     ) {

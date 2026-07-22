@@ -128,6 +128,11 @@ export interface ArchiveObjectRow extends PostgresRow {
   readonly content_type: string;
 }
 
+export interface ReconciliationProviderAttemptRow extends PostgresRow {
+  readonly attempt_id: string;
+  readonly stage: string;
+}
+
 export interface ProviderGapRow extends PostgresRow {
   readonly attempt_id: string;
   readonly stage: string;
@@ -141,6 +146,12 @@ export interface ProviderGapRow extends PostgresRow {
   readonly received_output_watermark: number | null;
   readonly emitted_output_watermark: number | null;
   readonly retry_decision: unknown;
+}
+
+export interface ReconciliationDirectionRow extends PostgresRow {
+  readonly mode: string;
+  readonly destination_participant_id: string;
+  readonly emitted_output: number;
 }
 
 export interface CheckpointRow extends PostgresRow {

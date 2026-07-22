@@ -1,0 +1,93 @@
+x-demo-google-env: &demo-google-env
+  APP_ENV: development
+  PROVIDER_PROFILE: google-eu
+  PROVIDER_NETWORK_DISABLED: "false"
+
+services:
+  migrate:
+    environment:
+      <<: *demo-google-env
+
+  bootstrap-admin:
+    environment:
+      <<: *demo-google-env
+
+  profile-preflight:
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+    command: [transhooter-provider, preflight]
+    volumes: !override
+      - test-capability-secrets:/run/secrets:ro
+      - ../../.secrets/google-adc.json:/run/secrets/google-adc.json:ro
+
+  capability-publisher:
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+      PUBLIC_BASE_URL: http://capability-publisher:3000
+      PUBLIC_LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_BROWSER_URL: ws://livekit:7880
+      SMTP_URL: smtp://mailpit:1025
+
+  language-refresh:
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+    command: [transhooter-provider, sync]
+    volumes: !override
+      - test-capability-secrets:/run/secrets:ro
+      - ../../.secrets/google-adc.json:/run/secrets/google-adc.json:ro
+
+  translation-worker:
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+    volumes: !override
+      - spool-data:/var/lib/transhooter/spool
+      - test-translation-secrets:/run/secrets:ro
+      - ../../.secrets/google-adc.json:/run/secrets/google-adc.json:ro
+
+  spool-drainer:
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+    volumes: !override
+      - spool-data:/var/lib/transhooter/spool
+      - test-spool-drainer-secrets:/run/secrets:ro
+
+  control-worker-1:
+    depends_on: !override
+      bootstrap-admin: {condition: service_completed_successfully}
+      otel-collector: {condition: service_healthy}
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+      SMTP_URL: smtp://mailpit:1025
+    volumes: !override
+      - test-control-secrets:/run/secrets:ro
+
+  control-worker-2:
+    depends_on: !override
+      bootstrap-admin: {condition: service_completed_successfully}
+      otel-collector: {condition: service_healthy}
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+      SMTP_URL: smtp://mailpit:1025
+    volumes: !override
+      - test-control-secrets:/run/secrets:ro
+
+  web:
+    environment:
+      <<: *demo-google-env
+      FIXTURE_SCENARIO_FILE: null
+      TEST_FAULT_CONTROL_FILE: null
+      SMTP_URL: smtp://mailpit:1025

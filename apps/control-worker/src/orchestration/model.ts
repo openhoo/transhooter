@@ -122,6 +122,11 @@ export interface ArchivedObject {
   readonly contentType: string;
 }
 
+export interface ReconciliationProviderAttempt {
+  readonly attemptId: Uuid;
+  readonly stage: string;
+}
+
 export interface ReconciliationProviderGap {
   readonly attemptId: Uuid;
   readonly stage: string;
@@ -137,6 +142,12 @@ export interface ReconciliationProviderGap {
   readonly retryDecision: unknown;
 }
 
+export interface ReconciliationDirection {
+  readonly mode: "same_language" | "translated";
+  readonly destinationParticipantId: Uuid;
+  readonly emittedOutput: number;
+}
+
 export interface ReconciliationSnapshot {
   readonly archiveId: Uuid;
   readonly state: "reconciling";
@@ -144,7 +155,9 @@ export interface ReconciliationSnapshot {
   readonly roomClose: unknown;
   readonly workerTerminal: unknown;
   readonly egressResults: readonly unknown[];
+  readonly providerAttempts: readonly ReconciliationProviderAttempt[];
   readonly providerGaps: readonly ReconciliationProviderGap[];
+  readonly directions: readonly ReconciliationDirection[];
   readonly expectations: readonly ReconciliationExpectation[];
   readonly objects: readonly ArchivedObject[];
 }

@@ -275,6 +275,17 @@ describe("ApplicationOperations typed views", () => {
     expect(detail.providerAttemptGroups[0]?.attemptIds).toEqual(detail.providerAttemptIds);
   });
 
+  it("lists archive objects only for finalized archives", async () => {
+    const { execute, operations } = createOperations([] as unknown[]);
+
+    await operations.archiveObjects(ADMIN, "00000000-0000-4000-8000-000000000004", null, 50);
+
+    const statement = (execute.mock.calls as unknown as [unknown][])[0]?.[0];
+    const query = new PgDialect().sqlToQuery(statement as never).sql;
+    expect(query).toContain("a.state IN ('complete','incomplete')");
+    expect(query).toContain("JOIN final_inventories f ON f.archive_id=a.id");
+  });
+
   it("persists a fenced immutable provider terminal and accepts only an exact replay", async () => {
     const input = {
       consultationId: "00000000-0000-4000-8000-000000000021",

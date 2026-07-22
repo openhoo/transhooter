@@ -53,7 +53,7 @@ export function createConsultationScenario(context) {
         await page.goto(`${baseUrl}/sign-in`);
         await page.getByLabel("Email address").fill(email);
         await page.getByRole("button", { name: "Email me a sign-in link" }).click();
-        await page.getByRole("status").filter({ hasText: "If this address can sign in" }).waitFor();
+        await page.getByText("If this address can sign in", { exact: false }).waitFor();
       }
       const link =
         existingLink ??
@@ -566,6 +566,7 @@ export function createConsultationScenario(context) {
       employeeEmail,
       failureHarnessReleaseFile,
       failureHarnessReleaseTimeoutMs,
+      onParticipantPagesReady,
       runId,
       skipAudibleInterpretationProof,
       skipMediaOutputProof,
@@ -620,6 +621,9 @@ export function createConsultationScenario(context) {
       latestLink(thirdEmail, { signal }),
     );
     const third = await authenticate(thirdContext, thirdEmail, thirdInvite);
+    if (onParticipantPagesReady) {
+      await onParticipantPagesReady(employee, customer);
+    }
 
     beginPhase("preferences-and-frozen-provider-consent");
     await boundedPages([employee, customer], "open participant lobbies", () =>
@@ -683,6 +687,7 @@ export function createConsultationScenario(context) {
           `surface=${String(exposedRoomSurface)})`,
       );
     }
+    if (onParticipantPagesReady) await third.close();
 
     if (!skipMediaOutputProof) {
       beginPhase("captions-interpretation-and-audio-modes");
@@ -704,18 +709,19 @@ export function createConsultationScenario(context) {
     }
 
     beginPhase("consultation-finalization");
-    await boundedPage(employee, "request consultation end", () =>
-      employee.getByRole("button", { name: "End consultation" }).click(),
-    );
+    await boundedPage(employee, "request consultation end", async () => {
+      employee.once("dialog", (dialog) => dialog.accept());
+      await employee.getByRole("button", { name: "End consultation" }).click();
+    });
     await boundedPages([employee, customer], "observe consultation ending", () =>
       Promise.all([
         employee
-          .getByRole("timer")
-          .filter({ hasText: /Consultation ending in [1-5] seconds?/ })
+          .getByLabel("Recording and storage status")
+          .filter({ hasText: "Recording and secure storage finalizing" })
           .waitFor(),
         customer
-          .getByRole("timer")
-          .filter({ hasText: /Consultation ending in [1-5] seconds?/ })
+          .getByLabel("Recording and storage status")
+          .filter({ hasText: "Recording and secure storage finalizing" })
           .waitFor(),
       ]),
     );
@@ -726,7 +732,14 @@ export function createConsultationScenario(context) {
     );
     const archiveId = employee.url().match(/\/archives\/([0-9a-f-]+)/)?.[1];
     requireValue(archiveId, "archive id");
-    return { archiveId, customerProfile, employeeProfile };
+    return {
+      archiveId,
+      customerProfile,
+      employeeProfile,
+      employeePage: employee,
+      customerPage: customer,
+      thirdPage: third,
+    };
   }
 
   return {

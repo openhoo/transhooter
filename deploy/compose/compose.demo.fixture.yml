@@ -1,0 +1,58 @@
+x-demo-fixture-env: &demo-fixture-env
+  APP_ENV: test
+  PROVIDER_PROFILE: fixture
+  PROVIDER_NETWORK_DISABLED: "true"
+
+services:
+  migrate:
+    environment:
+      <<: *demo-fixture-env
+
+  bootstrap-admin:
+    environment:
+      <<: *demo-fixture-env
+
+  profile-preflight:
+    environment:
+      <<: *demo-fixture-env
+    command: [transhooter-provider, preflight, --profile, fixture]
+
+  capability-publisher:
+    environment:
+      <<: *demo-fixture-env
+      PUBLIC_BASE_URL: http://capability-publisher:3000
+      PUBLIC_LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_BROWSER_URL: ws://livekit:7880
+      SMTP_URL: smtp://mailpit:1025
+
+  language-refresh:
+    environment:
+      <<: *demo-fixture-env
+    command: [transhooter-provider, sync, --profile, fixture]
+
+  translation-worker:
+    environment:
+      <<: *demo-fixture-env
+      FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+
+  spool-drainer:
+    environment:
+      <<: *demo-fixture-env
+      FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+
+  control-worker-1:
+    environment:
+      <<: *demo-fixture-env
+      TEST_FAULT_CONTROL_FILE: /shared/faults.json
+      SMTP_URL: smtp://mailpit:1025
+
+  control-worker-2:
+    environment:
+      <<: *demo-fixture-env
+      TEST_FAULT_CONTROL_FILE: /shared/faults.json
+      SMTP_URL: smtp://mailpit:1025
+
+  web:
+    environment:
+      <<: *demo-fixture-env
+      SMTP_URL: smtp://mailpit:1025

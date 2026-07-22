@@ -225,7 +225,7 @@ export class DrizzleArchiveRepository extends DrizzleRepository implements Archi
       WHERE
         consultation_id = ${object.consultationId}
         AND write_epoch = ${object.writerEpoch}
-        AND state NOT IN ('deleting', 'deleted')
+        AND state IN ('pending', 'recording', 'reconciling')
       ON CONFLICT DO NOTHING
       RETURNING id
     `);

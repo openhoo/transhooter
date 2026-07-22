@@ -1,0 +1,267 @@
+#!/bin/sh
+set -eu
+
+ROOT=${TRANSHOOTER_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+EMPLOYEE_INPUT=
+CUSTOMER_INPUT=
+PROVIDER_PROFILE=fixture
+seen_employee=false
+seen_customer=false
+seen_provider=false
+
+usage() {
+  printf 'Usage: bun run demo:consultation -- --employee-video <path> --customer-video <path> [--provider-profile fixture|google-eu|deepgram-deepl-eu]\n' >&2
+}
+
+fail() {
+  printf 'Demo consultation: %s\n' "$1" >&2
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --employee-video)
+      $seen_employee && fail 'duplicate --employee-video option'
+      [ "$#" -ge 2 ] || { usage; fail '--employee-video requires a path'; }
+      EMPLOYEE_INPUT=$2
+      seen_employee=true
+      shift 2
+      ;;
+    --customer-video)
+      $seen_customer && fail 'duplicate --customer-video option'
+      [ "$#" -ge 2 ] || { usage; fail '--customer-video requires a path'; }
+      CUSTOMER_INPUT=$2
+      seen_customer=true
+      shift 2
+      ;;
+    --provider-profile)
+      $seen_provider && fail 'duplicate --provider-profile option'
+      [ "$#" -ge 2 ] || { usage; fail '--provider-profile requires a value'; }
+      PROVIDER_PROFILE=$2
+      seen_provider=true
+      shift 2
+      ;;
+    --*) usage; fail "unknown option: $1" ;;
+    *) usage; fail "unexpected positional argument: $1" ;;
+  esac
+done
+
+$seen_employee || { usage; fail 'missing required --employee-video option'; }
+$seen_customer || { usage; fail 'missing required --customer-video option'; }
+case "$PROVIDER_PROFILE" in
+  fixture | google-eu | deepgram-deepl-eu) ;;
+  *) fail "unsupported provider profile: $PROVIDER_PROFILE" ;;
+esac
+
+require_executable() {
+  command -v "$1" >/dev/null 2>&1 || fail "missing required executable: $1"
+}
+for executable in bash bun docker ffmpeg ffprobe flock setsid curl ss awk grep mktemp timeout; do
+  require_executable "$executable"
+done
+docker compose version >/dev/null 2>&1 || fail 'Docker Compose plugin is required'
+
+resolve_input() {
+  participant=$1
+  input=$2
+  [ -f "$input" ] && [ -r "$input" ] || fail "$participant input is not a readable regular file: $input"
+  directory=$(CDPATH= cd -- "$(dirname -- "$input")" 2>/dev/null && pwd) || fail "$participant input path cannot be resolved: $input"
+  printf '%s/%s\n' "$directory" "$(basename -- "$input")"
+}
+EMPLOYEE_INPUT=$(resolve_input employee "$EMPLOYEE_INPUT")
+CUSTOMER_INPUT=$(resolve_input customer "$CUSTOMER_INPUT")
+[ "$EMPLOYEE_INPUT" != "$CUSTOMER_INPUT" ] || fail 'employee and customer videos must be different files'
+
+if [ -z "${DISPLAY:-}" ]; then
+  [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] || fail 'a graphical display is required (set DISPLAY, or WAYLAND_DISPLAY and XDG_RUNTIME_DIR)'
+fi
+
+PLAYWRIGHT_CHROMIUM=$(cd "$ROOT/tests/e2e" && bun -e 'import { chromium } from "playwright"; console.log(chromium.executablePath())' 2>/dev/null) ||
+  fail 'Playwright Chromium is unavailable. Run: bunx playwright install chromium'
+[ -n "$PLAYWRIGHT_CHROMIUM" ] && [ -x "$PLAYWRIGHT_CHROMIUM" ] ||
+  fail 'Playwright Chromium is unavailable. Run: bunx playwright install chromium'
+
+case "$PROVIDER_PROFILE" in
+  google-eu)
+    [ -s "$ROOT/.secrets/google-adc.json" ] || fail 'missing provider credential: .secrets/google-adc.json'
+    [ -n "${GOOGLE_CLOUD_PROJECT:-}" ] || fail 'missing provider setting: GOOGLE_CLOUD_PROJECT'
+    [ -n "${GOOGLE_QUOTA_PROJECT:-}" ] || fail 'missing provider setting: GOOGLE_QUOTA_PROJECT'
+    ;;
+  deepgram-deepl-eu)
+    [ -s "$ROOT/.secrets/deepgram-api-key" ] || fail 'missing provider credential: .secrets/deepgram-api-key'
+    [ -s "$ROOT/.secrets/deepl-api-key" ] || fail 'missing provider credential: .secrets/deepl-api-key'
+    for setting in DEEPGRAM_STREAMS DEEPGRAM_AUDIO_SECONDS_MINUTE DEEPL_REQUESTS_MINUTE DEEPL_CHARACTERS_MINUTE; do
+      eval "value=\${$setting:-}"
+      [ -n "$value" ] || fail "missing provider setting: $setting"
+    done
+    ;;
+esac
+
+LOCK_FILE=${TMPDIR:-/tmp}/transhooter-compose-harness.lock
+exec 9>"$LOCK_FILE"
+flock -n 9 || fail 'the Compose harness lock is already held by another demo, smoke, or hermetic test run'
+
+RUN_DIRECTORY=
+PROJECT_NAME=
+DEMO_PID=
+STACK_CREATED=false
+cleanup_started=false
+cleanup() {
+  status=$?
+  $cleanup_started && exit "$status"
+  cleanup_started=true
+  trap - 0 HUP INT TERM
+  if [ -n "$DEMO_PID" ]; then
+    kill -TERM -- "-$DEMO_PID" 2>/dev/null || true
+    wait "$DEMO_PID" 2>/dev/null || true
+  fi
+  if $STACK_CREATED && [ -n "$PROJECT_NAME" ]; then
+    if ! compose down --volumes --remove-orphans; then
+      [ "$status" -ne 0 ] || status=1
+      printf 'Demo consultation: owned stack cleanup failed for %s\n' "$PROJECT_NAME" >&2
+    fi
+  fi
+  if [ -n "$RUN_DIRECTORY" ] && ! rm -rf -- "$RUN_DIRECTORY"; then
+    [ "$status" -ne 0 ] || status=1
+    printf 'Demo consultation: private run directory cleanup failed\n' >&2
+  fi
+  flock -u 9 2>/dev/null || true
+  exit "$status"
+}
+interrupted() { exit 130; }
+trap cleanup 0
+trap interrupted HUP INT TERM
+
+RUN_DIRECTORY=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/transhooter-demo.XXXXXXXX") || fail 'could not create private run directory'
+chmod 0700 "$RUN_DIRECTORY" || fail 'could not secure private run directory'
+mkdir -m 0700 "$RUN_DIRECTORY/media"
+: > "$RUN_DIRECTORY/compose.env"
+chmod 0600 "$RUN_DIRECTORY/compose.env"
+PROJECT_NAME="transhooter-demo-$$-$(date +%s)"
+
+probe_input() {
+  participant=$1
+  input=$2
+  video_stream=$(ffprobe -v error -select_streams v:0 -show_entries stream=index -of csv=p=0 "$input" 2>/dev/null) || fail "$participant input cannot be decoded: $input"
+  [ -n "$video_stream" ] || fail "$participant input has no decodable video stream: $input"
+  audio_stream=$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$input" 2>/dev/null) || fail "$participant input cannot be decoded: $input"
+  [ -n "$audio_stream" ] || fail "$participant input has no decodable audio stream: $input"
+  duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null) || fail "$participant input duration cannot be decoded: $input"
+  awk -v duration="$duration" 'BEGIN { exit !(duration + 0 >= 1) }' || fail "$participant input is shorter than one second: $input"
+}
+probe_input employee "$EMPLOYEE_INPUT"
+probe_input customer "$CUSTOMER_INPUT"
+
+convert_input() {
+  participant=$1
+  input=$2
+  video_output="$RUN_DIRECTORY/media/$participant.y4m"
+  audio_output="$RUN_DIRECTORY/media/$participant.wav"
+  ffmpeg -nostdin -hide_banner -loglevel error -y -i "$input" -t 30 -an -vf "scale=w='min(640,iw)':h='min(360,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=15,format=yuv420p" -f yuv4mpegpipe "$video_output" || fail "$participant video conversion failed: $input"
+  [ -s "$video_output" ] || fail "$participant video conversion produced an empty file: $input"
+  ffmpeg -nostdin -hide_banner -loglevel error -y -i "$input" -t 30 -vn -ac 1 -ar 48000 -c:a pcm_s16le "$audio_output" || fail "$participant audio conversion failed: $input"
+  [ -s "$audio_output" ] || fail "$participant audio conversion produced an empty file: $input"
+}
+
+DEADLINE_SECONDS=${CONSULTATION_DEMO_DEADLINE_SECONDS:-300}
+case "$DEADLINE_SECONDS" in '' | *[!0-9]*) fail 'CONSULTATION_DEMO_DEADLINE_SECONDS must be a positive integer' ;; esac
+[ "$DEADLINE_SECONDS" -gt 0 ] || fail 'CONSULTATION_DEMO_DEADLINE_SECONDS must be a positive integer'
+SCENARIO_DEADLINE_EPOCH_MS=$((($(date +%s) + DEADLINE_SECONDS) * 1000))
+export SCENARIO_DEADLINE_EPOCH_MS
+convert_input employee "$EMPLOYEE_INPUT"
+convert_input customer "$CUSTOMER_INPUT"
+
+for port in 3000 7880 7881 8025 9000 9001; do
+  if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
+    fail "required TCP port is already occupied: $port"
+  fi
+done
+if ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq '(^|:)(500[0-9][0-9]|50100)$'; then
+  fail 'required UDP port range is already occupied: 50000-50100'
+fi
+
+BASE_FILE="$ROOT/deploy/compose/compose.yml"
+TEST_FILE="$ROOT/deploy/compose/compose.test.yml"
+COMMON_DEMO_FILE="$ROOT/deploy/compose/compose.demo.yml"
+case "$PROVIDER_PROFILE" in
+  fixture)
+    PROFILE_FILES="$ROOT/deploy/compose/compose.demo.fixture.yml"
+    ;;
+  google-eu)
+    PROFILE_FILES="$ROOT/deploy/compose/compose.google.yml $ROOT/deploy/compose/compose.demo.google.yml"
+    ;;
+  deepgram-deepl-eu)
+    PROFILE_FILES="$ROOT/deploy/compose/compose.providers.yml $ROOT/deploy/compose/compose.demo.providers.yml"
+    ;;
+esac
+PROFILE_COMPOSE_ARGS=
+for selected_file in $PROFILE_FILES; do
+  PROFILE_COMPOSE_ARGS="$PROFILE_COMPOSE_ARGS -f $selected_file"
+done
+for compose_file in "$BASE_FILE" "$TEST_FILE" $PROFILE_FILES "$COMMON_DEMO_FILE"; do
+  [ -f "$compose_file" ] || fail "missing demo Compose file: $compose_file"
+done
+
+export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+export APP_ENV=$([ "$PROVIDER_PROFILE" = fixture ] && printf test || printf development)
+export PROVIDER_PROFILE
+export PROVIDER_NETWORK_DISABLED=$([ "$PROVIDER_PROFILE" = fixture ] && printf true || printf false)
+export BOOTSTRAP_ADMIN_EMAIL=${BOOTSTRAP_ADMIN_EMAIL:-admin@example.test}
+export BOOTSTRAP_ADMIN_NAME=${BOOTSTRAP_ADMIN_NAME:-Demo Administrator}
+export RTC_SUBNET=10.254.232.0/24
+export RTC_NODE_IP=10.254.232.250
+export RTC_ADVERTISED_IP=$RTC_NODE_IP
+export PUBLIC_BASE_URL=http://localhost:3000
+export PUBLIC_LIVEKIT_URL=ws://localhost:7880
+export S3_PUBLIC_ENDPOINT=http://localhost:9000
+export SMTP_URL=smtp://mailpit:1025
+
+compose() {
+  # PROFILE_COMPOSE_ARGS is built exclusively from fixed repository paths.
+  # shellcheck disable=SC2086
+  docker compose --env-file "$RUN_DIRECTORY/compose.env" -p "$PROJECT_NAME" \
+    -f "$BASE_FILE" -f "$TEST_FILE" $PROFILE_COMPOSE_ARGS -f "$COMMON_DEMO_FILE" "$@"
+}
+
+STACK_CREATED=true
+RENDERED_CONFIG="$RUN_DIRECTORY/compose.config.yml"
+compose config > "$RENDERED_CONFIG" || fail 'demo Compose configuration is invalid'
+grep -F "PROVIDER_PROFILE: $PROVIDER_PROFILE" "$RENDERED_CONFIG" >/dev/null || fail 'rendered Compose configuration does not select the requested provider profile'
+grep -F "${PROJECT_NAME}_test-secrets" "$RENDERED_CONFIG" >/dev/null || fail 'rendered Compose configuration does not use project-scoped generated secret volumes'
+if [ "$PROVIDER_PROFILE" != fixture ]; then
+  if grep -E 'FIXTURE_SCENARIO_FILE|TEST_FAULT_CONTROL_FILE|fault-control:/shared' "$RENDERED_CONFIG" >/dev/null; then
+    fail 'real-provider Compose configuration retains fixture fault-control state'
+  fi
+fi
+compose run --rm --no-deps secrets-init
+compose up --build --wait --remove-orphans otel-collector mailpit web
+READY_JSON=$(curl --fail --silent --show-error --max-time 10 http://localhost:3000/api/health/ready) || fail 'web readiness endpoint is unreachable'
+printf '%s' "$READY_JSON" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"' || fail 'web readiness endpoint did not return ready JSON'
+MAILPIT_CONTAINER=$(compose ps -q mailpit) || fail 'Mailpit container cannot be resolved'
+[ -n "$MAILPIT_CONTAINER" ] || fail 'Mailpit container cannot be resolved'
+MAILPIT_HOST=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{.IPAddress}}{{end}}{{end}}' "$MAILPIT_CONTAINER") || fail 'Mailpit address cannot be resolved'
+[ -n "$MAILPIT_HOST" ] || fail 'Mailpit address cannot be resolved'
+MAILPIT_URL="http://$MAILPIT_HOST:8025"
+MAILPIT_READY=$(curl --fail --silent --show-error --max-time 3 "$MAILPIT_URL/api/v1/messages") || fail "Mailpit API is unreachable at $MAILPIT_URL"
+printf '%s' "$MAILPIT_READY" | grep -Eq '"messages"|"Messages"' || fail 'Mailpit API did not return a message listing'
+timeout 5 bash -c '</dev/tcp/'"$RTC_NODE_IP"'/7881' >/dev/null 2>&1 || fail "LiveKit RTC bridge is unreachable at $RTC_NODE_IP:7881"
+
+export BASE_URL=http://localhost:3000
+export LIVEKIT_URL=ws://localhost:7880
+export MAILPIT_URL
+export EXPECTED_PROFILE="$PROVIDER_PROFILE"
+export E2E_EMPLOYEE_EMAIL="$BOOTSTRAP_ADMIN_EMAIL"
+export E2E_EMPLOYEE_VIDEO_FILE="$RUN_DIRECTORY/media/employee.y4m"
+export E2E_EMPLOYEE_AUDIO_FILE="$RUN_DIRECTORY/media/employee.wav"
+export E2E_CUSTOMER_VIDEO_FILE="$RUN_DIRECTORY/media/customer.y4m"
+export E2E_CUSTOMER_AUDIO_FILE="$RUN_DIRECTORY/media/customer.wav"
+export EMIT_PROOF_JSON=true
+setsid bun "$ROOT/tests/e2e/demo-consultation.mjs" &
+DEMO_PID=$!
+if wait "$DEMO_PID"; then
+  DEMO_PID=
+else
+  status=$?
+  DEMO_PID=
+  exit "$status"
+fi

@@ -118,7 +118,7 @@ export class ApplicationOperationsQueries {
   ): Promise<ArchiveObjectPage> {
     const boundedLimit = Math.max(1, Math.min(limit, 100));
     const result = await this.database.execute(
-      sql`SELECT DISTINCT o.* FROM archive_objects o JOIN archives a ON a.id=o.archive_id LEFT JOIN consultation_participants p ON p.consultation_id=a.consultation_id AND p.user_id=${principal.userId} AND p.role='employee' WHERE (a.id=${routeId} OR a.consultation_id=${routeId}) AND (${principal.role}='admin' OR p.id IS NOT NULL) AND (${cursor}::uuid IS NULL OR o.id>${cursor}::uuid) ORDER BY o.id LIMIT ${boundedLimit + 1}`,
+      sql`SELECT DISTINCT o.* FROM archive_objects o JOIN archives a ON a.id=o.archive_id JOIN final_inventories f ON f.archive_id=a.id LEFT JOIN consultation_participants p ON p.consultation_id=a.consultation_id AND p.user_id=${principal.userId} AND p.role='employee' WHERE (a.id=${routeId} OR a.consultation_id=${routeId}) AND a.state IN ('complete','incomplete') AND (${principal.role}='admin' OR p.id IS NOT NULL) AND (${cursor}::uuid IS NULL OR o.id>${cursor}::uuid) ORDER BY o.id LIMIT ${boundedLimit + 1}`,
     );
     return presentArchiveObjectPage(result.rows, boundedLimit);
   }

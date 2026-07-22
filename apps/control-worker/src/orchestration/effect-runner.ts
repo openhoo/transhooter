@@ -582,6 +582,44 @@ export class EffectRunner {
     if (!terminalMarker(snapshot.workerTerminal)) {
       missing.push({ class: "worker_terminal", reason: "terminal_missing" });
     }
+    for (const attempt of snapshot.providerAttempts) {
+      for (const evidence of [
+        `/pipeline/terminal/raw/${attempt.attemptId}/`,
+        `/pipeline/${attempt.stage}/raw/${attempt.attemptId}/`,
+      ]) {
+        if (!objects.some((object) => object.key.includes(evidence))) {
+          missing.push({
+            class: "provider_attempt",
+            attemptId: attempt.attemptId,
+            stage: attempt.stage,
+            evidence,
+            reason: "object_missing",
+          });
+        }
+      }
+    }
+
+    for (const direction of snapshot.directions) {
+      if (direction.mode !== "translated" || direction.emittedOutput === 0) {
+        continue;
+      }
+      const directionSegment = `/${direction.destinationParticipantId}/`;
+      for (const objectClass of ["tts_output_pcm", "livekit_output_pcm"] as const) {
+        if (
+          !objects.some(
+            (object) => object.objectClass === objectClass && object.key.includes(directionSegment),
+          )
+        ) {
+          missing.push({
+            class: objectClass,
+            destinationParticipantId: direction.destinationParticipantId,
+            sampleStart: 0,
+            sampleEnd: direction.emittedOutput,
+            reason: "object_missing",
+          });
+        }
+      }
+    }
     snapshot.egressResults.forEach((result, index) => {
       if (!terminalMarker(result)) {
         missing.push({

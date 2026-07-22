@@ -25,6 +25,7 @@
     "test:contracts": "./scripts/run-tests --contracts-only",
     "test:hermetic": "./scripts/run-tests",
     "smoke:consultation": "./scripts/smoke-consultation",
+    "demo:consultation": "./scripts/demo-consultation",
     "failure-smoke": "./scripts/failure-smoke",
     "failure-smoke:parallel": "./scripts/failure-smoke-parallel",
     "failure-smoke:control": "./scripts/failure-smoke --shard control",
