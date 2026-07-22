@@ -76,8 +76,8 @@ CALLS="$TEST_DIRECTORY/calls"
 export CALLS
 cat > "$TEST_DIRECTORY/bin/docker" <<'MOCK'
 #!/bin/sh
-printf 'APP_ENV=%s SMTP_URL=%s RTC_ADVERTISED_IP=%s S3_PUBLIC_ENDPOINT=%s PUBLIC_BASE_URL=%s PUBLIC_LIVEKIT_URL=%s S3_KMS_KEY_ID=%s %s\n' \
-  "${APP_ENV:-}" "${SMTP_URL:-}" "${RTC_ADVERTISED_IP:-}" "${S3_PUBLIC_ENDPOINT:-}" "${PUBLIC_BASE_URL:-}" "${PUBLIC_LIVEKIT_URL:-}" "${S3_KMS_KEY_ID:-}" "$*" >> "$CALLS"
+printf 'APP_ENV=%s SMTP_URL=%s RTC_ADVERTISED_IP=%s S3_PUBLIC_ENDPOINT=%s PUBLIC_BASE_URL=%s PUBLIC_LIVEKIT_URL=%s S3_KMS_KEY_ID=%s %s RTC_SUBNET=%s\n' \
+  "${APP_ENV:-}" "${SMTP_URL:-}" "${RTC_ADVERTISED_IP:-}" "${S3_PUBLIC_ENDPOINT:-}" "${PUBLIC_BASE_URL:-}" "${PUBLIC_LIVEKIT_URL:-}" "${S3_KMS_KEY_ID:-}" "$*" "${RTC_SUBNET:-}" >> "$CALLS"
 case " $* " in
   *" compose version "*) exit 0 ;;
 esac
@@ -126,6 +126,24 @@ case " $* " in
     fi
     ;;
   *" down --volumes --remove-orphans "*) exit 0 ;;
+esac
+case " $* " in
+  *" failure-smoke bun ../failure-smoke/failure-smoke.mjs "*)
+    proof_directory=
+    previous=
+    for argument do
+      if [ "$previous" = -v ]; then
+        case "$argument" in
+          *:/proof) proof_directory=${argument%:/proof} ;;
+        esac
+      fi
+      previous=$argument
+    done
+    if [ -n "$proof_directory" ]; then
+      mkdir -p "$proof_directory"
+      printf '{"scenarios":[],"shard":"mock","totalDurationMs":1,"scenarioDurationsMs":{}}\n' > "$proof_directory/proof.json"
+    fi
+    ;;
 esac
 exit 0
 MOCK
@@ -231,6 +249,62 @@ generated_deadline=$(
   fail 'generated scenario deadline was shorter than configured'
 [ "$generated_deadline" -le "$deadline_test_finished_ms" ] ||
   fail 'generated scenario deadline excluded setup/build elapsed time'
+
+: > "$CALLS"
+build_metrics="$TEST_DIRECTORY/build-only.metrics.jsonl"
+if ! run_wrapper normal "$TEST_DIRECTORY/build-only-output" \
+  --build-only --metrics-file "$build_metrics"; then
+  fail 'build-only wrapper run failed'
+fi
+grep -F ' build minio egress-ready translation-worker web failure-smoke' "$CALLS" >/dev/null ||
+  fail 'build-only did not build the shared smoke images'
+if grep -F 'failure-smoke.mjs' "$CALLS" >/dev/null; then
+  fail 'build-only unexpectedly ran failure scenarios'
+fi
+grep -F '"name":"Building failure-smoke application and harness images"' "$build_metrics" >/dev/null ||
+  fail 'build-only metrics omitted the image build phase'
+
+: > "$CALLS"
+no_build_proof="$TEST_DIRECTORY/no-build.proof.json"
+no_build_metrics="$TEST_DIRECTORY/no-build.metrics.jsonl"
+if ! run_wrapper normal "$TEST_DIRECTORY/no-build-output" \
+  --no-build --proof-file "$no_build_proof" --metrics-file "$no_build_metrics" \
+  --shard provider; then
+  fail 'no-build shard wrapper run failed'
+fi
+if grep -F ' build minio egress-ready translation-worker web failure-smoke' "$CALLS" >/dev/null; then
+  fail 'no-build unexpectedly rebuilt smoke images'
+fi
+grep -F -- '--shard provider' "$CALLS" >/dev/null ||
+  fail 'no-build did not forward the selected shard'
+grep -F ':/proof' "$CALLS" >/dev/null || fail 'no-build did not mount the private proof directory'
+[ -s "$no_build_proof" ] || fail 'no-build did not copy the harness proof'
+grep -F '"name":"Running failure injection scenarios"' "$no_build_metrics" >/dev/null ||
+  fail 'no-build metrics omitted scenario execution'
+
+parallel_output="$TEST_DIRECTORY/parallel-artifacts"
+: > "$CALLS"
+if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
+  TMPDIR="$TEST_DIRECTORY" \
+  FAILURE_SMOKE_OUTPUT_DIR="$parallel_output" \
+  COMPOSE_DETECTION_TIMEOUT_SECONDS=1 \
+  COMPOSE_SETUP_TIMEOUT_SECONDS=1 \
+  COMPOSE_BUILD_TIMEOUT_SECONDS=1 \
+  COMPOSE_SCENARIO_TIMEOUT_SECONDS=1 \
+  COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS=1 \
+  COMPOSE_OWNERSHIP_TIMEOUT_SECONDS=1 \
+  COMPOSE_CLEANUP_TIMEOUT_SECONDS=1 \
+  timeout 30 "$ROOT/scripts/failure-smoke-parallel" > "$TEST_DIRECTORY/parallel-output" 2>&1; then
+  fail 'parallel shard wrapper run failed'
+fi
+for shard in control provider spool storage; do
+  [ -s "$parallel_output/$shard.proof.json" ] || fail "parallel run omitted $shard proof"
+  [ -s "$parallel_output/$shard.metrics.jsonl" ] || fail "parallel run omitted $shard metrics"
+  grep -F -- "--shard $shard" "$CALLS" >/dev/null || fail "parallel run omitted $shard shard"
+done
+for subnet in 10.254.233.0/24 10.254.234.0/24 10.254.235.0/24 10.254.236.0/24; do
+  grep -F "RTC_SUBNET=$subnet" "$CALLS" >/dev/null || fail "parallel run omitted RTC subnet $subnet"
+done
 
 
 : > "$CALLS"

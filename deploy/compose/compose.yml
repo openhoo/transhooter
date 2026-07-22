@@ -9,9 +9,9 @@ x-app-base: &app-base
   cap_drop: [ALL]
 
 x-runtime-images:
-  typescript: &typescript-runtime-image "${COMPOSE_PROJECT_NAME:-transhooter}-typescript-runtime:${APP_IMAGE_TAG:-local}"
-  translation: &translation-runtime-image "${COMPOSE_PROJECT_NAME:-transhooter}-translation-runtime:${APP_IMAGE_TAG:-local}"
-  bootstrap: &bootstrap-runtime-image "${COMPOSE_PROJECT_NAME:-transhooter}-bootstrap-runtime:${APP_IMAGE_TAG:-local}"
+  typescript: &typescript-runtime-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-typescript-runtime:${APP_IMAGE_TAG:-local}"
+  translation: &translation-runtime-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-translation-runtime:${APP_IMAGE_TAG:-local}"
+  bootstrap: &bootstrap-runtime-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-bootstrap-runtime:${APP_IMAGE_TAG:-local}"
 
 x-worker-health: &worker-health
   test: [CMD, bun, -e, "fetch('http://127.0.0.1:8080/health/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
@@ -171,7 +171,7 @@ services:
     command: [/bin/sh, -ec, "mkdir -p /data && chown 1000:10001 /data && chmod 0700 /data"]
 
   minio:
-    image: transhooter-minio:RELEASE.2025-07-23T15-54-02Z
+    image: "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-minio:RELEASE.2025-07-23T15-54-02Z"
     build:
       context: ../..
       dockerfile: deploy/docker/minio.Dockerfile
@@ -715,6 +715,7 @@ services:
   failure-smoke:
     profiles: [failure]
     <<: *app-base
+    image: "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-failure-smoke:${APP_IMAGE_TAG:-latest}"
     build:
       context: ../..
       dockerfile: deploy/docker/failure-smoke.Dockerfile

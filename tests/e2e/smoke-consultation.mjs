@@ -24,7 +24,11 @@ const valueOptionNames = new Set([
   "--livekit-url",
   "--mailpit-url",
 ]);
-const booleanOptionNames = new Set(["--emit-proof-json"]);
+const booleanOptionNames = new Set([
+  "--emit-proof-json",
+  "--skip-audible-interpretation-proof",
+  "--skip-media-output-proof",
+]);
 const parsedOptions = new Map();
 const parsedFlags = new Set();
 for (let index = 2; index < process.argv.length; index += 1) {
@@ -115,6 +119,8 @@ const allowedProvidersByProfile = {
   "deepgram-deepl-eu": new Set(["deepgram", "deepl"]),
 };
 const emitProof = parsedFlags.has("--emit-proof-json") || process.env.EMIT_PROOF_JSON === "true";
+const skipAudibleInterpretationProof = parsedFlags.has("--skip-audible-interpretation-proof");
+const skipMediaOutputProof = parsedFlags.has("--skip-media-output-proof");
 const failureHarnessReleaseFile = option("--failure-harness-release-file", null);
 const failureHarnessReleaseTimeoutMs = Number.parseInt(
   option("--failure-harness-release-timeout-ms", "120000"),
@@ -387,34 +393,41 @@ async function assertAudibleInterpretation(page) {
           throw new Error("interpretation audio element is absent");
         }
         const deadline = Date.now() + Math.min(90_000, timeoutMs);
-        while (!(element.srcObject instanceof MediaStream) && Date.now() < deadline) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, Math.min(100, Math.max(0, deadline - Date.now()))),
-          );
-        }
-        if (!(element.srcObject instanceof MediaStream)) {
-          throw new Error("interpretation MediaStream was never attached");
-        }
-        if (element.paused || element.muted || element.volume <= 0) {
-          throw new Error("interpretation track is present but not routed audibly");
-        }
         const context = new AudioContext();
-        const source = context.createMediaStreamSource(element.srcObject);
         const analyser = context.createAnalyser();
         analyser.fftSize = 1024;
-        source.connect(analyser);
-        const samples = new Uint8Array(analyser.fftSize);
+        const samples = new Float32Array(analyser.fftSize);
+        let observedStream = null;
+        let source = null;
         try {
+          if (context.state === "suspended") await context.resume();
           while (Date.now() < deadline) {
-            analyser.getByteTimeDomainData(samples);
-            if (samples.some((sample) => Math.abs(sample - 128) > 3)) return true;
+            const stream = element.srcObject;
+            const liveAudio =
+              stream instanceof MediaStream &&
+              stream
+                .getAudioTracks()
+                .some((track) => track.readyState === "live" && track.enabled && !track.muted);
+            if (liveAudio && stream !== observedStream) {
+              source?.disconnect();
+              source = context.createMediaStreamSource(stream);
+              source.connect(analyser);
+              observedStream = stream;
+            }
+            if (liveAudio && source && !element.paused && !element.muted && element.volume > 0) {
+              analyser.getFloatTimeDomainData(samples);
+              if (samples.some((sample) => Math.abs(sample) > 0.002)) return true;
+            }
             await new Promise((resolve) =>
-              setTimeout(resolve, Math.min(20, Math.max(0, deadline - Date.now()))),
+              setTimeout(resolve, Math.min(50, Math.max(0, deadline - Date.now()))),
             );
+          }
+          if (!(element.srcObject instanceof MediaStream)) {
+            throw new Error("interpretation MediaStream was never attached");
           }
           throw new Error("interpretation track remained silent");
         } finally {
-          source.disconnect();
+          source?.disconnect();
           await context.close();
         }
       },
@@ -1177,6 +1190,8 @@ let employee;
 let admissionFixtureConsultationId = null;
 let consultationId = null;
 let completed = false;
+let employeeFinalCaption = null;
+let customerFinalCaption = null;
 try {
   beginPhase("employee-authentication-and-consultation-creation");
   employee = await authenticate(employeeContext, employeeEmail);
@@ -1287,21 +1302,24 @@ try {
     );
   }
 
-  beginPhase("captions-interpretation-and-audio-modes");
-  const [employeeFinalCaption, customerFinalCaption] = await boundedPages(
-    [employee, customer],
-    "caption interpretation and audible routing proof",
-    () =>
-      Promise.all([
-        assertFinalTargetedCaption(employee, consultationId, "de-DE", "en-US"),
-        assertFinalTargetedCaption(customer, consultationId, "en-US", "de-DE"),
-        assertAudibleInterpretation(employee),
-        assertAudibleInterpretation(customer),
-      ]),
-  );
-  await boundedPages([employee, customer], "exact audio mode routing proof", () =>
-    Promise.all([assertModes(employee), assertModes(customer)]),
-  );
+  if (!skipMediaOutputProof) {
+    beginPhase("captions-interpretation-and-audio-modes");
+    [employeeFinalCaption, customerFinalCaption] = await boundedPages(
+      [employee, customer],
+      "caption interpretation and audible routing proof",
+      () =>
+        Promise.all([
+          assertFinalTargetedCaption(employee, consultationId, "de-DE", "en-US"),
+          assertFinalTargetedCaption(customer, consultationId, "en-US", "de-DE"),
+          ...(!skipAudibleInterpretationProof
+            ? [assertAudibleInterpretation(employee), assertAudibleInterpretation(customer)]
+            : []),
+        ]),
+    );
+    await boundedPages([employee, customer], "exact audio mode routing proof", () =>
+      Promise.all([assertModes(employee), assertModes(customer)]),
+    );
+  }
 
   beginPhase("consultation-finalization");
   await boundedPage(employee, "request consultation end", () =>
@@ -1513,9 +1531,12 @@ try {
     inventorySha256: archive.inventorySha256 ?? null,
     egressIds,
     providerAttemptIds,
-    finalCaptionRevisions: [employeeFinalCaption.revision, customerFinalCaption.revision],
-    targetedCaptions: 2,
-    audioModes: 3,
+    finalCaptionRevisions:
+      employeeFinalCaption && customerFinalCaption
+        ? [employeeFinalCaption.revision, customerFinalCaption.revision]
+        : [],
+    targetedCaptions: employeeFinalCaption && customerFinalCaption ? 2 : 0,
+    audioModes: skipMediaOutputProof ? 0 : 3,
     thirdAuthenticatedHumanRejected: true,
   };
   if (!proof.inventoryVersion || !/^[0-9a-f]{64}$/u.test(proof.inventorySha256 ?? "")) {

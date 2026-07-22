@@ -12,6 +12,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { dirname } from "node:path";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -74,6 +75,23 @@ const scenarioRegistry = Object.freeze([
   "spool-durable-recovery",
   "unwritable-spool",
 ]);
+const scenarioShards = Object.freeze({
+  control: Object.freeze([
+    "recovery-hold",
+    "remote-success-crash",
+    "applied-state-crash",
+    "stale-owner-fencing",
+  ]),
+  provider: Object.freeze([
+    "participant-egress-denied",
+    "translation-rate_limit",
+    "translation-quota",
+    "translation-transport",
+    "tts-partial-finalization",
+  ]),
+  spool: Object.freeze(["preservation-fence", "spool-durable-recovery"]),
+  storage: Object.freeze(["minio-inflight-recovery", "unwritable-spool"]),
+});
 const translationFailureCases = Object.freeze([
   Object.freeze({
     name: "translation-rate_limit",
@@ -100,25 +118,48 @@ const translationFailureCases = Object.freeze([
     watermarks: Object.freeze({ accepted: 1, received: 0, emitted: 0 }),
   }),
 ]);
-const cliOptions = { scenarios: undefined, resume: false, deadlineEpochMs: undefined };
+const cliOptions = {
+  scenarios: undefined,
+  shard: undefined,
+  resume: false,
+  deadlineEpochMs: undefined,
+};
 for (let index = 2; index < process.argv.length; index += 1) {
   const argument = process.argv[index];
   if (argument === "--resume") {
     cliOptions.resume = true;
     continue;
   }
-  if (argument !== "--scenarios" && argument !== "--deadline-epoch-ms") {
+  if (!["--scenarios", "--shard", "--deadline-epoch-ms"].includes(argument)) {
     throw new Error(`unknown failure-smoke argument: ${argument}`);
   }
   const value = process.argv[index + 1];
   if (value === undefined || value.startsWith("--")) {
     throw new Error(`${argument} requires a value`);
   }
+  if (argument === "--scenarios" && cliOptions.scenarios !== undefined) {
+    throw new Error("--scenarios may only be specified once");
+  }
+  if (argument === "--shard" && cliOptions.shard !== undefined) {
+    throw new Error("--shard may only be specified once");
+  }
+  if (argument === "--deadline-epoch-ms" && cliOptions.deadlineEpochMs !== undefined) {
+    throw new Error("--deadline-epoch-ms may only be specified once");
+  }
   index += 1;
   if (argument === "--scenarios") cliOptions.scenarios = value;
+  else if (argument === "--shard") cliOptions.shard = value;
   else cliOptions.deadlineEpochMs = value;
 }
 const requestedScenarioText = cliOptions.scenarios ?? process.env.FAILURE_SMOKE_SCENARIOS;
+if (cliOptions.shard !== undefined && requestedScenarioText !== undefined) {
+  throw new Error("--shard and --scenarios are mutually exclusive");
+}
+if (cliOptions.shard !== undefined && !(cliOptions.shard in scenarioShards)) {
+  throw new Error(
+    `unknown failure-smoke shard: ${cliOptions.shard}; expected one of ${Object.keys(scenarioShards).join(", ")}`,
+  );
+}
 const configuredDeadline =
   cliOptions.deadlineEpochMs ?? process.env.FAILURE_SMOKE_DEADLINE_EPOCH_MS;
 const harnessDeadlineMs =
@@ -130,14 +171,16 @@ if (
   throw new Error("--deadline-epoch-ms must be a future Unix epoch in milliseconds");
 }
 const selectedScenarios =
-  requestedScenarioText === undefined
-    ? new Set(scenarioRegistry)
-    : new Set(
-        requestedScenarioText
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      );
+  cliOptions.shard !== undefined
+    ? new Set(scenarioShards[cliOptions.shard])
+    : requestedScenarioText === undefined
+      ? new Set(scenarioRegistry)
+      : new Set(
+          requestedScenarioText
+            .split(",")
+            .map((value) => value.trim())
+            .filter(Boolean),
+        );
 if (requestedScenarioText !== undefined && selectedScenarios.size === 0) {
   throw new Error("explicit failure-smoke scenario selection must not be empty");
 }
@@ -153,6 +196,10 @@ const checkpointBinding = Object.freeze({
 });
 let completedScenarios = new Set();
 let capabilityLease = null;
+const scenarioStartedAt = new Map();
+const scenarioDurations = new Map();
+const checkpointedConsultations = new Set();
+const checkpointedReleaseFiles = new Set();
 const database = postgres((await readFile(databaseUrlFile, "utf8")).trim(), {
   max: 4,
   prepare: false,
@@ -332,7 +379,8 @@ async function waitFor(label, check, timeoutMs = 120_000, parentSignal) {
   });
 }
 async function writeJsonFile(path, value) {
-  const temporary = `${path}.${process.pid}.tmp`;
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value)}\n`, { mode: 0o666 });
   await chmod(temporary, 0o666);
   await rename(temporary, path);
@@ -375,7 +423,10 @@ function announcePhase(name) {
 function shouldRunScenario(name) {
   const selected =
     selectedScenarios.has(name) && !(resumeRequested && completedScenarios.has(name));
-  if (selected) announcePhase(name);
+  if (selected) {
+    announcePhase(name);
+    scenarioStartedAt.set(name, Date.now());
+  }
   return selected;
 }
 
@@ -390,10 +441,13 @@ async function checkpointScenario(name) {
         .join(", ")}`,
     );
   }
-  await settleConsultations(trackedConsultations);
+  const scenarioConsultations = [...trackedConsultations].filter(
+    (id) => !checkpointedConsultations.has(id),
+  );
+  await settleConsultations(scenarioConsultations);
   const unsettledIds = (
     await Promise.all(
-      [...trackedConsultations].map(async (id) => ({
+      scenarioConsultations.map(async (id) => ({
         id,
         clean: isCleanSettlement(await consultationEvidence(id)),
       })),
@@ -406,7 +460,15 @@ async function checkpointScenario(name) {
       `refusing to checkpoint ${name} before consultation cleanup: ${unsettledIds.join(", ")}`,
     );
   }
-  await Promise.all([...consultationRuns].map((run) => rm(run.releaseFile, { force: true })));
+  const scenarioReleaseFiles = [...consultationRuns]
+    .map((run) => run.releaseFile)
+    .filter((path) => !checkpointedReleaseFiles.has(path));
+  await Promise.all(scenarioReleaseFiles.map((path) => rm(path, { force: true })));
+  for (const id of scenarioConsultations) checkpointedConsultations.add(id);
+  for (const path of scenarioReleaseFiles) checkpointedReleaseFiles.add(path);
+  const startedAt = scenarioStartedAt.get(name);
+  if (startedAt === undefined) throw new Error(`scenario ${name} has no timing start`);
+  scenarioDurations.set(name, Date.now() - startedAt);
   completedScenarios.add(name);
   await writeJsonFile(checkpointFile, {
     ...checkpointBinding,
@@ -703,6 +765,7 @@ async function runConsultation({
       "--deadline-epoch-ms",
       String(runDeadline),
       "--emit-proof-json",
+      "--skip-media-output-proof",
       "--failure-harness-release-file",
       releaseFile,
       "--failure-harness-release-timeout-ms",
@@ -1697,7 +1760,8 @@ async function runEffectBoundaryCrash({ scenario, fault, expectedState, exitCode
 }
 
 async function main() {
-  const proof = { scenarios: [] };
+  const startedAt = Date.now();
+  const proof = { shard: cliOptions.shard ?? null, scenarios: [] };
   let primaryError = null;
   const cleanupFailures = [];
   try {
@@ -2088,20 +2152,24 @@ async function main() {
         workerScenario: { translation: { failure } },
       });
       const consultationId = run.consultationId;
-      const result = await run.completed;
-      if (result.code === 0) throw new Error(`${failure} unexpectedly produced a complete archive`);
       const evidence = await waitFor(
         `${failure} provider terminal`,
         async () => {
           const current = await consultationEvidence(consultationId);
-          return current.attempts.some(
-            (attempt) => attempt.stage === "translation" && attempt.errorKind === failure,
-          )
+          const attempts = current.attempts
+            .filter((attempt) => attempt.stage === "translation" && attempt.errorKind === failure)
+            .toSorted((left, right) => Number(left.attemptNumber) - Number(right.attemptNumber));
+          if (attempts.length === 0) return null;
+          const lastAttempt = attempts.at(-1);
+          return !expected.expectRetry ||
+            (attempts.length >= 2 && lastAttempt?.retryDecision?.action !== "retry")
             ? current
             : null;
         },
         90_000,
       );
+      const result = await terminateProcessTree(run);
+      if (result.code === 0) throw new Error(`${failure} unexpectedly produced a complete archive`);
       const attempt = assertTranslationFailureEvidence(evidence, expected);
       proof.scenarios.push({
         name,
@@ -2620,7 +2688,17 @@ async function main() {
     }
 
     announcePhase("proof-emission");
-    console.log(JSON.stringify(proof));
+    proof.totalDurationMs = Date.now() - startedAt;
+    proof.scenarioDurationsMs = Object.fromEntries(
+      scenarioRegistry
+        .filter((name) => scenarioDurations.has(name))
+        .map((name) => [name, scenarioDurations.get(name)]),
+    );
+    const serializedProof = JSON.stringify(proof);
+    if (process.env.FAILURE_SMOKE_PROOF_FILE) {
+      await writeJsonFile(process.env.FAILURE_SMOKE_PROOF_FILE, proof);
+    }
+    console.log(serializedProof);
   } catch (error) {
     primaryError = new Error(
       `[failure-smoke] phase ${activePhase} failed: ${error?.message ?? String(error)}`,

@@ -4,8 +4,42 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$ROOT/deploy/scripts/compose-lib.sh"
 
-if [ "${1:-}" = "--" ]; then
-  shift
+BUILD_ONLY=false
+NO_BUILD=false
+HOST_PROOF_FILE=
+HOST_METRICS_FILE=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --build-only)
+      BUILD_ONLY=true
+      shift
+      ;;
+    --no-build)
+      NO_BUILD=true
+      shift
+      ;;
+    --proof-file | --metrics-file)
+      option=$1
+      [ "$#" -ge 2 ] || {
+        printf '%s requires a path.\n' "$option" >&2
+        exit 2
+      }
+      case "$option" in
+        --proof-file) HOST_PROOF_FILE=$2 ;;
+        --metrics-file) HOST_METRICS_FILE=$2 ;;
+      esac
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *) break ;;
+  esac
+done
+if $BUILD_ONLY && $NO_BUILD; then
+  printf '%s\n' '--build-only and --no-build cannot be combined.' >&2
+  exit 2
 fi
 case "${1:-}" in
   "" | -*) ;;
@@ -15,9 +49,10 @@ case "${1:-}" in
     ;;
 esac
 
-PROJECT_NAME="transhooter-failure-$$-$(date +%s)"
+PROJECT_NAME="transhooter-failure-$$-$(date +%s%N)"
 FAILURE_SMOKE_OWNED_PROJECT_NAME=$PROJECT_NAME
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+export APP_IMAGE_NAMESPACE="${APP_IMAGE_NAMESPACE:-transhooter-harness}"
 OVERLAY_FILE="$ROOT/deploy/compose/compose.test.yml"
 export APP_ENV=test
 export PROVIDER_PROFILE=fixture
@@ -35,7 +70,7 @@ for argument do
   fi
 done
 
-LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
+LOCK_FILE=${COMPOSE_HARNESS_LOCK_FILE:-"${TMPDIR:-/tmp}/transhooter-compose-harness.lock"}
 LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
 DEFAULT_PHASE_TIMEOUT_SECONDS=${COMPOSE_PHASE_TIMEOUT_SECONDS:-900}
 COMPOSE_DETECTION_TIMEOUT_SECONDS=${COMPOSE_DETECTION_TIMEOUT_SECONDS:-15}
@@ -46,6 +81,17 @@ COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS=${COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS:-120}
 COMPOSE_OWNERSHIP_TIMEOUT_SECONDS=${COMPOSE_OWNERSHIP_TIMEOUT_SECONDS:-60}
 COMPOSE_CLEANUP_TIMEOUT_SECONDS=${COMPOSE_CLEANUP_TIMEOUT_SECONDS:-300}
 ACTIVE_PID=
+LOCK_HELD=false
+
+RUN_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/transhooter-failure-smoke.XXXXXXXX")
+chmod 0700 "$RUN_DIRECTORY"
+RESOURCE_PROOF_FILE="$RUN_DIRECTORY/compose-resources"
+PROOF_DIRECTORY="$RUN_DIRECTORY/proof"
+mkdir "$PROOF_DIRECTORY"
+chmod 0777 "$PROOF_DIRECTORY"
+METRICS_FILE="$RUN_DIRECTORY/wrapper-metrics.jsonl"
+PROOF_FILE="$PROOF_DIRECTORY/proof.json"
+: > "$METRICS_FILE"
 
 require_positive_seconds() {
   name=$1
@@ -66,10 +112,20 @@ require_positive_seconds COMPOSE_SCENARIO_TIMEOUT_SECONDS "$COMPOSE_SCENARIO_TIM
 require_positive_seconds COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS"
 require_positive_seconds COMPOSE_OWNERSHIP_TIMEOUT_SECONDS "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS"
 require_positive_seconds COMPOSE_CLEANUP_TIMEOUT_SECONDS "$COMPOSE_CLEANUP_TIMEOUT_SECONDS"
-if ! $deadline_supplied; then
+if ! $BUILD_ONLY && ! $deadline_supplied; then
   deadline_epoch_ms=$((($(date +%s) + ${FAILURE_SMOKE_DEADLINE_SECONDS:-3600}) * 1000))
   set -- "$@" --deadline-epoch-ms "$deadline_epoch_ms"
 fi
+
+record_metric() {
+  metric_name=$1
+  metric_started_ns=$2
+  metric_status=$3
+  metric_finished_ns=$(date +%s%N)
+  metric_duration_ms=$(((metric_finished_ns - metric_started_ns) / 1000000))
+  printf '{"name":"%s","durationMs":%s,"status":"%s"}\n' \
+    "$metric_name" "$metric_duration_ms" "$metric_status" >> "$METRICS_FILE"
+}
 
 terminate_active() {
   signal_status=$1
@@ -86,6 +142,7 @@ run_bounded() {
   phase=$1
   phase_timeout=$2
   shift 2
+  phase_started_ns=$(date +%s%N)
   announce_phase "$phase (deadline: ${phase_timeout}s)"
   setsid timeout --signal=TERM --kill-after=10s "${phase_timeout}s" "$@" &
   ACTIVE_PID=$!
@@ -95,6 +152,12 @@ run_bounded() {
     result=$?
   fi
   ACTIVE_PID=
+  if [ "$result" -eq 0 ]; then
+    metric_status=success
+  else
+    metric_status=failure
+  fi
+  record_metric "$phase" "$phase_started_ns" "$metric_status"
   case "$result" in
     124 | 137)
       printf 'Phase "%s" exceeded its absolute %ss deadline; its process group was terminated.\n' \
@@ -167,19 +230,46 @@ verify_failure_smoke_stack_ownership() {
   done < "$RESOURCE_PROOF_FILE"
 }
 
-RUN_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/transhooter-failure-smoke.XXXXXXXX")
-chmod 0700 "$RUN_DIRECTORY"
-RESOURCE_PROOF_FILE="$RUN_DIRECTORY/compose-resources"
+copy_artifact() {
+  source_file=$1
+  destination_file=$2
+  [ -n "$destination_file" ] || return 0
+  [ -f "$source_file" ] || return 0
+  destination_directory=$(dirname -- "$destination_file")
+  mkdir -p -- "$destination_directory"
+  cp -- "$source_file" "$destination_file"
+  chmod 0644 "$destination_file"
+}
+
+early_cleanup() {
+  status=$?
+  trap - 0 HUP INT TERM
+  copy_artifact "$METRICS_FILE" "$HOST_METRICS_FILE" || true
+  rm -rf -- "$RUN_DIRECTORY"
+  exit "$status"
+}
+
+trap early_cleanup 0
+trap 'terminate_active 129' HUP
+trap 'terminate_active 130' INT
+trap 'terminate_active 143' TERM
 
 select_compose_command_bounded
 exec 9>"$LOCK_FILE"
+lock_started_ns=$(date +%s%N)
 announce_phase "Waiting for the compose harness lock (deadline: ${LOCK_WAIT_SECONDS}s)"
-if ! flock -w "$LOCK_WAIT_SECONDS" 9; then
+if flock -w "$LOCK_WAIT_SECONDS" 9; then
+  LOCK_HELD=true
+  record_metric "Waiting for the compose harness lock" "$lock_started_ns" success
+else
+  record_metric "Waiting for the compose harness lock" "$lock_started_ns" failure
   printf 'Phase "Waiting for the compose harness lock" exceeded its absolute %ss deadline.\n' \
     "$LOCK_WAIT_SECONDS" >&2
+  copy_artifact "$METRICS_FILE" "$HOST_METRICS_FILE"
   rm -rf -- "$RUN_DIRECTORY"
   exit 1
 fi
+trap - 0
 
 capture_database_diagnostic() {
   phase=$1
@@ -206,7 +296,7 @@ capture_database_diagnostic() {
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 0 ] && ! $BUILD_ONLY; then
     compose_bounded "Capturing failure-smoke service status" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" ps || true
     compose_bounded "Capturing failure-smoke logs" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
       logs --no-color --tail=80 web translation-worker spool-drainer control-worker-1 control-worker-2 capability-publisher language-refresh postgres-role-bootstrap postgres-capability-bootstrap migrate livekit egress minio || true
@@ -228,8 +318,16 @@ cleanup() {
     [ "$status" -ne 0 ] || status=1
     printf 'Owned failure-smoke stack classification failed; no cleanup command was run.\n' >&2
   fi
+  copy_artifact "$PROOF_FILE" "$HOST_PROOF_FILE" || {
+    [ "$status" -ne 0 ] || status=1
+  }
+  copy_artifact "$METRICS_FILE" "$HOST_METRICS_FILE" || {
+    [ "$status" -ne 0 ] || status=1
+  }
   rm -rf -- "$RUN_DIRECTORY"
-  flock -u 9
+  if $LOCK_HELD; then
+    flock -u 9
+  fi
   exit "$status"
 }
 
@@ -237,10 +335,19 @@ trap cleanup 0
 trap 'terminate_active 129' HUP
 trap 'terminate_active 130' INT
 trap 'terminate_active 143' TERM
+
+if $BUILD_ONLY; then
+  compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
+    build minio egress-ready translation-worker web failure-smoke
+  exit 0
+fi
+
 compose_bounded "Initializing failure-smoke runtime secrets" "$COMPOSE_SETUP_TIMEOUT_SECONDS" \
   run --rm --no-deps secrets-init
-compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
-  build minio egress-ready translation-worker web failure-smoke
-
+if ! $NO_BUILD; then
+  compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
+    build minio egress-ready translation-worker web failure-smoke
+fi
 compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIMEOUT_SECONDS" \
-  run --rm failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@"
+  run --rm -v "$PROOF_DIRECTORY:/proof" -e FAILURE_SMOKE_PROOF_FILE=/proof/proof.json \
+    failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@"

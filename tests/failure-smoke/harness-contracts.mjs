@@ -32,6 +32,32 @@ export async function runWithDeadline(label, deadline, operation, parentSignal) 
   }
 }
 
+const transientPollErrorCodes = new Set([
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "ENETRESET",
+  "ENETUNREACH",
+  "EPIPE",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+export function isTransientPollError(error) {
+  const visited = new Set();
+  for (let current = error; current && !visited.has(current); current = current.cause) {
+    visited.add(current);
+    if (transientPollErrorCodes.has(current.code)) return true;
+    if (current.name === "TimeoutError") return true;
+    if (/ check exceeded absolute deadline /u.test(` ${current.message ?? ""} `)) return true;
+  }
+  return false;
+}
+
 export async function pollUntil(
   label,
   check,
@@ -51,6 +77,7 @@ export async function pollUntil(
       if (last) return last;
     } catch (error) {
       if (signal?.aborted) throw signal.reason;
+      if (!isTransientPollError(error)) throw error;
       last = error;
     }
     await runWithDeadline(

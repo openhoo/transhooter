@@ -59,7 +59,7 @@ run_lightweight_contract_suites
 
 . "$ROOT/deploy/scripts/compose-lib.sh"
 
-LOCK_FILE="${TMPDIR:-/tmp}/transhooter-compose-harness.lock"
+LOCK_FILE=${COMPOSE_HARNESS_LOCK_FILE:-"${TMPDIR:-/tmp}/transhooter-compose-harness.lock"}
 LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}
 BUILD_DEADLINE_SECONDS=${COMPOSE_BUILD_DEADLINE_SECONDS:-1800}
 START_DEADLINE_SECONDS=${COMPOSE_START_DEADLINE_SECONDS:-900}
@@ -83,6 +83,7 @@ fi
 RUN_ID=$(printf '%s' "${RUN_DIRECTORY##*.}" | tr '[:upper:]' '[:lower:]')
 PROJECT_NAME="transhooter-test-$RUN_ID"
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+export APP_IMAGE_NAMESPACE="${APP_IMAGE_NAMESPACE:-transhooter-harness}"
 
 OVERLAY_FILE="$ROOT/deploy/compose/compose.test.yml"
 export APP_ENV=test
@@ -156,7 +157,13 @@ fi
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
-  compose_with_deadline "Cleaning hermetic test stack" "$CLEANUP_DEADLINE_SECONDS" down --rmi local --volumes --remove-orphans || {
+  if [ "${HERMETIC_REMOVE_LOCAL_IMAGES:-false}" = true ]; then
+    cleanup_image_arguments="--rmi local"
+  else
+    cleanup_image_arguments=
+  fi
+  # shellcheck disable=SC2086
+  compose_with_deadline "Cleaning hermetic test stack" "$CLEANUP_DEADLINE_SECONDS" down $cleanup_image_arguments --volumes --remove-orphans || {
     cleanup_status=$?
     if [ "$status" -eq 0 ]; then
       status=$cleanup_status

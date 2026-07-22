@@ -5,6 +5,7 @@ import {
   crashRecoveryMatches,
   createBarrier,
   healthFailureAfter,
+  isTransientPollError,
   pollUntil,
   restartCountIncremented,
   runWithDeadline,
@@ -49,6 +50,40 @@ describe("failure-smoke proof contracts", () => {
       }),
     ).rejects.toThrow(/absolute deadline|timed out/u);
     expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it("fails polling immediately on permanent or unknown errors", async () => {
+    let attempts = 0;
+    const fatal = new Error("invalid durable state");
+    await expect(
+      pollUntil(
+        "fatal check",
+        () => {
+          attempts += 1;
+          throw fatal;
+        },
+        { deadline: Date.now() + 5_000, intervalMs: 1 },
+      ),
+    ).rejects.toBe(fatal);
+    expect(attempts).toBe(1);
+    expect(isTransientPollError(fatal)).toBe(false);
+  });
+
+  it("retries recognized transient transport errors", async () => {
+    let attempts = 0;
+    const result = await pollUntil(
+      "transient check",
+      () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+        }
+        return "ready";
+      },
+      { deadline: Date.now() + 5_000, intervalMs: 1 },
+    );
+    expect(result).toBe("ready");
+    expect(attempts).toBe(2);
   });
 
   it("propagates parent cancellation into a body operation", async () => {
