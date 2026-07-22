@@ -563,7 +563,7 @@ services:
       - ../../.secrets/minio-translation-credentials:/run/secrets/minio-translation-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
-    command: [python, apps/translation-worker/main.py]
+    command: [python, apps/translation-worker/main.py, start]
     healthcheck:
       test: [CMD, transhooter-worker-healthcheck]
       interval: 10s

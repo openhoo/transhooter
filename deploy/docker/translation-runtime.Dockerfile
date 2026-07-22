@@ -28,4 +28,4 @@ COPY --chown=transhooter:transhooter apps/translation-worker/main.py ./apps/tran
 COPY --chown=transhooter:transhooter apps/spool-drainer/main.py ./apps/spool-drainer/main.py
 USER transhooter
 WORKDIR /workspace
-CMD ["python", "apps/translation-worker/main.py"]
+CMD ["python", "apps/translation-worker/main.py", "start"]

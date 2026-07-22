@@ -39,7 +39,7 @@ spec:
           {{- if eq $component "spool-drainer" }}
           command: [python, apps/spool-drainer/main.py]
           {{- else }}
-          command: [python, apps/translation-worker/main.py]
+          command: [python, apps/translation-worker/main.py, start]
           {{- end }}
           {{- if eq $component "spool-drainer" }}
           env:
