@@ -1,10 +1,8 @@
 import type { ProviderAttemptReport, WorkerCheckpoint } from "@transhooter/contracts";
-import { sql } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { ApplicationOperationsQueries } from "./application-operations-queries";
 import { ApplicationOperationsWorkers } from "./application-operations-workers";
 import type { Clock, StaffRole, UUID } from "./domain/model";
-import type { DrizzleSchema } from "./persistence/repositories";
+import { Prisma, type PrismaClient } from "./persistence/database";
 import type { ObjectStoragePort } from "./ports/index";
 
 export interface StaffPrincipal {
@@ -122,12 +120,12 @@ export interface ApplicationOperations {
 
 export { checkpointPersistenceValues } from "./application-operations-workers";
 
-export class DrizzleApplicationOperations implements ApplicationOperations {
+export class PrismaApplicationOperations implements ApplicationOperations {
   private readonly queries: ApplicationOperationsQueries;
   private readonly workers: ApplicationOperationsWorkers;
 
   constructor(
-    private readonly database: NodePgDatabase<DrizzleSchema>,
+    private readonly database: PrismaClient,
     storage: ObjectStoragePort,
     clock: Clock,
   ) {
@@ -184,8 +182,8 @@ export class DrizzleApplicationOperations implements ApplicationOperations {
   }
 
   async logout(sessionId: UUID, userId: UUID): Promise<void> {
-    await this.database.execute(
-      sql`UPDATE sessions SET revoked_at=now() WHERE id=${sessionId} AND user_id=${userId} AND revoked_at IS NULL`,
+    await this.database.$executeRaw(
+      Prisma.sql`UPDATE sessions SET revoked_at=now() WHERE id=${sessionId} AND user_id=${userId} AND revoked_at IS NULL`,
     );
   }
 

@@ -23,7 +23,11 @@ export function StatusBadge({ status, className }: { status: string; className?:
   return (
     <Badge
       variant="outline"
-      className={cn("font-medium", statusStyles[status] ?? "border-border bg-transparent", className)}
+      className={cn(
+        "font-medium",
+        statusStyles[status] ?? "border-border bg-transparent",
+        className,
+      )}
     >
       {statusLabel(status)}
     </Badge>

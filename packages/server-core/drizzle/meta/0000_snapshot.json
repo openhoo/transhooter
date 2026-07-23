@@ -111,12 +111,8 @@
           "name": "archive_objects_archive_id_fkey",
           "tableFrom": "archive_objects",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -126,20 +122,12 @@
         "archive_objects_archive_id_object_class_attempt_sequence_key": {
           "name": "archive_objects_archive_id_object_class_attempt_sequence_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "archive_id",
-            "object_class",
-            "attempt",
-            "sequence"
-          ]
+          "columns": ["archive_id", "object_class", "attempt", "sequence"]
         },
         "archive_objects_key_version_id_key": {
           "name": "archive_objects_key_version_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "key",
-            "version_id"
-          ]
+          "columns": ["key", "version_id"]
         }
       },
       "policies": {},
@@ -273,12 +261,8 @@
           "name": "archives_consultation_id_fkey",
           "tableFrom": "archives",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -288,17 +272,12 @@
         "archives_consultation_id_key": {
           "name": "archives_consultation_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id"
-          ]
+          "columns": ["consultation_id"]
         },
         "archives_id_consultation_id_key": {
           "name": "archives_id_consultation_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "id",
-            "consultation_id"
-          ]
+          "columns": ["id", "consultation_id"]
         }
       },
       "policies": {},
@@ -395,12 +374,8 @@
           "name": "audit_events_actor_id_fkey",
           "tableFrom": "audit_events",
           "tableTo": "users",
-          "columnsFrom": [
-            "actor_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["actor_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -410,9 +385,7 @@
         "audit_events_id_key": {
           "name": "audit_events_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "id"
-          ]
+          "columns": ["id"]
         }
       },
       "policies": {},
@@ -526,12 +499,8 @@
           "name": "caption_ledger_consultation_id_fkey",
           "tableFrom": "caption_ledger",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -539,12 +508,8 @@
           "name": "caption_ledger_archived_object_id_fkey",
           "tableFrom": "caption_ledger",
           "tableTo": "archive_objects",
-          "columnsFrom": [
-            "archived_object_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archived_object_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -552,12 +517,7 @@
       "compositePrimaryKeys": {
         "caption_ledger_pkey": {
           "name": "caption_ledger_pkey",
-          "columns": [
-            "consultation_id",
-            "destination_participant_id",
-            "utterance_id",
-            "revision"
-          ]
+          "columns": ["consultation_id", "destination_participant_id", "utterance_id", "revision"]
         }
       },
       "uniqueConstraints": {},
@@ -731,12 +691,8 @@
           "name": "consultation_participants_consultation_id_fkey",
           "tableFrom": "consultation_participants",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -744,12 +700,8 @@
           "name": "consultation_participants_user_id_fkey",
           "tableFrom": "consultation_participants",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -757,12 +709,8 @@
           "name": "consultation_participants_capability_row_id_fkey",
           "tableFrom": "consultation_participants",
           "tableTo": "language_capabilities",
-          "columnsFrom": [
-            "capability_row_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["capability_row_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -772,33 +720,22 @@
         "consultation_participants_consultation_id_id_key": {
           "name": "consultation_participants_consultation_id_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id",
-            "id"
-          ]
+          "columns": ["consultation_id", "id"]
         },
         "consultation_participants_consultation_id_role_key": {
           "name": "consultation_participants_consultation_id_role_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id",
-            "role"
-          ]
+          "columns": ["consultation_id", "role"]
         },
         "consultation_participants_consultation_id_user_id_key": {
           "name": "consultation_participants_consultation_id_user_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id",
-            "user_id"
-          ]
+          "columns": ["consultation_id", "user_id"]
         },
         "consultation_participants_livekit_identity_key": {
           "name": "consultation_participants_livekit_identity_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "livekit_identity"
-          ]
+          "columns": ["livekit_identity"]
         }
       },
       "policies": {},
@@ -984,14 +921,8 @@
           "name": "consultations_provider_profile_id_provider_profile_revisio_fkey",
           "tableFrom": "consultations",
           "tableTo": "provider_profile_revisions",
-          "columnsFrom": [
-            "provider_profile_id",
-            "provider_profile_revision"
-          ],
-          "columnsTo": [
-            "profile_id",
-            "revision"
-          ],
+          "columnsFrom": ["provider_profile_id", "provider_profile_revision"],
+          "columnsTo": ["profile_id", "revision"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -999,12 +930,8 @@
           "name": "consultations_employee_user_id_fkey",
           "tableFrom": "consultations",
           "tableTo": "users",
-          "columnsFrom": [
-            "employee_user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["employee_user_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1014,24 +941,17 @@
         "consultations_room_name_key": {
           "name": "consultations_room_name_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "room_name"
-          ]
+          "columns": ["room_name"]
         },
         "consultations_worker_identity_key": {
           "name": "consultations_worker_identity_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "worker_identity"
-          ]
+          "columns": ["worker_identity"]
         },
         "consultations_employee_user_id_creation_idempotency_key_key": {
           "name": "consultations_employee_user_id_creation_idempotency_key_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "employee_user_id",
-            "creation_idempotency_key"
-          ]
+          "columns": ["employee_user_id", "creation_idempotency_key"]
         }
       },
       "policies": {},
@@ -1122,12 +1042,8 @@
           "name": "deletion_scans_archive_id_fkey",
           "tableFrom": "deletion_scans",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1190,12 +1106,8 @@
           "name": "effect_compensation_attempts_effect_id_fkey",
           "tableFrom": "effect_compensation_attempts",
           "tableTo": "external_effects",
-          "columnsFrom": [
-            "effect_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["effect_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1205,11 +1117,7 @@
         "effect_compensation_attempts_effect_id_owner_request_hash_key": {
           "name": "effect_compensation_attempts_effect_id_owner_request_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "effect_id",
-            "owner",
-            "request_hash"
-          ]
+          "columns": ["effect_id", "owner", "request_hash"]
         }
       },
       "policies": {},
@@ -1311,12 +1219,8 @@
           "name": "egress_jobs_consultation_id_fkey",
           "tableFrom": "egress_jobs",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1324,12 +1228,8 @@
           "name": "egress_expected_artifact_fk",
           "tableFrom": "egress_jobs",
           "tableTo": "expected_archive_artifacts",
-          "columnsFrom": [
-            "expected_artifact_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["expected_artifact_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1339,19 +1239,12 @@
         "egress_jobs_consultation_id_generation_kind_subject_id_key": {
           "name": "egress_jobs_consultation_id_generation_kind_subject_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id",
-            "generation",
-            "kind",
-            "subject_id"
-          ]
+          "columns": ["consultation_id", "generation", "kind", "subject_id"]
         },
         "egress_jobs_egress_id_key": {
           "name": "egress_jobs_egress_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "egress_id"
-          ]
+          "columns": ["egress_id"]
         }
       },
       "policies": {},
@@ -1469,12 +1362,8 @@
           "name": "expected_archive_artifacts_archive_id_fkey",
           "tableFrom": "expected_archive_artifacts",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1482,12 +1371,8 @@
           "name": "expected_archive_artifacts_effect_id_fkey",
           "tableFrom": "expected_archive_artifacts",
           "tableTo": "external_effects",
-          "columnsFrom": [
-            "effect_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["effect_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1495,14 +1380,8 @@
           "name": "expected_archive_artifacts_profile_id_profile_revision_fkey",
           "tableFrom": "expected_archive_artifacts",
           "tableTo": "provider_profile_revisions",
-          "columnsFrom": [
-            "profile_id",
-            "profile_revision"
-          ],
-          "columnsTo": [
-            "profile_id",
-            "revision"
-          ],
+          "columnsFrom": ["profile_id", "profile_revision"],
+          "columnsTo": ["profile_id", "revision"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1510,12 +1389,8 @@
           "name": "expected_fulfilled_object_fk",
           "tableFrom": "expected_archive_artifacts",
           "tableTo": "archive_objects",
-          "columnsFrom": [
-            "fulfilled_object_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["fulfilled_object_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1525,18 +1400,12 @@
         "expected_archive_artifacts_archive_id_object_class_causal_k_key": {
           "name": "expected_archive_artifacts_archive_id_object_class_causal_k_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "archive_id",
-            "object_class",
-            "causal_key"
-          ]
+          "columns": ["archive_id", "object_class", "causal_key"]
         },
         "expected_archive_artifacts_effect_id_key": {
           "name": "expected_archive_artifacts_effect_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "effect_id"
-          ]
+          "columns": ["effect_id"]
         }
       },
       "policies": {},
@@ -1662,12 +1531,8 @@
           "name": "external_effects_consultation_id_fkey",
           "tableFrom": "external_effects",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1784,12 +1649,8 @@
           "name": "final_inventories_archive_id_fkey",
           "tableFrom": "final_inventories",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1797,12 +1658,8 @@
           "name": "final_inventories_object_id_fkey",
           "tableFrom": "final_inventories",
           "tableTo": "archive_objects",
-          "columnsFrom": [
-            "object_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["object_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1812,9 +1669,7 @@
         "final_inventories_sha256_key": {
           "name": "final_inventories_sha256_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "sha256"
-          ]
+          "columns": ["sha256"]
         }
       },
       "policies": {},
@@ -1872,10 +1727,7 @@
       "compositePrimaryKeys": {
         "inbox_pkey": {
           "name": "inbox_pkey",
-          "columns": [
-            "source",
-            "event_id"
-          ]
+          "columns": ["source", "event_id"]
         }
       },
       "uniqueConstraints": {},
@@ -1936,12 +1788,8 @@
           "name": "inventory_supplements_archive_id_fkey",
           "tableFrom": "inventory_supplements",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1949,12 +1797,8 @@
           "name": "inventory_supplements_object_id_fkey",
           "tableFrom": "inventory_supplements",
           "tableTo": "archive_objects",
-          "columnsFrom": [
-            "object_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["object_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -1962,12 +1806,8 @@
           "name": "inventory_supplements_archive_id_fkey1",
           "tableFrom": "inventory_supplements",
           "tableTo": "final_inventories",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "archive_id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["archive_id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1977,9 +1817,7 @@
         "inventory_supplements_sha256_key": {
           "name": "inventory_supplements_sha256_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "sha256"
-          ]
+          "columns": ["sha256"]
         }
       },
       "policies": {},
@@ -2165,14 +2003,8 @@
           "name": "language_capabilities_profile_id_revision_fkey",
           "tableFrom": "language_capabilities",
           "tableTo": "provider_profile_revisions",
-          "columnsFrom": [
-            "profile_id",
-            "revision"
-          ],
-          "columnsTo": [
-            "profile_id",
-            "revision"
-          ],
+          "columnsFrom": ["profile_id", "revision"],
+          "columnsTo": ["profile_id", "revision"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -2182,13 +2014,7 @@
         "language_capabilities_profile_id_revision_source_locale_tar_key": {
           "name": "language_capabilities_profile_id_revision_source_locale_tar_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "profile_id",
-            "revision",
-            "source_locale",
-            "target_locale",
-            "mode"
-          ]
+          "columns": ["profile_id", "revision", "source_locale", "target_locale", "mode"]
         }
       },
       "policies": {},
@@ -2313,12 +2139,8 @@
           "name": "legal_holds_archive_id_fkey",
           "tableFrom": "legal_holds",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -2326,12 +2148,8 @@
           "name": "legal_holds_actor_id_fkey",
           "tableFrom": "legal_holds",
           "tableTo": "users",
-          "columnsFrom": [
-            "actor_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["actor_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -2339,12 +2157,8 @@
           "name": "legal_holds_session_id_fkey",
           "tableFrom": "legal_holds",
           "tableTo": "sessions",
-          "columnsFrom": [
-            "session_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -2352,12 +2166,8 @@
           "name": "legal_holds_released_by_fkey",
           "tableFrom": "legal_holds",
           "tableTo": "users",
-          "columnsFrom": [
-            "released_by"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["released_by"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -2603,12 +2413,8 @@
           "name": "magic_links_user_id_fkey",
           "tableFrom": "magic_links",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -2616,12 +2422,8 @@
           "name": "magic_links_consultation_id_fkey",
           "tableFrom": "magic_links",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -2629,12 +2431,8 @@
           "name": "magic_links_session_fk",
           "tableFrom": "magic_links",
           "tableTo": "sessions",
-          "columnsFrom": [
-            "session_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["session_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -2644,9 +2442,7 @@
         "magic_links_token_hash_key": {
           "name": "magic_links_token_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "token_hash"
-          ]
+          "columns": ["token_hash"]
         }
       },
       "policies": {},
@@ -2709,12 +2505,8 @@
           "name": "multipart_parts_upload_id_fkey",
           "tableFrom": "multipart_parts",
           "tableTo": "multipart_uploads",
-          "columnsFrom": [
-            "upload_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["upload_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -2722,10 +2514,7 @@
       "compositePrimaryKeys": {
         "multipart_parts_pkey": {
           "name": "multipart_parts_pkey",
-          "columns": [
-            "upload_id",
-            "part_number"
-          ]
+          "columns": ["upload_id", "part_number"]
         }
       },
       "uniqueConstraints": {},
@@ -2813,12 +2602,8 @@
           "name": "multipart_uploads_archive_id_fkey",
           "tableFrom": "multipart_uploads",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["archive_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -2828,9 +2613,7 @@
         "multipart_uploads_upload_id_key": {
           "name": "multipart_uploads_upload_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "upload_id"
-          ]
+          "columns": ["upload_id"]
         }
       },
       "policies": {},
@@ -2899,12 +2682,8 @@
           "name": "orchestration_deadlines_consultation_id_fkey",
           "tableFrom": "orchestration_deadlines",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -2912,11 +2691,7 @@
       "compositePrimaryKeys": {
         "orchestration_deadlines_pkey": {
           "name": "orchestration_deadlines_pkey",
-          "columns": [
-            "consultation_id",
-            "generation",
-            "kind"
-          ]
+          "columns": ["consultation_id", "generation", "kind"]
         }
       },
       "uniqueConstraints": {},
@@ -3096,12 +2871,8 @@
           "name": "pending_exchanges_magic_link_id_fkey",
           "tableFrom": "pending_exchanges",
           "tableTo": "magic_links",
-          "columnsFrom": [
-            "magic_link_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["magic_link_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -3111,9 +2882,7 @@
         "pending_exchanges_nonce_hash_key": {
           "name": "pending_exchanges_nonce_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "nonce_hash"
-          ]
+          "columns": ["nonce_hash"]
         }
       },
       "policies": {},
@@ -3349,14 +3118,8 @@
           "name": "provider_attempts_archive_consultation_fkey",
           "tableFrom": "provider_attempts",
           "tableTo": "archives",
-          "columnsFrom": [
-            "archive_id",
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id",
-            "consultation_id"
-          ],
+          "columnsFrom": ["archive_id", "consultation_id"],
+          "columnsTo": ["id", "consultation_id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -3364,12 +3127,8 @@
           "name": "provider_attempts_retry_of_fkey",
           "tableFrom": "provider_attempts",
           "tableTo": "provider_attempts",
-          "columnsFrom": [
-            "retry_of"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["retry_of"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -3377,14 +3136,8 @@
           "name": "provider_attempts_profile_id_profile_revision_fkey",
           "tableFrom": "provider_attempts",
           "tableTo": "provider_profile_revisions",
-          "columnsFrom": [
-            "profile_id",
-            "profile_revision"
-          ],
-          "columnsTo": [
-            "profile_id",
-            "revision"
-          ],
+          "columnsFrom": ["profile_id", "profile_revision"],
+          "columnsTo": ["profile_id", "revision"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -3394,19 +3147,12 @@
         "provider_attempts_consultation_id_direction_id_operation_id_key": {
           "name": "provider_attempts_consultation_id_direction_id_operation_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id",
-            "direction_id",
-            "operation_id",
-            "attempt_number"
-          ]
+          "columns": ["consultation_id", "direction_id", "operation_id", "attempt_number"]
         },
         "provider_attempts_terminal_hash_key": {
           "name": "provider_attempts_terminal_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "terminal_hash"
-          ]
+          "columns": ["terminal_hash"]
         }
       },
       "policies": {},
@@ -3495,12 +3241,8 @@
           "name": "provider_profile_revisions_profile_id_fkey",
           "tableFrom": "provider_profile_revisions",
           "tableTo": "provider_profiles",
-          "columnsFrom": [
-            "profile_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["profile_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -3508,20 +3250,14 @@
       "compositePrimaryKeys": {
         "provider_profile_revisions_pkey": {
           "name": "provider_profile_revisions_pkey",
-          "columns": [
-            "profile_id",
-            "revision"
-          ]
+          "columns": ["profile_id", "revision"]
         }
       },
       "uniqueConstraints": {
         "provider_profile_revisions_profile_id_capability_hash_key": {
           "name": "provider_profile_revisions_profile_id_capability_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "profile_id",
-            "capability_hash"
-          ]
+          "columns": ["profile_id", "capability_hash"]
         }
       },
       "policies": {},
@@ -3576,9 +3312,7 @@
         "provider_profiles_name_key": {
           "name": "provider_profiles_name_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "name"
-          ]
+          "columns": ["name"]
         }
       },
       "policies": {},
@@ -3643,12 +3377,8 @@
           "name": "room_provider_selections_consultation_id_fkey",
           "tableFrom": "room_provider_selections",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -3656,14 +3386,8 @@
           "name": "room_provider_selections_profile_id_profile_revision_fkey",
           "tableFrom": "room_provider_selections",
           "tableTo": "provider_profile_revisions",
-          "columnsFrom": [
-            "profile_id",
-            "profile_revision"
-          ],
-          "columnsTo": [
-            "profile_id",
-            "revision"
-          ],
+          "columnsFrom": ["profile_id", "profile_revision"],
+          "columnsTo": ["profile_id", "revision"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -3673,9 +3397,7 @@
         "room_provider_selections_selection_hash_key": {
           "name": "room_provider_selections_selection_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "selection_hash"
-          ]
+          "columns": ["selection_hash"]
         }
       },
       "policies": {},
@@ -3753,12 +3475,8 @@
           "name": "sessions_user_id_fkey",
           "tableFrom": "sessions",
           "tableTo": "users",
-          "columnsFrom": [
-            "user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["user_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -3766,12 +3484,8 @@
           "name": "sessions_reauth_consultation_id_fkey",
           "tableFrom": "sessions",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "reauth_consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["reauth_consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -3779,12 +3493,8 @@
           "name": "sessions_replaced_by_fkey",
           "tableFrom": "sessions",
           "tableTo": "sessions",
-          "columnsFrom": [
-            "replaced_by"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["replaced_by"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -3794,9 +3504,7 @@
         "sessions_token_hash_key": {
           "name": "sessions_token_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "token_hash"
-          ]
+          "columns": ["token_hash"]
         }
       },
       "policies": {},
@@ -3857,9 +3565,7 @@
         "users_email_key": {
           "name": "users_email_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "email"
-          ]
+          "columns": ["email"]
         }
       },
       "policies": {},
@@ -4056,12 +3762,8 @@
           "name": "worker_checkpoints_consultation_id_fkey",
           "tableFrom": "worker_checkpoints",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -4069,18 +3771,8 @@
           "name": "worker_checkpoints_consultation_id_generation_worker_id_wo_fkey",
           "tableFrom": "worker_checkpoints",
           "tableTo": "worker_reservations",
-          "columnsFrom": [
-            "consultation_id",
-            "generation",
-            "worker_id",
-            "worker_epoch"
-          ],
-          "columnsTo": [
-            "consultation_id",
-            "generation",
-            "worker_id",
-            "epoch"
-          ],
+          "columnsFrom": ["consultation_id", "generation", "worker_id", "worker_epoch"],
+          "columnsTo": ["consultation_id", "generation", "worker_id", "epoch"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -4088,14 +3780,8 @@
           "name": "worker_checkpoints_source_participant_fkey",
           "tableFrom": "worker_checkpoints",
           "tableTo": "consultation_participants",
-          "columnsFrom": [
-            "consultation_id",
-            "source_participant_id"
-          ],
-          "columnsTo": [
-            "consultation_id",
-            "id"
-          ],
+          "columnsFrom": ["consultation_id", "source_participant_id"],
+          "columnsTo": ["consultation_id", "id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -4103,14 +3789,8 @@
           "name": "worker_checkpoints_destination_participant_fkey",
           "tableFrom": "worker_checkpoints",
           "tableTo": "consultation_participants",
-          "columnsFrom": [
-            "consultation_id",
-            "destination_participant_id"
-          ],
-          "columnsTo": [
-            "consultation_id",
-            "id"
-          ],
+          "columnsFrom": ["consultation_id", "destination_participant_id"],
+          "columnsTo": ["consultation_id", "id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -4134,9 +3814,7 @@
         "worker_checkpoints_checkpoint_hash_key": {
           "name": "worker_checkpoints_checkpoint_hash_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "checkpoint_hash"
-          ]
+          "columns": ["checkpoint_hash"]
         }
       },
       "policies": {},
@@ -4232,12 +3910,8 @@
           "name": "worker_job_epochs_consultation_id_fkey",
           "tableFrom": "worker_job_epochs",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -4245,12 +3919,8 @@
           "name": "worker_job_epochs_worker_id_fkey",
           "tableFrom": "worker_job_epochs",
           "tableTo": "worker_leases",
-          "columnsFrom": [
-            "worker_id"
-          ],
-          "columnsTo": [
-            "worker_id"
-          ],
+          "columnsFrom": ["worker_id"],
+          "columnsTo": ["worker_id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -4258,12 +3928,8 @@
           "name": "worker_job_terminal_checkpoint_fk",
           "tableFrom": "worker_job_epochs",
           "tableTo": "worker_checkpoints",
-          "columnsFrom": [
-            "terminal_checkpoint_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["terminal_checkpoint_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -4271,22 +3937,14 @@
       "compositePrimaryKeys": {
         "worker_job_epochs_pkey": {
           "name": "worker_job_epochs_pkey",
-          "columns": [
-            "consultation_id",
-            "generation",
-            "epoch"
-          ]
+          "columns": ["consultation_id", "generation", "epoch"]
         }
       },
       "uniqueConstraints": {
         "worker_job_epochs_worker_id_epoch_consultation_id_key": {
           "name": "worker_job_epochs_worker_id_epoch_consultation_id_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id",
-            "worker_id",
-            "epoch"
-          ]
+          "columns": ["consultation_id", "worker_id", "epoch"]
         }
       },
       "policies": {},
@@ -4497,12 +4155,8 @@
           "name": "worker_reservations_consultation_id_fkey",
           "tableFrom": "worker_reservations",
           "tableTo": "consultations",
-          "columnsFrom": [
-            "consultation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["consultation_id"],
+          "columnsTo": ["id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -4510,12 +4164,8 @@
           "name": "worker_reservations_worker_id_fkey",
           "tableFrom": "worker_reservations",
           "tableTo": "worker_leases",
-          "columnsFrom": [
-            "worker_id"
-          ],
-          "columnsTo": [
-            "worker_id"
-          ],
+          "columnsFrom": ["worker_id"],
+          "columnsTo": ["worker_id"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -4523,22 +4173,14 @@
       "compositePrimaryKeys": {
         "worker_reservations_pkey": {
           "name": "worker_reservations_pkey",
-          "columns": [
-            "consultation_id",
-            "generation"
-          ]
+          "columns": ["consultation_id", "generation"]
         }
       },
       "uniqueConstraints": {
         "worker_reservations_consultation_id_generation_worker_id_ep_key": {
           "name": "worker_reservations_consultation_id_generation_worker_id_ep_key",
           "nullsNotDistinct": false,
-          "columns": [
-            "consultation_id",
-            "generation",
-            "worker_id",
-            "epoch"
-          ]
+          "columns": ["consultation_id", "generation", "worker_id", "epoch"]
         }
       },
       "policies": {},
@@ -4568,72 +4210,37 @@
     "public.consultation_state": {
       "name": "consultation_state",
       "schema": "public",
-      "values": [
-        "invited",
-        "ready",
-        "active",
-        "finalizing",
-        "ended",
-        "cancelled",
-        "deleted"
-      ]
+      "values": ["invited", "ready", "active", "finalizing", "ended", "cancelled", "deleted"]
     },
     "public.external_effect_state": {
       "name": "external_effect_state",
       "schema": "public",
-      "values": [
-        "planned",
-        "calling",
-        "applied",
-        "compensating",
-        "done",
-        "failed"
-      ]
+      "values": ["planned", "calling", "applied", "compensating", "done", "failed"]
     },
     "public.magic_link_purpose": {
       "name": "magic_link_purpose",
       "schema": "public",
-      "values": [
-        "sign_in",
-        "consultation_invite",
-        "archive_delete_reauth"
-      ]
+      "values": ["sign_in", "consultation_invite", "archive_delete_reauth"]
     },
     "public.participant_role": {
       "name": "participant_role",
       "schema": "public",
-      "values": [
-        "employee",
-        "customer"
-      ]
+      "values": ["employee", "customer"]
     },
     "public.staff_role": {
       "name": "staff_role",
       "schema": "public",
-      "values": [
-        "employee",
-        "admin"
-      ]
+      "values": ["employee", "admin"]
     },
     "public.terminal_outcome": {
       "name": "terminal_outcome",
       "schema": "public",
-      "values": [
-        "succeeded",
-        "failed",
-        "cancelled",
-        "degraded",
-        "unknown"
-      ]
+      "values": ["succeeded", "failed", "cancelled", "degraded", "unknown"]
     },
     "public.transport_kind": {
       "name": "transport_kind",
       "schema": "public",
-      "values": [
-        "http",
-        "websocket",
-        "grpc"
-      ]
+      "values": ["http", "websocket", "grpc"]
     }
   },
   "schemas": {},

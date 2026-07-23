@@ -63,7 +63,9 @@
   border-radius: 50%;
   background: var(--paper);
   color: var(--ink-muted);
-  font: 700 0.8125rem "Sora", sans-serif;
+  font:
+    700 0.8125rem "Sora",
+    sans-serif;
 }
 
 .currentMarker {

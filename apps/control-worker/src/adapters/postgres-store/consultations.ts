@@ -1,18 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import {
-  PARTICIPANT_ROLE_VALUES,
-  type RoomProviderSelection,
-  RoomProviderSelectionSchema,
-} from "@transhooter/contracts";
-import {
-  consultationParticipants,
-  consultations,
-  workerReservations,
-} from "@transhooter/server-core/persistence";
-import type { SQL } from "drizzle-orm";
-import { and, eq, inArray, sql } from "drizzle-orm";
-import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import type { Sql, TransactionSql } from "postgres";
+import { type RoomProviderSelection, RoomProviderSelectionSchema } from "@transhooter/contracts";
+import { Prisma } from "@transhooter/server-core/persistence";
 import type {
   ClaimOptions,
   ConsultationState,
@@ -35,6 +23,7 @@ import {
   mapDeadline,
   mapReservation,
   type ParticipantIdentityRow,
+  type PrismaConnection,
   perRoomQuotaUnits,
   type ReservationRow,
   type ReserveConsultationRow,
@@ -42,27 +31,24 @@ import {
   type WorkerDirectionRow,
   type WorkerDispatchRow,
   type WorkerEpochTerminalRow,
+  withTransaction,
 } from "./shared";
 
 export async function currentGeneration(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
 ): Promise<number | null> {
-  const rows = await db
-    .select({ generation: consultations.generation })
-    .from(consultations)
-    .where(eq(consultations.id, consultationId))
-    .limit(1);
+  const rows = await client.$queryRaw<{ readonly generation: number }[]>(
+    Prisma.sql`SELECT generation FROM consultations WHERE id=${consultationId} LIMIT 1`,
+  );
   return rows[0]?.generation ?? null;
 }
 
 export async function claimDeadlines(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   options: ClaimOptions,
 ): Promise<readonly Deadline[]> {
-  const rows = await db.execute<DeadlineRow>(sql`WITH picked AS (
+  const rows = await client.$queryRaw<DeadlineRow[]>(Prisma.sql`WITH picked AS (
     SELECT deadline.consultation_id,deadline.generation,deadline.kind
     FROM orchestration_deadlines deadline
     WHERE deadline.completed_at IS NULL
@@ -99,21 +85,19 @@ export async function claimDeadlines(
 }
 
 export async function completeDeadline(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   deadline: Deadline,
   owner: Uuid,
 ): Promise<void> {
-  await db.execute(sql`UPDATE orchestration_deadlines SET completed_at=now(),lease_owner=NULL,lease_expires_at=NULL
+  await client.$executeRaw(Prisma.sql`UPDATE orchestration_deadlines SET completed_at=now(),lease_owner=NULL,lease_expires_at=NULL
     WHERE consultation_id=${deadline.consultationId} AND generation=${deadline.generation} AND kind=${deadline.kind} AND lease_owner=${owner}`);
 }
 
 export async function claimStaleReservations(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   options: ClaimOptions,
 ): Promise<readonly WorkerReservation[]> {
-  const rows = await db.execute<ReservationRow>(sql`WITH picked AS (
+  const rows = await client.$queryRaw<ReservationRow[]>(Prisma.sql`WITH picked AS (
     SELECT reservation.consultation_id,reservation.generation FROM worker_reservations reservation
     WHERE reservation.fenced_at IS NULL AND reservation.released_at IS NULL
       AND reservation.lease_expires_at < ${options.now.toISOString()}
@@ -132,32 +116,31 @@ export async function claimStaleReservations(
 }
 
 export async function heartbeat(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   workerId: Uuid,
   epoch: number,
   now: Date,
   leaseExpiresAt: Date,
 ): Promise<boolean> {
-  const rows =
-    await db.execute<IdRow>(sql`UPDATE worker_reservations SET heartbeat_at=${now.toISOString()},lease_expires_at=${leaseExpiresAt.toISOString()}
+  const rows = await client.$queryRaw<
+    IdRow[]
+  >(Prisma.sql`UPDATE worker_reservations SET heartbeat_at=${now.toISOString()},lease_expires_at=${leaseExpiresAt.toISOString()}
     WHERE worker_id=${workerId} AND epoch=${epoch} AND fenced_at IS NULL RETURNING worker_id AS id`);
   return rows.length === 1;
 }
 
 export async function reserveWorker(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
 ): Promise<WorkerReservation> {
-  return client.begin(async (transaction) => {
-    const [consultationRow] = await transaction<
+  return withTransaction(client, async (transaction) => {
+    const [consultationRow] = await transaction.$queryRaw<
       ReserveConsultationRow[]
-    >`SELECT worker_identity,snapshot_hash
+    >(Prisma.sql`SELECT worker_identity,snapshot_hash
       FROM consultations
       WHERE id=${consultationId} AND generation=${generation} AND state='ready'
-      FOR UPDATE`;
+      FOR UPDATE`);
     const consultation =
       consultationRow === undefined
         ? undefined
@@ -174,19 +157,21 @@ export async function reserveWorker(
     }
     const workerId = consultation.workerIdentity;
     const epoch = generation;
-    await transaction`INSERT INTO worker_leases(worker_id,accepting_load,capacity,reserved,encrypted_spool_percent,providers_ok,archive_ok,heartbeat_at,expires_at,epoch,status)
+    await transaction.$executeRaw(Prisma.sql`INSERT INTO worker_leases(worker_id,accepting_load,capacity,reserved,encrypted_spool_percent,providers_ok,archive_ok,heartbeat_at,expires_at,epoch,status)
       VALUES (${workerId},true,1,1,0,true,true,now(),now()+interval '20 minutes',${epoch},'{}'::jsonb)
       ON CONFLICT(worker_id) DO UPDATE SET accepting_load=true,reserved=1,encrypted_spool_percent=0,
-        providers_ok=true,archive_ok=true,heartbeat_at=now(),expires_at=now()+interval '20 minutes',epoch=${epoch},status='{}'::jsonb`;
-    const rows = await transaction<ReservationRow[]>`INSERT INTO worker_reservations(
+        providers_ok=true,archive_ok=true,heartbeat_at=now(),expires_at=now()+interval '20 minutes',epoch=${epoch},status='{}'::jsonb`);
+    const rows = await transaction.$queryRaw<
+      ReservationRow[]
+    >(Prisma.sql`INSERT INTO worker_reservations(
         consultation_id,generation,worker_id,epoch,selection_hash,reserved_at,heartbeat_at,lease_expires_at,accepting_load
       ) VALUES (${consultationId},${generation},${workerId},${epoch},${consultation.snapshotHash},now(),now(),now()+interval '5 minutes',true)
       ON CONFLICT(consultation_id,generation) DO UPDATE SET accepting_load=true
-      RETURNING *`;
-    await transaction`INSERT INTO worker_job_epochs(
+      RETURNING *`);
+    await transaction.$executeRaw(Prisma.sql`INSERT INTO worker_job_epochs(
         consultation_id,generation,worker_id,epoch,write_epoch,heartbeat_at
       ) VALUES (${consultationId},${generation},${workerId},${epoch},0,now())
-      ON CONFLICT(consultation_id,generation,epoch) DO NOTHING`;
+      ON CONFLICT(consultation_id,generation,epoch) DO NOTHING`);
     const reservation = rows[0];
     if (reservation === undefined) {
       throw new Error("worker reservation was not persisted");
@@ -196,14 +181,13 @@ export async function reserveWorker(
 }
 
 export async function applyVerifiedWebhook(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   event: VerifiedWebhook,
 ): Promise<boolean> {
   // Inbox verification and all watermark/state mutations share this transaction.
   // A rollback therefore cannot leave an accepted webhook without its state change.
-  return db.transaction(async (transaction) => {
-    const accepted = await transaction.execute<{ readonly event_id: string }>(sql`
+  return withTransaction(client, async (transaction) => {
+    const accepted = await transaction.$queryRaw<{ readonly event_id: string }[]>(Prisma.sql`
       SELECT event_id
       FROM inbox
       WHERE source = 'livekit'
@@ -216,7 +200,7 @@ export async function applyVerifiedWebhook(
     }
 
     if (event.egressId !== null) {
-      const egressRows = await transaction.execute<IdRow>(verifiedEgressUpdate(event));
+      const egressRows = await transaction.$queryRaw<IdRow[]>(verifiedEgressUpdate(event));
       if (egressRows.length !== 1) {
         return false;
       }
@@ -230,84 +214,72 @@ export async function applyVerifiedWebhook(
     }
 
     const watermark = participantWatermark(event);
-    const rows = await transaction.execute<IdRow>(participantPresenceUpdate(event, watermark));
+    const rows = await transaction.$queryRaw<IdRow[]>(participantPresenceUpdate(event, watermark));
     if (rows.length === 1) {
-      await transaction.execute(participantPresenceTransition(event));
+      await transaction.$executeRaw(participantPresenceTransition(event));
     }
     return rows.length === 1;
   });
 }
 
 export async function presenceEpoch(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
 ): Promise<number | null> {
-  const rows = await db
-    .select({ presenceEpoch: consultations.presenceEpoch })
-    .from(consultations)
-    .where(and(eq(consultations.id, consultationId), eq(consultations.generation, generation)))
-    .limit(1);
-  return rows[0]?.presenceEpoch ?? null;
+  const rows = await client.$queryRaw<{ readonly presence_epoch: number }[]>(
+    Prisma.sql`SELECT presence_epoch FROM consultations WHERE id=${consultationId} AND generation=${generation} LIMIT 1`,
+  );
+  return rows[0]?.presence_epoch ?? null;
 }
 
 export async function admitFinalization(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
   presenceEpoch: number,
   now: Date,
 ): Promise<"admitted" | ConsultationState | null> {
-  return client.begin(async (transaction) => {
-    const rows = await transaction<
+  return withTransaction(client, async (transaction) => {
+    const rows = await transaction.$queryRaw<
       { readonly state: ConsultationState }[]
-    >`UPDATE consultations SET state='finalizing',finalize_deadline_at=COALESCE(finalize_deadline_at,${new Date(now.getTime() + 15 * 60_000).toISOString()}),updated_at=${now.toISOString()}
+    >(Prisma.sql`UPDATE consultations SET state='finalizing',finalize_deadline_at=COALESCE(finalize_deadline_at,${new Date(now.getTime() + 15 * 60_000).toISOString()}),updated_at=${now.toISOString()}
       WHERE id=${consultationId} AND generation=${generation} AND presence_epoch=${presenceEpoch}
-        AND state IN ('ready','active') RETURNING state`;
+        AND state IN ('ready','active') RETURNING state`);
     if (rows.length === 1) {
-      await transaction`UPDATE archives SET state='reconciling',reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,${new Date(now.getTime() + 30 * 60_000).toISOString()}),updated_at=${now.toISOString()}
-        WHERE consultation_id=${consultationId} AND state IN ('pending','recording')`;
+      await transaction.$executeRaw(Prisma.sql`UPDATE archives SET state='reconciling',reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,${new Date(now.getTime() + 30 * 60_000).toISOString()}),updated_at=${now.toISOString()}
+        WHERE consultation_id=${consultationId} AND state IN ('pending','recording')`);
       return "admitted" as const;
     }
-    const current = await transaction<
-      { readonly state: ConsultationState }[]
-    >`SELECT state FROM consultations WHERE id=${consultationId} AND generation=${generation}`;
+    const current = await transaction.$queryRaw<{ readonly state: ConsultationState }[]>(
+      Prisma.sql`SELECT state FROM consultations WHERE id=${consultationId} AND generation=${generation}`,
+    );
     return current[0]?.state ?? null;
   });
 }
 
 export async function isStandardHuman(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   participantId: Uuid,
 ): Promise<boolean> {
-  const rows = await db
-    .select({ id: consultationParticipants.id })
-    .from(consultationParticipants)
-    .where(
-      and(
-        eq(consultationParticipants.consultationId, consultationId),
-        eq(consultationParticipants.livekitIdentity, participantId),
-        inArray(consultationParticipants.role, PARTICIPANT_ROLE_VALUES),
-      ),
-    )
-    .limit(1);
+  const rows = await client.$queryRaw<IdRow[]>(Prisma.sql`SELECT id FROM consultation_participants
+    WHERE consultation_id=${consultationId} AND livekit_identity=${participantId}
+      AND role IN ('employee','customer') LIMIT 1`);
   return rows.length === 1;
 }
 
 export async function markCaptureReady(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
   participantIdentity: Uuid,
   participantEgressId: string,
 ): Promise<"active" | null> {
-  return client.begin(async (transaction) => {
-    const participants = await transaction<IdRow[]>`UPDATE consultation_participants participant
+  return withTransaction(client, async (transaction) => {
+    const participants = await transaction.$queryRaw<
+      IdRow[]
+    >(Prisma.sql`UPDATE consultation_participants participant
       SET participant_egress_id=${participantEgressId},publication_granted=true
       FROM consultations consultation
       WHERE participant.consultation_id=consultation.id
@@ -317,124 +289,98 @@ export async function markCaptureReady(
         AND consultation.admission_fenced_at IS NULL
         AND participant.livekit_identity=${participantIdentity}
         AND participant.role IN ('employee','customer')
-      RETURNING participant.id`;
+      RETURNING participant.id`);
     if (participants.length !== 1) {
       return null;
     }
-    const consultations = await transaction<
+    const consultations = await transaction.$queryRaw<
       { readonly state: "active" }[]
-    >`UPDATE consultations SET state='active',updated_at=now()
+    >(Prisma.sql`UPDATE consultations SET state='active',updated_at=now()
       WHERE id=${consultationId}
         AND generation=${generation}
         AND state IN ('ready','active')
         AND admission_fenced_at IS NULL
-      RETURNING state`;
+      RETURNING state`);
     return consultations.length === 1 ? "active" : null;
   });
 }
 
 export async function consultationState(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
 ): Promise<ConsultationState | null> {
-  const rows = await db
-    .select({ state: consultations.state })
-    .from(consultations)
-    .where(eq(consultations.id, consultationId))
-    .limit(1);
+  const rows = await client.$queryRaw<{ readonly state: ConsultationState }[]>(
+    Prisma.sql`SELECT state FROM consultations WHERE id=${consultationId} LIMIT 1`,
+  );
   return rows[0]?.state ?? null;
 }
 
 export async function workerReservation(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
 ): Promise<WorkerReservation | null> {
-  const rows = await db
-    .select()
-    .from(workerReservations)
-    .where(
-      and(
-        eq(workerReservations.consultationId, consultationId),
-        eq(workerReservations.generation, generation),
-      ),
-    )
-    .limit(1);
-  const row = rows[0];
-  return row === undefined
-    ? null
-    : {
-        consultationId: row.consultationId,
-        generation: row.generation,
-        workerId: row.workerId,
-        epoch: row.epoch,
-        heartbeatAt: row.heartbeatAt,
-        leaseExpiresAt: row.leaseExpiresAt,
-        acceptingLoad: row.acceptingLoad,
-      };
+  const rows = await client.$queryRaw<ReservationRow[]>(Prisma.sql`SELECT * FROM worker_reservations
+    WHERE consultation_id=${consultationId} AND generation=${generation} LIMIT 1`);
+  return rows[0] === undefined ? null : mapReservation(rows[0]);
 }
 
 export async function workerDispatchMetadata(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
 ): Promise<unknown> {
-  return client.begin(async (transaction) => {
-    const rows = await transaction<
+  return withTransaction(client, async (transaction) => {
+    const rows = await transaction.$queryRaw<
       WorkerDispatchRow[]
-    >`SELECT c.room_name,c.worker_identity,c.snapshot_hash,c.provider_selection,
+    >(Prisma.sql`SELECT c.room_name,c.worker_identity,c.snapshot_hash,c.provider_selection,
         reservation.epoch,archive.write_epoch
       FROM consultations c
       JOIN worker_reservations reservation ON reservation.consultation_id=c.id AND reservation.generation=c.generation
       JOIN archives archive ON archive.consultation_id=c.id
       WHERE c.id=${consultationId} AND c.generation=${generation}
         AND c.state IN ('ready','active') AND reservation.fenced_at IS NULL
-      FOR SHARE OF c,reservation,archive`;
+      FOR SHARE OF c,reservation,archive`);
     const row = rows[0];
     if (row === undefined) {
       throw new Error("worker dispatch metadata is not admitted");
     }
-    const participants = await transaction<
+    const participants = await transaction.$queryRaw<
       ParticipantIdentityRow[]
-    >`SELECT id,livekit_identity FROM consultation_participants
-      WHERE consultation_id=${consultationId} ORDER BY CASE role WHEN 'employee' THEN 0 ELSE 1 END FOR SHARE`;
+    >(Prisma.sql`SELECT id,livekit_identity FROM consultation_participants
+      WHERE consultation_id=${consultationId} ORDER BY CASE role WHEN 'employee' THEN 0 ELSE 1 END FOR SHARE`);
     return mapWorkerDispatchMetadata(row, participants, consultationId, generation);
   });
 }
 
 export async function planFailureEffects(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
   reason: string,
   effects: readonly PlannedEffect[],
 ): Promise<void> {
-  await client.begin(async (transaction) => {
-    await transaction`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
-      VALUES (gen_random_uuid(),${consultationId},NULL,'egress.supervisor_terminal',now(),${JSON.stringify({ generation, reason })}::jsonb)`;
+  await withTransaction(client, async (transaction) => {
+    await transaction.$executeRaw(Prisma.sql`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
+      VALUES (gen_random_uuid(),${consultationId},NULL,'egress.supervisor_terminal',now(),${JSON.stringify({ generation, reason })}::jsonb)`);
     await insertPlannedEffects(transaction, effects);
   });
 }
 
 export async function fenceWorkerAndPlanFailure(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   reservation: WorkerReservation,
   owner: Uuid,
   reason: string,
   effects: readonly PlannedEffect[],
 ): Promise<boolean> {
-  return client.begin(async (transaction) => {
-    const fenced = await transaction<
+  return withTransaction(client, async (transaction) => {
+    const fenced = await transaction.$queryRaw<
       { epoch: number }[]
-    >`UPDATE worker_reservations SET fenced_at=now(),fence_reason=${reason},
+    >(Prisma.sql`UPDATE worker_reservations SET fenced_at=now(),fence_reason=${reason},
       supervisor_owner=COALESCE(supervisor_owner,${owner})
       WHERE consultation_id=${reservation.consultationId} AND generation=${reservation.generation} AND epoch=${reservation.epoch}
-        AND (supervisor_owner=${owner} OR supervisor_owner IS NULL) AND fenced_at IS NULL RETURNING epoch`;
+        AND (supervisor_owner=${owner} OR supervisor_owner IS NULL) AND fenced_at IS NULL RETURNING epoch`);
     if (fenced.length !== 1) {
       return false;
     }
@@ -443,36 +389,35 @@ export async function fenceWorkerAndPlanFailure(
       reservation,
       reason,
     );
-    const terminalized = await transaction<
+    const terminalized = await transaction.$queryRaw<
       { readonly terminal_checkpoint_id: string }[]
-    >`UPDATE worker_job_epochs SET fenced_at=COALESCE(fenced_at,now()),
+    >(Prisma.sql`UPDATE worker_job_epochs SET fenced_at=COALESCE(fenced_at,now()),
         terminal_checkpoint_id=${terminalCheckpointId},terminal_outcome='failed',terminal_at=now()
       WHERE consultation_id=${reservation.consultationId}
         AND generation=${reservation.generation}
         AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}
         AND terminal_at IS NULL
-      RETURNING terminal_checkpoint_id`;
+      RETURNING terminal_checkpoint_id`);
     if (terminalized.length !== 1) {
       throw new Error("worker epoch was not terminalized after supervisor checkpoints");
     }
-    await transaction`UPDATE worker_reservations
+    await transaction.$executeRaw(Prisma.sql`UPDATE worker_reservations
       SET accepting_load=false,released_at=COALESCE(released_at,now())
       WHERE consultation_id=${reservation.consultationId}
         AND generation=${reservation.generation}
-        AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}`;
-    await transaction`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
+        AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}`);
+    await transaction.$executeRaw(Prisma.sql`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
       VALUES (gen_random_uuid(),${reservation.consultationId},NULL,'worker.supervisor_terminal',now(),
         jsonb_build_object('generation',${reservation.generation}::integer,
           'fencedEpoch',${reservation.epoch}::integer,'owner',${owner}::uuid,
-          'reason',${reason}::text,'terminalCheckpointId',${terminalCheckpointId}::uuid))`;
+          'reason',${reason}::text,'terminalCheckpointId',${terminalCheckpointId}::uuid))`);
     await insertPlannedEffects(transaction, effects);
     return true;
   });
 }
 
 export async function fenceWorkerAndScheduleCancellation(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   cleanupGeneration: number,
   resourceGeneration: number,
@@ -480,13 +425,13 @@ export async function fenceWorkerAndScheduleCancellation(
   reason: string,
   effects: readonly PlannedEffect[],
 ): Promise<void> {
-  await client.begin(async (transaction) => {
-    const [consultationRow] = await transaction<
+  await withTransaction(client, async (transaction) => {
+    const [consultationRow] = await transaction.$queryRaw<
       CancellationConsultationRow[]
-    >`SELECT generation,state
+    >(Prisma.sql`SELECT generation,state
       FROM consultations
       WHERE id=${consultationId}
-      FOR UPDATE`;
+      FOR UPDATE`);
     const consultation =
       consultationRow === undefined
         ? undefined
@@ -499,80 +444,77 @@ export async function fenceWorkerAndScheduleCancellation(
     ) {
       throw new Error("cancellation cleanup generation is not current");
     }
-    const [reservationRow] = await transaction<ReservationRow[]>`SELECT *
+    const [reservationRow] = await transaction.$queryRaw<ReservationRow[]>(Prisma.sql`SELECT *
       FROM worker_reservations
       WHERE consultation_id=${consultationId} AND generation=${resourceGeneration}
-      FOR UPDATE`;
+      FOR UPDATE`);
     if (reservationRow !== undefined) {
       const reservation = mapReservation(reservationRow);
-      const [epoch] = await transaction<WorkerEpochTerminalRow[]>`SELECT terminal_at
+      const [epoch] = await transaction.$queryRaw<
+        WorkerEpochTerminalRow[]
+      >(Prisma.sql`SELECT terminal_at
         FROM worker_job_epochs
         WHERE consultation_id=${consultationId}
           AND generation=${resourceGeneration}
           AND worker_id=${reservation.workerId}
           AND epoch=${reservation.epoch}
-        FOR UPDATE`;
+        FOR UPDATE`);
       if (epoch?.terminal_at === null) {
         const terminalCheckpointId = await persistSupervisorTerminalCheckpoints(
           transaction,
           reservation,
           reason,
         );
-        const terminalized = await transaction<
+        const terminalized = await transaction.$queryRaw<
           { readonly terminal_checkpoint_id: string }[]
-        >`UPDATE worker_job_epochs SET fenced_at=COALESCE(fenced_at,now()),
+        >(Prisma.sql`UPDATE worker_job_epochs SET fenced_at=COALESCE(fenced_at,now()),
             terminal_checkpoint_id=${terminalCheckpointId},terminal_outcome='failed',terminal_at=now()
           WHERE consultation_id=${consultationId} AND generation=${resourceGeneration}
             AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}
             AND terminal_at IS NULL
-          RETURNING terminal_checkpoint_id`;
+          RETURNING terminal_checkpoint_id`);
         if (terminalized.length !== 1) {
           throw new Error("cancellation worker epoch was not terminalized after checkpoints");
         }
-        await transaction`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
+        await transaction.$executeRaw(Prisma.sql`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
           VALUES (gen_random_uuid(),${consultationId},NULL,'worker.supervisor_terminal',now(),
             jsonb_build_object('generation',${resourceGeneration}::integer,
               'fencedEpoch',${reservation.epoch}::integer,'owner',${owner}::uuid,
-              'reason',${reason}::text,'terminalCheckpointId',${terminalCheckpointId}::uuid))`;
+              'reason',${reason}::text,'terminalCheckpointId',${terminalCheckpointId}::uuid))`);
       }
-      await transaction`UPDATE worker_reservations SET fenced_at=COALESCE(fenced_at,now()),
+      await transaction.$executeRaw(Prisma.sql`UPDATE worker_reservations SET fenced_at=COALESCE(fenced_at,now()),
         fence_reason=COALESCE(fence_reason,${reason}),accepting_load=false,
         released_at=COALESCE(released_at,now()),supervisor_owner=COALESCE(supervisor_owner,${owner})
         WHERE consultation_id=${consultationId} AND generation=${resourceGeneration}
-          AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}`;
+          AND worker_id=${reservation.workerId} AND epoch=${reservation.epoch}`);
     }
-    await transaction`UPDATE orchestration_deadlines
+    await transaction.$executeRaw(Prisma.sql`UPDATE orchestration_deadlines
       SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL
       WHERE consultation_id=${consultationId} AND generation < ${cleanupGeneration}
-        AND completed_at IS NULL`;
+        AND completed_at IS NULL`);
     await insertPlannedEffects(transaction, effects);
   });
 }
 
 export async function humanIdentities(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
 ): Promise<readonly [Uuid, Uuid]> {
-  const rows = await db
-    .select({ livekitIdentity: consultationParticipants.livekitIdentity })
-    .from(consultationParticipants)
-    .where(eq(consultationParticipants.consultationId, consultationId))
-    .orderBy(consultationParticipants.role);
+  const rows = await client.$queryRaw<LiveKitIdentityRow[]>(Prisma.sql`SELECT livekit_identity
+    FROM consultation_participants WHERE consultation_id=${consultationId} ORDER BY role`);
   const [first, second] = rows;
   if (first === undefined || second === undefined || rows.length !== 2) {
     throw new Error("consultation must have exactly two human identities");
   }
-  return [first.livekitIdentity, second.livekitIdentity];
+  return [first.livekit_identity, second.livekit_identity];
 }
 
 export async function seedDeadlines(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
 ): Promise<void> {
-  await db.execute(sql`INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
+  await client.$executeRaw(Prisma.sql`INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
     SELECT id,generation,'ready',ready_deadline_at FROM consultations
       WHERE id=${consultationId} AND generation=${generation}
         AND state IN ('ready','active') AND ready_deadline_at IS NOT NULL
@@ -585,8 +527,7 @@ export async function seedDeadlines(
 }
 
 export async function roomDrainPlan(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
 ): Promise<{
@@ -596,20 +537,22 @@ export async function roomDrainPlan(
   readonly roomCreated: boolean;
   readonly resourceRoomName: string | null;
 }> {
-  const [egress, participants, dispatches, rooms] = await Promise.all([
-    db.execute<EgressIdRow>(
-      sql`SELECT egress_id FROM egress_jobs WHERE consultation_id=${consultationId} AND generation=${generation} AND terminal_at IS NULL ORDER BY egress_id`,
-    ),
-    db.execute<LiveKitIdentityRow>(
-      sql`SELECT livekit_identity FROM consultation_participants WHERE consultation_id=${consultationId} ORDER BY role`,
-    ),
-    db.execute<DispatchIdRow>(sql`SELECT result->>'remoteId' AS dispatch_id FROM external_effects
-      WHERE consultation_id=${consultationId} AND generation=${generation} AND effect_kind='WORKER_DISPATCH'
-        AND result->>'remoteId' IS NOT NULL ORDER BY created_at`),
-    db.execute<RoomResourceRow>(sql`SELECT result->'plan'->>'roomName' AS resource_room_name FROM external_effects
-      WHERE consultation_id=${consultationId} AND generation=${generation} AND effect_kind='ROOM_CREATE'
-        AND state IN ('applied','done') AND result->'plan'->>'roomName' IS NOT NULL LIMIT 1`),
-  ]);
+  const egress = await client.$queryRaw<EgressIdRow[]>(
+    Prisma.sql`SELECT egress_id FROM egress_jobs WHERE consultation_id=${consultationId} AND generation=${generation} AND terminal_at IS NULL ORDER BY egress_id`,
+  );
+  const participants = await client.$queryRaw<LiveKitIdentityRow[]>(
+    Prisma.sql`SELECT livekit_identity FROM consultation_participants WHERE consultation_id=${consultationId} ORDER BY role`,
+  );
+  const dispatches = await client.$queryRaw<
+    DispatchIdRow[]
+  >(Prisma.sql`SELECT result->>'remoteId' AS dispatch_id FROM external_effects
+    WHERE consultation_id=${consultationId} AND generation=${generation} AND effect_kind='WORKER_DISPATCH'
+      AND result->>'remoteId' IS NOT NULL ORDER BY created_at`);
+  const rooms = await client.$queryRaw<
+    RoomResourceRow[]
+  >(Prisma.sql`SELECT result->'plan'->>'roomName' AS resource_room_name FROM external_effects
+    WHERE consultation_id=${consultationId} AND generation=${generation} AND effect_kind='ROOM_CREATE'
+      AND state IN ('applied','done') AND result->'plan'->>'roomName' IS NOT NULL LIMIT 1`);
   return {
     egressIds: egress.map((row) => String(row.egress_id)),
     participantIds: participants.map((row) => String(row.livekit_identity)),
@@ -620,41 +563,39 @@ export async function roomDrainPlan(
 }
 
 export async function completeRoomDrain(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
   generation: number,
 ): Promise<void> {
-  await client.begin(async (transaction) => {
-    await transaction`UPDATE consultations SET state='ended',updated_at=now() WHERE id=${consultationId} AND generation=${generation} AND state='finalizing'`;
-    await transaction`UPDATE orchestration_deadlines SET completed_at=COALESCE(completed_at,now()),
+  await withTransaction(client, async (transaction) => {
+    await transaction.$executeRaw(
+      Prisma.sql`UPDATE consultations SET state='ended',updated_at=now() WHERE id=${consultationId} AND generation=${generation} AND state='finalizing'`,
+    );
+    await transaction.$executeRaw(Prisma.sql`UPDATE orchestration_deadlines SET completed_at=COALESCE(completed_at,now()),
       lease_owner=NULL,lease_expires_at=NULL
       WHERE consultation_id=${consultationId} AND generation=${generation}
-        AND kind <> 'archive-reconcile' AND completed_at IS NULL`;
-    await transaction`UPDATE worker_reservations reservation SET accepting_load=false,released_at=COALESCE(reservation.released_at,epoch.terminal_at)
+        AND kind <> 'archive-reconcile' AND completed_at IS NULL`);
+    await transaction.$executeRaw(Prisma.sql`UPDATE worker_reservations reservation SET accepting_load=false,released_at=COALESCE(reservation.released_at,epoch.terminal_at)
       FROM worker_job_epochs epoch
       WHERE reservation.consultation_id=${consultationId} AND reservation.generation=${generation}
         AND epoch.consultation_id=reservation.consultation_id AND epoch.generation=reservation.generation
-        AND epoch.worker_id=reservation.worker_id AND epoch.epoch=reservation.epoch AND epoch.terminal_at IS NOT NULL`;
-    await transaction`UPDATE archives SET state='reconciling',reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,now()+interval '30 minutes'),updated_at=now()
-      WHERE consultation_id=${consultationId} AND state IN ('pending','recording')`;
-    await transaction`INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
+        AND epoch.worker_id=reservation.worker_id AND epoch.epoch=reservation.epoch AND epoch.terminal_at IS NOT NULL`);
+    await transaction.$executeRaw(Prisma.sql`UPDATE archives SET state='reconciling',reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,now()+interval '30 minutes'),updated_at=now()
+      WHERE consultation_id=${consultationId} AND state IN ('pending','recording')`);
+    await transaction.$executeRaw(Prisma.sql`INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
       SELECT ${consultationId},${generation},'archive-reconcile',reconciliation_deadline_at FROM archives WHERE consultation_id=${consultationId}
-      ON CONFLICT (consultation_id,generation,kind) DO UPDATE SET due_at=EXCLUDED.due_at`;
+      ON CONFLICT (consultation_id,generation,kind) DO UPDATE SET due_at=EXCLUDED.due_at`);
   });
 }
 
 export async function capacityDimensions(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   consultationId: Uuid,
 ): Promise<readonly CapacityDimension[]> {
-  const rows = await db
-    .select({ providerSelection: consultations.providerSelection })
-    .from(consultations)
-    .where(eq(consultations.id, consultationId))
-    .limit(1);
-  const selection = rows[0]?.providerSelection;
+  const rows = await client.$queryRaw<{ readonly provider_selection: unknown }[]>(
+    Prisma.sql`SELECT provider_selection FROM consultations WHERE id=${consultationId} LIMIT 1`,
+  );
+  const selection = rows[0]?.provider_selection;
   if (selection === undefined || selection === null) {
     throw new Error("consultation provider selection is missing");
   }
@@ -662,28 +603,28 @@ export async function capacityDimensions(
 }
 
 export async function persistSupervisorTerminalCheckpoints(
-  transaction: TransactionSql,
+  transaction: Prisma.TransactionClient,
   reservation: WorkerReservation,
   reason: string,
 ): Promise<Uuid> {
-  const directions = await transaction<
+  const directions = await transaction.$queryRaw<
     WorkerDirectionRow[]
-  >`SELECT direction->>'sourceParticipantId' AS source_participant_id,
+  >(Prisma.sql`SELECT direction->>'sourceParticipantId' AS source_participant_id,
       direction->>'destinationParticipantId' AS destination_participant_id
     FROM room_provider_selections selection
     CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
-    WHERE selection.consultation_id=${reservation.consultationId}`;
+    WHERE selection.consultation_id=${reservation.consultationId}`);
   if (directions.length !== 2) {
     throw new Error("worker supervisor settlement requires two frozen directions");
   }
 
-  await transaction<ConsultationIdRow[]>`select consultation_id
+  await transaction.$queryRaw<ConsultationIdRow[]>(Prisma.sql`select consultation_id
     from "worker_job_epochs"
     where consultation_id=${reservation.consultationId}
       and generation=${reservation.generation}
       and worker_id=${reservation.workerId}
       and epoch=${reservation.epoch}
-    for update`;
+    for update`);
   for (const direction of directions) {
     const { id, hash, objectKey } = supervisorTerminalIdentity(
       reservation,
@@ -691,7 +632,7 @@ export async function persistSupervisorTerminalCheckpoints(
       direction.source_participant_id,
       direction.destination_participant_id,
     );
-    await transaction`WITH previous AS (
+    await transaction.$executeRaw(Prisma.sql`WITH previous AS (
         SELECT accepted_input_sequence,accepted_input,received_output,emitted_output,
           checkpoint_hash,expected_ids,observed_ids,gaps
         FROM worker_checkpoints
@@ -735,10 +676,12 @@ export async function persistSupervisorTerminalCheckpoints(
           AND terminal.source_participant_id=${direction.source_participant_id}
           AND terminal.destination_participant_id=${direction.destination_participant_id}
           AND terminal.terminal
-      )`;
+      )`);
   }
 
-  const terminals = await transaction<{ readonly id: string }[]>`SELECT latest.id
+  const terminals = await transaction.$queryRaw<
+    { readonly id: string }[]
+  >(Prisma.sql`SELECT latest.id
     FROM room_provider_selections selection
     CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
     CROSS JOIN LATERAL (
@@ -752,14 +695,14 @@ export async function persistSupervisorTerminalCheckpoints(
         AND checkpoint.terminal
       ORDER BY checkpoint.accepted_input DESC LIMIT 1
     ) latest
-    WHERE selection.consultation_id=${reservation.consultationId}`;
+    WHERE selection.consultation_id=${reservation.consultationId}`);
   if (terminals.length !== 2 || terminals[0] === undefined) {
     throw new Error("supervisor terminal checkpoints were not persisted for both directions");
   }
   return terminals[0].id;
 }
 
-function verifiedEgressUpdate(event: VerifiedWebhook): SQL {
+function verifiedEgressUpdate(event: VerifiedWebhook): Prisma.Sql {
   const terminal = event.kind === "EGRESS_TERMINAL";
   const terminalResult = {
     eventId: event.eventId,
@@ -767,7 +710,7 @@ function verifiedEgressUpdate(event: VerifiedWebhook): SQL {
     status: event.egressStatus,
     rawSha256: event.rawSha256,
   };
-  return sql`UPDATE egress_jobs job SET state=${event.egressStatus ?? event.kind},
+  return Prisma.sql`UPDATE egress_jobs job SET state=${event.egressStatus ?? event.kind},
         terminal_at=CASE WHEN ${terminal} THEN now() ELSE job.terminal_at END,
         terminal_result=CASE WHEN ${terminal} THEN ${JSON.stringify(terminalResult)}::jsonb ELSE job.terminal_result END
         WHERE job.consultation_id=${event.consultationId} AND job.generation=${event.generation} AND job.egress_id=${event.egressId}
@@ -785,20 +728,20 @@ function participantWatermark(event: VerifiedWebhook): string {
   return `${event.occurredAtMs.toString().padStart(16, "0")}:${event.eventId}`;
 }
 
-function participantPresenceUpdate(event: VerifiedWebhook, watermark: string): SQL {
-  return sql`UPDATE consultation_participants participant SET presence_event_id=${watermark},
+function participantPresenceUpdate(event: VerifiedWebhook, watermark: string): Prisma.Sql {
+  return Prisma.sql`UPDATE consultation_participants participant SET presence_event_id=${watermark},
       present=${event.kind === "PARTICIPANT_JOINED"} FROM consultations consultation
       WHERE participant.consultation_id=consultation.id AND consultation.id=${event.consultationId}
         AND consultation.generation=${event.generation} AND participant.livekit_identity=${event.participantId}
         AND (participant.presence_event_id IS NULL OR participant.presence_event_id < ${watermark}) RETURNING participant.id`;
 }
 
-function participantPresenceTransition(event: VerifiedWebhook): SQL {
+function participantPresenceTransition(event: VerifiedWebhook): Prisma.Sql {
   if (event.kind === "PARTICIPANT_JOINED") {
-    return sql`UPDATE consultations SET both_absent_since=NULL,presence_epoch=presence_epoch+1,updated_at=now()
+    return Prisma.sql`UPDATE consultations SET both_absent_since=NULL,presence_epoch=presence_epoch+1,updated_at=now()
       WHERE id=${event.consultationId} AND generation=${event.generation}`;
   }
-  return sql`WITH changed AS (
+  return Prisma.sql`WITH changed AS (
               UPDATE consultations SET presence_epoch=presence_epoch+1,updated_at=now()
                 WHERE id=${event.consultationId} AND generation=${event.generation} RETURNING id,generation
             ), absent AS (

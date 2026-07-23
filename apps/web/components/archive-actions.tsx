@@ -370,10 +370,13 @@ export function ArchiveAdminActions({
       className="flex flex-col gap-5 rounded-md border border-border bg-card p-5"
     >
       <div className="border-b border-border pb-4">
-        <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">Restricted archive controls</p>
+        <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground">
+          Restricted archive controls
+        </p>
         <h2 className="mt-1 font-serif text-lg font-semibold">Hold or delete</h2>
         <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
-          Both actions require a fresh, consultation-bound administrator sign-in and are recorded in the audit register.
+          Both actions require a fresh, consultation-bound administrator sign-in and are recorded in
+          the audit register.
         </p>
       </div>
 
@@ -396,10 +399,21 @@ export function ArchiveAdminActions({
         }}
       >
         <div className="grid gap-2">
-          <label className="text-sm font-medium" htmlFor="hold-reason">Legal hold reason</label>
-          <input className="min-h-10 rounded-md border border-input bg-background px-3 text-sm" id="hold-reason" name="reason" required />
+          <label className="text-sm font-medium" htmlFor="hold-reason">
+            Legal hold reason
+          </label>
+          <input
+            className="min-h-10 rounded-md border border-input bg-background px-3 text-sm"
+            id="hold-reason"
+            name="reason"
+            required
+          />
         </div>
-        <button className="inline-flex min-h-9 w-fit items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50" disabled={busyAction !== null} type="submit">
+        <button
+          className="inline-flex min-h-9 w-fit items-center justify-center rounded-md border border-border bg-background px-3 text-sm font-medium transition-colors hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busyAction !== null}
+          type="submit"
+        >
           {busyAction === "hold" ? "Applying…" : "Apply legal hold"}
         </button>
       </form>
@@ -408,7 +422,10 @@ export function ArchiveAdminActions({
         <div className="grid gap-3 rounded-md border border-attention/70 bg-attention/20 p-4">
           <h3 className="font-serif text-base font-semibold">Release an active hold</h3>
           {activeHolds.map((hold) => (
-            <div className="grid gap-3 border-t border-border pt-3 first:border-0 first:pt-0" key={hold.id}>
+            <div
+              className="grid gap-3 border-t border-border pt-3 first:border-0 first:pt-0"
+              key={hold.id}
+            >
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <span className="archiveHoldReason">{hold.reason}</span>
                 {confirmingHoldId !== hold.id && (
@@ -478,7 +495,9 @@ export function ArchiveAdminActions({
         }}
       >
         <div className="grid gap-2">
-          <label className="text-sm font-medium" htmlFor="delete-reason">Deletion reason</label>
+          <label className="text-sm font-medium" htmlFor="delete-reason">
+            Deletion reason
+          </label>
           <input
             id="delete-reason"
             name="reason"
@@ -494,7 +513,10 @@ export function ArchiveAdminActions({
           This requests irreversible deletion of every stored object version.
         </p>
         {deletionBlockedByHold && (
-          <p className="rounded-md border border-attention bg-attention/30 p-3 text-sm text-attention-foreground" id="delete-hold-block">
+          <p
+            className="rounded-md border border-attention bg-attention/30 p-3 text-sm text-attention-foreground"
+            id="delete-hold-block"
+          >
             Release and verify every active legal hold before requesting deletion.
           </p>
         )}
@@ -529,7 +551,11 @@ export function ArchiveAdminActions({
         <div
           ref={feedbackRef}
           tabIndex={-1}
-          className={feedback.kind === "error" ? "rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive" : "rounded-md border border-verified/40 bg-verified/5 p-3 text-sm text-foreground"}
+          className={
+            feedback.kind === "error"
+              ? "rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive"
+              : "rounded-md border border-verified/40 bg-verified/5 p-3 text-sm text-foreground"
+          }
           id="archive-action-feedback"
           role={feedback.kind === "error" ? "alert" : "status"}
         >

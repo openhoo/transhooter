@@ -124,6 +124,7 @@ export async function runProviderScenarios(ctx, proof) {
     await resetAuthenticationThrottle();
     const partialRun = await runConsultation({
       workerScenario: { tts: { partialSamples: 960, failAfterPartial: true } },
+      skipMediaOutputProof: false,
     });
     const partialConsultationId = partialRun.consultationId;
     const partial = await partialRun.completed;
@@ -179,11 +180,20 @@ export async function runProviderScenarios(ctx, proof) {
       reconcilingSettlement.generation,
     );
     const deadlineEvidence = await settleConsultation(partialConsultationId);
+    const durableProviderGap = (deadlineEvidence.inventory?.missing ?? []).find(
+      (gap) =>
+        gap.class === "provider_terminal" &&
+        gap.reason === "provider_attempt_failed" &&
+        gap.attemptId === partialAttempt.id &&
+        gap.stage === "tts" &&
+        gap.outcome === "failed" &&
+        Number(gap.receivedOutputWatermark ?? 0) > 0,
+    );
     if (
       deadlineEvidence.state !== "ended" ||
       deadlineEvidence.archive_state !== "incomplete" ||
       deadlineEvidence.inventory?.status !== "incomplete" ||
-      (deadlineEvidence.inventory?.missing ?? []).length === 0 ||
+      !durableProviderGap ||
       deadlineEvidence.egress.length === 0 ||
       !deadlineEvidence.egress.every((job) => job.terminalAt && job.terminalResult)
     ) {

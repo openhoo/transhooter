@@ -1,5 +1,5 @@
-import type { Metadata } from "next";
 import { KeyRound, ShieldCheck, VideoOff } from "lucide-react";
+import type { Metadata } from "next";
 import { MagicLinkForm } from "@/components/auth-forms";
 
 export const metadata: Metadata = { title: "Sign in" };
@@ -11,7 +11,10 @@ export default function SignInPage() {
         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">
           Private consultation
         </p>
-        <h1 id="sign-in-title" className="mt-3 text-balance text-3xl font-semibold tracking-tight md:text-4xl">
+        <h1
+          id="sign-in-title"
+          className="mt-3 text-balance text-3xl font-semibold tracking-tight md:text-4xl"
+        >
           Sign in to your consultation
         </h1>
         <p className="mt-4 text-pretty leading-relaxed text-muted-foreground">
@@ -33,7 +36,8 @@ export default function SignInPage() {
             <div>
               <p className="text-sm font-semibold">Opening the link does not start a call</p>
               <p className="text-sm leading-relaxed text-muted-foreground">
-                Your camera and microphone stay off until you review your devices and choose to join.
+                Your camera and microphone stay off until you review your devices and choose to
+                join.
               </p>
             </div>
           </li>

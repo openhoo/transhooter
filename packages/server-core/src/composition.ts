@@ -1,21 +1,20 @@
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
-import { DrizzleApplicationOperations } from "./application-operations";
+import { PrismaApplicationOperations } from "./application-operations";
 import { ArchiveService, type InventoryHasher } from "./archives/service";
 import { type AuthSecrets, AuthService, type MagicLinkTokenSealer } from "./auth/service";
 import { type ConsultationHasher, ConsultationService } from "./consultations/service";
 import type { Clock, IdGenerator, TokenGenerator, TokenHasher } from "./domain/model";
 import { LanguageService } from "./languages/service";
 import {
-  DrizzleArchiveRepository,
-  DrizzleAuditRepository,
-  DrizzleConsultationRepository,
-  DrizzleLanguageRepository,
-  DrizzleProviderSnapshotRepository,
+  PrismaArchiveRepository,
+  PrismaAuditRepository,
+  PrismaConsultationRepository,
+  PrismaLanguageRepository,
+  PrismaProviderSnapshotRepository,
 } from "./persistence/application-repositories";
 import {
-  DrizzleAuthRepository,
-  DrizzleEffectRepository,
-  type DrizzleSchema,
+  PrismaAuthRepository,
+  type PrismaClient,
+  PrismaEffectRepository,
 } from "./persistence/repositories";
 import type {
   EgressPort,
@@ -35,7 +34,7 @@ export interface ConfiguredWebApplication extends WebApplication {
 }
 
 export interface ConfiguredWebApplicationConfig {
-  database: NodePgDatabase<DrizzleSchema>;
+  database: PrismaClient;
   mail: MailPort;
   storage: ObjectStoragePort;
   livekitRooms: LiveKitRoomPort;
@@ -57,13 +56,13 @@ export interface ConfiguredWebApplicationConfig {
 export function createConfiguredWebApplication(
   config: ConfiguredWebApplicationConfig,
 ): ConfiguredWebApplication {
-  const authRepository = new DrizzleAuthRepository(config.database);
-  const consultationRepository = new DrizzleConsultationRepository(config.database);
-  const effectRepository = new DrizzleEffectRepository(config.database);
-  const archiveRepository = new DrizzleArchiveRepository(config.database);
-  const languageRepository = new DrizzleLanguageRepository(config.database);
-  const auditRepository = new DrizzleAuditRepository(config.database);
-  const snapshotRepository = new DrizzleProviderSnapshotRepository(config.database, (value) =>
+  const authRepository = new PrismaAuthRepository(config.database);
+  const consultationRepository = new PrismaConsultationRepository(config.database);
+  const effectRepository = new PrismaEffectRepository(config.database);
+  const archiveRepository = new PrismaArchiveRepository(config.database);
+  const languageRepository = new PrismaLanguageRepository(config.database);
+  const auditRepository = new PrismaAuditRepository(config.database);
+  const snapshotRepository = new PrismaProviderSnapshotRepository(config.database, (value) =>
     config.hashing.sha256Canonical(value),
   );
 
@@ -98,11 +97,7 @@ export function createConfiguredWebApplication(
     effectRepository,
   );
   const languages = new LanguageService(languageRepository, config.clock, config.ids);
-  const operations = new DrizzleApplicationOperations(
-    config.database,
-    config.storage,
-    config.clock,
-  );
+  const operations = new PrismaApplicationOperations(config.database, config.storage, config.clock);
 
   const application = createWebApplication({
     auth,

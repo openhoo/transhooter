@@ -1,5 +1,5 @@
-import { createConsultationHarness } from "./consultation-harness.mjs";
 import { runConsultationBrowserWorkflow } from "./consultation-browser-workflow.mjs";
+import { createConsultationHarness } from "./consultation-harness.mjs";
 
 function requiredEnvironment(name) {
   const value = process.env[name];

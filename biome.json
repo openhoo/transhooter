@@ -9,9 +9,9 @@
     "includes": [
       "**",
       "!packages/contracts/generated",
+      "!packages/server-core/src/generated/prisma",
       "!packages/server-core/src/persistence/schema.ts",
       "!packages/server-core/src/persistence/relations.ts",
-      "!packages/server-core/drizzle/meta",
       "!**/*.map",
       "!.secrets",
       "!.env",
@@ -56,6 +56,12 @@
       "arrowParentheses": "always",
       "bracketSpacing": true,
       "bracketSameLine": false
+    }
+  },
+  "css": {
+    "parser": {
+      "cssModules": true,
+      "tailwindDirectives": true
     }
   },
   "overrides": [
@@ -104,6 +110,16 @@
                 ]
               }
             }
+          }
+        }
+      }
+    },
+    {
+      "includes": ["apps/web/components/ui/label.tsx"],
+      "linter": {
+        "rules": {
+          "a11y": {
+            "noLabelWithoutControl": "off"
           }
         }
       }

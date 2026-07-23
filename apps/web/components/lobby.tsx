@@ -314,7 +314,10 @@ function PreferencesForm({
         void onSubmit(event);
       }}
     >
-      <fieldset className={`${styles.preferenceGroup ?? ""} ${styles.previewCard ?? ""}`} disabled={busy}>
+      <fieldset
+        className={`${styles.preferenceGroup ?? ""} ${styles.previewCard ?? ""}`}
+        disabled={busy}
+      >
         <legend className="srOnly">Media preview</legend>
         <div className={styles.previewFrame}>
           <video
@@ -403,7 +406,9 @@ function PreferencesForm({
 function WaitingPanel() {
   return (
     <section className={styles.stateCard} aria-labelledby="preferences-waiting-title">
-      <span className={styles.stateIcon} aria-hidden="true">…</span>
+      <span className={styles.stateIcon} aria-hidden="true">
+        …
+      </span>
       <div>
         <p className="eyebrow">Preferences saved</p>
         <h2 id="preferences-waiting-title">Waiting for the other participant</h2>
@@ -420,7 +425,9 @@ function WaitingPanel() {
 function ConsentWaitingPanel() {
   return (
     <section className={styles.stateCard} aria-labelledby="consent-waiting-title">
-      <span className={styles.stateIcon} aria-hidden="true">✓</span>
+      <span className={styles.stateIcon} aria-hidden="true">
+        ✓
+      </span>
       <div>
         <p className="eyebrow">Consent recorded</p>
         <h2 id="consent-waiting-title">Waiting for matching consent</h2>
@@ -437,7 +444,9 @@ function ConsentWaitingPanel() {
 function TerminalPanel() {
   return (
     <section className={styles.stateCard} aria-labelledby="consultation-closed-title">
-      <span className={styles.stateIcon} aria-hidden="true">×</span>
+      <span className={styles.stateIcon} aria-hidden="true">
+        ×
+      </span>
       <div>
         <p className="eyebrow">Consultation unavailable</p>
         <h2 id="consultation-closed-title">This consultation is closed</h2>
@@ -470,7 +479,10 @@ function ProviderConsentForm({ busy, data, onSubmit }: ProviderConsentFormProps)
           </div>
           <span className={styles.revisionBadge}>Revision {data.profileRevision}</span>
         </div>
-        <section className={styles.providerTableWrap} aria-label="Frozen provider direction details">
+        <section
+          className={styles.providerTableWrap}
+          aria-label="Frozen provider direction details"
+        >
           <table className={styles.providerTable}>
             <caption className="srOnly">
               Speech, translation, voice, and processing region for each language direction
@@ -489,7 +501,9 @@ function ProviderConsentForm({ busy, data, onSubmit }: ProviderConsentFormProps)
                 <tr key={`${direction.sourceLabel}:${direction.destinationLabel}`}>
                   <td>
                     <span className={styles.mobileFieldLabel}>Direction</span>
-                    <strong>{direction.sourceLabel} → {direction.destinationLabel}</strong>
+                    <strong>
+                      {direction.sourceLabel} → {direction.destinationLabel}
+                    </strong>
                   </td>
                   <td>
                     <span className={styles.mobileFieldLabel}>Speech</span>
@@ -721,10 +735,12 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
       </p>
       {phaseContent}
       <aside className={styles.privacyNote} aria-label="Lobby privacy">
-        <span className={styles.privacyIcon} aria-hidden="true">◇</span>
+        <span className={styles.privacyIcon} aria-hidden="true">
+          ◇
+        </span>
         <p>
-          <strong>Your lobby preview stays private.</strong> Camera and microphone media remain local
-          until recording is ready and the server grants publication after you enter the room.
+          <strong>Your lobby preview stays private.</strong> Camera and microphone media remain
+          local until recording is ready and the server grants publication after you enter the room.
         </p>
       </aside>
       <div id="lobby-feedback" className={styles.feedback}>

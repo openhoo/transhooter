@@ -1,9 +1,8 @@
 "use client";
 
 import { useState } from "react";
-
-import { api } from "@/lib/browser/browser-api";
 import { Button } from "@/components/ui/button";
+import { api } from "@/lib/browser/browser-api";
 
 export function LogoutButton() {
   const [pending, setPending] = useState(false);

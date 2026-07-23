@@ -1,81 +1,85 @@
-import { and, eq, gt, lte, or, sql } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { DomainError, type Instant, type UUID } from "../domain/model";
 import type { EffectRepository, ExternalEffect, OutboxMessage, Transaction } from "../ports/index";
-import { effectCompensationAttempts, externalEffects as effects, inbox, outbox } from "./schema";
-import { type DrizzleSchema, TransactionHandle, unwrap } from "./transaction";
+import { Prisma, type PrismaClient } from "./database";
+import { TransactionHandle, unwrap } from "./transaction";
 
-export class DrizzleEffectRepository implements EffectRepository {
-  constructor(private readonly database: NodePgDatabase<DrizzleSchema>) {}
+export class PrismaEffectRepository implements EffectRepository {
+  constructor(private readonly database: PrismaClient) {}
 
   transaction<T>(work: (tx: Transaction) => Promise<T>): Promise<T> {
-    return this.database.transaction((database) => work(new TransactionHandle(database)));
+    return this.database.$transaction((database) => work(new TransactionHandle(database)));
   }
 
   async plan(effect: ExternalEffect, tx: Transaction): Promise<ExternalEffect> {
     const database = unwrap(tx);
-    const [row] = await database
-      .insert(effects)
-      .values({
-        id: effect.id,
-        consultationId: effect.consultationId,
-        generation: effect.generation,
-        effectKind: effect.kind,
-        subjectId: effect.subjectId,
-        occurrenceKey: "",
-        state: effect.state,
-        requestBytes: effect.requestBytes,
-        requestHash: effect.requestHash,
-        leaseOwner: effect.leaseOwner,
-        leaseExpiresAt: effect.leaseExpiresAt,
-        result: effect.result,
-        attempts: effect.attempts,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .onConflictDoNothing({
-        target: [
-          effects.consultationId,
-          effects.generation,
-          effects.effectKind,
-          effects.subjectId,
-          effects.occurrenceKey,
-        ],
-      })
-      .returning();
-
-    if (row) {
-      return mapEffect(row);
+    const now = new Date();
+    const inserted = await database.$queryRaw<EffectRow[]>(Prisma.sql`
+      INSERT INTO external_effects(
+        id,
+        consultation_id,
+        generation,
+        effect_kind,
+        subject_id,
+        occurrence_key,
+        state,
+        request_bytes,
+        request_hash,
+        lease_owner,
+        lease_expires_at,
+        result,
+        attempts,
+        created_at,
+        updated_at
+      ) VALUES (
+        ${effect.id},
+        ${effect.consultationId},
+        ${effect.generation},
+        ${effect.kind},
+        ${effect.subjectId},
+        '',
+        ${effect.state}::external_effect_state,
+        ${effect.requestBytes},
+        ${effect.requestHash},
+        ${effect.leaseOwner},
+        ${effect.leaseExpiresAt},
+        ${JSON.stringify(effect.result)}::jsonb,
+        ${effect.attempts},
+        ${now},
+        ${now}
+      )
+      ON CONFLICT(consultation_id, generation, effect_kind, subject_id, occurrence_key)
+      DO NOTHING
+      RETURNING *
+    `);
+    if (inserted[0]) {
+      return mapEffect(inserted[0]);
     }
 
-    const [existing] = await database
-      .select()
-      .from(effects)
-      .where(
-        and(
-          eq(effects.consultationId, effect.consultationId),
-          eq(effects.generation, effect.generation),
-          eq(effects.effectKind, effect.kind),
-          eq(effects.subjectId, effect.subjectId),
-          eq(effects.occurrenceKey, ""),
-        ),
-      )
-      .limit(1);
-
-    if (!existing) {
+    const existing = await database.$queryRaw<EffectRow[]>(Prisma.sql`
+      SELECT *
+      FROM external_effects
+      WHERE consultation_id = ${effect.consultationId}
+        AND generation = ${effect.generation}
+        AND effect_kind = ${effect.kind}
+        AND subject_id = ${effect.subjectId}
+        AND occurrence_key = ''
+      LIMIT 1
+    `);
+    if (!existing[0]) {
       throw new DomainError("EFFECT_IDENTITY_CONFLICT");
     }
-    return mapEffect(existing);
+    return mapEffect(existing[0]);
   }
 
   async lock(effectId: UUID, tx: Transaction): Promise<ExternalEffect | null> {
-    const [row] = await unwrap(tx)
-      .select()
-      .from(effects)
-      .where(eq(effects.id, effectId))
-      .limit(1)
-      .for("update");
-    return row ? mapEffect(row) : null;
+    const rows = await unwrap(tx).$queryRaw<EffectRow[]>(Prisma.sql`
+      SELECT *
+      FROM external_effects
+      WHERE id = ${effectId}
+      LIMIT 1
+      FOR UPDATE
+    `);
+    return rows[0] ? mapEffect(rows[0]) : null;
   }
 
   async beginCall(
@@ -86,27 +90,22 @@ export class DrizzleEffectRepository implements EffectRepository {
     leaseUntil: Instant,
     tx: Transaction,
   ): Promise<boolean> {
-    const rows = await unwrap(tx)
-      .update(effects)
-      .set({
-        state: "calling",
-        requestBytes,
-        requestHash,
-        leaseOwner: owner,
-        leaseExpiresAt: leaseUntil,
-        attempts: sql`${effects.attempts} + 1`,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(effects.id, effectId),
-          or(
-            eq(effects.state, "planned"),
-            and(eq(effects.state, "calling"), lte(effects.leaseExpiresAt, new Date())),
-          ),
-        ),
-      )
-      .returning({ id: effects.id });
+    const rows = await unwrap(tx).$queryRaw<IdRow[]>(Prisma.sql`
+      UPDATE external_effects
+      SET state = 'calling',
+          request_bytes = ${requestBytes},
+          request_hash = ${requestHash},
+          lease_owner = ${owner},
+          lease_expires_at = ${leaseUntil},
+          attempts = attempts + 1,
+          updated_at = ${new Date()}
+      WHERE id = ${effectId}
+        AND (
+          state = 'planned'
+          OR (state = 'calling' AND lease_expires_at <= ${new Date()})
+        )
+      RETURNING id
+    `);
     return rows.length === 1;
   }
 
@@ -116,21 +115,16 @@ export class DrizzleEffectRepository implements EffectRepository {
     leaseUntil: Instant,
     tx: Transaction,
   ): Promise<boolean> {
-    const rows = await unwrap(tx)
-      .update(effects)
-      .set({
-        leaseOwner: owner,
-        leaseExpiresAt: leaseUntil,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(effects.id, effectId),
-          eq(effects.state, "compensating"),
-          or(sql`${effects.leaseExpiresAt} IS NULL`, lte(effects.leaseExpiresAt, new Date())),
-        ),
-      )
-      .returning({ id: effects.id });
+    const rows = await unwrap(tx).$queryRaw<IdRow[]>(Prisma.sql`
+      UPDATE external_effects
+      SET lease_owner = ${owner},
+          lease_expires_at = ${leaseUntil},
+          updated_at = ${new Date()}
+      WHERE id = ${effectId}
+        AND state = 'compensating'
+        AND (lease_expires_at IS NULL OR lease_expires_at <= ${new Date()})
+      RETURNING id
+    `);
     return rows.length === 1;
   }
 
@@ -142,28 +136,22 @@ export class DrizzleEffectRepository implements EffectRepository {
     result: unknown,
     tx: Transaction,
   ): Promise<boolean> {
-    const update =
+    const leaseUpdate =
       state === "compensating"
-        ? { state, result, updatedAt: new Date() }
-        : {
-            state,
-            result,
-            leaseOwner: null,
-            leaseExpiresAt: null,
-            updatedAt: new Date(),
-          };
-    const rows = await unwrap(tx)
-      .update(effects)
-      .set(update)
-      .where(
-        and(
-          eq(effects.id, effectId),
-          eq(effects.state, "calling"),
-          eq(effects.leaseOwner, owner),
-          eq(effects.requestHash, requestHash),
-        ),
-      )
-      .returning({ id: effects.id });
+        ? Prisma.empty
+        : Prisma.sql`, lease_owner = NULL, lease_expires_at = NULL`;
+    const rows = await unwrap(tx).$queryRaw<IdRow[]>(Prisma.sql`
+      UPDATE external_effects
+      SET state = ${state}::external_effect_state,
+          result = ${JSON.stringify(result)}::jsonb,
+          updated_at = ${new Date()}
+          ${leaseUpdate}
+      WHERE id = ${effectId}
+        AND state = 'calling'
+        AND lease_owner = ${owner}
+        AND request_hash = ${requestHash}
+      RETURNING id
+    `);
     return rows.length === 1;
   }
 
@@ -174,24 +162,19 @@ export class DrizzleEffectRepository implements EffectRepository {
     result: unknown,
     tx: Transaction,
   ): Promise<boolean> {
-    const rows = await unwrap(tx)
-      .update(effects)
-      .set({
-        state: "done",
-        compensationResult: result,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(effects.id, effectId),
-          eq(effects.state, "compensating"),
-          eq(effects.leaseOwner, owner),
-          eq(effects.requestHash, requestHash),
-        ),
-      )
-      .returning({ id: effects.id });
+    const rows = await unwrap(tx).$queryRaw<IdRow[]>(Prisma.sql`
+      UPDATE external_effects
+      SET state = 'done',
+          compensation_result = ${JSON.stringify(result)}::jsonb,
+          lease_owner = NULL,
+          lease_expires_at = NULL,
+          updated_at = ${new Date()}
+      WHERE id = ${effectId}
+        AND state = 'compensating'
+        AND lease_owner = ${owner}
+        AND request_hash = ${requestHash}
+      RETURNING id
+    `);
     return rows.length === 1;
   }
 
@@ -202,23 +185,12 @@ export class DrizzleEffectRepository implements EffectRepository {
     result: unknown,
     tx: Transaction,
   ): Promise<void> {
-    await unwrap(tx)
-      .insert(effectCompensationAttempts)
-      .values({
-        effectId,
-        owner,
-        requestHash,
-        result,
-        createdAt: new Date(),
-      })
-      .onConflictDoUpdate({
-        target: [
-          effectCompensationAttempts.effectId,
-          effectCompensationAttempts.owner,
-          effectCompensationAttempts.requestHash,
-        ],
-        set: { result: sql`excluded.result` },
-      });
+    await unwrap(tx).$executeRaw(Prisma.sql`
+      INSERT INTO effect_compensation_attempts(effect_id, owner, request_hash, result, created_at)
+      VALUES (${effectId}, ${owner}, ${requestHash}, ${JSON.stringify(result)}::jsonb, ${new Date()})
+      ON CONFLICT(effect_id, owner, request_hash)
+      DO UPDATE SET result = excluded.result
+    `);
   }
 
   async claimOutbox(
@@ -228,7 +200,7 @@ export class DrizzleEffectRepository implements EffectRepository {
     limit: number,
     tx: Transaction,
   ): Promise<readonly OutboxMessage[]> {
-    const claimed = await unwrap(tx).execute<OutboxClaimRow>(sql`
+    const claimed = await unwrap(tx).$queryRaw<OutboxClaimRow[]>(Prisma.sql`
       WITH candidates AS (
         SELECT id
         FROM outbox
@@ -247,19 +219,34 @@ export class DrizzleEffectRepository implements EffectRepository {
       WHERE claimed.id = candidates.id
       RETURNING claimed.*
     `);
-    return claimed.rows.map(mapOutbox);
+    return claimed.map(mapOutbox);
   }
 
   async enqueue(message: OutboxMessage, tx: Transaction): Promise<void> {
-    await unwrap(tx).insert(outbox).values(message).onConflictDoNothing({ target: outbox.id });
+    await unwrap(tx).$executeRaw(Prisma.sql`
+      INSERT INTO outbox(id, topic, aggregate_id, generation, payload, available_at, attempts)
+      VALUES (
+        ${message.id},
+        ${message.topic},
+        ${message.aggregateId},
+        ${message.generation},
+        ${JSON.stringify(message.payload)}::jsonb,
+        ${message.availableAt},
+        ${message.attempts}
+      )
+      ON CONFLICT(id) DO NOTHING
+    `);
   }
 
   async markOutboxDone(id: UUID, owner: UUID, at: Instant, tx: Transaction): Promise<boolean> {
-    const rows = await unwrap(tx)
-      .update(outbox)
-      .set({ deliveredAt: at, leaseOwner: null, leaseExpiresAt: null })
-      .where(and(eq(outbox.id, id), eq(outbox.leaseOwner, owner), gt(outbox.leaseExpiresAt, at)))
-      .returning({ id: outbox.id });
+    const rows = await unwrap(tx).$queryRaw<IdRow[]>(Prisma.sql`
+      UPDATE outbox
+      SET delivered_at = ${at}, lease_owner = NULL, lease_expires_at = NULL
+      WHERE id = ${id}
+        AND lease_owner = ${owner}
+        AND lease_expires_at > ${at}
+      RETURNING id
+    `);
     return rows.length === 1;
   }
 
@@ -271,21 +258,39 @@ export class DrizzleEffectRepository implements EffectRepository {
     payload: unknown,
     tx: Transaction,
   ): Promise<boolean> {
-    const rows = await unwrap(tx)
-      .insert(inbox)
-      .values({
-        source,
-        eventId,
-        occurredAt,
-        payloadHash,
-        payload,
-        receivedAt: new Date(),
-      })
-      .onConflictDoNothing()
-      .returning({ eventId: inbox.eventId });
+    const rows = await unwrap(tx).$queryRaw<{ event_id: string }[]>(Prisma.sql`
+      INSERT INTO inbox(source, event_id, occurred_at, payload_hash, payload, received_at)
+      VALUES (
+        ${source},
+        ${eventId},
+        ${occurredAt},
+        ${payloadHash},
+        ${JSON.stringify(payload)}::jsonb,
+        ${new Date()}
+      )
+      ON CONFLICT DO NOTHING
+      RETURNING event_id
+    `);
     return rows.length === 1;
   }
 }
+
+type IdRow = { id: UUID };
+
+type EffectRow = {
+  id: UUID;
+  consultation_id: UUID;
+  generation: number;
+  effect_kind: string;
+  subject_id: UUID;
+  state: ExternalEffect["state"];
+  request_bytes: Uint8Array | null;
+  request_hash: string | null;
+  lease_owner: UUID | null;
+  lease_expires_at: Date | null;
+  result: unknown;
+  attempts: number;
+};
 
 type OutboxClaimRow = {
   id: UUID;
@@ -297,18 +302,18 @@ type OutboxClaimRow = {
   attempts: number;
 };
 
-function mapEffect(row: typeof effects.$inferSelect): ExternalEffect {
+function mapEffect(row: EffectRow): ExternalEffect {
   return {
     id: row.id,
-    consultationId: row.consultationId,
+    consultationId: row.consultation_id,
     generation: row.generation,
-    kind: row.effectKind,
-    subjectId: row.subjectId,
+    kind: row.effect_kind,
+    subjectId: row.subject_id,
     state: row.state,
-    requestBytes: row.requestBytes,
-    requestHash: row.requestHash,
-    leaseOwner: row.leaseOwner,
-    leaseExpiresAt: row.leaseExpiresAt,
+    requestBytes: row.request_bytes,
+    requestHash: row.request_hash,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAt: row.lease_expires_at,
     result: row.result,
     attempts: row.attempts,
   };

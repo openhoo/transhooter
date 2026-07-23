@@ -1,7 +1,7 @@
-export { DrizzleArchiveRepository } from "./archive-repository";
-export { DrizzleConsultationRepository } from "./consultation-repository";
-export { DrizzleLanguageRepository } from "./language-repository";
+export { PrismaArchiveRepository } from "./archive-repository";
+export { PrismaConsultationRepository } from "./consultation-repository";
+export { PrismaLanguageRepository } from "./language-repository";
 export {
-  DrizzleAuditRepository,
-  DrizzleProviderSnapshotRepository,
+  PrismaAuditRepository,
+  PrismaProviderSnapshotRepository,
 } from "./provider-snapshot-audit-repositories";

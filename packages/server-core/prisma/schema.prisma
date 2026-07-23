@@ -1,0 +1,790 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ArchiveState {
+  pending
+  recording
+  reconciling
+  complete
+  incomplete
+  deleting
+  deleted
+
+  @@map("archive_state")
+}
+
+enum ConsultationState {
+  invited
+  ready
+  active
+  finalizing
+  ended
+  cancelled
+  deleted
+
+  @@map("consultation_state")
+}
+
+enum ExternalEffectState {
+  planned
+  calling
+  applied
+  compensating
+  done
+  failed
+
+  @@map("external_effect_state")
+}
+
+enum MagicLinkPurpose {
+  sign_in
+  consultation_invite
+  archive_delete_reauth
+
+  @@map("magic_link_purpose")
+}
+
+enum ParticipantRole {
+  employee
+  customer
+
+  @@map("participant_role")
+}
+
+enum StaffRole {
+  employee
+  admin
+
+  @@map("staff_role")
+}
+
+enum TerminalOutcome {
+  succeeded
+  failed
+  cancelled
+  degraded
+  unknown
+
+  @@map("terminal_outcome")
+}
+
+enum TransportKind {
+  http
+  websocket
+  grpc
+
+  @@map("transport_kind")
+}
+
+model ProviderProfile {
+  id              String                    @id(map: "provider_profiles_pkey") @db.Uuid
+  name            String                    @unique(map: "provider_profiles_name_key") @db.Text
+  enabled         Boolean                   @default(false)
+  currentRevision Int                       @map("current_revision")
+  createdAt       DateTime                  @map("created_at") @db.Timestamptz(6)
+  revisions       ProviderProfileRevision[]
+
+  @@map("provider_profiles")
+}
+
+model ProviderProfileRevision {
+  profileId           String                    @map("profile_id") @db.Uuid
+  revision            Int
+  capabilityHash      String                    @map("capability_hash") @db.Text
+  adapterBuilds       Json                      @map("adapter_builds") @db.JsonB
+  policy              Json                      @db.JsonB
+  credentialReferences Json                     @map("credential_references") @db.JsonB
+  createdAt           DateTime                  @map("created_at") @db.Timestamptz(6)
+  profile             ProviderProfile           @relation(fields: [profileId], references: [id], map: "provider_profile_revisions_profile_id_fkey")
+  languageCapabilities LanguageCapability[]
+  consultations       Consultation[]
+  roomSelections      RoomProviderSelection[]
+  expectedArtifacts   ExpectedArchiveArtifact[]
+  providerAttempts    ProviderAttempt[]
+
+  @@id([profileId, revision], map: "provider_profile_revisions_pkey")
+  @@unique([profileId, capabilityHash], map: "provider_profile_revisions_profile_id_capability_hash_key")
+  @@map("provider_profile_revisions")
+}
+
+model LanguageCapability {
+  id                  String                  @id(map: "language_capabilities_pkey") @db.Uuid
+  profileId           String                  @map("profile_id") @db.Uuid
+  revision            Int
+  sourceLocale        String                  @map("source_locale") @db.Text
+  targetLocale        String                  @map("target_locale") @db.Text
+  mode                String                  @db.Text
+  sttProvider         String                  @map("stt_provider") @db.Text
+  sttEndpoint         String                  @map("stt_endpoint") @db.Text
+  sttModel            String                  @map("stt_model") @db.Text
+  sttEncoding         String                  @map("stt_encoding") @db.Text
+  sttLimits           Json                    @map("stt_limits") @db.JsonB
+  translationProvider String?                 @map("translation_provider") @db.Text
+  translationEndpoint String?                 @map("translation_endpoint") @db.Text
+  translationModel    String?                 @map("translation_model") @db.Text
+  translationCode     String?                 @map("translation_code") @db.Text
+  ttsProvider         String?                 @map("tts_provider") @db.Text
+  ttsEndpoint         String?                 @map("tts_endpoint") @db.Text
+  ttsModel            String?                 @map("tts_model") @db.Text
+  ttsVoice            String?                 @map("tts_voice") @db.Text
+  ttsFormat           String?                 @map("tts_format") @db.Text
+  ttsLimits           Json?                   @map("tts_limits") @db.JsonB
+  region              String                  @db.Text
+  adapterVersion      String                  @map("adapter_version") @db.Text
+  capabilityVersion   String                  @map("capability_version") @db.Text
+  capabilityHash      String                  @map("capability_hash") @db.Text
+  enabled             Boolean
+  freshUntil          DateTime                @map("fresh_until") @db.Timestamptz(6)
+  snapshot            Json                    @db.JsonB
+  profileRevision     ProviderProfileRevision @relation(fields: [profileId, revision], references: [profileId, revision], map: "language_capabilities_profile_id_revision_fkey")
+  participants        ConsultationParticipant[]
+
+  @@unique([profileId, revision, sourceLocale, targetLocale, mode], map: "language_capabilities_profile_id_revision_source_locale_tar_key")
+  @@map("language_capabilities")
+}
+
+model User {
+  id                    String                    @id(map: "users_pkey") @db.Uuid
+  email                 String                    @unique(map: "users_email_key") @db.Text
+  displayName           String                    @map("display_name") @db.Text
+  staffRole             StaffRole?                @map("staff_role")
+  piiErasedAt           DateTime?                 @map("pii_erased_at") @db.Timestamptz(6)
+  createdAt             DateTime                  @map("created_at") @db.Timestamptz(6)
+  participants          ConsultationParticipant[]
+  employeeConsultations Consultation[]            @relation("ConsultationEmployee")
+  magicLinks            MagicLink[]
+  sessions              Session[]                 @relation("SessionUser")
+  legalHoldsPlaced      LegalHold[]               @relation("LegalHoldActor")
+  legalHoldsReleased    LegalHold[]               @relation("LegalHoldReleasedBy")
+  auditEvents           AuditEvent[]
+
+  @@map("users")
+}
+
+model Consultation {
+  id                     String                    @id(map: "consultations_pkey") @db.Uuid
+  state                  ConsultationState         @default(invited)
+  providerProfileId      String                    @map("provider_profile_id") @db.Uuid
+  providerProfileRevision Int                       @map("provider_profile_revision")
+  providerSelection      Json?                     @map("provider_selection") @db.JsonB
+  snapshotHash           String?                   @map("snapshot_hash") @db.Text
+  generation             Int                       @default(0)
+  roomName               String?                   @unique(map: "consultations_room_name_key") @map("room_name") @db.Text
+  roomSid                String?                   @map("room_sid") @db.Text
+  workerIdentity         String?                   @unique(map: "consultations_worker_identity_key") @map("worker_identity") @db.Uuid
+  dispatchId             String?                   @map("dispatch_id") @db.Text
+  compositeEgressId      String?                   @map("composite_egress_id") @db.Text
+  readyDeadlineAt        DateTime?                 @map("ready_deadline_at") @db.Timestamptz(6)
+  finalizeDeadlineAt     DateTime?                 @map("finalize_deadline_at") @db.Timestamptz(6)
+  bothAbsentSince        DateTime?                 @map("both_absent_since") @db.Timestamptz(6)
+  admissionFencedAt      DateTime?                 @map("admission_fenced_at") @db.Timestamptz(6)
+  effectGeneration       Int                       @default(0) @map("effect_generation")
+  employeeUserId         String?                   @map("employee_user_id") @db.Uuid
+  creationIdempotencyKey String?                   @map("creation_idempotency_key") @db.Text
+  presenceEpoch          BigInt                    @default(0) @map("presence_epoch") @db.BigInt
+  createdAt              DateTime                  @map("created_at") @db.Timestamptz(6)
+  updatedAt              DateTime                  @map("updated_at") @db.Timestamptz(6)
+  deletedAt              DateTime?                 @map("deleted_at") @db.Timestamptz(6)
+  profileRevision        ProviderProfileRevision   @relation(fields: [providerProfileId, providerProfileRevision], references: [profileId, revision], map: "consultations_provider_profile_id_provider_profile_revisio_fkey")
+  employee               User?                     @relation("ConsultationEmployee", fields: [employeeUserId], references: [id], map: "consultations_employee_user_id_fkey")
+  participants           ConsultationParticipant[]
+  roomProviderSelection  RoomProviderSelection?
+  magicLinks             MagicLink[]
+  reauthSessions         Session[]                 @relation("SessionReauthConsultation")
+  externalEffects        ExternalEffect[]
+  egressJobs             EgressJob[]
+  archive                Archive?
+  orchestrationDeadlines OrchestrationDeadline[]
+  workerCheckpoints      WorkerCheckpoint[]        @relation("WorkerCheckpointConsultation")
+  workerJobEpochs        WorkerJobEpoch[]
+  workerReservations     WorkerReservation[]
+  captionEntries         CaptionLedger[]
+
+  @@unique([employeeUserId, creationIdempotencyKey], map: "consultations_employee_user_id_creation_idempotency_key_key")
+  @@map("consultations")
+}
+
+model ConsultationParticipant {
+  id                       String             @id(map: "consultation_participants_pkey") @db.Uuid
+  consultationId           String             @map("consultation_id") @db.Uuid
+  userId                   String             @map("user_id") @db.Uuid
+  role                     ParticipantRole
+  livekitIdentity          String             @unique(map: "consultation_participants_livekit_identity_key") @map("livekit_identity") @db.Uuid
+  displayName              String?            @map("display_name") @db.Text
+  language                 String?            @db.Text
+  capabilityRowId          String?            @map("capability_row_id") @db.Uuid
+  consentVersion           Int?               @map("consent_version")
+  consentCopyHash          String?            @map("consent_copy_hash") @db.Text
+  consentSnapshotHash      String?            @map("consent_snapshot_hash") @db.Text
+  consentedAt              DateTime?          @map("consented_at") @db.Timestamptz(6)
+  present                  Boolean            @default(false)
+  presenceEventId          String?            @map("presence_event_id") @db.Text
+  presenceEventTime        DateTime?          @map("presence_event_time") @db.Timestamptz(6)
+  absenceOrder             BigInt             @default(0) @map("absence_order") @db.BigInt
+  readyOrder               BigInt             @default(0) @map("ready_order") @db.BigInt
+  finalizeOrder            BigInt             @default(0) @map("finalize_order") @db.BigInt
+  publicationGranted       Boolean            @default(false) @map("publication_granted")
+  participantEgressId      String?            @map("participant_egress_id") @db.Text
+  joinedAt                 DateTime?          @map("joined_at") @db.Timestamptz(6)
+  disconnectedAt           DateTime?          @map("disconnected_at") @db.Timestamptz(6)
+  consultation             Consultation       @relation(fields: [consultationId], references: [id], map: "consultation_participants_consultation_id_fkey")
+  user                     User               @relation(fields: [userId], references: [id], map: "consultation_participants_user_id_fkey")
+  capability               LanguageCapability? @relation(fields: [capabilityRowId], references: [id], map: "consultation_participants_capability_row_id_fkey")
+  sourceCheckpoints        WorkerCheckpoint[] @relation("WorkerCheckpointSourceParticipant")
+  destinationCheckpoints   WorkerCheckpoint[] @relation("WorkerCheckpointDestinationParticipant")
+
+  @@unique([consultationId, id], map: "consultation_participants_consultation_id_id_key")
+  @@unique([consultationId, role], map: "consultation_participants_consultation_id_role_key")
+  @@unique([consultationId, userId], map: "consultation_participants_consultation_id_user_id_key")
+  @@map("consultation_participants")
+}
+
+model RoomProviderSelection {
+  consultationId String                  @id(map: "room_provider_selections_pkey") @map("consultation_id") @db.Uuid
+  profileId      String                  @map("profile_id") @db.Uuid
+  profileRevision Int                    @map("profile_revision")
+  capabilityHash String                  @map("capability_hash") @db.Text
+  selectionHash  String                  @unique(map: "room_provider_selections_selection_hash_key") @map("selection_hash") @db.Text
+  selection      Json                    @db.JsonB
+  createdAt      DateTime                @map("created_at") @db.Timestamptz(6)
+  consultation   Consultation            @relation(fields: [consultationId], references: [id], map: "room_provider_selections_consultation_id_fkey")
+  profile        ProviderProfileRevision @relation(fields: [profileId, profileRevision], references: [profileId, revision], map: "room_provider_selections_profile_id_profile_revision_fkey")
+
+  @@map("room_provider_selections")
+}
+
+model MagicLink {
+  id               String           @id(map: "magic_links_pkey") @db.Uuid
+  userId           String?          @map("user_id") @db.Uuid
+  consultationId   String?          @map("consultation_id") @db.Uuid
+  sessionId        String?          @map("session_id") @db.Uuid
+  purpose          MagicLinkPurpose
+  tokenHash        String           @unique(map: "magic_links_token_hash_key") @map("token_hash") @db.Text
+  expiresAt        DateTime         @map("expires_at") @db.Timestamptz(6)
+  consumedAt       DateTime?        @map("consumed_at") @db.Timestamptz(6)
+  revokedAt        DateTime?        @map("revoked_at") @db.Timestamptz(6)
+  createdAt        DateTime         @map("created_at") @db.Timestamptz(6)
+  sealedRawToken   String           @map("sealed_raw_token") @db.Text
+  sealedTokenKeyId String           @map("sealed_token_key_id") @db.Text
+  user             User?            @relation(fields: [userId], references: [id], map: "magic_links_user_id_fkey")
+  consultation     Consultation?    @relation(fields: [consultationId], references: [id], map: "magic_links_consultation_id_fkey")
+  session          Session?         @relation(fields: [sessionId], references: [id], map: "magic_links_session_fk")
+  pendingExchanges PendingExchange[]
+
+  @@map("magic_links")
+}
+
+model PendingExchange {
+  id          String    @id(map: "pending_exchanges_pkey") @db.Uuid
+  magicLinkId String    @map("magic_link_id") @db.Uuid
+  nonceHash   String    @unique(map: "pending_exchanges_nonce_hash_key") @map("nonce_hash") @db.Text
+  csrfHash    String    @map("csrf_hash") @db.Text
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  consumedAt  DateTime? @map("consumed_at") @db.Timestamptz(6)
+  createdAt   DateTime  @map("created_at") @db.Timestamptz(6)
+  magicLink   MagicLink @relation(fields: [magicLinkId], references: [id], map: "pending_exchanges_magic_link_id_fkey")
+
+  @@map("pending_exchanges")
+}
+
+model Session {
+  id                   String         @id(map: "sessions_pkey") @db.Uuid
+  userId               String         @map("user_id") @db.Uuid
+  tokenHash            String         @unique(map: "sessions_token_hash_key") @map("token_hash") @db.Text
+  csrfHash             String         @map("csrf_hash") @db.Text
+  expiresAt            DateTime       @map("expires_at") @db.Timestamptz(6)
+  reauthenticatedAt    DateTime?      @map("reauthenticated_at") @db.Timestamptz(6)
+  reauthConsultationId String?        @map("reauth_consultation_id") @db.Uuid
+  revokedAt            DateTime?      @map("revoked_at") @db.Timestamptz(6)
+  replacedBy           String?        @map("replaced_by") @db.Uuid
+  createdAt            DateTime       @map("created_at") @db.Timestamptz(6)
+  user                 User           @relation("SessionUser", fields: [userId], references: [id], map: "sessions_user_id_fkey")
+  reauthConsultation   Consultation?  @relation("SessionReauthConsultation", fields: [reauthConsultationId], references: [id], map: "sessions_reauth_consultation_id_fkey")
+  replacement          Session?       @relation("SessionReplacement", fields: [replacedBy], references: [id], map: "sessions_replaced_by_fkey")
+  replacedSessions     Session[]      @relation("SessionReplacement")
+  magicLinks           MagicLink[]
+  legalHolds           LegalHold[]
+
+  @@map("sessions")
+}
+
+model MagicLinkRequest {
+  id          BigInt   @id(map: "magic_link_requests_pkey") @default(autoincrement()) @db.BigInt
+  emailHash   String?  @map("email_hash") @db.Text
+  ipHash      String   @map("ip_hash") @db.Text
+  requestedAt DateTime @map("requested_at") @db.Timestamptz(6)
+
+  @@index([emailHash, requestedAt], map: "magic_link_email_rate_idx")
+  @@index([ipHash, requestedAt], map: "magic_link_ip_rate_idx")
+  @@index([requestedAt], map: "magic_link_requested_at_idx")
+  @@map("magic_link_requests")
+}
+
+model WorkerLease {
+  workerId               String              @id(map: "worker_leases_pkey") @map("worker_id") @db.Uuid
+  acceptingLoad          Boolean             @map("accepting_load")
+  capacity               Int
+  reserved               Int
+  encryptedSpoolPercent  Decimal             @map("encrypted_spool_percent") @db.Decimal(5, 2)
+  providersOk            Boolean             @map("providers_ok")
+  archiveOk              Boolean             @map("archive_ok")
+  heartbeatAt            DateTime            @map("heartbeat_at") @db.Timestamptz(6)
+  expiresAt              DateTime            @map("expires_at") @db.Timestamptz(6)
+  epoch                  BigInt              @db.BigInt
+  status                 Json                @db.JsonB
+  jobEpochs              WorkerJobEpoch[]
+  reservations           WorkerReservation[]
+
+  @@map("worker_leases")
+}
+
+model WorkerReservation {
+  consultationId          String             @map("consultation_id") @db.Uuid
+  generation              Int
+  workerId                String             @map("worker_id") @db.Uuid
+  epoch                   BigInt             @db.BigInt
+  selectionHash           String             @map("selection_hash") @db.Text
+  reservedAt              DateTime           @map("reserved_at") @db.Timestamptz(6)
+  heartbeatAt             DateTime           @map("heartbeat_at") @db.Timestamptz(6)
+  leaseExpiresAt          DateTime           @map("lease_expires_at") @db.Timestamptz(6)
+  acceptingLoad           Boolean            @map("accepting_load")
+  fencedAt                DateTime?          @map("fenced_at") @db.Timestamptz(6)
+  fenceReason             String?            @map("fence_reason") @db.Text
+  supervisorOwner         String?            @map("supervisor_owner") @db.Uuid
+  supervisorLeaseExpiresAt DateTime?         @map("supervisor_lease_expires_at") @db.Timestamptz(6)
+  releasedAt              DateTime?          @map("released_at") @db.Timestamptz(6)
+  consultation            Consultation       @relation(fields: [consultationId], references: [id], map: "worker_reservations_consultation_id_fkey")
+  worker                  WorkerLease        @relation(fields: [workerId], references: [workerId], map: "worker_reservations_worker_id_fkey")
+  checkpoints             WorkerCheckpoint[]
+
+  @@id([consultationId, generation], map: "worker_reservations_pkey")
+  @@unique([consultationId, generation, workerId, epoch], map: "worker_reservations_consultation_id_generation_worker_id_ep_key")
+  @@map("worker_reservations")
+}
+
+model WorkerCheckpoint {
+  id                       String                   @id(map: "worker_checkpoints_pkey") @db.Uuid
+  consultationId           String                   @map("consultation_id") @db.Uuid
+  generation               Int
+  workerId                 String                   @map("worker_id") @db.Uuid
+  workerEpoch              BigInt                   @map("worker_epoch") @db.BigInt
+  writeEpoch               Int                      @map("write_epoch")
+  sourceParticipantId      String                   @map("source_participant_id") @db.Uuid
+  destinationParticipantId String                   @map("destination_participant_id") @db.Uuid
+  acceptedInputSequence    BigInt                   @map("accepted_input_sequence") @db.BigInt
+  acceptedInput            BigInt                   @map("accepted_input") @db.BigInt
+  receivedOutput           BigInt                   @map("received_output") @db.BigInt
+  emittedOutput            BigInt                   @map("emitted_output") @db.BigInt
+  previousHash             String?                  @map("previous_hash") @db.Text
+  checkpointHash           String                   @unique(map: "worker_checkpoints_checkpoint_hash_key") @map("checkpoint_hash") @db.Text
+  expectedIds              Json                     @map("expected_ids") @db.JsonB
+  observedIds              Json                     @map("observed_ids") @db.JsonB
+  gaps                     Json                     @db.JsonB
+  terminal                 Boolean
+  objectKey                String                   @map("object_key") @db.Text
+  objectVersionId          String?                  @map("object_version_id") @db.Text
+  createdAt                DateTime                 @map("created_at") @db.Timestamptz(6)
+  consultation             Consultation             @relation("WorkerCheckpointConsultation", fields: [consultationId], references: [id], map: "worker_checkpoints_consultation_id_fkey")
+  reservation              WorkerReservation        @relation(fields: [consultationId, generation, workerId, workerEpoch], references: [consultationId, generation, workerId, epoch], map: "worker_checkpoints_consultation_id_generation_worker_id_wo_fkey")
+  sourceParticipant        ConsultationParticipant  @relation("WorkerCheckpointSourceParticipant", fields: [consultationId, sourceParticipantId], references: [consultationId, id], map: "worker_checkpoints_source_participant_fkey")
+  destinationParticipant   ConsultationParticipant  @relation("WorkerCheckpointDestinationParticipant", fields: [consultationId, destinationParticipantId], references: [consultationId, id], map: "worker_checkpoints_destination_participant_fkey")
+  terminalForJobEpochs     WorkerJobEpoch[]
+
+  @@unique([consultationId, workerEpoch, sourceParticipantId, destinationParticipantId, acceptedInputSequence, acceptedInput, receivedOutput, emittedOutput], map: "worker_checkpoints_direction_watermarks_key")
+  @@map("worker_checkpoints")
+}
+
+model WorkerJobEpoch {
+  consultationId      String            @map("consultation_id") @db.Uuid
+  generation          Int
+  workerId            String            @map("worker_id") @db.Uuid
+  epoch               BigInt            @db.BigInt
+  writeEpoch          Int               @default(0) @map("write_epoch")
+  heartbeatAt         DateTime          @map("heartbeat_at") @db.Timestamptz(6)
+  fencedAt            DateTime?         @map("fenced_at") @db.Timestamptz(6)
+  terminalCheckpointId String?          @map("terminal_checkpoint_id") @db.Uuid
+  terminalOutcome     String?           @map("terminal_outcome") @db.Text
+  terminalAt          DateTime?         @map("terminal_at") @db.Timestamptz(6)
+  consultation        Consultation      @relation(fields: [consultationId], references: [id], map: "worker_job_epochs_consultation_id_fkey")
+  worker              WorkerLease       @relation(fields: [workerId], references: [workerId], map: "worker_job_epochs_worker_id_fkey")
+  terminalCheckpoint  WorkerCheckpoint? @relation(fields: [terminalCheckpointId], references: [id], map: "worker_job_terminal_checkpoint_fk")
+
+  @@id([consultationId, generation, epoch], map: "worker_job_epochs_pkey")
+  @@unique([consultationId, workerId, epoch], map: "worker_job_epochs_worker_id_epoch_consultation_id_key")
+  @@map("worker_job_epochs")
+}
+
+model ExternalEffect {
+  id                   String                    @id(map: "external_effects_pkey") @db.Uuid
+  consultationId       String                    @map("consultation_id") @db.Uuid
+  generation           Int
+  effectKind           String                    @map("effect_kind") @db.Text
+  subjectId            String                    @map("subject_id") @db.Uuid
+  state                ExternalEffectState
+  requestBytes         Bytes?                    @map("request_bytes") @db.ByteA
+  requestHash          String?                   @map("request_hash") @db.Text
+  leaseOwner           String?                   @map("lease_owner") @db.Uuid
+  leaseExpiresAt       DateTime?                 @map("lease_expires_at") @db.Timestamptz(6)
+  result               Json?                     @db.JsonB
+  attempts             Int                       @default(0)
+  compensationResult   Json?                     @map("compensation_result") @db.JsonB
+  createdAt            DateTime                  @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime                  @map("updated_at") @db.Timestamptz(6)
+  occurrenceKey        String                    @default("") @map("occurrence_key") @db.Text
+  consultation         Consultation              @relation(fields: [consultationId], references: [id], map: "external_effects_consultation_id_fkey")
+  compensationAttempts EffectCompensationAttempt[]
+  expectedArtifact     ExpectedArchiveArtifact?
+
+  @@unique([consultationId, generation, effectKind, subjectId, occurrenceKey], map: "external_effect_occurrence_unique")
+  @@map("external_effects")
+}
+
+model EffectCompensationAttempt {
+  id          BigInt         @id(map: "effect_compensation_attempts_pkey") @default(autoincrement()) @db.BigInt
+  effectId    String         @map("effect_id") @db.Uuid
+  owner       String         @db.Uuid
+  requestHash String         @map("request_hash") @db.Text
+  result      Json           @db.JsonB
+  createdAt   DateTime       @map("created_at") @db.Timestamptz(6)
+  effect      ExternalEffect @relation(fields: [effectId], references: [id], map: "effect_compensation_attempts_effect_id_fkey")
+
+  @@unique([effectId, owner, requestHash], map: "effect_compensation_attempts_effect_id_owner_request_hash_key")
+  @@map("effect_compensation_attempts")
+}
+
+model Outbox {
+  id             String    @id(map: "outbox_pkey") @db.Uuid
+  topic          String    @db.Text
+  aggregateId    String    @map("aggregate_id") @db.Uuid
+  generation     Int
+  payload        Json      @db.JsonB
+  availableAt    DateTime  @map("available_at") @db.Timestamptz(6)
+  attempts       Int       @default(0)
+  leaseOwner     String?   @map("lease_owner") @db.Uuid
+  leaseExpiresAt DateTime? @map("lease_expires_at") @db.Timestamptz(6)
+  deliveredAt    DateTime? @map("delivered_at") @db.Timestamptz(6)
+
+  @@map("outbox")
+}
+
+model EgressJob {
+  id                 String                   @id(map: "egress_jobs_pkey") @db.Uuid
+  consultationId     String                   @map("consultation_id") @db.Uuid
+  generation         Int
+  kind               String                   @db.Text
+  subjectId          String                   @map("subject_id") @db.Uuid
+  egressId           String?                  @unique(map: "egress_jobs_egress_id_key") @map("egress_id") @db.Text
+  requestHash        String                   @map("request_hash") @db.Text
+  state              String                   @db.Text
+  outputPrefix       String                   @map("output_prefix") @db.Text
+  startedAt          DateTime?                @map("started_at") @db.Timestamptz(6)
+  terminalAt         DateTime?                @map("terminal_at") @db.Timestamptz(6)
+  terminalResult     Json?                    @map("terminal_result") @db.JsonB
+  expectedArtifactId String?                  @map("expected_artifact_id") @db.Uuid
+  createdAt          DateTime                 @map("created_at") @db.Timestamptz(6)
+  consultation       Consultation             @relation(fields: [consultationId], references: [id], map: "egress_jobs_consultation_id_fkey")
+  expectedArtifact   ExpectedArchiveArtifact? @relation(fields: [expectedArtifactId], references: [id], map: "egress_expected_artifact_fk")
+
+  @@unique([consultationId, generation, kind, subjectId], map: "egress_jobs_consultation_id_generation_kind_subject_id_key")
+  @@map("egress_jobs")
+}
+
+model Archive {
+  id                          String                    @id(map: "archives_pkey") @db.Uuid
+  consultationId              String                    @unique(map: "archives_consultation_id_key") @map("consultation_id") @db.Uuid
+  state                       ArchiveState              @default(pending)
+  writeEpoch                  Int                       @default(0) @map("write_epoch")
+  finalInventoryHash          String?                   @map("final_inventory_hash") @db.Text
+  reconciliationDeadlineAt    DateTime?                 @map("reconciliation_deadline_at") @db.Timestamptz(6)
+  deletionFailure             Json?                     @map("deletion_failure") @db.JsonB
+  completedDeletionEpoch      Int?                      @map("completed_deletion_epoch")
+  deletedAt                   DateTime?                 @map("deleted_at") @db.Timestamptz(6)
+  holdOperationId             String?                   @map("hold_operation_id") @db.Uuid
+  holdOperationOwner          String?                   @map("hold_operation_owner") @db.Uuid
+  holdOperationKind           String?                   @map("hold_operation_kind") @db.Text
+  holdOperationStartedAt      DateTime?                 @map("hold_operation_started_at") @db.Timestamptz(6)
+  holdOperationLeaseExpiresAt DateTime?                 @map("hold_operation_lease_expires_at") @db.Timestamptz(6)
+  createdAt                   DateTime                  @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime                  @map("updated_at") @db.Timestamptz(6)
+  consultation                Consultation              @relation(fields: [consultationId], references: [id], map: "archives_consultation_id_fkey")
+  objects                     ArchiveObject[]
+  expectedArtifacts           ExpectedArchiveArtifact[]
+  multipartUploads            MultipartUpload[]
+  providerAttempts            ProviderAttempt[]
+  finalInventory              FinalInventory?
+  inventorySupplements        InventorySupplement[]     @relation("InventorySupplementArchive")
+  legalHolds                  LegalHold[]
+  deletionScans               DeletionScan[]
+
+  @@unique([id, consultationId], map: "archives_id_consultation_id_key")
+  @@map("archives")
+}
+
+model ExpectedArchiveArtifact {
+  id                String                   @id(map: "expected_archive_artifacts_pkey") @db.Uuid
+  archiveId         String                   @map("archive_id") @db.Uuid
+  effectId          String?                  @unique(map: "expected_archive_artifacts_effect_id_key") @map("effect_id") @db.Uuid
+  profileId         String                   @map("profile_id") @db.Uuid
+  profileRevision   Int                      @map("profile_revision")
+  objectClass       String                   @map("object_class") @db.Text
+  causalKey         String                   @map("causal_key") @db.Text
+  sampleStart       BigInt?                  @map("sample_start") @db.BigInt
+  sampleEnd         BigInt?                  @map("sample_end") @db.BigInt
+  segmentStart      Int?                     @map("segment_start")
+  segmentEnd        Int?                     @map("segment_end")
+  ownerEpoch        BigInt                   @map("owner_epoch") @db.BigInt
+  disposition       String                   @default("expected") @db.Text
+  fulfilledObjectId String?                  @map("fulfilled_object_id") @db.Uuid
+  createdAt         DateTime                 @map("created_at") @db.Timestamptz(6)
+  archive           Archive                  @relation(fields: [archiveId], references: [id], map: "expected_archive_artifacts_archive_id_fkey")
+  effect            ExternalEffect?          @relation(fields: [effectId], references: [id], map: "expected_archive_artifacts_effect_id_fkey")
+  profile           ProviderProfileRevision  @relation(fields: [profileId, profileRevision], references: [profileId, revision], map: "expected_archive_artifacts_profile_id_profile_revision_fkey")
+  fulfilledObject   ArchiveObject?           @relation("ExpectedFulfilledObject", fields: [fulfilledObjectId], references: [id], map: "expected_fulfilled_object_fk")
+  egressJobs        EgressJob[]
+
+  @@unique([archiveId, objectClass, causalKey], map: "expected_archive_artifacts_archive_id_object_class_causal_k_key")
+  @@map("expected_archive_artifacts")
+}
+
+model ArchiveObject {
+  id                         String                    @id(map: "archive_objects_pkey") @db.Uuid
+  archiveId                  String                    @map("archive_id") @db.Uuid
+  objectClass                String                    @map("object_class") @db.Text
+  causalKey                  String                    @map("causal_key") @db.Text
+  key                        String                    @db.Text
+  versionId                  String                    @map("version_id") @db.Text
+  size                       BigInt                    @db.BigInt
+  sha256                     String                    @db.Text
+  s3Checksum                 String                    @map("s3_checksum") @db.Text
+  contentType                String                    @map("content_type") @db.Text
+  sampleStart                BigInt?                   @map("sample_start") @db.BigInt
+  sampleEnd                  BigInt?                   @map("sample_end") @db.BigInt
+  attempt                    Int?
+  sequence                   BigInt?                   @db.BigInt
+  writerEpoch                Int                       @map("writer_epoch")
+  createdAt                  DateTime                  @map("created_at") @db.Timestamptz(6)
+  archive                    Archive                   @relation(fields: [archiveId], references: [id], map: "archive_objects_archive_id_fkey")
+  fulfilledExpectedArtifacts ExpectedArchiveArtifact[] @relation("ExpectedFulfilledObject")
+  finalInventories           FinalInventory[]
+  inventorySupplements       InventorySupplement[]
+  captionEntries             CaptionLedger[]
+
+  @@unique([archiveId, objectClass, attempt, sequence], map: "archive_objects_archive_id_object_class_attempt_sequence_key")
+  @@unique([key, versionId], map: "archive_objects_key_version_id_key")
+  @@map("archive_objects")
+}
+
+model MultipartUpload {
+  id          String          @id(map: "multipart_uploads_pkey") @db.Uuid
+  archiveId   String          @map("archive_id") @db.Uuid
+  key         String          @db.Text
+  uploadId    String          @unique(map: "multipart_uploads_upload_id_key") @map("upload_id") @db.Text
+  size        BigInt          @db.BigInt
+  state       String          @db.Text
+  checksum    String          @db.Text
+  writerEpoch Int             @map("writer_epoch")
+  createdAt   DateTime        @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime        @map("updated_at") @db.Timestamptz(6)
+  archive     Archive         @relation(fields: [archiveId], references: [id], map: "multipart_uploads_archive_id_fkey")
+  parts       MultipartPart[]
+
+  @@map("multipart_uploads")
+}
+
+model MultipartPart {
+  uploadId   String          @map("upload_id") @db.Uuid
+  partNumber Int             @map("part_number")
+  etag       String          @db.Text
+  checksum   String          @db.Text
+  size       BigInt          @db.BigInt
+  uploadedAt DateTime        @map("uploaded_at") @db.Timestamptz(6)
+  upload     MultipartUpload @relation(fields: [uploadId], references: [id], map: "multipart_parts_upload_id_fkey")
+
+  @@id([uploadId, partNumber], map: "multipart_parts_pkey")
+  @@map("multipart_parts")
+}
+
+model ProviderAttempt {
+  id                      String                  @id(map: "provider_attempts_pkey") @db.Uuid
+  archiveId               String                  @map("archive_id") @db.Uuid
+  consultationId          String                  @map("consultation_id") @db.Uuid
+  profileId               String                  @map("profile_id") @db.Uuid
+  profileRevision         Int                     @map("profile_revision")
+  stage                   String                  @db.Text
+  provider                String                  @db.Text
+  directionId             String                  @map("direction_id") @db.Uuid
+  operationId             String                  @map("operation_id") @db.Uuid
+  attemptNumber           Int                     @map("attempt_number")
+  retryOf                 String?                 @map("retry_of") @db.Uuid
+  credentialReference     String                  @map("credential_reference") @db.Text
+  credentialVersion       String                  @map("credential_version") @db.Text
+  credentialFingerprint   String                  @map("credential_fingerprint") @db.Text
+  endpoint                String                  @db.Text
+  apiVersion              String                  @map("api_version") @db.Text
+  model                   String                  @db.Text
+  voice                   String?                 @db.Text
+  outcome                 TerminalOutcome?
+  errorKind               String?                 @map("error_kind") @db.Text
+  errorScope              String?                 @map("error_scope") @db.Text
+  providerRetryAdvice     String?                 @map("provider_retry_advice") @db.Text
+  providerCode            String?                 @map("provider_code") @db.Text
+  providerRequestId       String?                 @map("provider_request_id") @db.Text
+  retryDelayMs            Int?                    @map("retry_delay_ms")
+  acceptedInputWatermark  BigInt?                 @map("accepted_input_watermark") @db.BigInt
+  receivedOutputWatermark BigInt?                 @map("received_output_watermark") @db.BigInt
+  emittedOutputWatermark  BigInt?                 @map("emitted_output_watermark") @db.BigInt
+  retryDecision           Json?                   @map("retry_decision") @db.JsonB
+  transport               TransportKind?
+  rawHttp                 Json?                   @map("raw_http") @db.JsonB
+  rawWebsocket            Json?                   @map("raw_websocket") @db.JsonB
+  rawGrpc                 Json?                   @map("raw_grpc") @db.JsonB
+  terminalHash            String?                 @unique(map: "provider_attempts_terminal_hash_key") @map("terminal_hash") @db.Text
+  startedAt               DateTime                @map("started_at") @db.Timestamptz(6)
+  terminalAt              DateTime?               @map("terminal_at") @db.Timestamptz(6)
+  archive                 Archive                 @relation(fields: [archiveId, consultationId], references: [id, consultationId], map: "provider_attempts_archive_consultation_fkey")
+  retriedAttempt          ProviderAttempt?        @relation("ProviderAttemptRetry", fields: [retryOf], references: [id], map: "provider_attempts_retry_of_fkey")
+  retries                 ProviderAttempt[]       @relation("ProviderAttemptRetry")
+  profile                 ProviderProfileRevision @relation(fields: [profileId, profileRevision], references: [profileId, revision], map: "provider_attempts_profile_id_profile_revision_fkey")
+
+  @@unique([consultationId, directionId, operationId, attemptNumber], map: "provider_attempts_consultation_id_direction_id_operation_id_key")
+  @@map("provider_attempts")
+}
+
+model FinalInventory {
+  archiveId      String                @id(map: "final_inventories_pkey") @map("archive_id") @db.Uuid
+  status         String                @db.Text
+  inventory      Json                  @db.JsonB
+  sha256         String                @unique(map: "final_inventories_sha256_key") @db.Text
+  objectId       String?               @map("object_id") @db.Uuid
+  roomClose      Json                  @map("room_close") @db.JsonB
+  workerTerminal Json                  @map("worker_terminal") @db.JsonB
+  egressResults  Json                  @map("egress_results") @db.JsonB
+  missing        Json                  @db.JsonB
+  errors         Json                  @db.JsonB
+  createdAt      DateTime              @map("created_at") @db.Timestamptz(6)
+  archive        Archive               @relation(fields: [archiveId], references: [id], map: "final_inventories_archive_id_fkey")
+  object         ArchiveObject?        @relation(fields: [objectId], references: [id], map: "final_inventories_object_id_fkey")
+  supplements    InventorySupplement[]
+
+  @@map("final_inventories")
+}
+
+model InventorySupplement {
+  id                   String          @id(map: "inventory_supplements_pkey") @db.Uuid
+  archiveId            String          @map("archive_id") @db.Uuid
+  finalInventorySha256 String          @map("final_inventory_sha256") @db.Text
+  supplement           Json            @db.JsonB
+  sha256               String          @unique(map: "inventory_supplements_sha256_key") @db.Text
+  objectId             String?         @map("object_id") @db.Uuid
+  createdAt            DateTime        @map("created_at") @db.Timestamptz(6)
+  archive              Archive         @relation("InventorySupplementArchive", fields: [archiveId], references: [id], map: "inventory_supplements_archive_id_fkey")
+  object               ArchiveObject?  @relation(fields: [objectId], references: [id], map: "inventory_supplements_object_id_fkey")
+  finalInventory       FinalInventory  @relation(fields: [archiveId], references: [archiveId], map: "inventory_supplements_archive_id_fkey1")
+
+  @@map("inventory_supplements")
+}
+
+model LegalHold {
+  id                String    @id(map: "legal_holds_pkey") @db.Uuid
+  archiveId         String    @map("archive_id") @db.Uuid
+  reason            String    @db.Text
+  actorId           String    @map("actor_id") @db.Uuid
+  sessionId         String    @map("session_id") @db.Uuid
+  reauthenticatedAt DateTime  @map("reauthenticated_at") @db.Timestamptz(6)
+  state             String    @default("applying") @db.Text
+  placedAt          DateTime  @map("placed_at") @db.Timestamptz(6)
+  releasedAt        DateTime? @map("released_at") @db.Timestamptz(6)
+  releasedBy        String?   @map("released_by") @db.Uuid
+  aggregateResult   Json?     @map("aggregate_result") @db.JsonB
+  perVersionResults Json?     @map("per_version_results") @db.JsonB
+  archive           Archive   @relation(fields: [archiveId], references: [id], map: "legal_holds_archive_id_fkey")
+  actor             User      @relation("LegalHoldActor", fields: [actorId], references: [id], map: "legal_holds_actor_id_fkey")
+  session           Session   @relation(fields: [sessionId], references: [id], map: "legal_holds_session_id_fkey")
+  releaser          User?     @relation("LegalHoldReleasedBy", fields: [releasedBy], references: [id], map: "legal_holds_released_by_fkey")
+
+  @@map("legal_holds")
+}
+
+model DeletionScan {
+  id               String   @id(map: "deletion_scans_pkey") @db.Uuid
+  archiveId        String   @map("archive_id") @db.Uuid
+  writeEpoch       Int      @map("write_epoch")
+  versionCount     BigInt   @map("version_count") @db.BigInt
+  multipartCount   BigInt   @map("multipart_count") @db.BigInt
+  consecutiveEmpty Int      @map("consecutive_empty")
+  result           Json     @db.JsonB
+  scannedAt        DateTime @map("scanned_at") @db.Timestamptz(6)
+  archive          Archive  @relation(fields: [archiveId], references: [id], map: "deletion_scans_archive_id_fkey")
+
+  @@map("deletion_scans")
+}
+
+model AuditEvent {
+  sequence    BigInt   @id(map: "audit_events_pkey") @default(autoincrement()) @db.BigInt
+  id          String   @unique(map: "audit_events_id_key") @db.Uuid
+  aggregateId String   @map("aggregate_id") @db.Uuid
+  actorId     String?  @map("actor_id") @db.Uuid
+  kind        String   @db.Text
+  occurredAt  DateTime @map("occurred_at") @db.Timestamptz(6)
+  details     Json     @db.JsonB
+  actor       User?    @relation(fields: [actorId], references: [id], map: "audit_events_actor_id_fkey")
+
+  @@index([aggregateId, sequence], map: "audit_aggregate_sequence_idx")
+  @@map("audit_events")
+}
+
+model Inbox {
+  source      String   @db.Text
+  eventId     String   @map("event_id") @db.Text
+  occurredAt  DateTime @map("occurred_at") @db.Timestamptz(6)
+  payloadHash String   @map("payload_hash") @db.Text
+  payload     Json     @db.JsonB
+  receivedAt  DateTime @map("received_at") @db.Timestamptz(6)
+
+  @@id([source, eventId], map: "inbox_pkey")
+  @@map("inbox")
+}
+
+model OrchestrationDeadline {
+  consultationId String       @map("consultation_id") @db.Uuid
+  generation     Int
+  kind           String       @db.Text
+  dueAt          DateTime     @map("due_at") @db.Timestamptz(6)
+  leaseOwner     String?      @map("lease_owner") @db.Uuid
+  leaseExpiresAt DateTime?    @map("lease_expires_at") @db.Timestamptz(6)
+  completedAt    DateTime?    @map("completed_at") @db.Timestamptz(6)
+  consultation   Consultation @relation(fields: [consultationId], references: [id], map: "orchestration_deadlines_consultation_id_fkey")
+
+  @@id([consultationId, generation, kind], map: "orchestration_deadlines_pkey")
+  @@map("orchestration_deadlines")
+}
+
+model CaptionLedger {
+  consultationId           String        @map("consultation_id") @db.Uuid
+  destinationParticipantId String        @map("destination_participant_id") @db.Uuid
+  utteranceId              String        @map("utterance_id") @db.Uuid
+  revision                 Int
+  finality                 String        @db.Text
+  sourceParticipantId      String        @map("source_participant_id") @db.Uuid
+  sourceLanguage           String        @map("source_language") @db.Text
+  targetLanguage           String        @map("target_language") @db.Text
+  sourceText               String        @map("source_text") @db.Text
+  translatedText           String        @map("translated_text") @db.Text
+  sourceSampleStart        BigInt        @map("source_sample_start") @db.BigInt
+  sourceSampleEnd          BigInt        @map("source_sample_end") @db.BigInt
+  occurredAtMs             BigInt        @map("occurred_at_ms") @db.BigInt
+  writerEpoch              BigInt        @map("writer_epoch") @db.BigInt
+  archivedObjectId         String?       @map("archived_object_id") @db.Uuid
+  createdAt                DateTime      @map("created_at") @db.Timestamptz(6)
+  consultation             Consultation  @relation(fields: [consultationId], references: [id], map: "caption_ledger_consultation_id_fkey")
+  archivedObject           ArchiveObject? @relation(fields: [archivedObjectId], references: [id], map: "caption_ledger_archived_object_id_fkey")
+
+  @@id([consultationId, destinationParticipantId, utteranceId, revision], map: "caption_ledger_pkey")
+  @@map("caption_ledger")
+}

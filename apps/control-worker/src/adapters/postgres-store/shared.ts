@@ -1,5 +1,5 @@
 import { ExternalEffectStateSchema } from "@transhooter/contracts";
-import type { Row as PostgresRow } from "postgres";
+import type { Prisma, PrismaClient } from "@transhooter/server-core/persistence";
 import type {
   ConsultationState,
   Deadline,
@@ -7,8 +7,37 @@ import type {
   OutboxItem,
   WorkerReservation,
 } from "../../orchestration/model";
+export type PrismaConnection = PrismaClient | Prisma.TransactionClient;
 
-export interface ExternalEffectRow extends PostgresRow {
+export function withTransaction<T>(
+  client: PrismaConnection,
+  operation: (transaction: Prisma.TransactionClient) => Promise<T>,
+  options?: { readonly maxWait?: number; readonly timeout?: number },
+): Promise<T> {
+  if ("$transaction" in client) {
+    return options === undefined
+      ? client.$transaction(operation)
+      : client.$transaction(operation, options);
+  }
+  return operation(client);
+}
+
+export function safeDatabaseInteger(value: bigint | number, column: string): number {
+  const converted = typeof value === "bigint" ? Number(value) : value;
+  if (!Number.isSafeInteger(converted)) {
+    throw new Error(`${column} is outside the JavaScript safe integer range`);
+  }
+  return converted;
+}
+
+export function nullableSafeDatabaseInteger(
+  value: bigint | number | null,
+  column: string,
+): number | null {
+  return value === null ? null : safeDatabaseInteger(value, column);
+}
+
+export interface ExternalEffectRow {
   readonly id: string;
   readonly consultation_id: string;
   readonly generation: number;
@@ -24,7 +53,7 @@ export interface ExternalEffectRow extends PostgresRow {
   readonly attempts: number;
 }
 
-export interface OutboxRow extends PostgresRow {
+export interface OutboxRow {
   readonly id: string;
   readonly aggregate_id: string;
   readonly generation: number;
@@ -33,50 +62,50 @@ export interface OutboxRow extends PostgresRow {
   readonly attempts: number;
 }
 
-export interface DeadlineRow extends PostgresRow {
+export interface DeadlineRow {
   readonly consultation_id: string;
   readonly generation: number;
   readonly kind: Deadline["kind"];
   readonly due_at: Date | string;
 }
 
-export interface ReservationRow extends PostgresRow {
+export interface ReservationRow {
   readonly consultation_id: string;
   readonly generation: number;
   readonly worker_id: string;
-  readonly epoch: number;
+  readonly epoch: bigint;
   readonly heartbeat_at: Date | string;
   readonly lease_expires_at: Date | string;
   readonly accepting_load: boolean;
 }
 
-export interface IdRow extends PostgresRow {
+export interface IdRow {
   readonly id: string;
 }
 
-export interface AppliedTransitionRow extends PostgresRow {
+export interface AppliedTransitionRow {
   readonly transitioned: boolean;
 }
 
-export interface RoomResourceRow extends PostgresRow {
+export interface RoomResourceRow {
   readonly resource_room_name: string | null;
 }
 
-export interface ReserveConsultationRow extends PostgresRow {
+export interface ReserveConsultationRow {
   readonly worker_identity: string | null;
   readonly snapshot_hash: string | null;
 }
 
-export interface CancellationConsultationRow extends PostgresRow {
+export interface CancellationConsultationRow {
   readonly generation: number;
   readonly state: ConsultationState;
 }
 
-export interface WorkerEpochTerminalRow extends PostgresRow {
+export interface WorkerEpochTerminalRow {
   readonly terminal_at: Date | string | null;
 }
 
-export interface ArchiveStateRow extends PostgresRow {
+export interface ArchiveStateRow {
   readonly id: string;
   readonly state: unknown;
 }
@@ -85,55 +114,55 @@ export interface ReconciliationArchiveRow extends ArchiveStateRow {
   readonly reconciliation_deadline_at: Date | string | null;
 }
 
-export interface ConsultationIdRow extends PostgresRow {
+export interface ConsultationIdRow {
   readonly consultation_id: string;
 }
 
-export interface WorkerDispatchRow extends PostgresRow {
+export interface WorkerDispatchRow {
   readonly room_name: string;
   readonly worker_identity: string;
   readonly snapshot_hash: string;
   readonly provider_selection: unknown;
-  readonly epoch: number;
+  readonly epoch: bigint;
   readonly write_epoch: number;
 }
 
-export interface WorkerDirectionRow extends PostgresRow {
+export interface WorkerDirectionRow {
   readonly source_participant_id: string;
   readonly destination_participant_id: string;
 }
 
-export interface ParticipantIdentityRow extends PostgresRow {
+export interface ParticipantIdentityRow {
   readonly id: string;
   readonly livekit_identity: string;
 }
 
-export interface ExpectationRow extends PostgresRow {
+export interface ExpectationRow {
   readonly id: string;
   readonly object_class: string;
   readonly causal_key: string;
-  readonly sample_start: number | null;
-  readonly sample_end: number | null;
+  readonly sample_start: bigint | null;
+  readonly sample_end: bigint | null;
   readonly fulfilled_object_id: string | null;
 }
 
-export interface ArchiveObjectRow extends PostgresRow {
+export interface ArchiveObjectRow {
   readonly id: string;
   readonly object_class: string;
   readonly key: string;
   readonly version_id: string;
-  readonly size: number;
+  readonly size: bigint;
   readonly sha256: string;
   readonly s3_checksum: string;
   readonly content_type: string;
 }
 
-export interface ReconciliationProviderAttemptRow extends PostgresRow {
+export interface ReconciliationProviderAttemptRow {
   readonly attempt_id: string;
   readonly stage: string;
 }
 
-export interface ProviderGapRow extends PostgresRow {
+export interface ProviderGapRow {
   readonly attempt_id: string;
   readonly stage: string;
   readonly provider: string;
@@ -142,23 +171,23 @@ export interface ProviderGapRow extends PostgresRow {
   readonly attempt_number: number;
   readonly outcome: string;
   readonly error_kind: string | null;
-  readonly accepted_input_watermark: number | null;
-  readonly received_output_watermark: number | null;
-  readonly emitted_output_watermark: number | null;
+  readonly accepted_input_watermark: bigint | null;
+  readonly received_output_watermark: bigint | null;
+  readonly emitted_output_watermark: bigint | null;
   readonly retry_decision: unknown;
 }
 
-export interface ReconciliationDirectionRow extends PostgresRow {
+export interface ReconciliationDirectionRow {
   readonly mode: string;
   readonly destination_participant_id: string;
-  readonly emitted_output: number;
+  readonly emitted_output: bigint;
 }
 
-export interface CheckpointRow extends PostgresRow {
+export interface CheckpointRow {
   readonly checkpoint: unknown;
 }
 
-export interface EgressResultRow extends PostgresRow {
+export interface EgressResultRow {
   readonly id: string;
   readonly egress_id: string | null;
   readonly kind: string;
@@ -167,18 +196,18 @@ export interface EgressResultRow extends PostgresRow {
   readonly terminal_result: unknown;
 }
 
-export interface DrainResultRow extends PostgresRow {
+export interface DrainResultRow {
   readonly result: unknown;
 }
-export interface EgressIdRow extends PostgresRow {
+export interface EgressIdRow {
   readonly egress_id: string;
 }
 
-export interface LiveKitIdentityRow extends PostgresRow {
+export interface LiveKitIdentityRow {
   readonly livekit_identity: string;
 }
 
-export interface DispatchIdRow extends PostgresRow {
+export interface DispatchIdRow {
   readonly dispatch_id: string;
 }
 
@@ -199,24 +228,23 @@ export type ReconciliationEgressResult = {
 
 export function mapOutboxItem(row: OutboxRow): OutboxItem {
   return {
-    id: String(row.id),
-    aggregateId: String(row.aggregate_id),
-    generation: Number(row.generation),
-    type: String(row.topic),
+    id: row.id,
+    aggregateId: row.aggregate_id,
+    generation: safeDatabaseInteger(row.generation, "outbox.generation"),
+    type: row.topic,
     payload: row.payload,
-    attempts: Number(row.attempts),
+    attempts: safeDatabaseInteger(row.attempts, "outbox.attempts"),
   };
 }
 
 export function mapDeadline(row: DeadlineRow): Deadline {
   return {
-    consultationId: String(row.consultation_id),
-    generation: Number(row.generation),
-    kind: row.kind as Deadline["kind"],
-    dueAt: new Date(String(row.due_at)),
+    consultationId: row.consultation_id,
+    generation: safeDatabaseInteger(row.generation, "orchestration_deadlines.generation"),
+    kind: row.kind,
+    dueAt: date(row.due_at),
   };
 }
-
 export function perRoomQuotaUnits(stage: "stt" | "translation" | "tts", dimension: string): number {
   const normalized = dimension.toLowerCase().replaceAll("_", "-");
   const isAudioDuration =
@@ -271,38 +299,54 @@ export function nullableDate(value: unknown): Date | null {
   if (value === null || value === undefined) {
     return null;
   }
-  if (value instanceof Date) {
-    return value;
-  }
-  if (typeof value !== "string" && typeof value !== "number") {
+  const timestamp =
+    value instanceof Date
+      ? value
+      : typeof value === "string" || typeof value === "number"
+        ? new Date(value)
+        : null;
+  if (timestamp === null) {
     throw new Error("database timestamp has invalid type");
   }
-  return new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    throw new Error("database timestamp is invalid");
+  }
+  return timestamp;
+}
+
+export function date(value: unknown): Date {
+  const timestamp = nullableDate(value);
+  if (timestamp === null) {
+    throw new Error("database timestamp is required");
+  }
+  return timestamp;
 }
 
 export function mapEffect(row: ExternalEffectRow): Effect {
-  const result =
-    row.result !== null && typeof row.result === "object" && !Array.isArray(row.result)
-      ? (row.result as Readonly<Record<string, unknown>>)
-      : {};
-  const plan =
-    result.plan !== null && typeof result.plan === "object" && !Array.isArray(result.plan)
-      ? (result.plan as Readonly<Record<string, unknown>>)
-      : {};
+  if (row.result === null || typeof row.result !== "object" || Array.isArray(row.result)) {
+    throw new Error("external_effects.result must be an object");
+  }
+  const result = row.result as Readonly<Record<string, unknown>>;
+  if (result.plan === null || typeof result.plan !== "object" || Array.isArray(result.plan)) {
+    throw new Error("external_effects.result.plan must be an object");
+  }
+  if (row.request_bytes !== null && !(row.request_bytes instanceof Uint8Array)) {
+    throw new Error("external_effects.request_bytes must be bytea");
+  }
   return {
-    id: String(row.id),
-    consultationId: String(row.consultation_id),
-    generation: Number(row.generation),
-    kind: String(row.effect_kind) as Effect["kind"],
-    subjectId: String(row.subject_id),
-    occurrenceKey: String(row.occurrence_key),
-    plan,
+    id: row.id,
+    consultationId: row.consultation_id,
+    generation: safeDatabaseInteger(row.generation, "external_effects.generation"),
+    kind: row.effect_kind as Effect["kind"],
+    subjectId: row.subject_id,
+    occurrenceKey: row.occurrence_key,
+    plan: result.plan as Readonly<Record<string, unknown>>,
     state: ExternalEffectStateSchema.parse(row.state),
-    requestBytes: row.request_bytes instanceof Uint8Array ? row.request_bytes : null,
+    requestBytes: row.request_bytes,
     requestSha256: nullableString(row.request_hash),
     remoteId: typeof result.remoteId === "string" ? result.remoteId : null,
     appliedResult: "value" in result ? result.value : null,
-    attempt: Number(row.attempts),
+    attempt: safeDatabaseInteger(row.attempts, "external_effects.attempts"),
     leaseOwner: nullableString(row.lease_owner),
     leaseExpiresAt: nullableDate(row.lease_expires_at),
   };
@@ -310,12 +354,12 @@ export function mapEffect(row: ExternalEffectRow): Effect {
 
 export function mapReservation(row: ReservationRow): WorkerReservation {
   return {
-    consultationId: String(row.consultation_id),
-    generation: Number(row.generation),
-    workerId: String(row.worker_id),
-    epoch: Number(row.epoch),
-    heartbeatAt: new Date(String(row.heartbeat_at)),
-    leaseExpiresAt: new Date(String(row.lease_expires_at)),
-    acceptingLoad: Boolean(row.accepting_load),
+    consultationId: row.consultation_id,
+    generation: safeDatabaseInteger(row.generation, "worker_reservations.generation"),
+    workerId: row.worker_id,
+    epoch: safeDatabaseInteger(row.epoch, "worker_reservations.epoch"),
+    heartbeatAt: date(row.heartbeat_at),
+    leaseExpiresAt: date(row.lease_expires_at),
+    acceptingLoad: row.accepting_load,
   };
 }

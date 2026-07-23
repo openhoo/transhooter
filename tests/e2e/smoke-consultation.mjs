@@ -1,5 +1,5 @@
-import { createConsultationHarness } from "./consultation-harness.mjs";
 import { runConsultationBrowserWorkflow } from "./consultation-browser-workflow.mjs";
+import { createConsultationHarness } from "./consultation-harness.mjs";
 
 const workflow = await runConsultationBrowserWorkflow({
   harness: createConsultationHarness(),

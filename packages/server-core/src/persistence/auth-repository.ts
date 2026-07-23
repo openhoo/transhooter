@@ -1,6 +1,5 @@
-import { and, desc, eq, gt, isNull, lte, or, sql } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { DomainError, type Instant, type UUID } from "../domain/model";
+import type { MagicLink, PendingExchange, Session, User } from "../generated/prisma/client.js";
 import type {
   ActiveMagicLink,
   AuthRepository,
@@ -12,25 +11,25 @@ import type {
   Transaction,
   UserRecord,
 } from "../ports/index";
-import { magicLinkRequests, magicLinks, pendingExchanges, sessions, users } from "./schema";
-import { type DrizzleSchema, TransactionHandle, unwrap } from "./transaction";
+import { Prisma, type PrismaClient } from "./database";
+import { TransactionHandle, unwrap } from "./transaction";
 
-export class DrizzleAuthRepository implements AuthRepository {
-  constructor(private readonly database: NodePgDatabase<DrizzleSchema>) {}
+export class PrismaAuthRepository implements AuthRepository {
+  constructor(private readonly database: PrismaClient) {}
 
   transaction<T>(work: (tx: Transaction) => Promise<T>): Promise<T> {
-    return this.database.transaction((database) => work(new TransactionHandle(database)));
+    return this.database.$transaction((database) => work(new TransactionHandle(database)));
   }
 
   async findUserByEmail(email: string, tx?: Transaction): Promise<UserRecord | null> {
     const database = tx ? unwrap(tx) : this.database;
-    const [row] = await database.select().from(users).where(eq(users.email, email)).limit(1);
+    const row = await database.user.findUnique({ where: { email } });
     return row ? mapUser(row) : null;
   }
 
   async findUserById(id: UUID, tx?: Transaction): Promise<UserRecord | null> {
     const database = tx ? unwrap(tx) : this.database;
-    const [row] = await database.select().from(users).where(eq(users.id, id)).limit(1);
+    const row = await database.user.findUnique({ where: { id } });
     return row ? mapUser(row) : null;
   }
 
@@ -40,26 +39,18 @@ export class DrizzleAuthRepository implements AuthRepository {
     displayName: string,
     createdAt: Instant,
   ): Promise<UserRecord> {
-    const [row] = await this.database
-      .insert(users)
-      .values({ id, email, displayName, staffRole: null, createdAt })
-      .onConflictDoUpdate({
-        target: users.email,
-        set: { email: sql`excluded.email` },
-      })
-      .returning();
-    if (!row) {
-      throw new Error("customer upsert returned no row");
-    }
+    const row = await this.database.user.upsert({
+      where: { email },
+      create: { id, email, displayName, staffRole: null, createdAt },
+      update: { email },
+    });
     return mapUser(row);
   }
 
   async findSessionByTokenHash(hash: string): Promise<SessionRecord | null> {
-    const [row] = await this.database
-      .select()
-      .from(sessions)
-      .where(and(eq(sessions.tokenHash, hash), isNull(sessions.revokedAt)))
-      .limit(1);
+    const row = await this.database.session.findFirst({
+      where: { tokenHash: hash, revokedAt: null },
+    });
     return row ? mapSession(row) : null;
   }
 
@@ -82,8 +73,8 @@ export class DrizzleAuthRepository implements AuthRepository {
       throw new DomainError("INVALID_MAGIC_LINK_CANDIDATE");
     }
 
-    return this.database.transaction(async (database) => {
-      await database.execute<AdvisoryLockRow>(sql`
+    return this.database.$transaction(async (database) => {
+      await database.$queryRaw<AdvisoryLockRow[]>(Prisma.sql`
         SELECT pg_advisory_xact_lock(
           hashtextextended(
             jsonb_build_array(
@@ -94,25 +85,35 @@ export class DrizzleAuthRepository implements AuthRepository {
             )::text,
             2
           )
-        )
+        )::text AS locked
       `);
 
-      const [current] = await database
-        .select()
-        .from(magicLinks)
-        .where(
-          and(
-            sql`${magicLinks.userId} IS NOT DISTINCT FROM ${identity.userId}::uuid`,
-            eq(magicLinks.purpose, identity.purpose),
-            sql`${magicLinks.consultationId} IS NOT DISTINCT FROM ${identity.consultationId}::uuid`,
-            sql`${magicLinks.sessionId} IS NOT DISTINCT FROM ${identity.sessionId}::uuid`,
-            isNull(magicLinks.consumedAt),
-            isNull(magicLinks.revokedAt),
-          ),
-        )
-        .orderBy(desc(magicLinks.createdAt), desc(magicLinks.id))
-        .limit(1)
-        .for("update");
+      const rows = await database.$queryRaw<MagicLink[]>(Prisma.sql`
+        SELECT
+          id,
+          user_id AS "userId",
+          consultation_id AS "consultationId",
+          session_id AS "sessionId",
+          purpose,
+          token_hash AS "tokenHash",
+          expires_at AS "expiresAt",
+          consumed_at AS "consumedAt",
+          revoked_at AS "revokedAt",
+          created_at AS "createdAt",
+          sealed_raw_token AS "sealedRawToken",
+          sealed_token_key_id AS "sealedTokenKeyId"
+        FROM magic_links
+        WHERE user_id IS NOT DISTINCT FROM ${identity.userId}::uuid
+          AND purpose = ${identity.purpose}::magic_link_purpose
+          AND consultation_id IS NOT DISTINCT FROM ${identity.consultationId}::uuid
+          AND session_id IS NOT DISTINCT FROM ${identity.sessionId}::uuid
+          AND consumed_at IS NULL
+          AND revoked_at IS NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        FOR UPDATE
+      `);
+      const current = rows[0];
       if (current && current.expiresAt > now) {
         return {
           record: mapMagicLink(current),
@@ -123,83 +124,111 @@ export class DrizzleAuthRepository implements AuthRepository {
       }
 
       if (current) {
-        await database
-          .update(magicLinks)
-          .set({ revokedAt: now })
-          .where(
-            and(
-              eq(magicLinks.id, current.id),
-              isNull(magicLinks.consumedAt),
-              isNull(magicLinks.revokedAt),
-              lte(magicLinks.expiresAt, now),
-            ),
-          );
+        await database.magicLink.updateMany({
+          where: {
+            id: current.id,
+            consumedAt: null,
+            revokedAt: null,
+            expiresAt: { lte: now },
+          },
+          data: { revokedAt: now },
+        });
       }
 
-      await database.insert(magicLinks).values({
-        id: candidate.record.id,
-        userId: candidate.record.userId,
-        consultationId: candidate.record.consultationId,
-        sessionId: candidate.record.sessionId,
-        purpose: candidate.record.purpose,
-        tokenHash: candidate.record.tokenHash,
-        expiresAt: candidate.record.expiresAt,
-        consumedAt: null,
-        revokedAt: null,
-        createdAt: now,
-        sealedRawToken: candidate.sealedRawToken,
-        sealedTokenKeyId: candidate.keyId,
+      await database.magicLink.create({
+        data: {
+          id: candidate.record.id,
+          userId: candidate.record.userId,
+          consultationId: candidate.record.consultationId,
+          sessionId: candidate.record.sessionId,
+          purpose: candidate.record.purpose,
+          tokenHash: candidate.record.tokenHash,
+          expiresAt: candidate.record.expiresAt,
+          consumedAt: null,
+          revokedAt: null,
+          createdAt: now,
+          sealedRawToken: candidate.sealedRawToken,
+          sealedTokenKeyId: candidate.keyId,
+        },
       });
       return { ...candidate, created: true };
     });
   }
 
   async lockMagicLinkByTokenHash(hash: string, tx: Transaction): Promise<MagicLinkRecord | null> {
-    const [row] = await unwrap(tx)
-      .select()
-      .from(magicLinks)
-      .where(eq(magicLinks.tokenHash, hash))
-      .limit(1)
-      .for("update");
-    return row ? mapMagicLink(row) : null;
+    const rows = await unwrap(tx).$queryRaw<MagicLink[]>(Prisma.sql`
+      SELECT
+        id,
+        user_id AS "userId",
+        consultation_id AS "consultationId",
+        session_id AS "sessionId",
+        purpose,
+        token_hash AS "tokenHash",
+        expires_at AS "expiresAt",
+        consumed_at AS "consumedAt",
+        revoked_at AS "revokedAt",
+        created_at AS "createdAt",
+        sealed_raw_token AS "sealedRawToken",
+        sealed_token_key_id AS "sealedTokenKeyId"
+      FROM magic_links
+      WHERE token_hash = ${hash}
+      LIMIT 1
+      FOR UPDATE
+    `);
+    return rows[0] ? mapMagicLink(rows[0]) : null;
   }
 
   async lockMagicLinkById(id: UUID, tx: Transaction): Promise<MagicLinkRecord | null> {
-    const [row] = await unwrap(tx)
-      .select()
-      .from(magicLinks)
-      .where(eq(magicLinks.id, id))
-      .limit(1)
-      .for("update");
-    return row ? mapMagicLink(row) : null;
+    const rows = await unwrap(tx).$queryRaw<MagicLink[]>(Prisma.sql`
+      SELECT
+        id,
+        user_id AS "userId",
+        consultation_id AS "consultationId",
+        session_id AS "sessionId",
+        purpose,
+        token_hash AS "tokenHash",
+        expires_at AS "expiresAt",
+        consumed_at AS "consumedAt",
+        revoked_at AS "revokedAt",
+        created_at AS "createdAt",
+        sealed_raw_token AS "sealedRawToken",
+        sealed_token_key_id AS "sealedTokenKeyId"
+      FROM magic_links
+      WHERE id = ${id}::uuid
+      LIMIT 1
+      FOR UPDATE
+    `);
+    return rows[0] ? mapMagicLink(rows[0]) : null;
   }
 
   async createPendingExchange(exchange: PendingExchangeRecord, tx: Transaction): Promise<void> {
     const database = unwrap(tx);
-    await database
-      .delete(pendingExchanges)
-      .where(
-        and(
-          eq(pendingExchanges.magicLinkId, exchange.magicLinkId),
-          or(
-            sql`${pendingExchanges.consumedAt} IS NOT NULL`,
-            lte(pendingExchanges.expiresAt, sql`CURRENT_TIMESTAMP`),
-          ),
-        ),
-      );
-    const inserted = await database
-      .insert(pendingExchanges)
-      .values({
-        id: exchange.id,
-        magicLinkId: exchange.magicLinkId,
-        nonceHash: exchange.nonceHash,
-        csrfHash: exchange.csrfHash,
-        expiresAt: exchange.expiresAt,
-        consumedAt: exchange.consumedAt,
-        createdAt: sql`CURRENT_TIMESTAMP`,
-      })
-      .onConflictDoNothing()
-      .returning({ id: pendingExchanges.id });
+    await database.$executeRaw(Prisma.sql`
+      DELETE FROM pending_exchanges
+      WHERE magic_link_id = ${exchange.magicLinkId}::uuid
+        AND (consumed_at IS NOT NULL OR expires_at <= CURRENT_TIMESTAMP)
+    `);
+    const inserted = await database.$queryRaw<{ id: UUID }[]>(Prisma.sql`
+      INSERT INTO pending_exchanges (
+        id,
+        magic_link_id,
+        nonce_hash,
+        csrf_hash,
+        expires_at,
+        consumed_at,
+        created_at
+      ) VALUES (
+        ${exchange.id}::uuid,
+        ${exchange.magicLinkId}::uuid,
+        ${exchange.nonceHash},
+        ${exchange.csrfHash},
+        ${exchange.expiresAt},
+        ${exchange.consumedAt},
+        CURRENT_TIMESTAMP
+      )
+      ON CONFLICT DO NOTHING
+      RETURNING id
+    `);
     if (inserted.length !== 1) {
       throw new DomainError("INVALID_OR_EXPIRED_LINK");
     }
@@ -209,13 +238,21 @@ export class DrizzleAuthRepository implements AuthRepository {
     hash: string,
     tx: Transaction,
   ): Promise<PendingExchangeRecord | null> {
-    const [row] = await unwrap(tx)
-      .select()
-      .from(pendingExchanges)
-      .where(eq(pendingExchanges.nonceHash, hash))
-      .limit(1)
-      .for("update");
-    return row ? mapExchange(row) : null;
+    const rows = await unwrap(tx).$queryRaw<PendingExchange[]>(Prisma.sql`
+      SELECT
+        id,
+        magic_link_id AS "magicLinkId",
+        nonce_hash AS "nonceHash",
+        csrf_hash AS "csrfHash",
+        expires_at AS "expiresAt",
+        consumed_at AS "consumedAt",
+        created_at AS "createdAt"
+      FROM pending_exchanges
+      WHERE nonce_hash = ${hash}
+      LIMIT 1
+      FOR UPDATE
+    `);
+    return rows[0] ? mapExchange(rows[0]) : null;
   }
 
   async consumeExchangeAndLink(
@@ -224,17 +261,17 @@ export class DrizzleAuthRepository implements AuthRepository {
     at: Instant,
     tx: Transaction,
   ): Promise<boolean> {
-    const result = await unwrap(tx).execute<ConsumeExchangeRow>(sql`
+    const result = await unwrap(tx).$queryRaw<ConsumeExchangeRow[]>(Prisma.sql`
       WITH consumed_exchange AS (
         UPDATE pending_exchanges
         SET consumed_at = ${at}
-        WHERE id = ${exchangeId}
+        WHERE id = ${exchangeId}::uuid
           AND consumed_at IS NULL
         RETURNING id
       ), consumed_link AS (
         UPDATE magic_links
         SET consumed_at = ${at}
-        WHERE id = ${linkId}
+        WHERE id = ${linkId}::uuid
           AND consumed_at IS NULL
           AND revoked_at IS NULL
         RETURNING id
@@ -243,20 +280,31 @@ export class DrizzleAuthRepository implements AuthRepository {
         (SELECT count(*) FROM consumed_exchange) = 1
         AND (SELECT count(*) FROM consumed_link) = 1 AS consumed
     `);
-    return result.rows[0]?.consumed === true;
+    return result[0]?.consumed === true;
   }
 
   async createSession(session: SessionRecord, tx: Transaction): Promise<void> {
-    await unwrap(tx).insert(sessions).values({
-      id: session.id,
-      userId: session.userId,
-      tokenHash: session.tokenHash,
-      csrfHash: session.csrfHash,
-      expiresAt: session.expiresAt,
-      reauthenticatedAt: session.reauthenticatedAt,
-      reauthConsultationId: session.reauthConsultationId,
-      createdAt: sql`now()`,
-    });
+    await unwrap(tx).$executeRaw(Prisma.sql`
+      INSERT INTO sessions (
+        id,
+        user_id,
+        token_hash,
+        csrf_hash,
+        expires_at,
+        reauthenticated_at,
+        reauth_consultation_id,
+        created_at
+      ) VALUES (
+        ${session.id}::uuid,
+        ${session.userId}::uuid,
+        ${session.tokenHash},
+        ${session.csrfHash},
+        ${session.expiresAt},
+        ${session.reauthenticatedAt},
+        ${session.reauthConsultationId}::uuid,
+        now()
+      )
+    `);
   }
 
   async rotateSession(
@@ -265,50 +313,41 @@ export class DrizzleAuthRepository implements AuthRepository {
     tx: Transaction,
   ): Promise<void> {
     const database = unwrap(tx);
-    const eligible = await database.execute<SessionEligibilityRow>(sql`
+    const eligible = await database.$queryRaw<SessionEligibilityRow[]>(Prisma.sql`
       SELECT sessions.id
       FROM sessions
       JOIN users ON users.id = sessions.user_id
-      WHERE sessions.id = ${replacesSessionId}
-        AND sessions.user_id = ${session.userId}
+      WHERE sessions.id = ${replacesSessionId}::uuid
+        AND sessions.user_id = ${session.userId}::uuid
         AND sessions.revoked_at IS NULL
         AND sessions.expires_at > now()
         AND users.staff_role = 'admin'
       FOR UPDATE
     `);
-    if (eligible.rowCount !== 1) {
+    if (eligible.length !== 1) {
       throw new DomainError("INVALID_REAUTH_BINDING");
     }
 
     await this.createSession(session, tx);
-    const revoked = await database
-      .update(sessions)
-      .set({ revokedAt: sql`now()`, replacedBy: session.id })
-      .where(
-        and(
-          eq(sessions.id, replacesSessionId),
-          eq(sessions.userId, session.userId),
-          isNull(sessions.revokedAt),
-          gt(sessions.expiresAt, sql`now()`),
-        ),
-      )
-      .returning({ id: sessions.id });
+    const revoked = await database.$queryRaw<{ id: UUID }[]>(Prisma.sql`
+      UPDATE sessions
+      SET revoked_at = now(), replaced_by = ${session.id}::uuid
+      WHERE id = ${replacesSessionId}::uuid
+        AND user_id = ${session.userId}::uuid
+        AND revoked_at IS NULL
+        AND expires_at > now()
+      RETURNING id
+    `);
     if (revoked.length !== 1) {
       throw new DomainError("INVALID_REAUTH_BINDING");
     }
   }
 
   async revokeConsultationLinks(consultationId: UUID, at: Instant, tx: Transaction): Promise<void> {
-    await unwrap(tx)
-      .update(magicLinks)
-      .set({ revokedAt: at })
-      .where(
-        and(
-          eq(magicLinks.consultationId, consultationId),
-          isNull(magicLinks.consumedAt),
-          isNull(magicLinks.revokedAt),
-        ),
-      );
+    await unwrap(tx).magicLink.updateMany({
+      where: { consultationId, consumedAt: null, revokedAt: null },
+      data: { revokedAt: at },
+    });
   }
 
   async admitMagicLinkRequest(
@@ -319,26 +358,26 @@ export class DrizzleAuthRepository implements AuthRepository {
     emailLimit: number,
     ipLimit: number,
   ): Promise<boolean> {
-    return this.database.transaction(async (database) => {
-      await database.execute<AdvisoryLockRow>(sql`
-        SELECT pg_advisory_xact_lock(hashtextextended(${ipHash}, 0))
+    return this.database.$transaction(async (database) => {
+      await database.$queryRaw<AdvisoryLockRow[]>(Prisma.sql`
+        SELECT pg_advisory_xact_lock(hashtextextended(${ipHash}, 0))::text AS locked
       `);
       if (emailHash) {
-        await database.execute<AdvisoryLockRow>(sql`
-          SELECT pg_advisory_xact_lock(hashtextextended(${emailHash}, 1))
+        await database.$queryRaw<AdvisoryLockRow[]>(Prisma.sql`
+          SELECT pg_advisory_xact_lock(hashtextextended(${emailHash}, 1))::text AS locked
         `);
       }
 
-      await database.delete(magicLinkRequests).where(lte(magicLinkRequests.requestedAt, since));
+      await database.magicLinkRequest.deleteMany({ where: { requestedAt: { lte: since } } });
 
-      const result = await database.execute<RateLimitCountRow>(sql`
+      const result = await database.$queryRaw<RateLimitCountRow[]>(Prisma.sql`
         SELECT
           count(*) FILTER (WHERE email_hash = ${emailHash})::int AS email,
           count(*) FILTER (WHERE ip_hash = ${ipHash})::int AS ip
         FROM magic_link_requests
         WHERE requested_at > ${since}
       `);
-      const row = result.rows[0];
+      const row = result[0];
       if (!row) {
         throw new Error("magic-link admission count returned no row");
       }
@@ -349,11 +388,7 @@ export class DrizzleAuthRepository implements AuthRepository {
         return false;
       }
 
-      await database.insert(magicLinkRequests).values({
-        emailHash,
-        ipHash,
-        requestedAt: at,
-      });
+      await database.magicLinkRequest.create({ data: { emailHash, ipHash, requestedAt: at } });
       return true;
     });
   }
@@ -361,10 +396,10 @@ export class DrizzleAuthRepository implements AuthRepository {
 
 type ConsumeExchangeRow = { consumed: boolean };
 type SessionEligibilityRow = { id: UUID };
-type AdvisoryLockRow = { pg_advisory_xact_lock: string };
+type AdvisoryLockRow = { locked: string };
 type RateLimitCountRow = { email: number; ip: number };
 
-function mapUser(row: typeof users.$inferSelect): UserRecord {
+function mapUser(row: User): UserRecord {
   return {
     id: row.id,
     email: row.email,
@@ -373,7 +408,7 @@ function mapUser(row: typeof users.$inferSelect): UserRecord {
   };
 }
 
-function mapSession(row: typeof sessions.$inferSelect): SessionRecord {
+function mapSession(row: Session): SessionRecord {
   return {
     id: row.id,
     userId: row.userId,
@@ -385,7 +420,7 @@ function mapSession(row: typeof sessions.$inferSelect): SessionRecord {
   };
 }
 
-function mapMagicLink(row: typeof magicLinks.$inferSelect): MagicLinkRecord {
+function mapMagicLink(row: MagicLink): MagicLinkRecord {
   return {
     id: row.id,
     userId: row.userId,
@@ -399,7 +434,7 @@ function mapMagicLink(row: typeof magicLinks.$inferSelect): MagicLinkRecord {
   };
 }
 
-function mapExchange(row: typeof pendingExchanges.$inferSelect): PendingExchangeRecord {
+function mapExchange(row: PendingExchange): PendingExchangeRecord {
   return {
     id: row.id,
     magicLinkId: row.magicLinkId,

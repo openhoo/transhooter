@@ -17,7 +17,10 @@ COPY tsconfig.base.json biome.json ./
 COPY apps ./apps
 COPY packages ./packages
 COPY deploy/scripts/migrate.mjs ./deploy/scripts/migrate.mjs
-RUN bun run build
+COPY deploy/scripts/migration-plan.mjs ./deploy/scripts/migration-plan.mjs
+RUN DATABASE_URL=postgresql://transhooter:transhooter@postgres/transhooter \
+    bun run --filter @transhooter/server-core prisma:generate \
+    && bun run build
 
 FROM oven/bun:1.3.14-debian AS production-dependencies
 WORKDIR /workspace
@@ -32,7 +35,8 @@ COPY tests/failure-smoke/package.json ./tests/failure-smoke/package.json
 RUN --mount=type=cache,id=bun-runtime-v1,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --production \
       --filter @transhooter/control-worker \
-      --filter @transhooter/web
+      --filter @transhooter/web \
+      --filter @transhooter/server-core
 
 FROM oven/bun:1.3.14-debian AS runtime
 ENV NODE_ENV=production \
@@ -48,7 +52,9 @@ COPY --from=build --chown=10001:10001 /workspace/packages/contracts/dist /worksp
 COPY --from=build --chown=10001:10001 /workspace/packages/contracts/generated /workspace/packages/contracts/generated
 COPY --from=build --chown=10001:10001 /workspace/packages/telemetry/dist /workspace/packages/telemetry/dist
 COPY --from=build --chown=10001:10001 /workspace/packages/server-core/dist /workspace/packages/server-core/dist
-COPY --from=build --chown=10001:10001 /workspace/packages/server-core/drizzle /workspace/packages/server-core/drizzle
+COPY --from=build --chown=10001:10001 /workspace/packages/server-core/prisma /workspace/packages/server-core/prisma
+COPY --from=build --chown=10001:10001 /workspace/packages/server-core/prisma.config.ts /workspace/packages/server-core/prisma.config.ts
 COPY --from=build --chown=10001:10001 /workspace/deploy/scripts/migrate.mjs /workspace/deploy/scripts/migrate.mjs
+COPY --from=build --chown=10001:10001 /workspace/deploy/scripts/migration-plan.mjs /workspace/deploy/scripts/migration-plan.mjs
 USER 10001:10001
 EXPOSE 3000 8080

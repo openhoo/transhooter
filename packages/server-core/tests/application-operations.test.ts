@@ -1,10 +1,10 @@
 import { describe, expect, it, mock } from "bun:test";
-import { PgDialect } from "drizzle-orm/pg-core";
 import {
   checkpointPersistenceValues,
-  DrizzleApplicationOperations,
+  PrismaApplicationOperations,
 } from "../src/application-operations";
-import { DrizzleLanguageRepository } from "../src/persistence/application-repositories";
+import { PrismaLanguageRepository } from "../src/persistence/application-repositories";
+import { Prisma, type PrismaClient } from "../src/persistence/database";
 import { TransactionHandle } from "../src/persistence/repositories";
 
 const ADMIN = {
@@ -12,6 +12,14 @@ const ADMIN = {
   role: "admin" as const,
 };
 const PROFILE_FRESH_UNTIL = new Date("2026-02-01T00:00:00Z");
+function inspectSql(statement: unknown): { text: string; values: readonly unknown[] } {
+  expect(statement).toBeInstanceOf(Prisma.Sql);
+  const sql = statement as Prisma.Sql;
+  return {
+    text: sql.strings.join("?").replace(/\s+/g, " ").trim(),
+    values: sql.values,
+  };
+}
 
 const ENABLED_DIRECTION_ROW = {
   id: "00000000-0000-4000-8000-000000000002",
@@ -187,37 +195,59 @@ const ARCHIVE_DETAIL_ROW = {
   ],
 };
 
-function createOperations(rows: unknown[]) {
-  const execute = mock(async () => ({ rows }));
-  const operations = new DrizzleApplicationOperations({ execute } as never, {} as never, {
-    now: () => new Date(),
+function prismaRawQueryError(originalCode: string): Prisma.PrismaClientKnownRequestError {
+  return new Prisma.PrismaClientKnownRequestError(`Raw query failed. Code: \`${originalCode}\`.`, {
+    code: "P2010",
+    clientVersion: "7.6.0",
+    meta: {
+      driverAdapterError: {
+        name: "DriverAdapterError",
+        cause: { originalCode },
+      },
+    },
   });
-  return { execute, operations };
 }
 
-function createSequentialOperations(
-  results: Array<{ rows: Record<string, unknown>[]; rowCount?: number }>,
-) {
-  const execute = mock(async (_statement: unknown) => results.shift() ?? { rows: [], rowCount: 0 });
-  const forUpdate = mock(async () => [{ consultationId: "00000000-0000-4000-8000-000000000021" }]);
-  const select = () => ({
-    from: () => ({
-      where: () => ({
-        for: forUpdate,
-      }),
-    }),
-  });
-  const transaction = async <T>(
-    callback: (transaction: { execute: typeof execute; select: typeof select }) => Promise<T>,
-  ) => callback({ execute, select });
-  const operations = new DrizzleApplicationOperations(
-    { execute, transaction } as never,
+function createOperations(rows: unknown[]) {
+  const queryRaw = mock(async (_statement: Prisma.Sql) => rows);
+  const operations = new PrismaApplicationOperations(
+    { $queryRaw: queryRaw } as unknown as PrismaClient,
     {} as never,
-    {
-      now: () => new Date(),
-    },
+    { now: () => new Date() },
   );
-  return { execute, forUpdate, operations };
+  return { queryRaw, operations };
+}
+
+function createSequentialOperations(results: Array<Record<string, unknown>[]>) {
+  const queryRaw = mock(async (statement: Prisma.Sql) => {
+    const query = inspectSql(statement).text;
+    if (query.startsWith("SELECT id FROM consultations") && query.endsWith("FOR UPDATE")) {
+      return [{ id: "00000000-0000-4000-8000-000000000021" }];
+    }
+    if (
+      query.startsWith("SELECT consultation_id FROM worker_job_epochs") &&
+      query.endsWith("FOR UPDATE")
+    ) {
+      return [{ consultation_id: "00000000-0000-4000-8000-000000000021" }];
+    }
+    return results.shift() ?? [];
+  });
+  const executeRaw = mock(async (_statement: Prisma.Sql) => 0);
+  const transaction = async <T>(callback: (transaction: Prisma.TransactionClient) => Promise<T>) =>
+    callback({
+      $queryRaw: queryRaw,
+      $executeRaw: executeRaw,
+    } as unknown as Prisma.TransactionClient);
+  const operations = new PrismaApplicationOperations(
+    {
+      $queryRaw: queryRaw,
+      $executeRaw: executeRaw,
+      $transaction: transaction,
+    } as unknown as PrismaClient,
+    {} as never,
+    { now: () => new Date() },
+  );
+  return { queryRaw, executeRaw, operations };
 }
 
 describe("ApplicationOperations typed views", () => {
@@ -235,10 +265,12 @@ describe("ApplicationOperations typed views", () => {
   });
 
   it("accepts heartbeats only for an active unfenced reservation and job epoch", async () => {
-    const execute = mock(async (_statement: unknown) => ({ rows: [], rowCount: 0 }));
-    const operations = new DrizzleApplicationOperations({ execute } as never, {} as never, {
-      now: () => new Date("2026-01-01T00:00:00Z"),
-    });
+    const queryRaw = mock(async (_statement: Prisma.Sql) => []);
+    const operations = new PrismaApplicationOperations(
+      { $queryRaw: queryRaw } as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date("2026-01-01T00:00:00Z") },
+    );
 
     await expect(
       operations.heartbeat(
@@ -249,8 +281,7 @@ describe("ApplicationOperations typed views", () => {
       ),
     ).resolves.toBe(false);
 
-    const statement = execute.mock.calls[0]?.[0];
-    const heartbeatSql = new PgDialect().sqlToQuery(statement as never).sql;
+    const heartbeatSql = inspectSql(queryRaw.mock.calls[0]?.[0]).text;
     expect(heartbeatSql).toContain("consultation.state IN ('ready','active')");
     expect(heartbeatSql).toContain("reservation.fenced_at IS NULL");
     expect(heartbeatSql).toContain("reservation.released_at IS NULL");
@@ -276,12 +307,11 @@ describe("ApplicationOperations typed views", () => {
   });
 
   it("lists archive objects only for finalized archives", async () => {
-    const { execute, operations } = createOperations([] as unknown[]);
+    const { queryRaw, operations } = createOperations([] as unknown[]);
 
     await operations.archiveObjects(ADMIN, "00000000-0000-4000-8000-000000000004", null, 50);
 
-    const statement = (execute.mock.calls as unknown as [unknown][])[0]?.[0];
-    const query = new PgDialect().sqlToQuery(statement as never).sql;
+    const query = inspectSql(queryRaw.mock.calls[0]?.[0]).text;
     expect(query).toContain("a.state IN ('complete','incomplete')");
     expect(query).toContain("JOIN final_inventories f ON f.archive_id=a.id");
   });
@@ -296,43 +326,37 @@ describe("ApplicationOperations typed views", () => {
       report: PROVIDER_REPORT,
     };
     const inserted = createSequentialOperations([
-      { rows: [PROVIDER_CONTEXT_ROW], rowCount: 1 },
-      { rows: [{ id: PROVIDER_REPORT.attemptId }], rowCount: 1 },
+      [PROVIDER_CONTEXT_ROW],
+      [{ id: PROVIDER_REPORT.attemptId }],
     ]);
     await expect(inserted.operations.providerAttempt(input)).resolves.toBe(true);
-    expect(inserted.execute).toHaveBeenCalledTimes(2);
+    expect(inserted.queryRaw).toHaveBeenCalledTimes(2);
 
-    const replayed = createSequentialOperations([
-      { rows: [PROVIDER_CONTEXT_ROW], rowCount: 1 },
-      { rows: [], rowCount: 0 },
-      { rows: [{ "?column?": 1 }], rowCount: 1 },
-    ]);
+    const replayed = createSequentialOperations([[PROVIDER_CONTEXT_ROW], [], [{ "?column?": 1 }]]);
     await expect(replayed.operations.providerAttempt(input)).resolves.toBe(true);
 
-    const conflict = createSequentialOperations([
-      { rows: [PROVIDER_CONTEXT_ROW], rowCount: 1 },
-      { rows: [], rowCount: 0 },
-      { rows: [], rowCount: 0 },
-    ]);
+    const conflict = createSequentialOperations([[PROVIDER_CONTEXT_ROW], [], []]);
     await expect(conflict.operations.providerAttempt(input)).rejects.toThrow(
       "PROVIDER_ATTEMPT_CONFLICT",
     );
   });
-  it("retries a provider terminal after a PostgreSQL deadlock", async () => {
+  it("retries a provider terminal after a Prisma P2010 PostgreSQL deadlock", async () => {
     let calls = 0;
-    const execute = mock(async () => {
+    const queryRaw = mock(async () => {
       calls += 1;
       if (calls === 1) {
-        return { rows: [PROVIDER_CONTEXT_ROW], rowCount: 1 };
+        return [PROVIDER_CONTEXT_ROW];
       }
       if (calls === 2) {
-        throw new Error("provider attempt deadlocked", { cause: { code: "40P01" } });
+        throw prismaRawQueryError("40P01");
       }
-      return { rows: [{ id: PROVIDER_REPORT.attemptId }], rowCount: 1 };
+      return [{ id: PROVIDER_REPORT.attemptId }];
     });
-    const operations = new DrizzleApplicationOperations({ execute } as never, {} as never, {
-      now: () => new Date(),
-    });
+    const operations = new PrismaApplicationOperations(
+      { $queryRaw: queryRaw } as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date() },
+    );
 
     await expect(
       operations.providerAttempt({
@@ -344,11 +368,101 @@ describe("ApplicationOperations typed views", () => {
         report: PROVIDER_REPORT,
       }),
     ).resolves.toBe(true);
-    expect(execute).toHaveBeenCalledTimes(3);
+    expect(queryRaw).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries a provider terminal after a Prisma P2010 serialization failure", async () => {
+    let calls = 0;
+    const queryRaw = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return [PROVIDER_CONTEXT_ROW];
+      }
+      if (calls === 2) {
+        throw prismaRawQueryError("40001");
+      }
+      return [{ id: PROVIDER_REPORT.attemptId }];
+    });
+    const operations = new PrismaApplicationOperations(
+      { $queryRaw: queryRaw } as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date() },
+    );
+
+    await expect(
+      operations.providerAttempt({
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        workerId: "00000000-0000-4000-8000-000000000022",
+        epoch: 2,
+        eventId: "00000000-0000-4000-8000-000000000023",
+        report: PROVIDER_REPORT,
+      }),
+    ).resolves.toBe(true);
+    expect(queryRaw).toHaveBeenCalledTimes(3);
+  });
+
+  it("retains direct PostgreSQL driver-code retry compatibility", async () => {
+    let calls = 0;
+    const queryRaw = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return [PROVIDER_CONTEXT_ROW];
+      }
+      if (calls === 2) {
+        throw Object.assign(new Error("driver serialization failure"), { code: "40001" });
+      }
+      return [{ id: PROVIDER_REPORT.attemptId }];
+    });
+    const operations = new PrismaApplicationOperations(
+      { $queryRaw: queryRaw } as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date() },
+    );
+
+    await expect(
+      operations.providerAttempt({
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        workerId: "00000000-0000-4000-8000-000000000022",
+        epoch: 2,
+        eventId: "00000000-0000-4000-8000-000000000023",
+        report: PROVIDER_REPORT,
+      }),
+    ).resolves.toBe(true);
+    expect(queryRaw).toHaveBeenCalledTimes(3);
+  });
+  it("does not retry a Prisma P2010 raw-query error with another SQLSTATE", async () => {
+    const error = prismaRawQueryError("23505");
+    let calls = 0;
+    const queryRaw = mock(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return [PROVIDER_CONTEXT_ROW];
+      }
+      throw error;
+    });
+    const operations = new PrismaApplicationOperations(
+      { $queryRaw: queryRaw } as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date() },
+    );
+
+    await expect(
+      operations.providerAttempt({
+        consultationId: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        workerId: "00000000-0000-4000-8000-000000000022",
+        epoch: 2,
+        eventId: "00000000-0000-4000-8000-000000000023",
+        report: PROVIDER_REPORT,
+      }),
+    ).rejects.toBe(error);
+    expect(queryRaw).toHaveBeenCalledTimes(2);
   });
 
   it("rejects provider evidence from a fenced worker or an unselected stage", async () => {
-    const fenced = createSequentialOperations([{ rows: [], rowCount: 0 }]);
+    const fenced = createSequentialOperations([[]]);
     await expect(
       fenced.operations.providerAttempt({
         consultationId: "00000000-0000-4000-8000-000000000021",
@@ -360,7 +474,7 @@ describe("ApplicationOperations typed views", () => {
       }),
     ).rejects.toThrow("PROVIDER_ATTEMPT_FENCED");
 
-    const bypass = createSequentialOperations([{ rows: [PROVIDER_CONTEXT_ROW], rowCount: 1 }]);
+    const bypass = createSequentialOperations([[PROVIDER_CONTEXT_ROW]]);
     await expect(
       bypass.operations.providerAttempt({
         consultationId: "00000000-0000-4000-8000-000000000021",
@@ -408,7 +522,7 @@ describe("ApplicationOperations typed views", () => {
 
   it("continues an output-only chain from its unique structural head when input watermarks tie", async () => {
     const outputOnly = createSequentialOperations([
-      { rows: [{ id: "00000000-0000-4000-8000-000000000032" }], rowCount: 1 },
+      [{ id: "00000000-0000-4000-8000-000000000032" }],
     ]);
 
     await expect(
@@ -438,8 +552,10 @@ describe("ApplicationOperations typed views", () => {
       }),
     ).resolves.toBe(true);
 
-    const insertStatement = outputOnly.execute.mock.calls[0]?.[0];
-    const insertSql = new PgDialect().sqlToQuery(insertStatement as never).sql;
+    const insertStatement = outputOnly.queryRaw.mock.calls.find(([statement]) =>
+      inspectSql(statement).text.includes("INSERT INTO worker_checkpoints"),
+    )?.[0];
+    const insertSql = inspectSql(insertStatement).text;
     expect(insertSql).toContain("WITH chain_heads AS");
     expect(insertSql).toContain("child.previous_hash=head.checkpoint_hash");
     expect(insertSql).toContain("(SELECT count(*) FROM chain_heads) <= 1");
@@ -448,11 +564,7 @@ describe("ApplicationOperations typed views", () => {
   });
 
   it("rejects a second child that no longer names the unique chain head", async () => {
-    const fork = createSequentialOperations([
-      { rows: [], rowCount: 0 },
-      { rows: [], rowCount: 0 },
-    ]);
-
+    const fork = createSequentialOperations([[], []]);
     await expect(
       fork.operations.checkpoint({
         workerId: "00000000-0000-4000-8000-000000000022",
@@ -508,16 +620,13 @@ describe("ApplicationOperations typed views", () => {
       checkpoint: terminalCheckpoint,
     };
 
-    const firstDirection = createSequentialOperations([
-      { rows: [{ id: terminalCheckpoint.checkpointId }], rowCount: 1 },
-      { rows: [], rowCount: 0 },
-    ]);
+    const firstDirection = createSequentialOperations([[{ id: terminalCheckpoint.checkpointId }]]);
     await expect(firstDirection.operations.checkpoint(input)).resolves.toBe(true);
-    expect(firstDirection.execute).toHaveBeenCalledTimes(2);
+    expect(firstDirection.queryRaw).toHaveBeenCalledTimes(3);
+    expect(firstDirection.executeRaw).toHaveBeenCalledTimes(1);
 
     const reverseDirection = createSequentialOperations([
-      { rows: [{ id: "00000000-0000-4000-8000-000000000032" }], rowCount: 1 },
-      { rows: [{ worker_id: input.workerId }], rowCount: 1 },
+      [{ id: "00000000-0000-4000-8000-000000000032" }],
     ]);
     await expect(
       reverseDirection.operations.checkpoint({
@@ -531,61 +640,47 @@ describe("ApplicationOperations typed views", () => {
         },
       }),
     ).resolves.toBe(true);
-    expect(reverseDirection.execute).toHaveBeenCalledTimes(2);
+    expect(reverseDirection.queryRaw).toHaveBeenCalledTimes(3);
+    expect(reverseDirection.executeRaw).toHaveBeenCalledTimes(1);
   });
-
   it("serializes concurrent directional appends and rejects a stale committed head", async () => {
     let tail = Promise.resolve();
     let insertAttempt = 0;
     let activeLocks = 0;
     let maximumActiveLocks = 0;
     const database = {
-      transaction: async <T>(
-        callback: (transaction: {
-          execute: () => Promise<{ rows: Record<string, unknown>[]; rowCount: number }>;
-          select: () => {
-            from: () => {
-              where: () => { for: () => Promise<{ consultationId: string }[]> };
-            };
-          };
-        }) => Promise<T>,
-      ) => {
+      $transaction: async <T>(callback: (transaction: Prisma.TransactionClient) => Promise<T>) => {
         let release: (() => void) | undefined;
         let transactionLocked = false;
-        const transaction = {
-          select: () => ({
-            from: () => ({
-              where: () => ({
-                for: async () => {
-                  if (!transactionLocked) {
-                    const predecessor = tail;
-                    tail = new Promise<void>((resolve) => {
-                      release = resolve;
-                    });
-                    await predecessor;
-                    activeLocks += 1;
-                    maximumActiveLocks = Math.max(maximumActiveLocks, activeLocks);
-                    transactionLocked = true;
-                  }
-                  return [{ consultationId: "00000000-0000-4000-8000-000000000021" }];
-                },
-              }),
-            }),
-          }),
-          execute: async () => {
+        const queryRaw = async (statement: Prisma.Sql): Promise<Record<string, unknown>[]> => {
+          const query = inspectSql(statement).text;
+          if (query.startsWith("SELECT id FROM consultations") && query.endsWith("FOR UPDATE")) {
+            if (!transactionLocked) {
+              const predecessor = tail;
+              tail = new Promise<void>((resolve) => {
+                release = resolve;
+              });
+              await predecessor;
+              activeLocks += 1;
+              maximumActiveLocks = Math.max(maximumActiveLocks, activeLocks);
+              transactionLocked = true;
+            }
+            return [{ id: "00000000-0000-4000-8000-000000000021" }];
+          }
+          if (query.startsWith("SELECT consultation_id FROM worker_job_epochs")) {
+            return [{ consultation_id: "00000000-0000-4000-8000-000000000021" }];
+          }
+          if (query.includes("INSERT INTO worker_checkpoints")) {
             insertAttempt += 1;
             if (insertAttempt === 1) {
               await Promise.resolve();
-              return {
-                rows: [{ id: "00000000-0000-4000-8000-000000000031" }],
-                rowCount: 1,
-              };
+              return [{ id: "00000000-0000-4000-8000-000000000031" }];
             }
-            return { rows: [], rowCount: 0 };
-          },
+          }
+          return [];
         };
         try {
-          return await callback(transaction);
+          return await callback({ $queryRaw: queryRaw } as unknown as Prisma.TransactionClient);
         } finally {
           if (release !== undefined) {
             activeLocks -= 1;
@@ -594,9 +689,11 @@ describe("ApplicationOperations typed views", () => {
         }
       },
     };
-    const operations = new DrizzleApplicationOperations(database as never, {} as never, {
-      now: () => new Date(),
-    });
+    const operations = new PrismaApplicationOperations(
+      database as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date() },
+    );
     const base = {
       workerId: "00000000-0000-4000-8000-000000000022",
       consultationId: "00000000-0000-4000-8000-000000000021",
@@ -645,11 +742,7 @@ describe("ApplicationOperations typed views", () => {
   });
 
   it("accepts an exact terminal replay after clean two-direction settlement", async () => {
-    const replayed = createSequentialOperations([
-      { rows: [], rowCount: 0 },
-      { rows: [{ "?column?": 1 }], rowCount: 1 },
-      { rows: [], rowCount: 0 },
-    ]);
+    const replayed = createSequentialOperations([[], [{ "?column?": 1 }]]);
 
     await expect(
       replayed.operations.checkpoint({
@@ -677,19 +770,19 @@ describe("ApplicationOperations typed views", () => {
         },
       }),
     ).resolves.toBe(true);
-    expect(replayed.execute).toHaveBeenCalledTimes(3);
+    expect(replayed.queryRaw).toHaveBeenCalledTimes(4);
+    expect(replayed.executeRaw).toHaveBeenCalledTimes(1);
 
-    const replayStatement = replayed.execute.mock.calls[1]?.[0];
-    const replaySql = new PgDialect().sqlToQuery(replayStatement as never).sql;
+    const replayStatement = replayed.queryRaw.mock.calls.find(([statement]) =>
+      inspectSql(statement).text.startsWith("SELECT 1 FROM worker_checkpoints checkpoint"),
+    )?.[0];
+    const replaySql = inspectSql(replayStatement).text;
     expect(replaySql).toContain("job.terminal_outcome='clean'");
     expect(replaySql).toContain("consultation.generation=checkpoint.generation");
     expect(replaySql).toContain("reservation.fenced_at IS NULL");
   });
   it("rejects an old-generation or inactive-job checkpoint replay", async () => {
-    const operations = createSequentialOperations([
-      { rows: [], rowCount: 0 },
-      { rows: [], rowCount: 0 },
-    ]);
+    const operations = createSequentialOperations([[], []]);
 
     await expect(
       operations.operations.checkpoint({
@@ -720,24 +813,29 @@ describe("ApplicationOperations typed views", () => {
   });
 
   it("leaves explicit worker failure eligible for supervisor checkpoint settlement", async () => {
-    const transactionResults = [
-      { rows: [], rowCount: 0 },
-      { rows: [{ generation: 4 }], rowCount: 1 },
-      { rows: [], rowCount: 1 },
-      { rows: [], rowCount: 1 },
-      { rows: [], rowCount: 1 },
-    ];
-    const execute = mock(
-      async (_statement: unknown) => transactionResults.shift() ?? { rows: [], rowCount: 0 },
-    );
-    const database = {
-      execute,
-      transaction: async <T>(callback: (transaction: { execute: typeof execute }) => Promise<T>) =>
-        callback({ execute }),
-    };
-    const operations = new DrizzleApplicationOperations(database as never, {} as never, {
-      now: () => new Date("2026-01-01T00:00:00Z"),
+    const queryRaw = mock(async (statement: Prisma.Sql) => {
+      const query = inspectSql(statement).text;
+      if (query.startsWith("SELECT 1 FROM outbox")) {
+        return [];
+      }
+      if (query.startsWith("WITH locked AS")) {
+        return [{ generation: 4 }];
+      }
+      return [];
     });
+    const executeRaw = mock(async (_statement: Prisma.Sql) => 1);
+    const database = {
+      $transaction: async <T>(callback: (transaction: Prisma.TransactionClient) => Promise<T>) =>
+        callback({
+          $queryRaw: queryRaw,
+          $executeRaw: executeRaw,
+        } as unknown as Prisma.TransactionClient),
+    };
+    const operations = new PrismaApplicationOperations(
+      database as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date("2026-01-01T00:00:00Z") },
+    );
 
     await expect(
       operations.workerFailure({
@@ -752,9 +850,11 @@ describe("ApplicationOperations typed views", () => {
       }),
     ).resolves.toBe(true);
 
-    const admissionStatement = execute.mock.calls[1]?.[0];
-    const admissionSql = new PgDialect().sqlToQuery(admissionStatement as never).sql;
-    expect(admissionSql).toContain("lease_expires_at=");
+    const admissionStatement = queryRaw.mock.calls.find(([statement]) =>
+      inspectSql(statement).text.startsWith("WITH locked AS"),
+    )?.[0];
+    const admissionSql = inspectSql(admissionStatement).text;
+    expect(admissionSql).toContain("lease_expires_at=?");
     expect(admissionSql).toContain("accepting_load=false");
     expect(admissionSql).not.toContain("released_at=");
     expect(admissionSql).not.toContain("archive_state");
@@ -767,13 +867,12 @@ describe("Language capability revision fencing", () => {
   const PROFILE_ID = "00000000-0000-4000-8000-000000000042";
 
   function repositoryFixture(updated: readonly { id: string }[]) {
-    const returning = mock(async () => updated);
-    const where = mock((_predicate: unknown) => ({ returning }));
-    const set = mock((_values: unknown) => ({ where }));
-    const update = mock((_table: unknown) => ({ set }));
-    const repository = new DrizzleLanguageRepository({} as never);
-    const transaction = new TransactionHandle({ update } as never);
-    return { repository, transaction, set, where };
+    const queryRaw = mock(async (_statement: Prisma.Sql) => [...updated]);
+    const repository = new PrismaLanguageRepository({} as unknown as PrismaClient);
+    const transaction = new TransactionHandle({
+      $queryRaw: queryRaw,
+    } as unknown as Prisma.TransactionClient);
+    return { repository, transaction, queryRaw };
   }
 
   it("updates an exact current profile revision once", async () => {
@@ -781,15 +880,15 @@ describe("Language capability revision fencing", () => {
 
     await fixture.repository.setEnabled(CAPABILITY_ID, PROFILE_ID, 7, true, fixture.transaction);
 
-    expect(fixture.set).toHaveBeenCalledTimes(1);
-    expect(fixture.set).toHaveBeenCalledWith({ enabled: true });
-    const predicate = fixture.where.mock.calls[0]?.[0];
-    const predicateSql = new PgDialect().sqlToQuery(predicate as never).sql;
-    expect(predicateSql).toContain("language_capabilities");
-    expect(predicateSql).toContain("profile_id");
-    expect(predicateSql).toContain("revision");
-    expect(predicateSql).toContain("provider_profiles");
-    expect(predicateSql).toContain("current_revision");
+    expect(fixture.queryRaw).toHaveBeenCalledTimes(1);
+    const statement = fixture.queryRaw.mock.calls[0]?.[0];
+    const inspected = inspectSql(statement);
+    expect(inspected.text).toContain("UPDATE language_capabilities");
+    expect(inspected.text).toContain("profile_id = ?::uuid");
+    expect(inspected.text).toContain("revision = ?");
+    expect(inspected.text).toContain("FROM provider_profiles");
+    expect(inspected.text).toContain("current_revision = ?");
+    expect(inspected.values).toEqual([true, CAPABILITY_ID, PROFILE_ID, 7, PROFILE_ID, 7]);
   });
 
   it("returns a conflict when the capability revision is stale or absent", async () => {

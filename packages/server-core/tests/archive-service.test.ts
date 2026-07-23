@@ -599,7 +599,7 @@ describe("ArchiveService invariants", () => {
     const order: string[] = [];
     const repository = {
       transaction: runTransaction,
-      lockByConsultation: async () => lockedArchive(),
+      lockByConsultation: async () => lockedArchive({ state: "recording" }),
       activeHolds: async () => [{ id: HOLD_ID, reason: "case" }],
       recordObject: async () => {
         order.push("record");
@@ -1142,7 +1142,47 @@ describe("ArchiveService invariants", () => {
     expect(putCreateOnce).not.toHaveBeenCalled();
   });
 
-  it("rejects spool-drainer writes after archive finalization", async () => {
+  it("accepts spool-drainer writes while the archive is reconciling", async () => {
+    const verify = mock(async () => true);
+    const recordObject = mock(async () => undefined);
+    const service = createService(
+      {
+        transaction: runTransaction,
+        lockByConsultation: async () =>
+          lockedArchive({ state: "reconciling", finalInventoryHash: null }),
+        activeHolds: async () => [],
+        recordObject,
+      } as unknown as ArchiveRepository,
+      { verify } as unknown as ObjectStoragePort,
+    );
+
+    await expect(
+      service.recordDrainerObject(CONSULTATION, "exchange:late", {
+        objectId: OBJECT_ID,
+        class: "pipeline_exchange",
+        key: "v1/meetings/x/late",
+        versionId: "v1",
+        size: 1,
+        sha256: CONFLICTING_HASH,
+        s3Checksum: "crc",
+        contentType: "application/octet-stream",
+        sampleRange: null,
+        attempt: 1,
+        sequence: 0,
+      }),
+    ).resolves.toBeUndefined();
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(recordObject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        consultationId: CONSULTATION,
+        writerEpoch: 2,
+        causalKey: "exchange:late",
+      }),
+      transaction,
+    );
+  });
+
+  it("rejects spool-drainer writes once the archive is complete", async () => {
     const verify = mock(async () => true);
     const recordObject = mock(async () => undefined);
     const service = createService(

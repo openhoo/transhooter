@@ -3,17 +3,10 @@ import {
   type RoomProviderSelection,
   RoomProviderSelectionSchema,
 } from "@transhooter/contracts";
-import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { DomainError, type Instant, type UUID } from "../domain/model";
 import type { AuditPort, ProviderSnapshotPort, Transaction } from "../ports/index";
-import { type DrizzleSchema, TransactionHandle, unwrap } from "./repositories";
-import {
-  auditEvents,
-  languageCapabilities,
-  providerProfileRevisions,
-  providerProfiles,
-} from "./schema";
+import { Prisma, type PrismaClient } from "./database";
+import { TransactionHandle, unwrap } from "./repositories";
 
 type CapabilitySnapshot = (
   | Omit<
@@ -33,21 +26,29 @@ type BypassSelectionRow = {
   snapshot: CapabilitySnapshot;
 };
 type CurrentProfileRow = { id: UUID; current_revision: number };
+type TranslatedSelectionRow = {
+  profileName: string;
+  currentRevision: number;
+  capabilityHash: string;
+  id: UUID;
+  sourceLocale: string;
+  snapshot: CapabilitySnapshot;
+};
 
-abstract class DrizzleRepository {
-  constructor(protected readonly database: NodePgDatabase<DrizzleSchema>) {}
+abstract class PrismaRepository {
+  constructor(protected readonly database: PrismaClient) {}
 
   transaction<T>(work: (tx: Transaction) => Promise<T>): Promise<T> {
-    return this.database.transaction((database) => work(new TransactionHandle(database)));
+    return this.database.$transaction((database) => work(new TransactionHandle(database)));
   }
 }
 
-export class DrizzleProviderSnapshotRepository
-  extends DrizzleRepository
+export class PrismaProviderSnapshotRepository
+  extends PrismaRepository
   implements ProviderSnapshotPort
 {
   constructor(
-    database: NodePgDatabase<DrizzleSchema>,
+    database: PrismaClient,
     private readonly canonicalHash: (value: unknown) => string,
   ) {
     super(database);
@@ -63,8 +64,7 @@ export class DrizzleProviderSnapshotRepository
     profileRevision: number;
   }> {
     if (participants[0].language === participants[1].language) {
-      const bypass = await unwrap(tx).execute<BypassSelectionRow>(
-        sql`
+      const bypass = await unwrap(tx).$queryRaw<BypassSelectionRow[]>(Prisma.sql`
         SELECT
           p.name AS profile_name,
           p.current_revision,
@@ -77,7 +77,7 @@ export class DrizzleProviderSnapshotRepository
         JOIN language_capabilities l
           ON l.profile_id = p.id AND l.revision = p.current_revision
         WHERE
-          p.id = ${profileId}
+          p.id = ${profileId}::uuid
           AND p.enabled
           AND l.enabled
           AND l.fresh_until > now()
@@ -85,9 +85,8 @@ export class DrizzleProviderSnapshotRepository
           AND l.source_locale = ${participants[0].language}
           AND l.target_locale = ${participants[0].language}
           FOR SHARE
-        `,
-      );
-      const row = bypass.rows[0];
+      `);
+      const row = bypass[0];
       if (!row) {
         throw new DomainError("PROFILE_INCOMPATIBLE");
       }
@@ -114,48 +113,32 @@ export class DrizzleProviderSnapshotRepository
       };
     }
 
-    const rows = await unwrap(tx)
-      .select({
-        profileName: providerProfiles.name,
-        currentRevision: providerProfiles.currentRevision,
-        capabilityHash: providerProfileRevisions.capabilityHash,
-        id: languageCapabilities.id,
-        sourceLocale: languageCapabilities.sourceLocale,
-        snapshot: languageCapabilities.snapshot,
-      })
-      .from(providerProfiles)
-      .innerJoin(
-        providerProfileRevisions,
-        and(
-          eq(providerProfileRevisions.profileId, providerProfiles.id),
-          eq(providerProfileRevisions.revision, providerProfiles.currentRevision),
-        ),
-      )
-      .innerJoin(
-        languageCapabilities,
-        and(
-          eq(languageCapabilities.profileId, providerProfiles.id),
-          eq(languageCapabilities.revision, providerProfiles.currentRevision),
-          eq(languageCapabilities.enabled, true),
-        ),
-      )
-      .where(
-        and(
-          eq(providerProfiles.id, profileId),
-          eq(providerProfiles.enabled, true),
-          gt(languageCapabilities.freshUntil, sql`now()`),
-          or(
-            and(
-              eq(languageCapabilities.sourceLocale, participants[0].language),
-              eq(languageCapabilities.targetLocale, participants[1].language),
-            ),
-            and(
-              eq(languageCapabilities.sourceLocale, participants[1].language),
-              eq(languageCapabilities.targetLocale, participants[0].language),
-            ),
-          ),
-        ),
-      );
+    const rows = await unwrap(tx).$queryRaw<TranslatedSelectionRow[]>(Prisma.sql`
+      SELECT
+        p.name AS "profileName",
+        p.current_revision AS "currentRevision",
+        r.capability_hash AS "capabilityHash",
+        l.id,
+        l.source_locale AS "sourceLocale",
+        l.snapshot
+      FROM provider_profiles p
+      JOIN provider_profile_revisions r
+        ON r.profile_id = p.id AND r.revision = p.current_revision
+      JOIN language_capabilities l
+        ON l.profile_id = p.id
+        AND l.revision = p.current_revision
+        AND l.enabled = true
+      WHERE p.id = ${profileId}::uuid
+        AND p.enabled = true
+        AND l.fresh_until > now()
+        AND (
+          (l.source_locale = ${participants[0].language}
+            AND l.target_locale = ${participants[1].language})
+          OR
+          (l.source_locale = ${participants[1].language}
+            AND l.target_locale = ${participants[0].language})
+        )
+    `);
     if (rows.length !== 2) {
       throw new DomainError("PROFILE_INCOMPATIBLE");
     }
@@ -165,7 +148,7 @@ export class DrizzleProviderSnapshotRepository
       throw new DomainError("PROFILE_INCOMPATIBLE");
     }
     const directions = rows.map((row, index) => ({
-      ...(row.snapshot as CapabilitySnapshot),
+      ...row.snapshot,
       sourceParticipantId: participants[index]?.id,
       destinationParticipantId: participants[index === 0 ? 1 : 0]?.id,
       capabilityRowId: row.id,
@@ -187,28 +170,20 @@ export class DrizzleProviderSnapshotRepository
 
   async assertFreshAndHealthy(selection: RoomProviderSelection): Promise<void> {
     const rowIds = [...new Set(selection.directions.map((direction) => direction.capabilityRowId))];
-    const rows = await this.database
-      .select({ id: languageCapabilities.id })
-      .from(languageCapabilities)
-      .innerJoin(providerProfiles, eq(providerProfiles.id, languageCapabilities.profileId))
-      .innerJoin(
-        providerProfileRevisions,
-        and(
-          eq(providerProfileRevisions.profileId, providerProfiles.id),
-          eq(providerProfileRevisions.revision, languageCapabilities.revision),
-        ),
-      )
-      .where(
-        and(
-          inArray(languageCapabilities.id, rowIds),
-          eq(providerProfiles.name, selection.profileId),
-          eq(languageCapabilities.revision, selection.profileRevision),
-          eq(providerProfileRevisions.capabilityHash, selection.capabilityHash),
-          eq(providerProfiles.enabled, true),
-          eq(languageCapabilities.enabled, true),
-          gt(languageCapabilities.freshUntil, sql`now()`),
-        ),
-      );
+    const rows = await this.database.$queryRaw<{ id: UUID }[]>(Prisma.sql`
+      SELECT l.id
+      FROM language_capabilities l
+      JOIN provider_profiles p ON p.id = l.profile_id
+      JOIN provider_profile_revisions r
+        ON r.profile_id = p.id AND r.revision = l.revision
+      WHERE l.id IN (${Prisma.join(rowIds.map((id) => Prisma.sql`${id}::uuid`))})
+        AND p.name = ${selection.profileId}
+        AND l.revision = ${selection.profileRevision}
+        AND r.capability_hash = ${selection.capabilityHash}
+        AND p.enabled = true
+        AND l.enabled = true
+        AND l.fresh_until > now()
+    `);
     if (rows.length !== rowIds.length) {
       throw new DomainError("PROFILE_STALE_OR_DISABLED");
     }
@@ -218,19 +193,17 @@ export class DrizzleProviderSnapshotRepository
     profileReference: string,
     tx: Transaction,
   ): Promise<{ profileId: UUID; revision: number }> {
-    const result = await unwrap(tx).execute<CurrentProfileRow>(
-      sql`
-        SELECT id, current_revision
-        FROM provider_profiles
-        WHERE
-          (id::text = ${profileReference} OR name = ${profileReference})
-          AND enabled
-        ORDER BY (id::text = ${profileReference}) DESC
-        LIMIT 1
-        FOR SHARE
-      `,
-    );
-    const row = result.rows[0];
+    const result = await unwrap(tx).$queryRaw<CurrentProfileRow[]>(Prisma.sql`
+      SELECT id, current_revision
+      FROM provider_profiles
+      WHERE
+        (id::text = ${profileReference} OR name = ${profileReference})
+        AND enabled
+      ORDER BY (id::text = ${profileReference}) DESC
+      LIMIT 1
+      FOR SHARE
+    `);
+    const row = result[0];
     if (!row) {
       throw new DomainError("PROFILE_DISABLED_OR_NOT_FOUND");
     }
@@ -241,7 +214,7 @@ export class DrizzleProviderSnapshotRepository
   }
 }
 
-export class DrizzleAuditRepository extends DrizzleRepository implements AuditPort {
+export class PrismaAuditRepository extends PrismaRepository implements AuditPort {
   async append(
     input: {
       id: UUID;
@@ -253,13 +226,16 @@ export class DrizzleAuditRepository extends DrizzleRepository implements AuditPo
     },
     tx: Transaction,
   ): Promise<void> {
-    await unwrap(tx).insert(auditEvents).values({
-      id: input.id,
-      aggregateId: input.aggregateId,
-      actorId: input.actorId,
-      kind: input.kind,
-      occurredAt: input.occurredAt,
-      details: input.details,
-    });
+    await unwrap(tx).$executeRaw(Prisma.sql`
+      INSERT INTO audit_events (id, aggregate_id, actor_id, kind, occurred_at, details)
+      VALUES (
+        ${input.id}::uuid,
+        ${input.aggregateId}::uuid,
+        ${input.actorId}::uuid,
+        ${input.kind},
+        ${input.occurredAt},
+        ${JSON.stringify(input.details)}::jsonb
+      )
+    `);
   }
 }

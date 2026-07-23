@@ -9,11 +9,9 @@ import {
   KubernetesServiceAccountVerifier,
   type ServiceJwtVerifier,
 } from "@transhooter/server-core";
-import * as schema from "@transhooter/server-core/persistence";
-import { drizzle } from "drizzle-orm/node-postgres";
+import { createPrismaDatabase, type PrismaDatabase } from "@transhooter/server-core/persistence";
 import Redis from "ioredis";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { Pool } from "pg";
 import { type WebConfig, webConfig } from "./config";
 import {
   AesGcmMagicLinkTokenSealer,
@@ -28,7 +26,48 @@ async function ensureRedisConnected(redis: Redis): Promise<void> {
     await redis.connect();
   }
 }
-let application: ConfiguredWebApplication | undefined;
+interface ApplicationResources {
+  readonly application: ConfiguredWebApplication;
+  dispose(): Promise<void>;
+}
+
+let resources: ApplicationResources | undefined;
+
+function disposeApplicationResources(
+  database: PrismaDatabase,
+  redis: Redis,
+  mail: SmtpMailAdapter,
+  storage: S3ArchiveAdapter,
+): () => Promise<void> {
+  let disposal: Promise<void> | undefined;
+  return async () => {
+    if (disposal) {
+      return disposal;
+    }
+    disposal = Promise.allSettled([
+      database.disconnect(),
+      Promise.resolve().then(() => redis.disconnect()),
+      Promise.resolve().then(() => mail.close()),
+      Promise.resolve().then(() => storage.destroy()),
+    ]).then((results) => {
+      const failures = results.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      if (failures.length === 1) {
+        throw failures[0];
+      }
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "Failed to dispose web application resources");
+      }
+    });
+    try {
+      await disposal;
+    } catch (error) {
+      disposal = undefined;
+      throw error;
+    }
+  };
+}
 
 type InternalVerifierPrimitives = {
   hashing: {
@@ -189,18 +228,19 @@ function internalPrincipalVerifier(
 }
 
 export function configuredApplication(): ConfiguredWebApplication {
-  if (application) {
-    return application;
+  if (resources) {
+    return resources.application;
   }
 
   const config = webConfig();
-  const pool = new Pool({
+  const database = createPrismaDatabase({
     connectionString: config.databaseUrl,
-    max: 20,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 5_000,
+    pool: {
+      max: 20,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000,
+    },
   });
-  const database = drizzle(pool, { schema });
   const redis = new Redis(config.redisUrl, {
     lazyConnect: true,
     maxRetriesPerRequest: 1,
@@ -208,43 +248,57 @@ export function configuredApplication(): ConfiguredWebApplication {
   });
   const mail = new SmtpMailAdapter(config.smtpUrl, config.publicUrl);
   const storage = new S3ArchiveAdapter(config);
-  const livekit = liveKitAdapters(config);
-  const primitives = cryptoPrimitives();
+  const dispose = disposeApplicationResources(database, redis, mail, storage);
+  try {
+    const livekit = liveKitAdapters(config);
+    const primitives = cryptoPrimitives();
+    const application = createConfiguredWebApplication({
+      database: database.client,
+      mail,
+      storage,
+      livekitRooms: livekit.rooms,
+      livekitTokens: livekit.tokens,
+      egress: livekit.egress,
+      webhookVerifier: livekit.webhookVerifier,
+      internalPrincipalVerifier: internalPrincipalVerifier(config, primitives),
+      ...primitives,
+      authSecrets: { rateLimitKey: config.sessionSecret },
+      magicLinkTokenSealer: new AesGcmMagicLinkTokenSealer(config.magicLinkSealKeyring),
+      publicBaseUrl: config.publicUrl,
+      clientIp: (request) =>
+        trustedClientIp(
+          request,
+          config.trustedClientIpHeader
+            ? { mode: "trusted-header", headerName: config.trustedClientIpHeader }
+            : { mode: "direct-local" },
+        ),
+      readiness: async () => {
+        await database.readiness();
+        await ensureRedisConnected(redis);
+        const [, mailReady, storageReady, liveKitReady] = await Promise.all([
+          redis.ping(),
+          mail.verify(),
+          storage.ready(),
+          livekit.ready(),
+        ]);
+        return mailReady && storageReady && liveKitReady;
+      },
+    });
+    resources = { application, dispose };
+    return application;
+  } catch (error) {
+    void dispose().catch(() => undefined);
+    throw error;
+  }
+}
 
-  application = createConfiguredWebApplication({
-    database,
-    mail,
-    storage,
-    livekitRooms: livekit.rooms,
-    livekitTokens: livekit.tokens,
-    egress: livekit.egress,
-    webhookVerifier: livekit.webhookVerifier,
-    internalPrincipalVerifier: internalPrincipalVerifier(config, primitives),
-    ...primitives,
-    authSecrets: { rateLimitKey: config.sessionSecret },
-    magicLinkTokenSealer: new AesGcmMagicLinkTokenSealer(config.magicLinkSealKeyring),
-    publicBaseUrl: config.publicUrl,
-    clientIp: (request) =>
-      trustedClientIp(
-        request,
-        config.trustedClientIpHeader
-          ? { mode: "trusted-header", headerName: config.trustedClientIpHeader }
-          : { mode: "direct-local" },
-      ),
-    readiness: async () => {
-      const databaseResult = await pool.query<{ value: number }>("SELECT 1 AS value");
-      if (databaseResult.rows[0]?.value !== 1) {
-        return false;
-      }
-      await ensureRedisConnected(redis);
-      const [, mailReady, storageReady, liveKitReady] = await Promise.all([
-        redis.ping(),
-        mail.verify(),
-        storage.ready(),
-        livekit.ready(),
-      ]);
-      return mailReady && storageReady && liveKitReady;
-    },
-  });
-  return application;
+export async function disposeConfiguredApplication(): Promise<void> {
+  const ownedResources = resources;
+  if (!ownedResources) {
+    return;
+  }
+  await ownedResources.dispose();
+  if (resources === ownedResources) {
+    resources = undefined;
+  }
 }

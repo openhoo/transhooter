@@ -1,6 +1,4 @@
-import { sql } from "drizzle-orm";
-import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import postgres, { type Sql } from "postgres";
+import { createPrismaDatabase, type PrismaDatabase } from "@transhooter/server-core/persistence";
 import type {
   AppliedTransition,
   ClaimOptions,
@@ -25,42 +23,39 @@ import type { CapacityDimension } from "./postgres-store/shared";
 export { persistSupervisorTerminalCheckpoints } from "./postgres-store/consultations";
 
 export class PostgresStore implements DurableStore {
-  private readonly db: PostgresJsDatabase;
-  private constructor(private readonly client: Sql) {
-    this.db = drizzle({ client });
-  }
+  private constructor(private readonly database: PrismaDatabase) {}
 
   static connect(url: string): PostgresStore {
-    const client = postgres(url, {
-      max: 10,
-      prepare: false,
-      transform: { undefined: null },
-    });
-    return new PostgresStore(client);
+    return new PostgresStore(
+      createPrismaDatabase({
+        connectionString: url,
+        pool: { max: 10 },
+      }),
+    );
   }
 
   async close(): Promise<void> {
-    await this.client.end({ timeout: 5 });
+    await this.database.disconnect();
   }
 
   async readiness(): Promise<void> {
-    await this.db.execute(sql`SELECT 1`);
+    await this.database.readiness();
   }
 
   async claimOutbox(options: ClaimOptions): Promise<readonly OutboxItem[]> {
-    return effectOperations.claimOutbox(this.db, this.client, options);
+    return effectOperations.claimOutbox(this.database.client, options);
   }
 
   async completeOutbox(id: Uuid, owner: Uuid): Promise<void> {
-    return effectOperations.completeOutbox(this.db, this.client, id, owner);
+    return effectOperations.completeOutbox(this.database.client, id, owner);
   }
 
   async retryOutbox(id: Uuid, owner: Uuid, error: string, nextAt: Date): Promise<void> {
-    return effectOperations.retryOutbox(this.db, this.client, id, owner, error, nextAt);
+    return effectOperations.retryOutbox(this.database.client, id, owner, error, nextAt);
   }
 
   async claimEffects(options: ClaimOptions): Promise<readonly Effect[]> {
-    return effectOperations.claimEffects(this.db, this.client, options);
+    return effectOperations.claimEffects(this.database.client, options);
   }
 
   async persistCalling(
@@ -70,8 +65,7 @@ export class PostgresStore implements DurableStore {
     requestSha256: string,
   ): Promise<Effect | null> {
     return effectOperations.persistCalling(
-      this.db,
-      this.client,
+      this.database.client,
       effectId,
       owner,
       requestBytes,
@@ -85,11 +79,11 @@ export class PostgresStore implements DurableStore {
     remoteId: string | null,
     result: unknown,
   ): Promise<AppliedTransition> {
-    return effectOperations.markApplied(this.db, this.client, effectId, owner, remoteId, result);
+    return effectOperations.markApplied(this.database.client, effectId, owner, remoteId, result);
   }
 
   async markDone(effectId: Uuid, owner: Uuid): Promise<void> {
-    return effectOperations.markDone(this.db, this.client, effectId, owner);
+    return effectOperations.markDone(this.database.client, effectId, owner);
   }
 
   async markFailed(
@@ -98,37 +92,33 @@ export class PostgresStore implements DurableStore {
     error: string,
     retryAt: Date | null,
   ): Promise<void> {
-    return effectOperations.markFailed(this.db, this.client, effectId, owner, error, retryAt);
+    return effectOperations.markFailed(this.database.client, effectId, owner, error, retryAt);
   }
 
   async renewEffectLease(effectId: Uuid, owner: Uuid, leaseExpiresAt: Date): Promise<boolean> {
-    return effectOperations.renewEffectLease(this.db, this.client, effectId, owner, leaseExpiresAt);
+    return effectOperations.renewEffectLease(this.database.client, effectId, owner, leaseExpiresAt);
   }
 
   async markCompensating(effectId: Uuid, owner: Uuid, reason: string): Promise<void> {
-    return effectOperations.markCompensating(this.db, this.client, effectId, owner, reason);
+    return effectOperations.markCompensating(this.database.client, effectId, owner, reason);
   }
 
   async scheduleEffect(input: PlannedEffect): Promise<void> {
-    return effectOperations.scheduleEffect(this.db, this.client, input);
+    return effectOperations.scheduleEffect(this.database.client, input);
   }
 
   async currentGeneration(consultationId: Uuid): Promise<number | null> {
-    return consultationOperations.currentGeneration(this.db, this.client, consultationId);
+    return consultationOperations.currentGeneration(this.database.client, consultationId);
   }
-
   async claimDeadlines(options: ClaimOptions): Promise<readonly Deadline[]> {
-    return consultationOperations.claimDeadlines(this.db, this.client, options);
+    return consultationOperations.claimDeadlines(this.database.client, options);
   }
-
   async completeDeadline(deadline: Deadline, owner: Uuid): Promise<void> {
-    return consultationOperations.completeDeadline(this.db, this.client, deadline, owner);
+    return consultationOperations.completeDeadline(this.database.client, deadline, owner);
   }
-
   async claimStaleReservations(options: ClaimOptions): Promise<readonly WorkerReservation[]> {
-    return consultationOperations.claimStaleReservations(this.db, this.client, options);
+    return consultationOperations.claimStaleReservations(this.database.client, options);
   }
-
   async heartbeat(
     workerId: Uuid,
     epoch: number,
@@ -136,93 +126,77 @@ export class PostgresStore implements DurableStore {
     leaseExpiresAt: Date,
   ): Promise<boolean> {
     return consultationOperations.heartbeat(
-      this.db,
-      this.client,
+      this.database.client,
       workerId,
       epoch,
       now,
       leaseExpiresAt,
     );
   }
-
   async reserveWorker(consultationId: Uuid, generation: number): Promise<WorkerReservation> {
-    return consultationOperations.reserveWorker(this.db, this.client, consultationId, generation);
+    return consultationOperations.reserveWorker(this.database.client, consultationId, generation);
   }
-
   async applyVerifiedWebhook(event: VerifiedWebhook): Promise<boolean> {
-    return consultationOperations.applyVerifiedWebhook(this.db, this.client, event);
+    return consultationOperations.applyVerifiedWebhook(this.database.client, event);
   }
-
   async presenceEpoch(consultationId: Uuid, generation: number): Promise<number | null> {
-    return consultationOperations.presenceEpoch(this.db, this.client, consultationId, generation);
+    return consultationOperations.presenceEpoch(this.database.client, consultationId, generation);
   }
-
   async admitFinalization(
     consultationId: Uuid,
     generation: number,
     presenceEpoch: number,
     now: Date,
-  ): Promise<"admitted" | ConsultationState | null> {
+  ) {
     return consultationOperations.admitFinalization(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       generation,
       presenceEpoch,
       now,
     );
   }
-
   async isStandardHuman(consultationId: Uuid, participantId: Uuid): Promise<boolean> {
     return consultationOperations.isStandardHuman(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       participantId,
     );
   }
-
   async markCaptureReady(
     consultationId: Uuid,
     generation: number,
     participantIdentity: Uuid,
     participantEgressId: string,
-  ): Promise<"active" | null> {
+  ) {
     return consultationOperations.markCaptureReady(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       generation,
       participantIdentity,
       participantEgressId,
     );
   }
-
   async consultationState(consultationId: Uuid): Promise<ConsultationState | null> {
-    return consultationOperations.consultationState(this.db, this.client, consultationId);
+    return consultationOperations.consultationState(this.database.client, consultationId);
   }
-
   async workerReservation(
     consultationId: Uuid,
     generation: number,
   ): Promise<WorkerReservation | null> {
     return consultationOperations.workerReservation(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       generation,
     );
   }
-
   async workerDispatchMetadata(consultationId: Uuid, generation: number): Promise<unknown> {
     return consultationOperations.workerDispatchMetadata(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       generation,
     );
   }
-
   async planFailureEffects(
     consultationId: Uuid,
     generation: number,
@@ -230,15 +204,13 @@ export class PostgresStore implements DurableStore {
     effects: readonly PlannedEffect[],
   ): Promise<void> {
     return consultationOperations.planFailureEffects(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       generation,
       reason,
       effects,
     );
   }
-
   async fenceWorkerAndPlanFailure(
     reservation: WorkerReservation,
     owner: Uuid,
@@ -246,15 +218,13 @@ export class PostgresStore implements DurableStore {
     effects: readonly PlannedEffect[],
   ): Promise<boolean> {
     return consultationOperations.fenceWorkerAndPlanFailure(
-      this.db,
-      this.client,
+      this.database.client,
       reservation,
       owner,
       reason,
       effects,
     );
   }
-
   async fenceWorkerAndScheduleCancellation(
     consultationId: Uuid,
     cleanupGeneration: number,
@@ -264,8 +234,7 @@ export class PostgresStore implements DurableStore {
     effects: readonly PlannedEffect[],
   ): Promise<void> {
     return consultationOperations.fenceWorkerAndScheduleCancellation(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       cleanupGeneration,
       resourceGeneration,
@@ -274,59 +243,40 @@ export class PostgresStore implements DurableStore {
       effects,
     );
   }
-
   async humanIdentities(consultationId: Uuid): Promise<readonly [Uuid, Uuid]> {
-    return consultationOperations.humanIdentities(this.db, this.client, consultationId);
+    return consultationOperations.humanIdentities(this.database.client, consultationId);
   }
-
   async seedDeadlines(consultationId: Uuid, generation: number): Promise<void> {
-    return consultationOperations.seedDeadlines(this.db, this.client, consultationId, generation);
+    return consultationOperations.seedDeadlines(this.database.client, consultationId, generation);
   }
-
-  async roomDrainPlan(
-    consultationId: Uuid,
-    generation: number,
-  ): Promise<{
-    readonly egressIds: readonly string[];
-    readonly participantIds: readonly Uuid[];
-    readonly dispatchIds: readonly string[];
-    readonly roomCreated: boolean;
-    readonly resourceRoomName: string | null;
-  }> {
-    return consultationOperations.roomDrainPlan(this.db, this.client, consultationId, generation);
+  async roomDrainPlan(consultationId: Uuid, generation: number) {
+    return consultationOperations.roomDrainPlan(this.database.client, consultationId, generation);
   }
-
   async completeRoomDrain(consultationId: Uuid, generation: number): Promise<void> {
     return consultationOperations.completeRoomDrain(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       generation,
     );
   }
-
   async capacityDimensions(consultationId: Uuid): Promise<readonly CapacityDimension[]> {
-    return consultationOperations.capacityDimensions(this.db, this.client, consultationId);
+    return consultationOperations.capacityDimensions(this.database.client, consultationId);
   }
-
-  async preparePendingArchiveDeletes(): Promise<void> {
-    return archiveOperations.preparePendingArchiveDeletes(this.db, this.client);
+  async preparePendingArchiveDeletes(_options: ClaimOptions): Promise<void> {
+    return archiveOperations.preparePendingArchiveDeletes(this.database.client);
   }
-
   async reconciliationSnapshot(
     consultationId: Uuid,
     cleanupGeneration: number,
     resourceGeneration: number,
   ): Promise<ReconciliationSnapshot | null> {
     return archiveOperations.reconciliationSnapshot(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       cleanupGeneration,
       resourceGeneration,
     );
   }
-
   async completeReconciliation(
     effect: Effect,
     owner: Uuid,
@@ -338,8 +288,7 @@ export class PostgresStore implements DurableStore {
     derivedObjects: readonly DerivedArchiveObject[],
   ): Promise<boolean> {
     return archiveOperations.completeReconciliation(
-      this.db,
-      this.client,
+      this.database.client,
       effect,
       owner,
       now,
@@ -350,15 +299,13 @@ export class PostgresStore implements DurableStore {
       derivedObjects,
     );
   }
-
   async finishArchiveDeletionIfEmpty(
     consultationId: Uuid,
     generation: number,
     writeEpoch: number,
   ): Promise<boolean> {
     return archiveOperations.finishArchiveDeletionIfEmpty(
-      this.db,
-      this.client,
+      this.database.client,
       consultationId,
       generation,
       writeEpoch,

@@ -17,32 +17,17 @@ const RESERVATION: WorkerReservation = {
 
 function fakeTransaction(results: unknown[]) {
   const calls: Array<{ readonly text: string; readonly values: readonly unknown[] }> = [];
-  const execute = (text: string, values: readonly unknown[]) => {
-    calls.push({ text, values });
+  const execute = (query: {
+    readonly strings: readonly string[];
+    readonly values: readonly unknown[];
+  }) => {
+    calls.push({ text: query.strings.join("?"), values: query.values });
     return Promise.resolve(results.shift() ?? []);
   };
-  const transaction = Object.assign(
-    (strings: TemplateStringsArray, ...values: unknown[]) => execute(strings.join("?"), values),
-    {
-      options: {
-        parsers: {} as Record<string, unknown>,
-        serializers: {} as Record<string, unknown>,
-      },
-      unsafe: (text: string, values: readonly unknown[] = []) => {
-        const pending = execute(text, values);
-        return Object.assign(pending, {
-          values: async () => {
-            const rows = await pending;
-            return Array.isArray(rows)
-              ? rows.map((row) =>
-                  typeof row === "object" && row !== null ? Object.values(row) : [row],
-                )
-              : [];
-          },
-        });
-      },
-    },
-  );
+  const transaction = {
+    $queryRaw: execute,
+    $executeRaw: execute,
+  };
   return { calls, transaction };
 }
 

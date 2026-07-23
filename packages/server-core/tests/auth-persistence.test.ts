@@ -1,13 +1,17 @@
 import { describe, expect, it, mock } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drizzle } from "drizzle-orm/node-postgres";
 import { Client } from "pg";
 import { LanguageService } from "../src/languages/service";
-import { DrizzleLanguageRepository } from "../src/persistence/application-repositories";
-import { DrizzleAuthRepository, TransactionHandle } from "../src/persistence/repositories";
-import * as schema from "../src/persistence/schema";
+import { PrismaLanguageRepository } from "../src/persistence/application-repositories";
+import {
+  createPrismaDatabase,
+  PrismaAuthRepository,
+  type PrismaDatabase,
+  TransactionHandle,
+} from "../src/persistence/repositories";
 import type { PendingExchangeRecord } from "../src/ports/index";
 
 const NOW = new Date("2026-01-01T00:00:00Z");
@@ -15,25 +19,23 @@ const SINCE = new Date("2025-12-31T23:45:00Z");
 const LINK_ID = "00000000-0000-4000-8000-000000000001";
 
 function admissionDatabase(counts: { email: number; ip: number }) {
-  const removeExpired = mock(async () => undefined);
-  const values = mock(async () => undefined);
-  let execution = 0;
-  const execute = mock(async () => {
-    execution += 1;
-    if (execution % 3 === 0) {
-      return { rows: [counts], rowCount: 1 };
+  const deleteMany = mock(async () => ({ count: 0 }));
+  const create = mock(async () => undefined);
+  let query = 0;
+  const $queryRaw = mock(async () => {
+    query += 1;
+    if (query % 3 === 0) {
+      return [counts];
     }
-    return { rows: [], rowCount: 1 };
+    return [];
   });
-  const transaction = async <T>(work: (transaction: unknown) => Promise<T>): Promise<T> =>
-    work(database);
   const database = {
-    execute,
-    delete: mock(() => ({ where: removeExpired })),
-    insert: mock(() => ({ values })),
-    transaction,
+    $queryRaw,
+    $transaction: async <T>(work: (transaction: unknown) => Promise<T>): Promise<T> =>
+      work(database),
+    magicLinkRequest: { create, deleteMany },
   };
-  return { database, removeExpired, values };
+  return { database, create, deleteMany };
 }
 
 function exchangeRecord(): PendingExchangeRecord {
@@ -47,44 +49,39 @@ function exchangeRecord(): PendingExchangeRecord {
   };
 }
 
-describe("DrizzleAuthRepository bounded storage", () => {
+describe("PrismaAuthRepository bounded storage", () => {
   it("removes expired admission rows and does not persist denied requests", async () => {
     const fixture = admissionDatabase({ email: 5, ip: 5 });
-    const repository = new DrizzleAuthRepository(fixture.database as never);
+    const repository = new PrismaAuthRepository(fixture.database as never);
 
     for (let request = 0; request < 100; request += 1) {
       expect(await repository.admitMagicLinkRequest("email", "ip", SINCE, NOW, 5, 20)).toBe(false);
     }
 
-    expect(fixture.removeExpired).toHaveBeenCalledTimes(100);
-    expect(fixture.values).not.toHaveBeenCalled();
+    expect(fixture.deleteMany).toHaveBeenCalledTimes(100);
+    expect(fixture.create).not.toHaveBeenCalled();
   });
 
   it("persists an admitted request after cleaning its retention window", async () => {
     const fixture = admissionDatabase({ email: 4, ip: 19 });
-    const repository = new DrizzleAuthRepository(fixture.database as never);
+    const repository = new PrismaAuthRepository(fixture.database as never);
 
     expect(await repository.admitMagicLinkRequest("email", "ip", SINCE, NOW, 5, 20)).toBe(true);
-    expect(fixture.removeExpired).toHaveBeenCalledTimes(1);
-    expect(fixture.values).toHaveBeenCalledTimes(1);
+    expect(fixture.deleteMany).toHaveBeenCalledTimes(1);
+    expect(fixture.create).toHaveBeenCalledTimes(1);
   });
 
   it("cleans terminal preparations and rejects a second live preparation", async () => {
-    const removeTerminal = mock(async () => undefined);
-    const returning = mock(async () => []);
-    const onConflictDoNothing = mock(() => ({ returning }));
-    const values = mock(() => ({ onConflictDoNothing }));
-    const database = {
-      delete: mock(() => ({ where: removeTerminal })),
-      insert: mock(() => ({ values })),
-    };
-    const repository = new DrizzleAuthRepository({} as never);
+    const $executeRaw = mock(async () => 1);
+    const $queryRaw = mock(async () => []);
+    const database = { $executeRaw, $queryRaw };
+    const repository = new PrismaAuthRepository({} as never);
 
     await expect(
       repository.createPendingExchange(exchangeRecord(), new TransactionHandle(database as never)),
     ).rejects.toThrow(/INVALID_OR_EXPIRED_LINK/);
-    expect(removeTerminal).toHaveBeenCalledTimes(1);
-    expect(onConflictDoNothing).toHaveBeenCalledTimes(1);
+    expect($executeRaw).toHaveBeenCalledTimes(1);
+    expect($queryRaw).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -109,13 +106,15 @@ async function capabilityDatabaseUrl(): Promise<string> {
   "dedicated capability publisher PostgreSQL contract",
   () => {
     it("publishes a fresh and duplicate revision without access to unrelated tables", async () => {
-      const client = new Client({
-        connectionString: await capabilityDatabaseUrl(),
-      });
-      await client.connect();
+      const connectionString = await capabilityDatabaseUrl();
+      const client = new Client({ connectionString });
+      let prisma: PrismaDatabase | null = null;
+      let clientConnected = false;
       try {
-        const database = drizzle(client, { schema });
-        const repository = new DrizzleLanguageRepository(database);
+        await client.connect();
+        clientConnected = true;
+        prisma = createPrismaDatabase({ connectionString, pool: { max: 2 } });
+        const repository = new PrismaLanguageRepository(prisma.client);
         const profileId = crypto.randomUUID();
         const capabilityHash = "a".repeat(64);
         const refresh = {
@@ -189,7 +188,12 @@ async function capabilityDatabaseUrl(): Promise<string> {
           code: "42501",
         });
       } finally {
-        await client.end();
+        if (prisma) {
+          await prisma.disconnect();
+        }
+        if (clientConnected) {
+          await client.end();
+        }
       }
     });
   },
@@ -261,9 +265,9 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
       const migrators: Bun.Subprocess<"ignore", "pipe", "pipe">[] = [];
       const temporaryDirectory = await mkdtemp(join(tmpdir(), "transhooter-migrations-"));
       const secretFile = join(temporaryDirectory, "database-url");
-      await writeFile(secretFile, `${connectionString}\n`, { mode: 0o600 });
 
       try {
+        await writeFile(secretFile, `${connectionString}\n`, { mode: 0o600 });
         await database.connect();
         databaseConnected = true;
         const ownership = await database.query<{
@@ -271,7 +275,6 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           database_name: string;
           database_owner: string;
           public_schema_owner: string;
-          history_schema_owner: string;
           runtime_can_connect: boolean;
           user_tables: string;
         }>(
@@ -280,7 +283,6 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
              current_database() AS database_name,
              pg_get_userbyid(database.datdba) AS database_owner,
              pg_get_userbyid(public_schema.nspowner) AS public_schema_owner,
-             pg_get_userbyid(history_schema.nspowner) AS history_schema_owner,
              (
                has_database_privilege('transhooter_web', current_database(), 'CONNECT')
                OR has_database_privilege('transhooter_control', current_database(), 'CONNECT')
@@ -290,11 +292,10 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
              (
                SELECT count(*)::text
                FROM information_schema.tables
-               WHERE table_schema IN ('public', 'drizzle')
+               WHERE table_schema = 'public'
              ) AS user_tables
            FROM pg_database AS database
            JOIN pg_namespace AS public_schema ON public_schema.nspname = 'public'
-           JOIN pg_namespace AS history_schema ON history_schema.nspname = 'drizzle'
            WHERE database.datname = current_database()`,
         );
         expect(ownership.rows).toEqual([
@@ -303,13 +304,12 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
             database_name: "transhooter_integration",
             database_owner: "transhooter_migrator",
             public_schema_owner: "transhooter_migrator",
-            history_schema_owner: "transhooter_migrator",
             runtime_can_connect: false,
             user_tables: "0",
           },
         ]);
         const clean = await database.query<{ history: string | null }>(
-          "SELECT to_regclass('drizzle.__drizzle_migrations')::text AS history",
+          "SELECT to_regclass('public._prisma_migrations')::text AS history",
         );
         expect(clean.rows[0]?.history).toBeNull();
 
@@ -369,18 +369,38 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           expect(result.output).toContain("database migrations applied");
         }
 
-        const journal = JSON.parse(
-          await readFile(join(import.meta.dir, "../drizzle/meta/_journal.json"), "utf8"),
-        ) as { entries: readonly unknown[] };
-        expect(journal.entries).toHaveLength(1);
-        const history = await database.query<{ total: string; unique_hashes: string }>(
-          `SELECT count(*)::text AS total, count(DISTINCT hash)::text AS unique_hashes
-           FROM drizzle.__drizzle_migrations`,
+        const migrationSql = await readFile(
+          join(import.meta.dir, "../prisma/migrations/0000_baseline/migration.sql"),
         );
-        expect(history.rows[0]).toEqual({
-          total: "1",
-          unique_hashes: "1",
+        const baselineChecksum = createHash("sha256").update(migrationSql).digest("hex");
+        const history = await database.query<{
+          migration_name: string;
+          checksum: string;
+          finished: boolean;
+          not_rolled_back: boolean;
+          applied_steps_count: number;
+        }>(
+          `SELECT
+             migration_name,
+             checksum,
+             finished_at IS NOT NULL AS finished,
+             rolled_back_at IS NULL AS not_rolled_back,
+             applied_steps_count
+           FROM public._prisma_migrations
+           ORDER BY started_at, id`,
+        );
+        expect(history.rows).toHaveLength(1);
+        expect(history.rows[0]).toMatchObject({
+          migration_name: "0000_baseline",
+          checksum: baselineChecksum,
+          finished: true,
+          not_rolled_back: true,
         });
+        const appliedStepsCount = history.rows[0]?.applied_steps_count;
+        if (appliedStepsCount === undefined) {
+          throw new Error("expected applied migration history");
+        }
+        expect([0, 1]).toContain(appliedStepsCount);
         const migratedTables = await database.query<{ name: string }>(
           `SELECT table_name AS name
            FROM information_schema.tables
@@ -425,12 +445,13 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           ],
         );
 
-        const leftClient = new Client({ connectionString });
-        const rightClient = new Client({ connectionString });
-        await Promise.all([leftClient.connect(), rightClient.connect()]);
+        let leftDatabase: PrismaDatabase | null = null;
+        let rightDatabase: PrismaDatabase | null = null;
         try {
-          const left = new DrizzleAuthRepository(drizzle(leftClient));
-          const right = new DrizzleAuthRepository(drizzle(rightClient));
+          leftDatabase = createPrismaDatabase({ connectionString, pool: { max: 1 } });
+          rightDatabase = createPrismaDatabase({ connectionString, pool: { max: 1 } });
+          const left = new PrismaAuthRepository(leftDatabase.client);
+          const right = new PrismaAuthRepository(rightDatabase.client);
           const settlements = await Promise.all([
             left.transaction((transaction) =>
               left.consumeExchangeAndLink(exchangeId, linkId, settledAt, transaction),
@@ -441,9 +462,11 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           ]);
           expect(settlements.sort()).toEqual([false, true]);
         } finally {
-          await Promise.all([leftClient.end(), rightClient.end()]);
+          await Promise.all([
+            leftDatabase?.disconnect() ?? Promise.resolve(),
+            rightDatabase?.disconnect() ?? Promise.resolve(),
+          ]);
         }
-
         const terminalRows = await database.query<{
           exchange_terminal_rows: string;
           link_terminal_rows: string;

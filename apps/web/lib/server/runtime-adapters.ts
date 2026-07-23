@@ -185,6 +185,10 @@ export class SmtpMailAdapter implements MailPort {
   async verify(): Promise<boolean> {
     return this.#transport.verify();
   }
+
+  close(): void {
+    this.#transport.close();
+  }
 }
 
 function parseS3Credentials(serialized: string | null): S3Credentials | undefined {
@@ -273,6 +277,11 @@ export class S3ArchiveAdapter implements ObjectStoragePort {
     this.#publicClient = new S3Client(
       this.#credentials ? { ...publicBase, credentials: this.#credentials } : publicBase,
     );
+  }
+
+  destroy(): void {
+    this.#client.destroy();
+    this.#publicClient.destroy();
   }
 
   async putCreateOnce(input: {

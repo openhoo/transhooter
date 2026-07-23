@@ -165,6 +165,7 @@ export function installConsultation(ctx) {
     faults = {},
     workerScenario = {},
     captureBarrierTimeoutMs = null,
+    skipMediaOutputProof = true,
   } = {}) {
     await assertFixtureCapabilityLease();
     const runId = randomUUID();
@@ -189,7 +190,7 @@ export function installConsultation(ctx) {
         "--deadline-epoch-ms",
         String(runDeadline),
         "--emit-proof-json",
-        "--skip-media-output-proof",
+        ...(skipMediaOutputProof ? ["--skip-media-output-proof"] : []),
         "--failure-harness-release-file",
         releaseFile,
         "--failure-harness-release-timeout-ms",

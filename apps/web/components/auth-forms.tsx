@@ -1,8 +1,8 @@
 "use client";
 
+import { AlertCircle, Loader2, MailCheck, ShieldCheck } from "lucide-react";
 import type { FormEvent } from "react";
 import { useState } from "react";
-import { AlertCircle, Loader2, MailCheck, ShieldCheck } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {

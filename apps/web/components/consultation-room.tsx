@@ -626,7 +626,9 @@ function JoinPanel({
 }) {
   return (
     <section className={styles.gate} aria-labelledby="room-join-title">
-      <div className={styles.gateIcon} aria-hidden="true">◇</div>
+      <div className={styles.gateIcon} aria-hidden="true">
+        ◇
+      </div>
       <div>
         <p className="eyebrow">Recording is prepared</p>
         <h1 id="room-join-title">The consultation room is ready</h1>
@@ -657,7 +659,9 @@ function JoinPanel({
       >
         {connecting ? "Connecting…" : "Enter room"}
       </button>
-      <p className={styles.gateFootnote}>Media is published only after validated capture readiness.</p>
+      <p className={styles.gateFootnote}>
+        Media is published only after validated capture readiness.
+      </p>
     </section>
   );
 }
@@ -665,7 +669,9 @@ function JoinPanel({
 function LeftPanel({ consultationId }: { consultationId: string }) {
   return (
     <section className={styles.gate} aria-labelledby="room-left-title">
-      <div className={styles.gateIcon} aria-hidden="true">✓</div>
+      <div className={styles.gateIcon} aria-hidden="true">
+        ✓
+      </div>
       <div>
         <p className="eyebrow">Left locally</p>
         <h1 id="room-left-title">You have left the consultation</h1>
@@ -702,7 +708,9 @@ function RecordingStatus({
   return (
     <header className={styles.chrome}>
       <div className={styles.roomIdentity}>
-        <span className={styles.roomMark} aria-hidden="true">↔</span>
+        <span className={styles.roomMark} aria-hidden="true">
+          ↔
+        </span>
         <div>
           <strong>Live consultation</strong>
           <span>{captureReady ? "Media enabled" : "Waiting for capture readiness"}</span>
@@ -788,7 +796,9 @@ function TranslationRibbon({
               <strong>
                 <bdi dir="auto">{otherDisplayName}</bdi>
               </strong>
-              <span>{caption.sourceLanguage} → {caption.targetLanguage}</span>
+              <span>
+                {caption.sourceLanguage} → {caption.targetLanguage}
+              </span>
             </>
           ) : (
             <span>Listening for the other speaker</span>

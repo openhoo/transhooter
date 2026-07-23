@@ -68,10 +68,8 @@ GRANT CONNECT, CREATE ON DATABASE transhooter TO transhooter_migrator;
 GRANT CONNECT ON DATABASE transhooter TO transhooter_web, transhooter_control, transhooter_translation, transhooter_capability;
 
 ALTER SCHEMA public OWNER TO transhooter_migrator;
-CREATE SCHEMA IF NOT EXISTS drizzle AUTHORIZATION transhooter_migrator;
-ALTER SCHEMA drizzle OWNER TO transhooter_migrator;
-REVOKE ALL ON SCHEMA public, drizzle FROM PUBLIC;
-GRANT ALL ON SCHEMA public, drizzle TO transhooter_migrator;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT ALL ON SCHEMA public TO transhooter_migrator;
 GRANT USAGE ON SCHEMA public TO transhooter_web, transhooter_control, transhooter_translation, transhooter_capability;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO transhooter_web, transhooter_control, transhooter_translation;
@@ -104,8 +102,6 @@ SQL
 psql --host=postgres --username=transhooter_owner --dbname=transhooter_integration \
   --set=ON_ERROR_STOP=1 <<'SQL'
 ALTER SCHEMA public OWNER TO transhooter_migrator;
-CREATE SCHEMA IF NOT EXISTS drizzle AUTHORIZATION transhooter_migrator;
-ALTER SCHEMA drizzle OWNER TO transhooter_migrator;
-REVOKE ALL ON SCHEMA public, drizzle FROM PUBLIC;
-GRANT ALL ON SCHEMA public, drizzle TO transhooter_migrator;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT ALL ON SCHEMA public TO transhooter_migrator;
 SQL

@@ -6,7 +6,10 @@ export const dynamic = "force-dynamic";
 
 export default function VerifyPage() {
   return (
-    <section className="flex min-h-[65svh] items-center justify-center py-10" aria-label="Sign-in verification">
+    <section
+      className="flex min-h-[65svh] items-center justify-center py-10"
+      aria-label="Sign-in verification"
+    >
       <VerifyForm />
     </section>
   );

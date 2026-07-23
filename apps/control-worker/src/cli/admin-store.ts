@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import postgres from "postgres";
+import { createPrismaDatabase, Prisma } from "@transhooter/server-core/persistence";
 
 export async function databaseUrlFromEnvironment(environment: NodeJS.ProcessEnv): Promise<string> {
   const path = environment.DATABASE_URL_FILE;
@@ -36,17 +36,20 @@ export async function createStaff(
   databaseUrl: string,
   input: CreateStaffInput,
 ): Promise<CreateStaffResult> {
-  const client = postgres(databaseUrl, { max: 1, prepare: false });
+  const database = createPrismaDatabase({
+    connectionString: databaseUrl,
+    pool: { max: 1 },
+  });
   try {
     const normalizedEmail = input.email.trim().normalize("NFKC").toLocaleLowerCase("en-US");
     const id = randomUUID();
-    const rows = await client<CreateStaffResult[]>`
+    const rows = await database.client.$queryRaw<CreateStaffResult[]>(Prisma.sql`
       INSERT INTO users(id,email,display_name,staff_role,created_at)
       VALUES (${id},${normalizedEmail},${input.displayName.trim()},${input.role},now())
       ON CONFLICT (email) DO UPDATE
       SET display_name=EXCLUDED.display_name,staff_role=EXCLUDED.staff_role
-      RETURNING id,(xmax=0) AS created
-    `;
+      RETURNING id,(xmax::text='0') AS created
+    `);
     const result = rows[0];
     if (result === undefined) {
       throw new Error("staff upsert returned no row");
@@ -57,7 +60,7 @@ export async function createStaff(
       created: result.created,
     };
   } finally {
-    await client.end({ timeout: 5 });
+    await database.disconnect();
   }
 }
 
@@ -70,9 +73,12 @@ interface SetLanguageInput {
 }
 
 export async function setLanguage(databaseUrl: string, input: SetLanguageInput): Promise<void> {
-  const client = postgres(databaseUrl, { max: 1, prepare: false });
+  const database = createPrismaDatabase({
+    connectionString: databaseUrl,
+    pool: { max: 1 },
+  });
   try {
-    const result = await client`
+    const result = await database.client.$executeRaw(Prisma.sql`
       WITH candidate AS (
         SELECT capability.id
         FROM language_capabilities AS capability
@@ -91,11 +97,11 @@ export async function setLanguage(databaseUrl: string, input: SetLanguageInput):
         FROM candidate
         WHERE (SELECT count(*) FROM candidate)=1
       )
-    `;
-    if (result.count !== 1) {
+    `);
+    if (result !== 1) {
       throw new Error("language capability revision is stale or does not exist");
     }
   } finally {
-    await client.end({ timeout: 5 });
+    await database.disconnect();
   }
 }

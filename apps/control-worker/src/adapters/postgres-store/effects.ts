@@ -1,7 +1,4 @@
-import type { SQL } from "drizzle-orm";
-import { sql } from "drizzle-orm";
-import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import type { Sql, TransactionSql } from "postgres";
+import { Prisma } from "@transhooter/server-core/persistence";
 import type {
   AppliedTransition,
   ClaimOptions,
@@ -17,14 +14,15 @@ import {
   mapEffect,
   mapOutboxItem,
   type OutboxRow,
+  type PrismaConnection,
+  withTransaction,
 } from "./shared";
 
 export async function claimOutbox(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   options: ClaimOptions,
 ): Promise<readonly OutboxItem[]> {
-  const rows = await db.execute<OutboxRow>(sql`WITH picked AS (
+  const rows = await client.$queryRaw<OutboxRow[]>(Prisma.sql`WITH picked AS (
     SELECT id FROM outbox WHERE delivered_at IS NULL AND available_at <= ${options.now.toISOString()}
       AND (lease_expires_at IS NULL OR lease_expires_at < ${options.now.toISOString()})
     ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT ${options.limit}
@@ -34,34 +32,31 @@ export async function claimOutbox(
 }
 
 export async function completeOutbox(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   id: Uuid,
   owner: Uuid,
 ): Promise<void> {
-  await db.execute(
-    sql`UPDATE outbox SET delivered_at=now(), lease_owner=NULL, lease_expires_at=NULL WHERE id=${id} AND lease_owner=${owner}`,
+  await client.$executeRaw(
+    Prisma.sql`UPDATE outbox SET delivered_at=now(), lease_owner=NULL, lease_expires_at=NULL WHERE id=${id} AND lease_owner=${owner}`,
   );
 }
 
 export async function retryOutbox(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   id: Uuid,
   owner: Uuid,
   error: string,
   nextAt: Date,
 ): Promise<void> {
-  await db.execute(sql`UPDATE outbox SET available_at=${nextAt.toISOString()}, lease_owner=NULL, lease_expires_at=NULL,
+  await client.$executeRaw(Prisma.sql`UPDATE outbox SET available_at=${nextAt.toISOString()}, lease_owner=NULL, lease_expires_at=NULL,
     payload=jsonb_set(payload,'{lastDispatchError}',to_jsonb(${error}::text),true) WHERE id=${id} AND lease_owner=${owner}`);
 }
 
 export async function claimEffects(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   options: ClaimOptions,
 ): Promise<readonly Effect[]> {
-  const rows = await db.execute<ExternalEffectRow>(sql`WITH picked AS (
+  const rows = await client.$queryRaw<ExternalEffectRow[]>(Prisma.sql`WITH picked AS (
     SELECT candidate.id FROM external_effects candidate WHERE candidate.state IN ('planned','calling','applied','compensating')
       AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < ${options.now.toISOString()})
       AND (
@@ -94,35 +89,34 @@ export async function claimEffects(
 }
 
 export async function persistCalling(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   effectId: Uuid,
   owner: Uuid,
   requestBytes: Uint8Array,
   requestSha256: string,
 ): Promise<Effect | null> {
-  const rows =
-    await db.execute<ExternalEffectRow>(sql`UPDATE external_effects SET state='calling', request_bytes=COALESCE(request_bytes, ${Buffer.from(requestBytes)}),
+  const rows = await client.$queryRaw<
+    ExternalEffectRow[]
+  >(Prisma.sql`UPDATE external_effects SET state='calling', request_bytes=COALESCE(request_bytes, ${Buffer.from(requestBytes)}),
     request_hash=COALESCE(request_hash, ${requestSha256}), attempts=attempts+1,updated_at=now()
     WHERE id=${effectId} AND lease_owner=${owner} AND state IN ('planned','calling') AND (request_hash IS NULL OR request_hash=${requestSha256}) RETURNING *`);
   return rows[0] === undefined ? null : mapEffect(rows[0]);
 }
 
 export async function markApplied(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   effectId: Uuid,
   owner: Uuid,
   remoteId: string | null,
   result: unknown,
 ): Promise<AppliedTransition> {
-  return db.transaction(async (transaction) => {
-    await transaction.execute(sql`SELECT consultation.id
+  return withTransaction(client, async (transaction) => {
+    await transaction.$queryRaw(Prisma.sql`SELECT consultation.id
       FROM consultations consultation
       JOIN external_effects effect ON effect.consultation_id=consultation.id
       WHERE effect.id=${effectId}
       FOR UPDATE OF consultation`);
-    const rows = await transaction.execute<AppliedTransitionRow>(
+    const rows = await transaction.$queryRaw<AppliedTransitionRow[]>(
       markAppliedStatement(effectId, owner, remoteId, result),
     );
     return rows[0]?.transitioned === true ? "applied" : "rejected";
@@ -130,13 +124,12 @@ export async function markApplied(
 }
 
 export async function markDone(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   effectId: Uuid,
   owner: Uuid,
 ): Promise<void> {
-  await db.execute(
-    sql`UPDATE external_effects SET state='done',updated_at=now(),lease_owner=NULL,lease_expires_at=NULL
+  await client.$executeRaw(
+    Prisma.sql`UPDATE external_effects SET state='done',updated_at=now(),lease_owner=NULL,lease_expires_at=NULL
       WHERE id=${effectId} AND lease_owner=${owner}
         AND lease_expires_at > now()
         AND state IN ('calling','applied','compensating')`,
@@ -144,26 +137,24 @@ export async function markDone(
 }
 
 export async function markFailed(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   effectId: Uuid,
   owner: Uuid,
   error: string,
   retryAt: Date | null,
 ): Promise<void> {
-  await db.execute(sql`UPDATE external_effects SET state=${retryAt === null ? "failed" : "calling"},
+  await client.$executeRaw(Prisma.sql`UPDATE external_effects SET state=${retryAt === null ? "failed" : "calling"},
     result=COALESCE(result,'{}'::jsonb) || ${JSON.stringify({ error })}::jsonb,
     updated_at=now(),lease_owner=NULL,lease_expires_at=${retryAt?.toISOString() ?? null} WHERE id=${effectId} AND lease_owner=${owner}`);
 }
 
 export async function renewEffectLease(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   effectId: Uuid,
   owner: Uuid,
   leaseExpiresAt: Date,
 ): Promise<boolean> {
-  const rows = await db.execute<IdRow>(sql`UPDATE external_effects
+  const rows = await client.$queryRaw<IdRow[]>(Prisma.sql`UPDATE external_effects
     SET lease_expires_at=GREATEST(lease_expires_at,${leaseExpiresAt.toISOString()}::timestamptz),updated_at=now()
     WHERE id=${effectId} AND lease_owner=${owner} AND lease_expires_at > now()
       AND state IN ('calling','applied','compensating') RETURNING id`);
@@ -171,42 +162,40 @@ export async function renewEffectLease(
 }
 
 export async function markCompensating(
-  db: PostgresJsDatabase,
-  _client: Sql,
+  client: PrismaConnection,
   effectId: Uuid,
   owner: Uuid,
   reason: string,
 ): Promise<void> {
-  await db.execute(
-    sql`UPDATE external_effects SET state='compensating',
+  await client.$executeRaw(
+    Prisma.sql`UPDATE external_effects SET state='compensating',
       result=COALESCE(result,'{}'::jsonb) || ${JSON.stringify({ reason })}::jsonb,updated_at=now()
       WHERE id=${effectId} AND lease_owner=${owner} AND lease_expires_at > now()`,
   );
 }
 
 export async function scheduleEffect(
-  _db: PostgresJsDatabase,
-  client: Sql,
+  client: PrismaConnection,
   input: PlannedEffect,
 ): Promise<void> {
-  await client.begin(async (transaction) => {
+  await withTransaction(client, async (transaction) => {
     await insertPlannedEffects(transaction, [input]);
   });
 }
 
 export async function insertPlannedEffects(
-  transaction: TransactionSql,
+  transaction: Prisma.TransactionClient,
   effects: readonly PlannedEffect[],
 ): Promise<void> {
   for (const effect of effects) {
-    const authoritative = await transaction<
+    const authoritative = await transaction.$queryRaw<
       IdRow[]
-    >`INSERT INTO external_effects(id,consultation_id,generation,effect_kind,subject_id,occurrence_key,state,result,attempts,created_at,updated_at)
+    >(Prisma.sql`INSERT INTO external_effects(id,consultation_id,generation,effect_kind,subject_id,occurrence_key,state,result,attempts,created_at,updated_at)
       VALUES (${effect.id},${effect.consultationId},${effect.generation},${effect.kind},${effect.subjectId},${effect.occurrenceKey},'planned',
         ${JSON.stringify({ plan: effect.plan })}::jsonb,0,now(),now())
       ON CONFLICT (consultation_id,generation,effect_kind,subject_id,occurrence_key)
       DO UPDATE SET updated_at=external_effects.updated_at
-      RETURNING id`;
+      RETURNING id`);
     const effectId = authoritative[0]?.id;
     if (effectId === undefined) {
       throw new Error("authoritative effect was not persisted");
@@ -218,7 +207,7 @@ export async function insertPlannedEffects(
       }
       const objectClass =
         effect.kind === "ROOM_COMPOSITE_EGRESS" ? "room_composite" : "participant_original";
-      await transaction`INSERT INTO expected_archive_artifacts(
+      await transaction.$executeRaw(Prisma.sql`INSERT INTO expected_archive_artifacts(
           id,archive_id,effect_id,profile_id,profile_revision,object_class,causal_key,
           sample_start,sample_end,owner_epoch,disposition,created_at
         )
@@ -233,7 +222,7 @@ export async function insertPlannedEffects(
         ON CONFLICT (archive_id,object_class,causal_key) DO UPDATE
         SET effect_id=COALESCE(expected_archive_artifacts.effect_id,EXCLUDED.effect_id)
         WHERE expected_archive_artifacts.effect_id IS NULL
-          OR expected_archive_artifacts.effect_id=EXCLUDED.effect_id`;
+          OR expected_archive_artifacts.effect_id=EXCLUDED.effect_id`);
     }
   }
 }
@@ -243,8 +232,8 @@ function markAppliedStatement(
   owner: Uuid,
   remoteId: string | null,
   result: unknown,
-): SQL {
-  return sql`WITH changed AS (
+): Prisma.Sql {
+  return Prisma.sql`WITH changed AS (
       UPDATE external_effects SET state='applied',
         result=COALESCE(result,'{}'::jsonb) || ${JSON.stringify({ remoteId, value: result })}::jsonb,updated_at=now()
       WHERE id=${effectId} AND lease_owner=${owner} AND lease_expires_at > now()
