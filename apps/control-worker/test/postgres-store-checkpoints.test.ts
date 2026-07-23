@@ -775,7 +775,7 @@ describe("PostgresStore batched persistence contracts", () => {
     expect(rolledBack).toBe(true);
   });
 
-  it("orders active effect claims by recovery first, then STATUS_PACKET priority", async () => {
+  it("ages every active effect claim before applying recovery and STATUS_PACKET tie-breaks", async () => {
     const fake = fakeTransaction([[]]);
 
     await claimEffects(fake.transaction as never, {
@@ -787,13 +787,13 @@ describe("PostgresStore batched persistence contracts", () => {
 
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0]?.text).toContain(
-      "ORDER BY CASE candidate.state WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END,",
+      "ORDER BY COALESCE(candidate.lease_expires_at,candidate.created_at),",
     );
     expect(fake.calls[0]?.text).toContain(
-      "CASE candidate.effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END,",
+      "CASE candidate.state WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END,",
     );
     expect(fake.calls[0]?.text).toContain(
-      "candidate.lease_expires_at NULLS LAST,candidate.created_at,candidate.id",
+      "CASE candidate.effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END,candidate.created_at,candidate.id",
     );
     expect(fake.calls[0]?.text).not.toContain("candidate.claim_priority");
     expect(fake.calls[0]?.text).toContain(
@@ -801,29 +801,38 @@ describe("PostgresStore batched persistence contracts", () => {
     );
   });
 
-  it("declares the active external-effect claim index in schema and additive migration", async () => {
-    const [schema, migration] = await Promise.all([
+  it("keeps the released claim index immutable and replaces it additively", async () => {
+    const [schema, releasedMigration, replacementMigration] = await Promise.all([
       readFile(`${import.meta.dir}/../../../packages/server-core/prisma/schema.prisma`, "utf8"),
       readFile(
         `${import.meta.dir}/../../../packages/server-core/prisma/migrations/` +
           "20260723070000_performance_indexes/migration.sql",
         "utf8",
       ),
+      readFile(
+        `${import.meta.dir}/../../../packages/server-core/prisma/migrations/` +
+          "20260723120000_reorder_active_effect_claims/migration.sql",
+        "utf8",
+      ),
     ]);
     expect(schema).toContain(
-      "external_effects_active_claim_priority_lease_created_id_idx exactly covers recovery-first state ordering, STATUS_PACKET priority within each class, expired lease ordering, and deterministic ties",
+      "external_effects_active_claim_priority_lease_created_id_idx ages eligible work by first/current eligibility, then prefers recovery and STATUS_PACKET work within equal-age ties",
     );
     expect(schema).not.toContain("claimPriority");
     expect(schema).not.toContain('map("claim_priority")');
-    expect(migration).toContain(
-      'CREATE INDEX CONCURRENTLY "external_effects_active_claim_priority_lease_created_id_idx"',
+    expect(new Bun.CryptoHasher("sha256").update(releasedMigration).digest("hex")).toBe(
+      "a4cc7cf07091c747690246b14b88c9c14e419bbc61701ab224abca4c9155672f",
     );
-    expect(migration).not.toContain('ADD COLUMN "claim_priority"');
-    expect(migration).not.toContain("GENERATED ALWAYS AS");
-    expect(migration).toContain(
-      `ON "external_effects" ((CASE "state" WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END), (CASE "effect_kind" WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END), "lease_expires_at" ASC NULLS LAST, "created_at", "id")`,
+    expect(replacementMigration).toContain(
+      'DROP INDEX "external_effects_active_claim_priority_lease_created_id_idx"',
     );
-    expect(migration).toContain("'planned'::external_effect_state");
-    expect(migration).toContain("'compensating'::external_effect_state");
+    expect(replacementMigration).toContain(
+      'CREATE INDEX "external_effects_active_claim_priority_lease_created_id_idx"',
+    );
+    expect(replacementMigration).toContain(
+      `ON "external_effects" (COALESCE("lease_expires_at", "created_at"), (CASE "state" WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END), (CASE "effect_kind" WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END), "created_at", "id")`,
+    );
+    expect(replacementMigration).toContain("'planned'::external_effect_state");
+    expect(replacementMigration).toContain("'compensating'::external_effect_state");
   });
 });

@@ -120,6 +120,8 @@ chmod 0777 "$PROOF_DIRECTORY"
 METRICS_FILE="$RUN_DIRECTORY/wrapper-metrics.jsonl"
 PROOF_FILE="$PROOF_DIRECTORY/proof.json"
 : > "$METRICS_FILE"
+SCENARIO_STARTED=false
+SCENARIO_LOG="$RUN_DIRECTORY/scenario.log"
 
 require_positive_seconds() {
   name=$1
@@ -293,9 +295,18 @@ copy_artifact() {
   [ -n "$destination_file" ] || return 0
   [ -f "$source_file" ] || return 0
   destination_directory=$(dirname -- "$destination_file")
-  mkdir -p -- "$destination_directory"
-  cp -- "$source_file" "$destination_file"
-  chmod 0644 "$destination_file"
+  destination_name=$(basename -- "$destination_file")
+  mkdir -p -- "$destination_directory" || return $?
+  temporary_file=$(mktemp "$destination_directory/.${destination_name}.XXXXXXXX") || return $?
+  if cp -- "$source_file" "$temporary_file" &&
+    chmod 0644 "$temporary_file" &&
+    mv -f -- "$temporary_file" "$destination_file"; then
+    return 0
+  else
+    copy_status=$?
+  fi
+  rm -f -- "$temporary_file"
+  return "$copy_status"
 }
 
 early_cleanup() {
@@ -378,6 +389,7 @@ capture_database_diagnostics() {
 cleanup() {
   status=$?
   trap - 0 HUP INT TERM
+  retain_run_directory=false
   if [ "$status" -ne 0 ] && ! $BUILD_ONLY; then
     compose_bounded "Capturing failure-smoke service status" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" ps || true
     compose_bounded "Capturing failure-smoke logs" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
@@ -393,13 +405,23 @@ cleanup() {
     [ "$status" -ne 0 ] || status=1
     printf 'Owned failure-smoke stack classification failed; no cleanup command was run.\n' >&2
   fi
+  if [ "$status" -ne 0 ] && $SCENARIO_STARTED && [ -f "$SCENARIO_LOG" ]; then
+    if copy_artifact "$SCENARIO_LOG" "$HOST_SCENARIO_LOG_FILE"; then
+      printf 'Complete failure-smoke scenario log: %s\n' "$HOST_SCENARIO_LOG_FILE" >&2
+    else
+      retain_run_directory=true
+      printf 'Failed to preserve complete failure-smoke scenario log at %s; source retained at %s.\n' \
+        "$HOST_SCENARIO_LOG_FILE" "$SCENARIO_LOG" >&2
+    fi
+    tail -n 200 "$SCENARIO_LOG" >&2
+  fi
   copy_artifact "$PROOF_FILE" "$HOST_PROOF_FILE" || {
     [ "$status" -ne 0 ] || status=1
   }
   copy_artifact "$METRICS_FILE" "$HOST_METRICS_FILE" || {
     [ "$status" -ne 0 ] || status=1
   }
-  rm -rf -- "$RUN_DIRECTORY"
+  $retain_run_directory || rm -rf -- "$RUN_DIRECTORY"
   if $LOCK_HELD; then
     flock -u 9
   fi
@@ -423,19 +445,11 @@ if ! $NO_BUILD; then
   compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
     build minio egress-ready translation-worker web failure-smoke
 fi
-scenario_log="$RUN_DIRECTORY/scenario.log"
+SCENARIO_STARTED=true
 if compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIMEOUT_SECONDS" \
   run --rm -v "$PROOF_DIRECTORY:/proof" -e FAILURE_SMOKE_PROOF_FILE=/proof/proof.json \
-    failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@" >"$scenario_log" 2>&1; then
-  cat "$scenario_log"
+    failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@" >"$SCENARIO_LOG" 2>&1; then
+  cat "$SCENARIO_LOG"
 else
-  status=$?
-  if copy_artifact "$scenario_log" "$HOST_SCENARIO_LOG_FILE"; then
-    printf 'Complete failure-smoke scenario log: %s\n' "$HOST_SCENARIO_LOG_FILE" >&2
-  else
-    printf 'Failed to preserve complete failure-smoke scenario log at %s.\n' \
-      "$HOST_SCENARIO_LOG_FILE" >&2
-  fi
-  tail -n 200 "$scenario_log" >&2
-  exit "$status"
+  exit $?
 fi

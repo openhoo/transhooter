@@ -177,11 +177,25 @@ case " $* " in
       printf 'full-log-last-line\n'
       exit 42
     fi
+    if [ "${MOCK_MODE:-}" = scenario-signal ]; then
+      printf 'signal-log-first-line\n'
+      printf 'signal-log-last-line\n'
+      printf 'ready\n' > "$READY_FIFO"
+      exec sleep 30
+    fi
     ;;
 esac
 exit 0
 MOCK
 chmod +x "$TEST_DIRECTORY/bin/docker"
+cat > "$TEST_DIRECTORY/bin/mv" <<'MOCK'
+#!/bin/sh
+if [ "${MOCK_ARTIFACT_RENAME_FAILURE:-}" = true ]; then
+  exit 73
+fi
+exec /usr/bin/mv "$@"
+MOCK
+chmod +x "$TEST_DIRECTORY/bin/mv"
 
 run_wrapper() {
   mode=$1
@@ -309,6 +323,9 @@ if grep -F 'failure-smoke.mjs' "$CALLS" >/dev/null; then
 fi
 grep -F '"name":"Building failure-smoke application and harness images"' "$build_metrics" >/dev/null ||
   fail 'build-only metrics omitted the image build phase'
+if [ -e "$TEST_DIRECTORY/build-only.scenario.log" ]; then
+  fail 'build-only unexpectedly created a failure scenario log'
+fi
 
 : > "$CALLS"
 no_build_proof="$TEST_DIRECTORY/no-build.proof.json"
@@ -327,6 +344,9 @@ grep -F ':/proof' "$CALLS" >/dev/null || fail 'no-build did not mount the privat
 [ -s "$no_build_proof" ] || fail 'no-build did not copy the harness proof'
 grep -F '"name":"Running failure injection scenarios"' "$no_build_metrics" >/dev/null ||
   fail 'no-build metrics omitted scenario execution'
+if [ -e "$TEST_DIRECTORY/no-build.scenario.log" ]; then
+  fail 'successful scenario run unexpectedly created a failure scenario log'
+fi
 
 : > "$CALLS"
 failed_scenario_log="$TEST_DIRECTORY/failed-scenario.log"
@@ -358,6 +378,75 @@ for remaining_run_directory in "$TEST_DIRECTORY"/transhooter-failure-smoke.*; do
   [ ! -e "$remaining_run_directory" ] ||
     fail 'failed scenario retained its private run directory after artifact copy'
 done
+
+: > "$CALLS"
+signal_scenario_log="$TEST_DIRECTORY/signal-scenario.log"
+READY_FIFO="$TEST_DIRECTORY/scenario-ready"
+export READY_FIFO
+mkfifo "$READY_FIFO"
+PATH="$TEST_DIRECTORY/bin:$PATH" \
+  MOCK_MODE=scenario-signal \
+  TMPDIR="$TEST_DIRECTORY" \
+  COMPOSE_DETECTION_TIMEOUT_SECONDS=1 \
+  COMPOSE_SETUP_TIMEOUT_SECONDS=1 \
+  COMPOSE_BUILD_TIMEOUT_SECONDS=1 \
+  COMPOSE_SCENARIO_TIMEOUT_SECONDS=30 \
+  COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS=1 \
+  COMPOSE_OWNERSHIP_TIMEOUT_SECONDS=1 \
+  COMPOSE_CLEANUP_TIMEOUT_SECONDS=1 \
+  "$ROOT/scripts/failure-smoke" --no-build \
+    --scenario-log-file "$signal_scenario_log" \
+    > "$TEST_DIRECTORY/scenario-signal-output" 2>&1 &
+wrapper_pid=$!
+IFS= read -r ready < "$READY_FIFO"
+[ "$ready" = ready ] || fail 'scenario signal test did not produce log output'
+kill -TERM "$wrapper_pid"
+if wait "$wrapper_pid"; then
+  fail 'scenario-signalled wrapper succeeded'
+else
+  signal_status=$?
+fi
+[ "$signal_status" -eq 143 ] || fail "scenario SIGTERM returned $signal_status instead of 143"
+grep -Fx 'signal-log-first-line' "$signal_scenario_log" >/dev/null ||
+  fail 'scenario SIGTERM artifact omitted initial log output'
+grep -Fx 'signal-log-last-line' "$signal_scenario_log" >/dev/null ||
+  fail 'scenario SIGTERM artifact omitted terminal log output'
+
+: > "$CALLS"
+failed_atomic_log="$TEST_DIRECTORY/failed-atomic.log"
+printf 'existing-artifact-content\n' > "$failed_atomic_log"
+if PATH="$TEST_DIRECTORY/bin:$PATH" \
+  MOCK_MODE=scenario-failure \
+  MOCK_ARTIFACT_RENAME_FAILURE=true \
+  TMPDIR="$TEST_DIRECTORY" \
+  COMPOSE_DETECTION_TIMEOUT_SECONDS=1 \
+  COMPOSE_SETUP_TIMEOUT_SECONDS=1 \
+  COMPOSE_BUILD_TIMEOUT_SECONDS=1 \
+  COMPOSE_SCENARIO_TIMEOUT_SECONDS=1 \
+  COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS=1 \
+  COMPOSE_OWNERSHIP_TIMEOUT_SECONDS=1 \
+  COMPOSE_CLEANUP_TIMEOUT_SECONDS=1 \
+  timeout 15 "$ROOT/scripts/failure-smoke" --no-build \
+    --scenario-log-file "$failed_atomic_log" \
+    > "$TEST_DIRECTORY/atomic-failure-output" 2>&1; then
+  fail 'failed destination preservation wrapper run succeeded'
+else
+  atomic_failure_status=$?
+fi
+[ "$atomic_failure_status" -eq 42 ] ||
+  fail "failed destination preservation returned $atomic_failure_status instead of 42"
+[ "$(cat "$failed_atomic_log")" = existing-artifact-content ] ||
+  fail 'failed atomic preservation truncated or replaced the existing artifact'
+retained_source=$(
+  sed -n 's/.*source retained at \([^ ]*\)\.$/\1/p' \
+    "$TEST_DIRECTORY/atomic-failure-output"
+)
+[ -n "$retained_source" ] || fail 'failed preservation did not report its retained source path'
+[ -f "$retained_source" ] || fail 'failed preservation deleted its retained source log'
+grep -Fx 'full-log-first-line' "$retained_source" >/dev/null ||
+  fail 'retained source log omitted the initial context'
+grep -Fx 'full-log-last-line' "$retained_source" >/dev/null ||
+  fail 'retained source log omitted the terminal context'
 
 parallel_output="$TEST_DIRECTORY/parallel-artifacts"
 : > "$CALLS"

@@ -14,5 +14,9 @@ else
 fi
 
 POSTGRES_CONCURRENCY_INTEGRATION=1 \
-  exec bun test packages/server-core/tests/auth-persistence.test.ts \
+  bun test packages/server-core/tests/auth-persistence.test.ts \
     --test-name-pattern 'PostgreSQL migration and terminal settlement integration'
+
+POSTGRES_CONCURRENCY_INTEGRATION=1 \
+  exec bun test apps/control-worker/test/postgres-effect-claim-integration.test.ts \
+    --test-name-pattern 'PostgreSQL effect claim fairness'

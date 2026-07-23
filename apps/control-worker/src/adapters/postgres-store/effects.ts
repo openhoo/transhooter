@@ -81,9 +81,9 @@ export async function claimEffects(
             AND epoch.terminal_at IS NOT NULL
         )
       )
-    ORDER BY CASE candidate.state WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END,
-      CASE candidate.effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END,
-      candidate.lease_expires_at NULLS LAST,candidate.created_at,candidate.id
+    ORDER BY COALESCE(candidate.lease_expires_at,candidate.created_at),
+      CASE candidate.state WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END,
+      CASE candidate.effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END,candidate.created_at,candidate.id
     FOR UPDATE SKIP LOCKED LIMIT ${options.limit}
   ) UPDATE external_effects e SET lease_owner=${options.owner}, lease_expires_at=${new Date(options.now.getTime() + options.leaseMs).toISOString()}
     FROM picked WHERE e.id=picked.id RETURNING e.*`);

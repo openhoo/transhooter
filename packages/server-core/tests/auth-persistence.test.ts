@@ -363,7 +363,11 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           expect(result.output).toContain("database migrations applied");
         }
 
-        const [baselineMigrationBytes, performanceIndexesMigrationBytes] = await Promise.all([
+        const [
+          baselineMigrationBytes,
+          performanceIndexesMigrationBytes,
+          reorderedClaimsMigrationBytes,
+        ] = await Promise.all([
           readFile(join(import.meta.dir, "../prisma/migrations/0000_baseline/migration.sql")),
           readFile(
             join(
@@ -371,9 +375,19 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
               "../prisma/migrations/20260723070000_performance_indexes/migration.sql",
             ),
           ),
+          readFile(
+            join(
+              import.meta.dir,
+              "../prisma/migrations/20260723120000_reorder_active_effect_claims/migration.sql",
+            ),
+          ),
         ]);
         const baselineMigrationSql = baselineMigrationBytes.toString("utf-8");
+        const reorderedClaimsMigrationSql = reorderedClaimsMigrationBytes.toString("utf-8");
         const performanceIndexesMigrationSql = performanceIndexesMigrationBytes.toString("utf-8");
+        expect(createHash("sha256").update(performanceIndexesMigrationBytes).digest("hex")).toBe(
+          "a4cc7cf07091c747690246b14b88c9c14e419bbc61701ab224abca4c9155672f",
+        );
         const expectedMigrations = [
           {
             migration_name: "0000_baseline",
@@ -381,7 +395,11 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           },
           {
             migration_name: "20260723070000_performance_indexes",
-            checksum: createHash("sha256").update(performanceIndexesMigrationSql).digest("hex"),
+            checksum: createHash("sha256").update(performanceIndexesMigrationBytes).digest("hex"),
+          },
+          {
+            migration_name: "20260723120000_reorder_active_effect_claims",
+            checksum: createHash("sha256").update(reorderedClaimsMigrationSql).digest("hex"),
           },
         ];
         const history = await database.query<{
@@ -439,15 +457,13 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           .split(";")
           .map((statement) => statement.trim())
           .filter((statement) => statement.length > 0);
-        const concurrentClaimIndex = performanceStatements.find((statement) =>
+        const releasedClaimIndex = performanceStatements.find((statement) =>
           statement.startsWith(
             'CREATE INDEX CONCURRENTLY "external_effects_active_claim_priority_lease_created_id_idx"',
           ),
         );
-        if (!concurrentClaimIndex) {
-          throw new Error(
-            "performance migration omitted the concurrent external-effect claim index",
-          );
+        if (!releasedClaimIndex) {
+          throw new Error("released performance migration omitted the external-effect claim index");
         }
 
         const populatedProfileId = "20000000-0000-4000-8000-000000000001";
@@ -484,13 +500,28 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
             new Date(),
           ],
         );
-        await database.query('DROP INDEX "consultation_participants_user_id_consultation_id_idx"');
+        await database.query(
+          `DELETE FROM public._prisma_migrations
+           WHERE migration_name = '20260723120000_reorder_active_effect_claims'`,
+        );
         await database.query(
           'DROP INDEX "external_effects_active_claim_priority_lease_created_id_idx"',
         );
-        for (const statement of performanceStatements) {
-          await database.query(statement);
+        await database.query(releasedClaimIndex);
+        const upgrade = Bun.spawn([process.execPath, "deploy/scripts/migrate.mjs"], {
+          cwd: join(import.meta.dir, "../../.."),
+          env: environment,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        migrators.push(upgrade);
+        const upgradeResult = await migratorResult(upgrade);
+        if (upgradeResult.exitCode !== 0) {
+          throw new Error(
+            `upgrade migrator failed with exit ${upgradeResult.exitCode}:\n${upgradeResult.output}`,
+          );
         }
+        expect(upgradeResult.output).toContain("database migrations applied");
 
         const claimIndex = await database.query<{
           definition: string;
@@ -512,15 +543,20 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
         expect(claimIndex.rows).toHaveLength(1);
         expect(claimIndex.rows[0]).toMatchObject({ ready: true, valid: true });
         const claimExpression = claimIndex.rows[0]?.expression.replaceAll(/\s+/g, " ").trim();
+        const eligibilityAge = "COALESCE(lease_expires_at, created_at)";
         const recoveryPriority =
           "CASE state WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END";
         const statusPriority = "CASE effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END";
+        expect(claimExpression).toContain(eligibilityAge);
         expect(claimExpression).toContain(recoveryPriority);
         expect(claimExpression).toContain(statusPriority);
+        expect(claimExpression?.indexOf(eligibilityAge)).toBeLessThan(
+          claimExpression?.indexOf(recoveryPriority) ?? -1,
+        );
         expect(claimExpression?.indexOf(recoveryPriority)).toBeLessThan(
           claimExpression?.indexOf(statusPriority) ?? -1,
         );
-        expect(claimIndex.rows[0]?.definition).toContain("lease_expires_at, created_at, id");
+        expect(claimIndex.rows[0]?.definition).toContain("created_at, id");
         expect(claimIndex.rows[0]?.predicate).toContain("'planned'::external_effect_state");
         expect(claimIndex.rows[0]?.predicate).toContain("'compensating'::external_effect_state");
 
