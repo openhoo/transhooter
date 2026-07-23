@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from transhooter_worker.adapters.deepgram.provider import (
     DeepgramConfig,
@@ -70,6 +70,36 @@ class GoogleProfile(BaseModel):
     probe_voice_locale: str = "en-US"
 
 
+class GoogleSpeechProfile(BaseModel):
+    kind: Literal["google-speech-eu"]
+    project: str
+    quota_project: str
+    credential_fingerprint: str
+    probe_voice: str
+    probe_voice_locale: str = "en-US"
+    speech_location: str = "europe-west3"
+    speech_model: str = "long"
+    translation_location: str = "europe-west1"
+    translation_model: str = "general/base"
+    tts_location: str = "eu"
+
+    @model_validator(mode="after")
+    def validate_supported_configuration(self) -> GoogleSpeechProfile:
+        expected = {
+            "speech_location": (self.speech_location, "europe-west3"),
+            "speech_model": (self.speech_model, "long"),
+            "translation_location": (self.translation_location, "europe-west1"),
+            "translation_model": (self.translation_model, "general/base"),
+            "tts_location": (self.tts_location, "eu"),
+        }
+        invalid = [name for name, (value, required) in expected.items() if value != required]
+        if invalid:
+            raise ValueError(
+                "google-speech-eu has unsupported configuration: " + ", ".join(invalid)
+            )
+        return self
+
+
 class AlternateProfile(BaseModel):
     kind: Literal["deepgram-deepl-eu"]
     deepgram_key_file: Path
@@ -92,7 +122,8 @@ class AlternateProfile(BaseModel):
 
 
 ProfileConfig = Annotated[
-    FixtureProfile | GoogleProfile | AlternateProfile, Field(discriminator="kind")
+    FixtureProfile | GoogleProfile | GoogleSpeechProfile | AlternateProfile,
+    Field(discriminator="kind"),
 ]
 
 
@@ -133,6 +164,22 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _speech_endpoint(location: str) -> str:
+    return f"{location}-speech.googleapis.com:443"
+
+
+def _translation_endpoint(location: str) -> str:
+    endpoints = {"europe-west1": "translate-eu.googleapis.com:443"}
+    try:
+        return endpoints[location]
+    except KeyError as exc:
+        raise RuntimeError(f"unsupported Google Translation location: {location}") from exc
+
+
+def _tts_endpoint(location: str) -> str:
+    return f"{location}-texttospeech.googleapis.com:443"
+
+
 def _fixture_config() -> FixtureProfile:
     return FixtureProfile(kind="fixture")
 
@@ -145,6 +192,26 @@ def _google_config() -> GoogleProfile:
         quota_project=_required_env("GOOGLE_QUOTA_PROJECT"),
         credential_fingerprint=credential_fingerprint(credentials_path, "Google ADC"),
         probe_voice=_required_env("GOOGLE_TTS_VOICE"),
+    )
+
+
+def _google_speech_config() -> GoogleSpeechProfile:
+    credentials_path = Path(_required_env("GOOGLE_APPLICATION_CREDENTIALS"))
+    return GoogleSpeechProfile(
+        kind="google-speech-eu",
+        project=_required_env("GOOGLE_CLOUD_PROJECT"),
+        quota_project=_required_env("GOOGLE_QUOTA_PROJECT"),
+        credential_fingerprint=credential_fingerprint(credentials_path, "Google ADC"),
+        probe_voice=_required_env("GOOGLE_TTS_VOICE"),
+        probe_voice_locale=os.environ.get("GOOGLE_TTS_VOICE_LOCALE", "en-US").strip() or "en-US",
+        speech_location=os.environ.get("GOOGLE_SPEECH_LOCATION", "europe-west3").strip()
+        or "europe-west3",
+        speech_model=os.environ.get("GOOGLE_SPEECH_MODEL", "long").strip() or "long",
+        translation_location=os.environ.get("GOOGLE_TRANSLATION_LOCATION", "europe-west1").strip()
+        or "europe-west1",
+        translation_model=os.environ.get("GOOGLE_TRANSLATION_MODEL", "general/base").strip()
+        or "general/base",
+        tts_location=os.environ.get("GOOGLE_TTS_LOCATION", "eu").strip() or "eu",
     )
 
 
@@ -181,6 +248,8 @@ def resolve_profile_config(
         return _fixture_config()
     if profile_id == "google-eu":
         return _google_config()
+    if profile_id == "google-speech-eu":
+        return _google_speech_config()
     if profile_id == "deepgram-deepl-eu":
         return _alternate_config(languages)
     raise RuntimeError(f"unregistered provider profile: {profile_id}")
@@ -205,6 +274,8 @@ class ProviderRegistry:
     ) -> Providers:
         if isinstance(config, FixtureProfile):
             return ProviderRegistry._construct_fixture(meeting_id)
+        if isinstance(config, GoogleSpeechProfile):
+            return ProviderRegistry._construct_google_speech(config, meeting_id, journal)
         if isinstance(config, GoogleProfile):
             return ProviderRegistry._construct_google(config, meeting_id, journal)
         return ProviderRegistry._construct_alternate(config, meeting_id, journal)
@@ -230,7 +301,35 @@ class ProviderRegistry:
             probe_voice=config.probe_voice,
             probe_voice_locale=config.probe_voice_locale,
         )
-        channels = GoogleChannelPool(config.quota_project)
+        return ProviderRegistry._construct_google_pipeline(google_config, journal)
+
+    @staticmethod
+    def _construct_google_speech(
+        config: GoogleSpeechProfile, meeting_id: UUID, journal: ExchangeJournal
+    ) -> Providers:
+        google_config = GoogleConfig(
+            project=config.project,
+            quota_project=config.quota_project,
+            meeting_id=meeting_id,
+            credential_fingerprint=config.credential_fingerprint,
+            probe_voice=config.probe_voice,
+            probe_voice_locale=config.probe_voice_locale,
+            speech_location=config.speech_location,
+            speech_endpoint=_speech_endpoint(config.speech_location),
+            speech_model=config.speech_model,
+            translation_location=config.translation_location,
+            translation_endpoint=_translation_endpoint(config.translation_location),
+            translation_model=config.translation_model,
+            tts_location=config.tts_location,
+            tts_endpoint=_tts_endpoint(config.tts_location),
+        )
+        return ProviderRegistry._construct_google_pipeline(google_config, journal)
+
+    @staticmethod
+    def _construct_google_pipeline(
+        google_config: GoogleConfig, journal: ExchangeJournal
+    ) -> Providers:
+        channels = GoogleChannelPool(google_config.quota_project)
         return Providers(
             stt=GoogleSttProvider(google_config, journal, channel_pool=channels),
             translation=GoogleTranslationProvider(google_config, journal, channel_pool=channels),

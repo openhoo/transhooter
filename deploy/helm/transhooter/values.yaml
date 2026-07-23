@@ -108,6 +108,16 @@ config:
       translationCharactersMinute: 100000
       ttsSessions: 2
       ttsStartsMinute: 40
+    googleSpeechEu:
+      cloudProject: example-project
+      quotaProject: example-project
+      speechLocation: europe-west3
+      speechModel: long
+      translationLocation: europe-west1
+      translationModel: general/base
+      ttsLocation: eu
+      ttsVoice: en-US-Chirp3-HD-Charon
+      ttsVoiceLocale: en-US
     deepgramDeeplEu:
       deepgramListenEndpoint: wss://api.eu.deepgram.com/v1/listen
       deepgramSpeakEndpoint: wss://api.eu.deepgram.com/v1/speak

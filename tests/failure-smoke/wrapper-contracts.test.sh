@@ -516,6 +516,7 @@ cp "$ROOT/deploy/scripts/compose-lib.sh" "$DEV_ROOT/deploy/scripts/compose-lib.s
 printf '{}\n' > "$DEV_ROOT/.secrets/google-adc.json"
 : > "$DEV_ROOT/deploy/compose/compose.yml"
 : > "$DEV_ROOT/deploy/compose/compose.google.yml"
+: > "$DEV_ROOT/deploy/compose/compose.google-speech.yml"
 : > "$DEV_ROOT/deploy/compose/compose.test.yml"
 : > "$CALLS"
 
@@ -539,6 +540,32 @@ if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
 fi
 grep -F 'APP_ENV=development SMTP_URL=smtp://custom-mail:2525 RTC_ADVERTISED_IP=192.0.2.44 S3_PUBLIC_ENDPOINT=https://objects.dev.example PUBLIC_BASE_URL=https://app.dev.example PUBLIC_LIVEKIT_URL=wss://rtc.dev.example S3_KMS_KEY_ID=' \
   "$CALLS" >/dev/null || fail 'dev-up overwrote configured endpoints or required a KMS key for bundled MinIO'
+
+: > "$CALLS"
+if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
+  PUBLIC_BASE_URL=https://app.dev.example \
+  PUBLIC_LIVEKIT_URL=wss://rtc.dev.example \
+  "$DEV_ROOT/scripts/dev-up" --provider-profile google-speech-eu \
+  > "$TEST_DIRECTORY/dev-up-google-speech-output" 2>&1; then
+  fail 'google-speech-eu dev-up wrapper run failed with ADC present'
+fi
+grep -F 'compose.google-speech.yml' "$CALLS" >/dev/null ||
+  fail 'google-speech-eu dev-up did not select its Compose overlay'
+
+mv "$DEV_ROOT/.secrets/google-adc.json" "$DEV_ROOT/.secrets/google-adc.missing"
+: > "$CALLS"
+if PATH="$TEST_DIRECTORY/bin:$PATH" \
+  PUBLIC_BASE_URL=https://app.dev.example \
+  PUBLIC_LIVEKIT_URL=wss://rtc.dev.example \
+  "$DEV_ROOT/scripts/dev-up" --provider-profile google-speech-eu \
+  > "$TEST_DIRECTORY/dev-up-google-speech-missing-adc-output" 2>&1; then
+  fail 'google-speech-eu dev-up accepted a missing ADC file'
+fi
+grep -F 'Missing .secrets/google-adc.json' \
+  "$TEST_DIRECTORY/dev-up-google-speech-missing-adc-output" >/dev/null ||
+  fail 'google-speech-eu missing ADC failure lacked the expected diagnostic'
+[ ! -s "$CALLS" ] || fail 'google-speech-eu missing ADC failure invoked Compose'
+mv "$DEV_ROOT/.secrets/google-adc.missing" "$DEV_ROOT/.secrets/google-adc.json"
 cat > "$DEV_ROOT/.env" <<'ENV'
 PUBLIC_BASE_URL=https://app.env.example
 PUBLIC_LIVEKIT_URL=wss://rtc.env.example
@@ -587,6 +614,21 @@ render_google_config() (
     -f "$ROOT/deploy/compose/compose.google.yml" config "$@"
 )
 
+render_google_speech_config() (
+  export PROVIDER_PROFILE=google-speech-eu
+  export BOOTSTRAP_ADMIN_EMAIL=admin@example.test
+  export GOOGLE_CLOUD_PROJECT=example-project
+  export GOOGLE_QUOTA_PROJECT=example-quota
+  export SMTP_URL=smtp://smtp.example.test:2525
+  export RTC_ADVERTISED_IP=203.0.113.10
+  export S3_PUBLIC_ENDPOINT=https://objects.example.test
+  export PUBLIC_BASE_URL=https://app.example.test
+  export PUBLIC_LIVEKIT_URL=wss://rtc.example.test
+  config_compose --env-file "$EMPTY_ENV" \
+    -f "$ROOT/deploy/compose/compose.yml" \
+    -f "$ROOT/deploy/compose/compose.google-speech.yml" config "$@"
+)
+
 for overlay in compose.google.yml compose.providers.yml; do
   for required in SMTP_URL RTC_ADVERTISED_IP S3_PUBLIC_ENDPOINT PUBLIC_BASE_URL PUBLIC_LIVEKIT_URL; do
     output="$TEST_DIRECTORY/${overlay}.${required}.output"
@@ -615,6 +657,26 @@ for overlay in compose.google.yml compose.providers.yml; do
       fail "$overlay missing-$required error was not actionable"
   done
 done
+
+render_google_speech_config > "$TEST_DIRECTORY/google-speech-config"
+grep -F 'GOOGLE_SPEECH_LOCATION: europe-west3' \
+  "$TEST_DIRECTORY/google-speech-config" >/dev/null ||
+  fail 'google-speech-eu did not default to the reference Speech location'
+grep -F 'GOOGLE_SPEECH_MODEL: long' \
+  "$TEST_DIRECTORY/google-speech-config" >/dev/null ||
+  fail 'google-speech-eu did not default to the reference Speech model'
+grep -F 'GOOGLE_TRANSLATION_LOCATION: europe-west1' \
+  "$TEST_DIRECTORY/google-speech-config" >/dev/null ||
+  fail 'google-speech-eu did not default to the reference Translation location'
+grep -F 'GOOGLE_TRANSLATION_MODEL: general/base' \
+  "$TEST_DIRECTORY/google-speech-config" >/dev/null ||
+  fail 'google-speech-eu did not default to the reference Translation model'
+grep -F 'GOOGLE_TTS_LOCATION: eu' \
+  "$TEST_DIRECTORY/google-speech-config" >/dev/null ||
+  fail 'google-speech-eu did not default to the reference TTS location'
+grep -F 'GOOGLE_TTS_VOICE: en-US-Chirp3-HD-Charon' \
+  "$TEST_DIRECTORY/google-speech-config" >/dev/null ||
+  fail 'google-speech-eu did not default to the reference TTS voice'
 
 unset APP_ENV
 render_google_config > "$TEST_DIRECTORY/production-config"

@@ -33,6 +33,7 @@ from transhooter_worker.runtime.provider_registry import (
     AlternateProfile,
     FixtureProfile,
     GoogleProfile,
+    GoogleSpeechProfile,
     ProfileConfig,
     ProviderRegistry,
     Providers,
@@ -107,7 +108,7 @@ def _profile_id(name: str) -> UUID:
 
 
 def _credential(profile: ProfileConfig, stage: str) -> dict[str, str]:
-    if isinstance(profile, GoogleProfile):
+    if isinstance(profile, GoogleProfile | GoogleSpeechProfile):
         return {"reference": "google-adc", "version": profile.credential_fingerprint}
     if isinstance(profile, AlternateProfile):
         if stage == "translation":
@@ -117,6 +118,8 @@ def _credential(profile: ProfileConfig, stage: str) -> dict[str, str]:
 
 
 def _language_code(provider: str, locale: str) -> str:
+    if provider == "google" and locale in {"fr-CA", "fr-FR", "pt-BR", "pt-PT", "zh-CN", "zh-TW"}:
+        return locale
     code = locale.split("-", 1)[0]
     return code.upper() if provider == "deepl" else code.lower()
 
@@ -158,7 +161,7 @@ def _approved_voice(
 
 
 def _frozen_stage(
-    profile: FixtureProfile | GoogleProfile | AlternateProfile,
+    profile: ProfileConfig,
     capability: StageCapabilities,
 ) -> dict[str, object]:
     if not capability.models or not capability.regions:
@@ -185,7 +188,7 @@ def _stage_capabilities(
 
 
 def _stt_snapshot(
-    profile: FixtureProfile | GoogleProfile | AlternateProfile,
+    profile: ProfileConfig,
     capability: StageCapabilities,
     locale: str,
 ) -> dict[str, object]:
@@ -197,7 +200,7 @@ def _stt_snapshot(
 
 
 def _same_language_row(
-    profile: FixtureProfile | GoogleProfile | AlternateProfile,
+    profile: ProfileConfig,
     stt: StageCapabilities,
     locale: str,
 ) -> dict[str, object]:
@@ -215,7 +218,7 @@ def _same_language_row(
 
 
 def _translated_row(
-    profile: FixtureProfile | GoogleProfile | AlternateProfile,
+    profile: ProfileConfig,
     stt: StageCapabilities,
     translation: StageCapabilities,
     tts: StageCapabilities,
@@ -258,11 +261,7 @@ def _supports_capability_locale(
     language_only: bool,
 ) -> bool:
     normalized_locale = locale.casefold()
-    normalized_language = (
-        _language_code(capability.provider, locale).casefold()
-        if language_only
-        else normalized_locale.split("-", 1)[0]
-    )
+    normalized_language = normalized_locale.split("-", 1)[0]
     return any(
         normalized == normalized_locale if "-" in normalized else normalized == normalized_language
         for normalized in (language.casefold() for language in capability.languages)
@@ -316,7 +315,7 @@ def _validate_capability_locales(
 
 
 def _capability_rows(
-    profile: FixtureProfile | GoogleProfile | AlternateProfile,
+    profile: ProfileConfig,
     source: str,
     target: str,
     stages: dict[str, StageCapabilities],
@@ -366,7 +365,7 @@ def _capability_hash(
 
 
 def _credential_references(
-    profile: FixtureProfile | GoogleProfile | AlternateProfile,
+    profile: ProfileConfig,
 ) -> list[dict[str, str]]:
     credentials = sorted(
         {
@@ -380,7 +379,7 @@ def _credential_references(
 
 def _capability_refresh(
     profile_name: str,
-    profile: FixtureProfile | GoogleProfile | AlternateProfile,
+    profile: ProfileConfig,
     source: str,
     target: str,
     capabilities: tuple[StageCapabilities, ...],
@@ -495,7 +494,7 @@ def _effective_voice(
         "fixture"
         if isinstance(profile, FixtureProfile)
         else "google"
-        if isinstance(profile, GoogleProfile)
+        if isinstance(profile, GoogleProfile | GoogleSpeechProfile)
         else "deepgram"
     )
     if capability.provider != expected_provider or capability.stage != "tts":
@@ -504,7 +503,7 @@ def _effective_voice(
 
 
 def _profile_voice(profile: ProfileConfig, voice: str, locale: str) -> ProfileConfig:
-    if isinstance(profile, GoogleProfile):
+    if isinstance(profile, GoogleProfile | GoogleSpeechProfile):
         return profile.model_copy(update={"probe_voice": voice, "probe_voice_locale": locale})
     if isinstance(profile, AlternateProfile):
         return profile.model_copy(update={"voice": voice})

@@ -43,6 +43,28 @@
           "type": "object",
           "required": ["providerProfile", "providers"],
           "properties": {
+            "providerProfile": { "const": "google-speech-eu" },
+            "providers": {
+              "type": "object",
+              "required": ["googleSpeechEu"]
+            }
+          }
+        },
+        "providerSecretKeys": {
+          "type": "array",
+          "items": { "const": "google-adc.json" },
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    {
+      "required": ["config", "providerSecretKeys"],
+      "properties": {
+        "config": {
+          "type": "object",
+          "required": ["providerProfile", "providers"],
+          "properties": {
             "providerProfile": { "const": "deepgram-deepl-eu" },
             "providers": {
               "type": "object",
@@ -273,7 +295,7 @@
       ],
       "properties": {
         "appEnv": { "const": "production" },
-        "providerProfile": { "enum": ["google-eu", "deepgram-deepl-eu"] },
+        "providerProfile": { "enum": ["google-eu", "google-speech-eu", "deepgram-deepl-eu"] },
         "archiveRequireKms": { "const": true },
         "livekitUrl": { "type": "string", "pattern": "^wss://" },
         "publicUrl": { "type": "string", "pattern": "^https://" },
@@ -354,6 +376,32 @@
                 "translationCharactersMinute": { "type": "integer", "minimum": 1 },
                 "ttsSessions": { "type": "integer", "minimum": 1 },
                 "ttsStartsMinute": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "googleSpeechEu": {
+              "type": "object",
+              "required": [
+                "cloudProject",
+                "quotaProject",
+                "speechLocation",
+                "speechModel",
+                "translationLocation",
+                "translationModel",
+                "ttsLocation",
+                "ttsVoice",
+                "ttsVoiceLocale"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "cloudProject": { "type": "string", "minLength": 1 },
+                "quotaProject": { "type": "string", "minLength": 1 },
+                "speechLocation": { "const": "europe-west3" },
+                "speechModel": { "const": "long" },
+                "translationLocation": { "const": "europe-west1" },
+                "translationModel": { "const": "general/base" },
+                "ttsLocation": { "const": "eu" },
+                "ttsVoice": { "type": "string", "minLength": 1 },
+                "ttsVoiceLocale": { "type": "string", "minLength": 1 }
               }
             },
             "deepgramDeeplEu": {

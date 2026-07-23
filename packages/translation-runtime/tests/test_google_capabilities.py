@@ -120,7 +120,10 @@ async def test_speech_capabilities_decode_nested_language_model_maps(
                     model_features={"long": locations_metadata.ModelFeatures()}
                 ),
                 "en-US": locations_metadata.ModelMetadata(
-                    model_features={"short": locations_metadata.ModelFeatures()}
+                    model_features={
+                        "long": locations_metadata.ModelFeatures(),
+                        "short": locations_metadata.ModelFeatures(),
+                    }
                 ),
             }
         )
@@ -150,7 +153,7 @@ async def test_speech_capabilities_decode_nested_language_model_maps(
     capabilities = await provider.capabilities()
 
     assert capabilities.languages == ("de-DE", "en-US")
-    assert capabilities.models == ("long", "short")
+    assert capabilities.models == ("long",)
     assert capabilities.evidence == evidence
 
 
@@ -324,6 +327,143 @@ async def test_replayed_final_trims_words_committed_before_watermark() -> None:
     assert isinstance(boundary, BoundaryEvent)
     assert boundary.committed_through == 32_000
     assert boundary.raw_ref == raw_ref
+
+
+@pytest.mark.asyncio
+async def test_chirp_revisions_keep_one_utterance_sample_range_without_word_offsets() -> None:
+    raw_ref = RawRef(UUID(int=8), 8, "8" * 64, 1, "application/protobuf")
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._received = 0
+    session._refs = [raw_ref]
+    session._commit_watermark = 0
+    session._last_result_end = 0
+    session._active_utterance_start = 0
+    session._boundaries = []
+    session._events = asyncio.Queue()
+    session._event_slots = asyncio.Semaphore(64)
+
+    for transcript, is_final, seconds in (
+        ("hello", False, 1),
+        ("hello world", False, 2),
+        ("hello world.", True, 3),
+    ):
+        response = google_provider.cloud_speech.StreamingRecognizeResponse(
+            results=[
+                google_provider.cloud_speech.StreamingRecognitionResult(
+                    alternatives=[
+                        google_provider.cloud_speech.SpeechRecognitionAlternative(
+                            transcript=transcript
+                        )
+                    ],
+                    is_final=is_final,
+                    result_end_offset=timedelta(seconds=seconds),
+                )
+            ]
+        )
+        await session._emit_transcript_results(response, base_sample=0)
+
+    events = [session._events.get_nowait() for _ in range(3)]
+    assert [event.samples for event in events if isinstance(event, TranscriptEvent)] == [
+        SampleRange(0, 16_000),
+        SampleRange(0, 32_000),
+        SampleRange(0, 48_000),
+    ]
+    assert session._active_utterance_start == 48_000
+
+
+@pytest.mark.asyncio
+async def test_next_chirp_utterance_starts_after_the_previous_final() -> None:
+    raw_ref = RawRef(UUID(int=8), 8, "8" * 64, 1, "application/protobuf")
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._received = 0
+    session._refs = [raw_ref]
+    session._commit_watermark = 0
+    session._last_result_end = 16_000
+    session._active_utterance_start = 16_000
+    session._boundaries = []
+    session._events = asyncio.Queue()
+    session._event_slots = asyncio.Semaphore(64)
+    response = google_provider.cloud_speech.StreamingRecognizeResponse(
+        results=[
+            google_provider.cloud_speech.StreamingRecognitionResult(
+                alternatives=[
+                    google_provider.cloud_speech.SpeechRecognitionAlternative(transcript="next")
+                ],
+                is_final=False,
+                result_end_offset=timedelta(seconds=2),
+            )
+        ]
+    )
+
+    await session._emit_transcript_results(response, base_sample=0)
+
+    event = session._events.get_nowait()
+    assert isinstance(event, TranscriptEvent)
+    assert event.samples == SampleRange(16_000, 32_000)
+
+
+@pytest.mark.asyncio
+async def test_google_speech_pipeline_builds_chirp_streaming_request() -> None:
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._config = google_provider.GoogleConfig(
+        "project",
+        "quota",
+        UUID(int=2),
+        "credential",
+        speech_location="eu",
+        speech_endpoint="eu-speech.googleapis.com:443",
+        speech_model="chirp_3",
+        translation_location="europe-west1",
+        translation_model="general/base",
+    )
+    session._language = "en-US"
+    session._input = asyncio.Queue()
+    await session._input.put(None)
+
+    requests = [request async for request in session._requests()]
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.recognizer == "projects/project/locations/eu/recognizers/_"
+    assert request.streaming_config.config.model == "chirp_3"
+    assert request.streaming_config.config.language_codes == ["en-US"]
+    assert request.streaming_config.config.features.enable_automatic_punctuation
+    assert not request.streaming_config.config.features.enable_word_time_offsets
+    assert request.streaming_config.streaming_features.interim_results
+    assert request.streaming_config.streaming_features.enable_voice_activity_events
+
+
+@pytest.mark.asyncio
+async def test_google_speech_pipeline_builds_reference_long_streaming_request() -> None:
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._config = google_provider.GoogleConfig(
+        "project",
+        "quota",
+        UUID(int=2),
+        "credential",
+        speech_location="europe-west3",
+        speech_endpoint="europe-west3-speech.googleapis.com:443",
+        speech_model="long",
+        translation_location="europe-west1",
+        translation_model="general/base",
+        tts_location="eu",
+        tts_endpoint="eu-texttospeech.googleapis.com:443",
+    )
+    session._language = "de-DE"
+    session._input = asyncio.Queue()
+    await session._input.put(None)
+
+    requests = [request async for request in session._requests()]
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.recognizer == ("projects/project/locations/europe-west3/recognizers/_")
+    assert request.streaming_config.config.model == "long"
+    assert request.streaming_config.config.language_codes == ["de-DE"]
+    assert request.streaming_config.config.features.enable_automatic_punctuation
+    assert request.streaming_config.config.features.enable_word_time_offsets
+    assert request.streaming_config.streaming_features.interim_results
+    assert request.streaming_config.streaming_features.enable_voice_activity_events
 
 
 def test_capability_refresh_rejects_unsupported_source_locale() -> None:
@@ -514,6 +654,148 @@ async def test_google_tts_requests_reconstruct_multibyte_text_within_byte_limit(
     assert "".join(chunks) == text
     assert len(chunks) > 1
     assert all(len(chunk.encode("utf-8")) <= 5_000 for chunk in chunks)
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "expected_source", "expected_target"),
+    [
+        ("en-US", "de-DE", "en", "de"),
+        ("pt-BR", "pt-PT", "pt-BR", "pt-PT"),
+        ("zh-TW", "zh-CN", "zh-TW", "zh-CN"),
+    ],
+)
+def test_google_translation_request_preserves_supported_language_variants(
+    source: str,
+    target: str,
+    expected_source: str,
+    expected_target: str,
+) -> None:
+    request = TranslationRequest(
+        uuid4(), uuid4(), "final", source, target, "Fish & chips", SampleRange(0, 1)
+    )
+    attempt = google_provider.GoogleTranslationAttempt(
+        google_provider.GoogleConfig(
+            "project",
+            "quota",
+            uuid4(),
+            "credential",
+            translation_location="europe-west1",
+            translation_model="general/base",
+        ),
+        RecordingJournal(),
+        object(),  # type: ignore[arg-type]
+        request,
+    )
+
+    built = attempt._build_request()
+
+    assert built.parent == "projects/project/locations/europe-west1"
+    assert built.model == "projects/project/locations/europe-west1/models/general/base"
+    assert built.source_language_code == expected_source
+    assert built.target_language_code == expected_target
+
+
+@pytest.mark.asyncio
+async def test_translation_capabilities_query_the_configured_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = google_provider.translation_service.SupportedLanguages(
+        languages=[google_provider.translation_service.SupportedLanguage(language_code="de")]
+    )
+    payload = bytes(
+        google_provider.translation_service.SupportedLanguages.pb(response).SerializeToString()
+    )
+    evidence = RawRef(UUID(int=1), 1, "1" * 64, 1, "application/protobuf")
+    seen_model: str | None = None
+
+    async def rpc(
+        _: object,
+        __: object,
+        ___: object,
+        ____: str,
+        _____: str,
+        request_payload: bytes,
+    ) -> google_provider._CapabilityRpcResult:
+        nonlocal seen_model
+        request = google_provider.translation_service.GetSupportedLanguagesRequest.deserialize(
+            request_payload
+        )
+        seen_model = request.model
+        return google_provider._CapabilityRpcResult(payload, UUID(int=10), (evidence,))
+
+    monkeypatch.setattr(google_provider, "_capability_rpc", rpc)
+    config = google_provider.GoogleConfig(
+        "project",
+        "quota",
+        UUID(int=2),
+        "credential",
+        translation_location="europe-west1",
+        translation_model="general/base",
+    )
+    provider = google_provider.GoogleTranslationProvider(
+        config,
+        Journal(),
+        object(),  # type: ignore[arg-type]
+    )
+
+    capabilities = await provider.capabilities()
+
+    assert seen_model == config.model
+    assert capabilities.models == ("general/base",)
+
+
+@pytest.mark.asyncio
+async def test_google_translation_unescapes_provider_text() -> None:
+    response = google_provider.translation_service.TranslateTextResponse(
+        translations=[
+            google_provider.translation_service.Translation(translated_text="Fish &amp; chips")
+        ]
+    )
+    raw = bytes(
+        google_provider.translation_service.TranslateTextResponse.pb(response).SerializeToString()
+    )
+
+    class Call:
+        def __await__(self):
+            async def result() -> Any:
+                return google_provider.translation_service.TranslateTextResponse.deserialize(raw)
+
+            return result().__await__()
+
+        async def initial_metadata(self) -> tuple[tuple[str, str], ...]:
+            return ()
+
+        async def trailing_metadata(self) -> tuple[tuple[str, str], ...]:
+            return ()
+
+        async def code(self) -> str:
+            return "StatusCode.OK"
+
+        async def details(self) -> str:
+            return ""
+
+    class Channel:
+        def unary_unary(self, _: str, request_serializer: Any, response_deserializer: Any):
+            def invoke(request: Any, **__: Any) -> Call:
+                request_serializer(request)
+                return Call()
+
+            return invoke
+
+    request = TranslationRequest(
+        uuid4(), uuid4(), "final", "en-US", "de-DE", "Fish & chips", SampleRange(0, 1)
+    )
+    attempt = google_provider.GoogleTranslationAttempt(
+        google_provider.GoogleConfig("project", "quota", uuid4(), "credential"),
+        RecordingJournal(),
+        Channel(),  # type: ignore[arg-type]
+        request,
+    )
+
+    outcome = await attempt.result()
+
+    assert outcome.result is not None
+    assert outcome.result.text == "Fish & chips"
 
 
 def test_linear16_decoder_strips_split_wav_header_and_preserves_pcm() -> None:

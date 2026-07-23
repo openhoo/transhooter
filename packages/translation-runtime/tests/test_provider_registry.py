@@ -11,6 +11,7 @@ import pytest
 from transhooter_worker.domain.models import RawRef, SampleRange, TranslationRequest
 from transhooter_worker.runtime.provider_registry import (
     AlternateProfile,
+    GoogleSpeechProfile,
     ProviderRegistry,
     resolve_profile_config,
 )
@@ -122,6 +123,66 @@ def test_environment_resolver_preserves_alternate_profile_fingerprints(
     assert profile.deepl_credential_fingerprint == hashlib.sha256(b"dl").hexdigest()
 
 
+def test_google_speech_profile_resolves_example_pipeline_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    credentials = tmp_path / "google-adc.json"
+    credentials.write_text('{"type":"service_account"}')
+    environment = {
+        "GOOGLE_APPLICATION_CREDENTIALS": str(credentials),
+        "GOOGLE_CLOUD_PROJECT": "project",
+        "GOOGLE_QUOTA_PROJECT": "quota",
+        "GOOGLE_TTS_VOICE": "de-DE-Chirp3-HD-Achernar",
+        "GOOGLE_TTS_VOICE_LOCALE": "de-DE",
+        "GOOGLE_SPEECH_LOCATION": "europe-west3",
+        "GOOGLE_SPEECH_MODEL": "long",
+        "GOOGLE_TRANSLATION_LOCATION": "europe-west1",
+        "GOOGLE_TRANSLATION_MODEL": "general/base",
+        "GOOGLE_TTS_LOCATION": "eu",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    profile = resolve_profile_config("google-speech-eu", ("en-US", "de-DE"))
+
+    assert isinstance(profile, GoogleSpeechProfile)
+    assert profile.speech_location == "europe-west3"
+    assert profile.speech_model == "long"
+    assert profile.translation_location == "europe-west1"
+    assert profile.translation_model == "general/base"
+    assert profile.tts_location == "eu"
+    assert profile.credential_fingerprint == hashlib.sha256(credentials.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GOOGLE_SPEECH_LOCATION", "eu"),
+        ("GOOGLE_SPEECH_MODEL", "chirp_3"),
+        ("GOOGLE_TRANSLATION_LOCATION", "us-central1"),
+        ("GOOGLE_TRANSLATION_MODEL", "general/nmt"),
+        ("GOOGLE_TTS_LOCATION", "us"),
+    ],
+)
+def test_google_speech_profile_rejects_unsupported_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    credentials = tmp_path / "google-adc.json"
+    credentials.write_text('{"type":"service_account"}')
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(credentials))
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "project")
+    monkeypatch.setenv("GOOGLE_QUOTA_PROJECT", "quota")
+    monkeypatch.setenv("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Achernar")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match="unsupported configuration"):
+        resolve_profile_config("google-speech-eu", ("en-US", "de-DE"))
+
+
 @pytest.mark.asyncio
 async def test_alternate_capabilities_cover_bilingual_directions(
     tmp_path: Path,
@@ -180,6 +241,67 @@ def test_alternate_credentials_are_read_once_and_bound_to_fingerprints(
     assert providers.translation._config.api_key == "dl-original"
     assert profile.deepgram_credential_fingerprint == hashlib.sha256(b"dg-original").hexdigest()
     assert profile.deepl_credential_fingerprint == hashlib.sha256(b"dl-original").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_google_speech_registry_uses_configured_pipeline_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transhooter_worker.adapters.google import provider as google_provider
+
+    class Channel:
+        def __init__(self, endpoint: str) -> None:
+            self.endpoint = endpoint
+
+        async def close(self) -> None:
+            return None
+
+    created: list[Channel] = []
+
+    def create_channel(endpoint: str, _: str) -> Channel:
+        channel = Channel(endpoint)
+        created.append(channel)
+        return channel
+
+    monkeypatch.setattr(google_provider, "authenticated_channel", create_channel)
+    providers = ProviderRegistry.construct(
+        GoogleSpeechProfile(
+            kind="google-speech-eu",
+            project="project",
+            quota_project="quota",
+            credential_fingerprint="credential",
+            probe_voice="de-DE-Chirp3-HD-Achernar",
+        ),
+        UUID(int=7),
+        DeterministicJournal(),
+    )
+
+    providers.stt._channels.channel()
+    request = TranslationRequest(
+        UUID(int=31),
+        UUID(int=32),
+        "final",
+        "en-US",
+        "de-DE",
+        "hello",
+        SampleRange(0, 1),
+    )
+    await providers.translation.start(request)
+    await providers.tts.open(UUID(int=33), "de-DE", "de-DE-Chirp3-HD-Achernar")
+
+    assert [channel.endpoint for channel in created] == [
+        "europe-west3-speech.googleapis.com:443",
+        "translate-eu.googleapis.com:443",
+        "eu-texttospeech.googleapis.com:443",
+    ]
+    assert providers.stt._config.recognizer == (
+        "projects/project/locations/europe-west3/recognizers/_"
+    )
+    assert providers.stt._config.speech_model == "long"
+    assert providers.translation._config.parent == "projects/project/locations/europe-west1"
+    assert providers.translation._config.model.endswith("/models/general/base")
+    assert providers.tts._config.tts_location == "eu"
+    await providers.aclose()
 
 
 @pytest.mark.asyncio

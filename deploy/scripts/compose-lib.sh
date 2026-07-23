@@ -47,6 +47,10 @@ resolve_profile() {
       overlay=deploy/compose/compose.google.yml
       APP_ENV=development
       ;;
+    google-speech-eu)
+      overlay=deploy/compose/compose.google-speech.yml
+      APP_ENV=development
+      ;;
     deepgram-deepl-eu)
       overlay=deploy/compose/compose.providers.yml
       APP_ENV=development

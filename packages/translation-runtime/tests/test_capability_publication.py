@@ -16,10 +16,12 @@ from transhooter_worker.provider_cli import (
     _profile_id,
     _profile_voice,
     _publish_capabilities,
+    _supports_capability_locale,
 )
 from transhooter_worker.runtime.provider_registry import (
     FixtureProfile,
     GoogleProfile,
+    GoogleSpeechProfile,
     ProviderRegistry,
 )
 
@@ -195,6 +197,23 @@ async def test_publish_rejection_reports_only_bounded_status_and_server_code(
     assert "http://web" not in diagnostic
 
 
+@pytest.mark.parametrize("locale", ["fr-CA", "fr-FR", "pt-BR", "pt-PT", "zh-CN", "zh-TW"])
+def test_google_translation_generic_languages_admit_preserved_variants(locale: str) -> None:
+    language = locale.split("-", 1)[0]
+    capability = StageCapabilities(
+        provider="google",
+        stage="translation",
+        endpoint="translate-eu.googleapis.com",
+        regions=("europe-west1",),
+        languages=(language,),
+        models=("general/base",),
+        limits=(),
+        evidence=None,
+    )
+
+    assert _supports_capability_locale(capability, locale, language_only=True)
+
+
 def google_tts_capabilities(voices: tuple[str, ...]) -> StageCapabilities:
     return StageCapabilities(
         provider="google",
@@ -255,6 +274,25 @@ def test_google_smoke_voice_does_not_replace_discovered_target_catalog() -> None
     voice = _effective_voice(profile, "de-DE", None, discovered)
 
     assert voice == "de-DE-Chirp3-HD-Algenib"
+
+
+def test_google_speech_profile_selects_and_binds_target_voice() -> None:
+    profile = GoogleSpeechProfile(
+        kind="google-speech-eu",
+        project="project",
+        quota_project="quota",
+        credential_fingerprint="fingerprint",
+        probe_voice="en-US-Chirp3-HD-Achernar",
+    )
+    discovered = google_tts_capabilities(("de-DE-Chirp3-HD-Algenib",))
+
+    voice = _effective_voice(profile, "de-DE", None, discovered)
+    execution_profile = _profile_voice(profile, voice, "de-DE")
+
+    assert voice == "de-DE-Chirp3-HD-Algenib"
+    assert isinstance(execution_profile, GoogleSpeechProfile)
+    assert execution_profile.probe_voice == voice
+    assert execution_profile.probe_voice_locale == "de-DE"
 
 
 def test_google_missing_discovered_target_voice_fails_closed() -> None:

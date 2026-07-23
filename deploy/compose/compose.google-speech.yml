@@ -1,0 +1,79 @@
+x-production-env: &production-env
+  APP_ENV: ${APP_ENV:-production}
+  RTC_ADVERTISED_IP: ${RTC_ADVERTISED_IP:?set RTC_ADVERTISED_IP to the externally reachable LiveKit RTC address}
+  S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:?set S3_PUBLIC_ENDPOINT to the externally reachable S3 address}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to an explicit https:// URL}
+  PUBLIC_LIVEKIT_URL: ${PUBLIC_LIVEKIT_URL:?set PUBLIC_LIVEKIT_URL to an explicit wss:// URL}
+  LIVEKIT_BROWSER_URL: ${PUBLIC_LIVEKIT_URL:?set PUBLIC_LIVEKIT_URL to an explicit wss:// URL}
+  ARCHIVE_REQUIRE_KMS: "false"
+
+x-production-mail-env: &production-mail-env
+  <<: *production-env
+  SMTP_URL: ${SMTP_URL:?set SMTP_URL for production mail delivery}
+
+x-google-speech-env: &google-speech-env
+  <<: *production-env
+  PROVIDER_PROFILE: google-speech-eu
+  GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/google-adc.json
+  GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:?set GOOGLE_CLOUD_PROJECT}
+  GOOGLE_QUOTA_PROJECT: ${GOOGLE_QUOTA_PROJECT:?set GOOGLE_QUOTA_PROJECT}
+  GOOGLE_SPEECH_LOCATION: ${GOOGLE_SPEECH_LOCATION:-europe-west3}
+  GOOGLE_SPEECH_MODEL: ${GOOGLE_SPEECH_MODEL:-long}
+  GOOGLE_TRANSLATION_LOCATION: ${GOOGLE_TRANSLATION_LOCATION:-europe-west1}
+  GOOGLE_TRANSLATION_MODEL: ${GOOGLE_TRANSLATION_MODEL:-general/base}
+  GOOGLE_TTS_LOCATION: ${GOOGLE_TTS_LOCATION:-eu}
+  GOOGLE_TTS_VOICE: ${GOOGLE_TTS_VOICE:-en-US-Chirp3-HD-Charon}
+  GOOGLE_TTS_VOICE_LOCALE: ${GOOGLE_TTS_VOICE_LOCALE:-en-US}
+
+x-google-secret-volumes: &google-secret-volumes
+  - ../../.secrets/google-adc.json:/run/secrets/google-adc.json:ro
+
+services:
+  migrate:
+    environment:
+      <<: *production-env
+
+  bootstrap-admin:
+    environment:
+      <<: *production-env
+
+  capability-publisher:
+    environment:
+      <<: *production-mail-env
+
+  profile-preflight:
+    environment:
+      <<: *google-speech-env
+    volumes: *google-secret-volumes
+
+  language-refresh:
+    environment:
+      <<: *google-speech-env
+    volumes: *google-secret-volumes
+
+  translation-worker:
+    environment:
+      <<: *google-speech-env
+    volumes: *google-secret-volumes
+
+  spool-drainer:
+    environment:
+      <<: *production-env
+
+  control-worker-1:
+    environment:
+      <<: *production-mail-env
+
+  control-worker-2:
+    environment:
+      <<: *production-mail-env
+
+  web:
+    environment:
+      <<: *production-mail-env
+
+  provider-benchmark:
+    environment:
+      <<: *google-speech-env
+      APP_ENV: benchmark
+    volumes: *google-secret-volumes

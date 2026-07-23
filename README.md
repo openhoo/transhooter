@@ -344,6 +344,28 @@ Standardprofil von `./scripts/dev-up`. Erforderlich:
 Das Overlay verwendet die EU-Endpunkte für Speech und Translation. Die
 Credentials-Datei wird read-only nach `/run/secrets/google-adc.json` gemountet.
 
+### `google-speech-eu`
+
+Google-Cloud-Sprachpipeline mit exakt den Providerressourcen des
+`../google_live_file_translation`-Beispiels:
+
+- Speech-to-Text V2 Streaming mit `long` in `europe-west3`,
+- Translation Advanced V3 mit `general/base` in `europe-west1`,
+- Streaming Text-to-Speech mit Chirp-3-HD in `eu`; Standardstimme
+  `en-US-Chirp3-HD-Charon`.
+
+Das Profil verwendet dieselbe `.secrets/google-adc.json` und dieselben
+Projektvariablen wie `google-eu`. Locations und Modelle werden über
+`GOOGLE_SPEECH_LOCATION`, `GOOGLE_SPEECH_MODEL`,
+`GOOGLE_TRANSLATION_LOCATION`, `GOOGLE_TRANSLATION_MODEL` und
+`GOOGLE_TTS_LOCATION` konfiguriert; Stimme und Stimmen-Locale über
+`GOOGLE_TTS_VOICE` und `GOOGLE_TTS_VOICE_LOCALE`. Die API-Endpunkte werden
+kanonisch aus den jeweiligen Locations abgeleitet und können in diesem Profil
+nicht überschrieben werden. Die drei Stufen implementieren weiterhin
+die providerneutralen STT-, Textübersetzungs- und TTS-Ports; weitere Profile
+werden ausschließlich in der Registry komponiert.
+
+
 ### `deepgram-deepl-eu`
 
 Erforderlich:
@@ -377,6 +399,7 @@ Harnesses gedacht, nicht als interaktiver Browser-Entwicklungsstack.
 
 # Explizites Profil
 ./scripts/dev-up --provider-profile google-eu
+./scripts/dev-up --provider-profile google-speech-eu
 ./scripts/dev-up --provider-profile deepgram-deepl-eu
 ./scripts/dev-up --provider-profile fixture
 ```
@@ -452,7 +475,7 @@ Subnetzkollisionen müssen `RTC_SUBNET`, `RTC_ADVERTISED_IP` beziehungsweise
 | Variable | Zweck |
 | --- | --- |
 | `APP_ENV` | Laufzeitumgebung. |
-| `PROVIDER_PROFILE` | `google-eu`, `deepgram-deepl-eu` oder `fixture`. Der Wrapper-Parameter ist maßgeblich. |
+| `PROVIDER_PROFILE` | `google-eu`, `google-speech-eu`, `deepgram-deepl-eu` oder `fixture`. Der Wrapper-Parameter ist maßgeblich. |
 | `SMTP_URL` | SMTP-Verbindung für Magic Links; in echten Providerprofilen Pflicht. |
 | `RTC_ADVERTISED_IP` | Von LiveKit extern annoncierte RTC-Adresse. |
 | `S3_PUBLIC_ENDPOINT` | Vom Browser erreichbarer S3-Endpunkt. |
@@ -465,6 +488,11 @@ Subnetzkollisionen müssen `RTC_SUBNET`, `RTC_ADVERTISED_IP` beziehungsweise
 | `OTEL_TRACE_SAMPLE_RATIO` | Trace-Sampling zwischen `0` und `1`. |
 | `GOOGLE_CLOUD_PROJECT` | Google-Cloud-Projekt für Provideraufrufe. |
 | `GOOGLE_QUOTA_PROJECT` | Google-Projekt für Quotenabrechnung. |
+| `GOOGLE_SPEECH_LOCATION` | Speech-to-Text-Location; für `google-speech-eu` zwingend `europe-west3`. Der Endpunkt wird daraus abgeleitet. |
+| `GOOGLE_SPEECH_MODEL` | Speech-to-Text-Modell; für `google-speech-eu` zwingend `long`. |
+| `GOOGLE_TRANSLATION_LOCATION` | Translation-Location; für `google-speech-eu` zwingend `europe-west1`. Der Endpunkt wird daraus abgeleitet. |
+| `GOOGLE_TRANSLATION_MODEL` | Translation-Modell; für `google-speech-eu` zwingend `general/base`. |
+| `GOOGLE_TTS_LOCATION` | Text-to-Speech-Location; für `google-speech-eu` zwingend `eu`. Der Endpunkt wird daraus abgeleitet. |
 | `DEEPGRAM_STREAMS` | Maximale parallele Deepgram-Streams. |
 | `DEEPGRAM_AUDIO_SECONDS_MINUTE` | Deepgram-Audiobudget pro Minute. |
 | `DEEPL_REQUESTS_MINUTE` | DeepL-Requestbudget pro Minute. |
@@ -608,14 +636,15 @@ mindestens Folgendes festlegen:
 
 - reale, unveränderliche Image-Tags; `latest` ist nicht zulässig,
 - `config.appEnv: production`,
-- `config.providerProfile: google-eu` oder `deepgram-deepl-eu`,
+- `config.providerProfile: google-eu`, `google-speech-eu` oder `deepgram-deepl-eu`,
 - HTTPS für Web und S3 sowie WSS für LiveKit,
 - `config.archiveRequireKms: true` und eine nichtleere `s3KmsKeyId`,
 - Runtime-, Migrator-, Provider- und Egress-Config-Secrets,
 - vorhandenen Spool-PVC unter `spool.existingClaim`, der von Translation-Worker
   und Spool Drainer gleichzeitig nutzbar ist; typischerweise `ReadWriteMany`
   oder eine ausdrücklich sichergestellte gemeinsame Node-/Storage-Topologie,
-- reale Providerprojekte, Endpunkte, Modelle und Quoten,
+- reale Providerprojekte, Locations, Modelle und Quoten; Endpunkte des Profils
+  `google-speech-eu` werden aus den Locations abgeleitet,
 - passende Ressourcen, Replikate, Ingress und Telemetrie.
 
 Benötigte Secret-Grenzen:
@@ -627,8 +656,8 @@ Benötigte Secret-Grenzen:
 - `migratorSecret.existingSecret`: ausschließlich Migration-DB-Zugang,
 - `magicLinkSealKeys.existingSecret`: versionierter Web-Keyring,
 - `providerSecretName`: Provider-Credentials; `providerSecretKeys` muss für
-  `google-eu` auf `[google-adc.json]` und für `deepgram-deepl-eu` auf
-  `[deepgram-api-key, deepl-api-key]` gesetzt werden,
+  `google-eu` und `google-speech-eu` auf `[google-adc.json]` und für
+  `deepgram-deepl-eu` auf `[deepgram-api-key, deepl-api-key]` gesetzt werden,
 - `egressConfigSecret`: LiveKit-Egress-Konfiguration.
 
 ### Chart prüfen und installieren

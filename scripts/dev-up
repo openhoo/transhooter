@@ -4,10 +4,10 @@ set -eu
 
 profile=google-eu
 if [ "${1:-}" = "--provider-profile" ]; then
-  test "$#" -eq 2 || { echo "usage: ./scripts/dev-up [--provider-profile google-eu|deepgram-deepl-eu|fixture]" >&2; exit 2; }
+  test "$#" -eq 2 || { echo "usage: ./scripts/dev-up [--provider-profile google-eu|google-speech-eu|deepgram-deepl-eu|fixture]" >&2; exit 2; }
   profile=$2
 elif [ "$#" -ne 0 ]; then
-  echo "usage: ./scripts/dev-up [--provider-profile google-eu|deepgram-deepl-eu|fixture]" >&2
+  echo "usage: ./scripts/dev-up [--provider-profile google-eu|google-speech-eu|deepgram-deepl-eu|fixture]" >&2
   exit 2
 fi
 
@@ -29,7 +29,7 @@ mkdir -p "$ROOT/.secrets"
 
 resolve_profile "$profile"
 case "$profile" in
-  google-eu)
+  google-eu|google-speech-eu)
     test -s "$ROOT/.secrets/google-adc.json" || { echo "Missing .secrets/google-adc.json" >&2; exit 1; }
     ;;
   deepgram-deepl-eu)

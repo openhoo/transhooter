@@ -26,6 +26,17 @@ data:
   GOOGLE_TRANSLATION_CHARACTERS_MINUTE: {{ .Values.config.providers.googleEu.translationCharactersMinute | quote }}
   GOOGLE_TTS_SESSIONS: {{ .Values.config.providers.googleEu.ttsSessions | quote }}
   GOOGLE_TTS_STARTS_MINUTE: {{ .Values.config.providers.googleEu.ttsStartsMinute | quote }}
+  {{- else if eq .Values.config.providerProfile "google-speech-eu" }}
+  GOOGLE_APPLICATION_CREDENTIALS: "/run/secrets/google-adc.json"
+  GOOGLE_CLOUD_PROJECT: {{ .Values.config.providers.googleSpeechEu.cloudProject | quote }}
+  GOOGLE_QUOTA_PROJECT: {{ .Values.config.providers.googleSpeechEu.quotaProject | quote }}
+  GOOGLE_SPEECH_LOCATION: {{ .Values.config.providers.googleSpeechEu.speechLocation | quote }}
+  GOOGLE_SPEECH_MODEL: {{ .Values.config.providers.googleSpeechEu.speechModel | quote }}
+  GOOGLE_TRANSLATION_LOCATION: {{ .Values.config.providers.googleSpeechEu.translationLocation | quote }}
+  GOOGLE_TRANSLATION_MODEL: {{ .Values.config.providers.googleSpeechEu.translationModel | quote }}
+  GOOGLE_TTS_LOCATION: {{ .Values.config.providers.googleSpeechEu.ttsLocation | quote }}
+  GOOGLE_TTS_VOICE: {{ .Values.config.providers.googleSpeechEu.ttsVoice | quote }}
+  GOOGLE_TTS_VOICE_LOCALE: {{ .Values.config.providers.googleSpeechEu.ttsVoiceLocale | quote }}
   {{- else if eq .Values.config.providerProfile "deepgram-deepl-eu" }}
   DEEPGRAM_API_KEY_FILE: "/run/secrets/deepgram-api-key"
   DEEPL_API_KEY_FILE: "/run/secrets/deepl-api-key"

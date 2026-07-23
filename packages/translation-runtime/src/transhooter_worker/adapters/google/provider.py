@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import struct
 import time
@@ -266,34 +267,63 @@ class GoogleConfig:
     credential_fingerprint: str
     probe_voice: str = "test-probe"
     probe_voice_locale: str = "en-US"
+    speech_location: str = "eu"
     speech_endpoint: str = "eu-speech.googleapis.com:443"
+    speech_model: str = "long"
+    translation_location: str = "eu"
     translation_endpoint: str = "translate-eu.googleapis.com:443"
+    translation_model: str = "general/nmt"
+    tts_location: str = "eu"
     tts_endpoint: str = "eu-texttospeech.googleapis.com:443"
 
     def __post_init__(self) -> None:
-        if not self.project or not self.quota_project:
-            raise ValueError("Google project and quota project are required")
-        if not self.probe_voice or not self.probe_voice_locale:
-            raise ValueError("Google probe voice and locale are required")
-        expected = (
-            "eu-speech.googleapis.com:443",
-            "translate-eu.googleapis.com:443",
-            "eu-texttospeech.googleapis.com:443",
+        required = (
+            self.project,
+            self.quota_project,
+            self.probe_voice,
+            self.probe_voice_locale,
+            self.speech_location,
+            self.speech_endpoint,
+            self.speech_model,
+            self.translation_location,
+            self.translation_endpoint,
+            self.translation_model,
+            self.tts_endpoint,
+            self.tts_location,
         )
-        if (self.speech_endpoint, self.translation_endpoint, self.tts_endpoint) != expected:
-            raise ValueError("Google EU endpoints are mandatory")
+        if any(not value.strip() for value in required):
+            raise ValueError("Google speech pipeline configuration is incomplete")
+        if any(
+            not endpoint.endswith(":443")
+            for endpoint in (
+                self.speech_endpoint,
+                self.translation_endpoint,
+                self.tts_endpoint,
+            )
+        ):
+            raise ValueError("Google gRPC endpoints must include port 443")
+
+    @property
+    def speech_region(self) -> str:
+        return self.speech_location
+
+    @property
+    def translation_region(self) -> str:
+        return self.translation_location
 
     @property
     def recognizer(self) -> str:
-        return f"projects/{self.project}/locations/eu/recognizers/_"
+        return f"projects/{self.project}/locations/{self.speech_location}/recognizers/_"
 
     @property
     def parent(self) -> str:
-        return f"projects/{self.project}/locations/eu"
+        return f"projects/{self.project}/locations/{self.translation_location}"
 
     @property
     def model(self) -> str:
-        return f"projects/{self.project}/locations/eu/models/general/nmt"
+        if self.translation_model.startswith("projects/"):
+            return self.translation_model
+        return f"{self.parent}/models/{self.translation_model}"
 
 
 class Linear16StreamDecoder:
@@ -475,7 +505,7 @@ class GoogleSttProvider:
         rpc: _CapabilityRpcResult | None = None
         try:
             request = locations_pb2.GetLocationRequest(
-                name=f"projects/{self._config.project}/locations/eu"
+                name=f"projects/{self._config.project}/locations/{self._config.speech_location}"
             )
             rpc = await _capability_rpc(
                 self._config,
@@ -488,26 +518,23 @@ class GoogleSttProvider:
             location = locations_pb2.Location.FromString(rpc.payload)
             metadata = locations_metadata.LocationsMetadata()
             if not location.metadata.Unpack(locations_metadata.LocationsMetadata.pb(metadata)):
-                raise RuntimeError("Google Speech EU location omitted LocationsMetadata")
-            languages = tuple(sorted(metadata.languages.models.keys()))
-            models = tuple(
+                raise RuntimeError("Google Speech location omitted LocationsMetadata")
+            languages = tuple(
                 sorted(
-                    {
-                        model
-                        for language in metadata.languages.models.values()
-                        for model in language.model_features.keys()
-                    }
+                    language
+                    for language, metadata_for_language in metadata.languages.models.items()
+                    if self._config.speech_model in metadata_for_language.model_features
                 )
             )
-            if not languages or "long" not in models:
-                raise RuntimeError("Google Speech EU location capability is incomplete")
+            if not languages:
+                raise RuntimeError("Google Speech location does not support the configured model")
             capability = StageCapabilities(
                 "google",
                 "stt",
                 self._config.speech_endpoint,
-                ("eu",),
+                (self._config.speech_region,),
                 languages,
-                models,
+                (self._config.speech_model,),
                 (
                     ("chunk_bytes", 8000),
                     ("session_seconds", 270),
@@ -603,6 +630,7 @@ class GoogleSttSession:
         self._boundaries: list[UUID] = []
         self._last_result_end = commit_watermark
         self._commit_watermark = commit_watermark
+        self._active_utterance_start = max(resume_at_sample, commit_watermark)
         self._recent: list[AudioChunk] = []
         self._stream_bases: list[int] = [resume_at_sample]
         self._next_rotation = resume_at_sample + 270 * 16000
@@ -743,10 +771,16 @@ class GoogleSttSession:
                     audio_channel_count=1,
                 ),
                 language_codes=[self._language],
-                model="long",
-                features=cloud_speech.RecognitionFeatures(enable_word_time_offsets=True),
+                model=self._config.speech_model,
+                features=cloud_speech.RecognitionFeatures(
+                    enable_automatic_punctuation=True,
+                    enable_word_time_offsets=self._config.speech_model != "chirp_3",
+                ),
             ),
-            streaming_features=cloud_speech.StreamingRecognitionFeatures(interim_results=True),
+            streaming_features=cloud_speech.StreamingRecognitionFeatures(
+                interim_results=True,
+                enable_voice_activity_events=True,
+            ),
         )
         yield cloud_speech.StreamingRecognizeRequest(
             recognizer=self._config.recognizer, streaming_config=config
@@ -851,11 +885,17 @@ class GoogleSttSession:
                     trimmed_transcript = " ".join(word.text for word in words).strip()
                     if trimmed_transcript:
                         transcript = trimmed_transcript
-            start = words[0].samples.start if words else max(base_sample, self._last_result_end)
+            if words:
+                start = words[0].samples.start
+                self._active_utterance_start = start
+            else:
+                start = max(base_sample, self._active_utterance_start, self._commit_watermark)
             if result.is_final:
                 start = max(start, self._commit_watermark)
             end = max(start + 1, reported_end, words[-1].samples.end if words else reported_end)
             self._last_result_end = max(self._last_result_end, end)
+            if result.is_final:
+                self._active_utterance_start = end
             await self._emit_event(
                 TranscriptEvent(
                     samples=SampleRange(start=start, end=end),
@@ -1003,8 +1043,9 @@ class GoogleTranslationProvider:
         rpc: _CapabilityRpcResult | None = None
         try:
             request = translation_service.GetSupportedLanguagesRequest(
-                parent=f"projects/{self._config.project}/locations/eu",
+                parent=self._config.parent,
                 display_language_code="en",
+                model=self._config.model,
             )
             payload = translation_service.GetSupportedLanguagesRequest.pb(
                 request
@@ -1025,9 +1066,9 @@ class GoogleTranslationProvider:
                 "google",
                 "translation",
                 self._config.translation_endpoint,
-                ("eu",),
+                (self._config.translation_region,),
                 languages,
-                ("general/nmt",),
+                (self._config.translation_model,),
                 (("requests_minute", 100), ("characters_minute", 100000)),
                 rpc.evidence,
             )
@@ -1069,6 +1110,22 @@ class GoogleTranslationProvider:
 
     async def aclose(self) -> None:
         await self._channels.aclose()
+
+
+_GOOGLE_TRANSLATION_VARIANTS = frozenset(
+    {
+        "fr-CA",
+        "fr-FR",
+        "pt-BR",
+        "pt-PT",
+        "zh-CN",
+        "zh-TW",
+    }
+)
+
+
+def _google_translation_code(locale: str) -> str:
+    return locale if locale in _GOOGLE_TRANSLATION_VARIANTS else locale.split("-", 1)[0]
 
 
 class GoogleTranslationAttempt:
@@ -1181,7 +1238,7 @@ class GoogleTranslationAttempt:
                 result = TranslationResult(
                     operation_id=self._request.operation_id,
                     attempt_id=self._request.attempt_id,
-                    text=response.translations[0].translated_text,
+                    text=html.unescape(response.translations[0].translated_text),
                     source_range=self._request.source_range,
                     raw_ref=self._refs[-2],
                 )
@@ -1211,8 +1268,8 @@ class GoogleTranslationAttempt:
             parent=self._config.parent,
             contents=[self._request.text],
             mime_type="text/plain",
-            source_language_code=self._request.source_language,
-            target_language_code=self._request.target_language,
+            source_language_code=_google_translation_code(self._request.source_language),
+            target_language_code=_google_translation_code(self._request.target_language),
             model=self._config.model,
         )
 
@@ -1415,7 +1472,7 @@ class GoogleTtsProvider:
                 "google",
                 "tts",
                 self._config.tts_endpoint,
-                ("eu",),
+                (self._config.tts_location,),
                 languages,
                 ("Chirp3-HD",),
                 (

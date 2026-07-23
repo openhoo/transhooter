@@ -310,7 +310,7 @@ def _selected_locales(metadata: JobMetadata) -> tuple[str, ...]:
 
 
 def _expected_credential_version(profile_id: str, capability: StageCapabilities) -> str:
-    if profile_id == "google-eu":
+    if profile_id in {"google-eu", "google-speech-eu"}:
         return credential_fingerprint(
             Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]),
             "Google ADC",
@@ -326,7 +326,7 @@ def _expected_credential_version(profile_id: str, capability: StageCapabilities)
 
 
 def _expected_credential_reference(profile_id: str, stage: str) -> str:
-    if profile_id == "google-eu":
+    if profile_id in {"google-eu", "google-speech-eu"}:
         return "google-adc"
     if profile_id == "deepgram-deepl-eu":
         return "deepl-api-key" if stage == "translation" else "deepgram-api-key"
