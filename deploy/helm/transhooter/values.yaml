@@ -93,21 +93,7 @@ config:
     googleEu:
       cloudProject: example-project
       quotaProject: example-project
-      speechEndpoint: eu-speech.googleapis.com
-      speechRecognizer: projects/example-project/locations/eu/recognizers/_
-      speechModel: long
-      translationEndpoint: translate-eu.googleapis.com
-      translationParent: projects/example-project/locations/eu
-      translationModel: projects/example-project/locations/eu/models/general/nmt
-      ttsEndpoint: eu-texttospeech.googleapis.com
-      ttsModel: chirp-3-hd
       ttsVoice: en-US-Chirp3-HD-Achernar
-      sttStreams: 2
-      sttMessagesMinute: 500
-      translationRequestsMinute: 100
-      translationCharactersMinute: 100000
-      ttsSessions: 2
-      ttsStartsMinute: 40
     googleSpeechEu:
       cloudProject: example-project
       quotaProject: example-project
@@ -119,16 +105,10 @@ config:
       ttsVoice: en-US-Chirp3-HD-Charon
       ttsVoiceLocale: en-US
     deepgramDeeplEu:
-      deepgramListenEndpoint: wss://api.eu.deepgram.com/v1/listen
-      deepgramSpeakEndpoint: wss://api.eu.deepgram.com/v1/speak
-      deepgramSttModel: nova-3
-      deepgramTtsModel: aura-2
       deepgramVoice: aura-2-viktoria-de
       deepgramApprovedVoices:
         - aura-2-thalia-en
         - aura-2-viktoria-de
-      deeplEndpoint: https://api.deepl.com
-      deeplModelType: latency_optimized
       deepgramStreams: 1
       deepgramAudioSecondsMinute: 60
       deeplRequestsMinute: 1
@@ -171,6 +151,9 @@ resources:
     requests: {cpu: 250m, memory: 256Mi}
     limits: {cpu: "2", memory: 2Gi}
   translationWorker:
+    requests: {cpu: "1", memory: 1Gi}
+    limits: {cpu: "4", memory: 4Gi}
+  spoolDrainer:
     requests: {cpu: "1", memory: 1Gi}
     limits: {cpu: "4", memory: 4Gi}
 

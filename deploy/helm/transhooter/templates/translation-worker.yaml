@@ -78,7 +78,7 @@ spec:
           {{- end }}
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
           resources:
-            {{- toYaml $root.Values.resources.translationWorker | nindent 12 }}
+            {{- toYaml (ternary $root.Values.resources.spoolDrainer $root.Values.resources.translationWorker (eq $component "spool-drainer")) | nindent 12 }}
           volumeMounts:
             - {name: runtime-secrets, mountPath: /run/secrets, readOnly: true}
             - {name: internal-token, mountPath: /var/run/secrets/transhooter, readOnly: true}

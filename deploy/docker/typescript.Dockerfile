@@ -14,8 +14,11 @@ RUN --mount=type=cache,id=bun-runtime-v1,target=/root/.bun/install/cache \
 FROM development-dependencies AS build
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY tsconfig.base.json biome.json ./
-COPY apps ./apps
-COPY packages ./packages
+COPY apps/control-worker ./apps/control-worker
+COPY apps/web ./apps/web
+COPY packages/contracts ./packages/contracts
+COPY packages/server-core ./packages/server-core
+COPY packages/telemetry ./packages/telemetry
 COPY deploy/scripts/migrate.mjs ./deploy/scripts/migrate.mjs
 RUN DATABASE_URL=postgresql://transhooter:transhooter@postgres/transhooter \
     bun run --filter @transhooter/server-core prisma:generate \
@@ -34,7 +37,6 @@ COPY tests/failure-smoke/package.json ./tests/failure-smoke/package.json
 RUN --mount=type=cache,id=bun-runtime-v1,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --production \
       --filter @transhooter/control-worker \
-      --filter @transhooter/web \
       --filter @transhooter/server-core
 
 FROM oven/bun:1.3.14-debian AS runtime

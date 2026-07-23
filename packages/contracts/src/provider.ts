@@ -8,11 +8,15 @@ import {
   Sha256Schema,
   UuidSchema,
 } from "./primitives";
-import {
-  ProviderOutcomeSchema,
-  ProviderRetryActionSchema,
-  ProviderRetryAdviceSchema,
-} from "./wire";
+
+export const ProviderOutcomeSchema = z.enum(["succeeded", "failed", "cancelled"]);
+export type ProviderOutcome = z.infer<typeof ProviderOutcomeSchema>;
+
+export const ProviderRetryAdviceSchema = z.enum(["never", "retry_after", "unspecified"]);
+export type ProviderRetryAdvice = z.infer<typeof ProviderRetryAdviceSchema>;
+
+export const ProviderRetryActionSchema = z.enum(["retry", "do_not_retry", "degrade"]);
+export type ProviderRetryAction = z.infer<typeof ProviderRetryActionSchema>;
 
 export const TRANSPORT_KIND_VALUES = ["http", "websocket", "grpc"] as const;
 

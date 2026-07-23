@@ -17,7 +17,6 @@ import {
   PrismaEffectRepository,
 } from "./persistence/repositories";
 import type {
-  EgressPort,
   InternalPrincipalVerifier,
   LiveKitRoomPort,
   LiveKitTokenPort,
@@ -39,7 +38,6 @@ export interface ConfiguredWebApplicationConfig {
   storage: ObjectStoragePort;
   livekitRooms: LiveKitRoomPort;
   livekitTokens: LiveKitTokenPort;
-  egress: EgressPort;
   webhookVerifier: WebhookVerifier;
   internalPrincipalVerifier: InternalPrincipalVerifier;
   clock: Clock;
@@ -114,9 +112,7 @@ export function createConfiguredWebApplication(
     consultationRepository,
     effectRepository,
     config.livekitRooms,
-    config.egress,
     config.webhookVerifier,
-    auditRepository,
     config.clock,
     config.ids,
     config.hashing,

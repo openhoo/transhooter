@@ -63,18 +63,6 @@ function hasParticipant(value: Consultation, participantId: UUID): boolean {
   return value.participants.some((slot) => slot.id === participantId);
 }
 
-export function assertTwoSlots(value: Consultation): void {
-  const roles = new Set(value.participants.map((slot) => slot.role));
-  if (roles.size !== 2 || !roles.has("employee") || !roles.has("customer")) {
-    throw new DomainError("INVALID_PARTICIPANTS");
-  }
-
-  const participantIds = new Set(value.participants.map((slot) => slot.id));
-  if (participantIds.size !== 2) {
-    throw new DomainError("INVALID_PARTICIPANTS");
-  }
-}
-
 export function slotForUser(value: Consultation, userId: UUID): ParticipantSlot {
   const slot = value.participants.find((candidate) => candidate.userId === userId);
   if (!slot) {

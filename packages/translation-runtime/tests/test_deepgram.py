@@ -14,7 +14,7 @@ from transhooter_worker.adapters.deepgram.provider import (
     DeepgramSynthesisAttempt,
 )
 from transhooter_worker.adapters.deepgram.sansio import SansIoWebSocket
-from transhooter_worker.application.session import _audio_after_watermark
+from transhooter_worker.application.session_audio import _audio_after_watermark
 from transhooter_worker.domain.models import (
     AudioChunk,
     BoundaryEvent,

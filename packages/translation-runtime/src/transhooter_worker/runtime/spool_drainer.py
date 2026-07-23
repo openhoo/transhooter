@@ -152,7 +152,7 @@ def _compact_pcm_scopes(spool: EncryptedSpool, archive: S3Archive) -> None:
             if checkpoint is not None:
                 compactor.acknowledge_covering_checkpoint(
                     closed_pcm_object,
-                    str(checkpoint),
+                    checkpoint,
                 )
 
 

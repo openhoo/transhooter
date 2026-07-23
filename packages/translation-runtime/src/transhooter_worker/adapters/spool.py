@@ -285,10 +285,9 @@ class EncryptedSpool:
                 "deterministic spool identity was reused with different evidence"
             )
         indexed = (row[1], row[2], row[3], row[12], row[13], row[14], row[7], row[15])
-        authenticated = self._decrypt_indexed_record(object_id, indexed)
+        header, authenticated = self._read_authenticated_indexed_record(object_id, indexed)
         if authenticated != payload:
             raise SpoolUnavailable("deterministic spool payload mismatch")
-        header, _ = self._unpack(Path(row[12]).read_bytes())
         expected_header = {
             "object_id": str(object_id),
             "attempt_id": str(attempt_id),
@@ -491,6 +490,8 @@ class EncryptedSpool:
     @staticmethod
     def _checkpoint_body_identity(
         body: bytes,
+        *,
+        malformed_message: str = "checkpoint body identity is malformed",
     ) -> tuple[UUID, UUID, int, str, str | None]:
         payload = json.loads(body.decode("utf-8"))
         if (
@@ -511,7 +512,7 @@ class EncryptedSpool:
             or not checkpoint_hash
             or (previous_hash is not None and not isinstance(previous_hash, str))
         ):
-            raise ValueError("checkpoint body identity is malformed")
+            raise ValueError(malformed_message)
         return checkpoint_id, source_id, worker_epoch, checkpoint_hash, previous_hash
 
     def _attempt_context(self, attempt_id: UUID) -> tuple[UUID, str, tuple[tuple[str, str], ...]]:
@@ -719,8 +720,7 @@ class EncryptedSpool:
             or bytes(row[18]) != json.dumps(expected_metadata, separators=(",", ":")).encode()
         ):
             raise SpoolUnavailable("checkpoint delivery WAL identity mismatch")
-        body = self.read(checkpoint_id)
-        header, _ = self._unpack(Path(row[13]).read_bytes())
+        header, body = self._read_authenticated_record(checkpoint_id)
         expected_header = {
             "object_id": str(checkpoint_id),
             "attempt_id": str(checkpoint_id),
@@ -785,17 +785,16 @@ class EncryptedSpool:
 
     @_locked
     def read(self, object_id: UUID) -> bytes:
+        _, plain = self._read_authenticated_record(object_id)
+        return plain
+
+    def _read_authenticated_record(self, object_id: UUID) -> tuple[dict[str, Any], bytes]:
         row = self._db.execute(
             """
             SELECT
-                meeting_id,
-                attempt_id,
-                stage,
-                opaque_path,
-                key_id,
-                nonce,
-                plaintext_sha256,
-                ciphertext_sha256
+                attempt_id, meeting_id, stage, opaque_path, key_id, nonce,
+                plaintext_sha256, ciphertext_sha256, size, transport, direction,
+                media_type, sample_start, sample_end, metadata_json
             FROM records
             WHERE object_id = ?
             """,
@@ -804,12 +803,14 @@ class EncryptedSpool:
         if row is None:
             raise KeyError(object_id)
         try:
-            return self._decrypt_indexed_record(object_id, row)
+            return self._read_authenticated_indexed_record(object_id, row)
         except SpoolUnavailable:
             self._quarantine(object_id)
             raise
 
-    def _decrypt_indexed_record(self, object_id: UUID, row: tuple[Any, ...]) -> bytes:
+    def _read_authenticated_indexed_record(
+        self, object_id: UUID, row: tuple[Any, ...]
+    ) -> tuple[dict[str, Any], bytes]:
         try:
             header, encrypted = self._unpack(Path(row[3]).read_bytes())
         except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -826,7 +827,7 @@ class EncryptedSpool:
             raise SpoolUnavailable("spool key missing or authentication failed") from exc
         if sha256_hex(plain) != row[6]:
             raise SpoolUnavailable("plaintext hash mismatch")
-        return plain
+        return header, plain
 
     @_locked
     def committed(self, stage: str | None = None) -> list[tuple[RawRef, SampleRange | None]]:
@@ -843,6 +844,37 @@ class EncryptedSpool:
             args = (stage,)
         rows = self._db.execute(sql + " ORDER BY ordinal", args).fetchall()
         return [self._record_with_range(row) for row in rows]
+
+    @_locked
+    def committed_drainable(
+        self, meeting_id: UUID
+    ) -> list[
+        tuple[
+            RawRef,
+            SampleRange | None,
+            tuple[UUID, UUID, str, int, str],
+        ]
+    ]:
+        rows = self._db.execute(
+            """
+            SELECT
+                object_id, ordinal, plaintext_sha256, size, media_type,
+                sample_start, sample_end, meeting_id, attempt_id, stage
+            FROM records
+            WHERE state = 'committed'
+              AND meeting_id = ?
+              AND stage NOT IN ('stt-input', 'tts-output', 'livekit-output', 'checkpoint')
+            ORDER BY ordinal
+            """,
+            (str(meeting_id),),
+        ).fetchall()
+        return [
+            (
+                *self._record_with_range(row[:7]),
+                (UUID(row[7]), UUID(row[8]), str(row[9]), int(row[1]), str(row[4])),
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _record_with_range(
@@ -1071,7 +1103,7 @@ class EncryptedSpool:
     def _recover_checkpoint_deliveries(self) -> None:
         rows = self._db.execute(
             """
-            SELECT records.object_id, records.meeting_id, records.opaque_path
+            SELECT records.object_id, records.meeting_id
             FROM records
             LEFT JOIN checkpoint_deliveries
               ON checkpoint_deliveries.checkpoint_id = records.object_id
@@ -1081,11 +1113,10 @@ class EncryptedSpool:
             ORDER BY records.ordinal
             """
         ).fetchall()
-        for object_id_value, meeting_id_value, opaque_path in rows:
+        for object_id_value, meeting_id_value in rows:
             object_id = UUID(object_id_value)
             try:
-                body = self.read(object_id)
-                header, _ = self._unpack(Path(opaque_path).read_bytes())
+                header, body = self._read_authenticated_record(object_id)
                 self._db.execute("BEGIN IMMEDIATE")
                 try:
                     self._insert_orphan_checkpoint_delivery(
@@ -1233,26 +1264,19 @@ class EncryptedSpool:
         checkpoint_id: UUID,
         meeting_id: UUID,
     ) -> None:
-        payload = json.loads(body.decode("utf-8"))
-        if (
-            not isinstance(payload, dict)
-            or json.dumps(payload, separators=(",", ":"), sort_keys=True).encode() != body
-        ):
-            raise ValueError("orphan checkpoint body is not canonical")
-        source_id = UUID(str(payload["sourceParticipantId"]))
-        body_checkpoint_id = UUID(str(payload["checkpointId"]))
-        worker_epoch = payload["workerEpoch"]
-        checkpoint_hash = payload["highWatermarkSha256"]
-        previous_hash = payload.get("previousCheckpointSha256")
+        (
+            body_checkpoint_id,
+            source_id,
+            worker_epoch,
+            checkpoint_hash,
+            previous_hash,
+        ) = self._checkpoint_body_identity(
+            body,
+            malformed_message="orphan checkpoint replay identity is malformed",
+        )
         metadata = tuple(tuple(item) for item in header["metadata"])
         if (
             body_checkpoint_id != checkpoint_id
-            or not isinstance(worker_epoch, int)
-            or isinstance(worker_epoch, bool)
-            or worker_epoch < 1
-            or not isinstance(checkpoint_hash, str)
-            or not checkpoint_hash
-            or (previous_hash is not None and not isinstance(previous_hash, str))
             or header["attempt_id"] != str(checkpoint_id)
             or header["meeting_id"] != str(meeting_id)
             or header["transport"] != "http"

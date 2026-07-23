@@ -17,14 +17,8 @@ x-provider-env: &provider-env
   PROVIDER_PROFILE: deepgram-deepl-eu
   DEEPGRAM_API_KEY_FILE: /run/secrets/deepgram-api-key
   DEEPL_API_KEY_FILE: /run/secrets/deepl-api-key
-  DEEPGRAM_LISTEN_ENDPOINT: wss://api.eu.deepgram.com/v1/listen
-  DEEPGRAM_SPEAK_ENDPOINT: wss://api.eu.deepgram.com/v1/speak
-  DEEPGRAM_STT_MODEL: nova-3
-  DEEPGRAM_TTS_MODEL: aura-2
   DEEPGRAM_VOICE: aura-2-viktoria-de
   DEEPGRAM_APPROVED_VOICES: aura-2-thalia-en,aura-2-viktoria-de
-  DEEPL_ENDPOINT: https://api.deepl.com
-  DEEPL_MODEL_TYPE: latency_optimized
   DEEPGRAM_STREAMS: ${DEEPGRAM_STREAMS:?set DEEPGRAM_STREAMS from your account quota}
   DEEPGRAM_AUDIO_SECONDS_MINUTE: ${DEEPGRAM_AUDIO_SECONDS_MINUTE:?set DEEPGRAM_AUDIO_SECONDS_MINUTE from your account quota}
   DEEPL_REQUESTS_MINUTE: ${DEEPL_REQUESTS_MINUTE:?set DEEPL_REQUESTS_MINUTE from your account quota}

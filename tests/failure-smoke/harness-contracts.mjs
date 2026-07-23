@@ -105,6 +105,26 @@ export async function pollUntil(
   throw new Error(`timed out waiting for ${label}: ${detail}`);
 }
 
+export function resumedSelectionFullyComplete({
+  resumeRequested,
+  selectedScenarios,
+  completedScenarios,
+}) {
+  return (
+    resumeRequested === true &&
+    selectedScenarios.size > 0 &&
+    [...selectedScenarios].every((scenario) => completedScenarios.has(scenario))
+  );
+}
+export function shouldEmitFailureSmokeProof({ resumedSelectionAlreadyComplete, scenarioCount }) {
+  if (!Number.isInteger(scenarioCount) || scenarioCount < 0) {
+    throw new Error("failure-smoke proof scenario count must be a non-negative integer");
+  }
+  if (scenarioCount > 0) return true;
+  if (resumedSelectionAlreadyComplete) return false;
+  throw new Error("failure-smoke produced no scenario evidence");
+}
+
 export function crashRecoveryMatches(expected, observation) {
   return (
     typeof expected?.workerId === "string" &&

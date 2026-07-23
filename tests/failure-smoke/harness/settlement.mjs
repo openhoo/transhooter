@@ -24,6 +24,143 @@ export function installSettlement(ctx) {
     );
     return JSON.parse(output || "[]");
   }
+  async function consultationStatus(consultationId) {
+    const rows = await queryJson(`
+      SELECT c.id,c.generation,c.state,c.admission_fenced_at,
+        a.id AS archive_id,a.state AS archive_state,a.final_inventory_hash,
+        COALESCE((SELECT count(*) FROM expected_archive_artifacts x WHERE x.archive_id=a.id),0)::int AS expected_count,
+        COALESCE((SELECT count(*) FROM archive_objects o WHERE o.archive_id=a.id),0)::int AS object_count,
+        COALESCE((SELECT count(*) FROM consultation_participants p
+          WHERE p.consultation_id=c.id AND p.publication_granted),0)::int AS publication_grants,
+        COALESCE((SELECT count(*) FROM external_effects e
+          WHERE e.consultation_id=c.id AND e.effect_kind='PARTICIPANT_GRANT'),0)::int AS participant_grant_effects,
+        COALESCE((SELECT count(*) FROM external_effects e
+          WHERE e.consultation_id=c.id AND e.effect_kind='STATUS_PACKET'
+            AND e.result->'plan'->>'reasonCode'='CAPTURE_READY'
+            AND e.request_bytes IS NOT NULL),0)::int AS capture_ready_packets
+      FROM consultations c JOIN archives a ON a.consultation_id=c.id
+      WHERE c.id='${consultationId}'`);
+    if (rows.length !== 1) throw new Error(`missing durable consultation ${consultationId}`);
+    return rows[0];
+  }
+
+  async function effectEvidence(consultationId, effectKind) {
+    return await queryJson(`
+      SELECT id,effect_kind AS kind,generation,subject_id AS "subjectId",state,attempts,
+        request_hash AS "requestHash",lease_owner AS "leaseOwner",
+        lease_expires_at AS "leaseExpiresAt",result,compensation_result AS "compensationResult"
+      FROM external_effects
+      WHERE consultation_id='${consultationId}' AND effect_kind='${effectKind}'
+      ORDER BY created_at`);
+  }
+
+  async function participantEgressDenialEvidence(consultationId) {
+    const rows = await queryJson(`
+      SELECT c.admission_fenced_at,
+        COALESCE((SELECT count(*) FROM consultation_participants p
+          WHERE p.consultation_id=c.id AND p.publication_granted),0)::int AS publication_grants,
+        COALESCE((SELECT count(*) FROM external_effects grant_effect
+          WHERE grant_effect.consultation_id=c.id
+            AND grant_effect.effect_kind='PARTICIPANT_GRANT'),0)::int AS participant_grant_effects,
+        COALESCE((SELECT count(*) FROM external_effects packet
+          WHERE packet.consultation_id=c.id AND packet.effect_kind='STATUS_PACKET'
+            AND packet.result->'plan'->>'reasonCode'='CAPTURE_READY'
+            AND packet.request_bytes IS NOT NULL),0)::int AS capture_ready_packets,
+        denied.effect AS denied_effect
+      FROM consultations c
+      LEFT JOIN LATERAL (
+        SELECT json_build_object(
+          'id',effect.id,'kind',effect.effect_kind,'generation',effect.generation,
+          'subjectId',effect.subject_id,'state',effect.state,'attempts',effect.attempts,
+          'requestHash',effect.request_hash,'leaseOwner',effect.lease_owner,
+          'leaseExpiresAt',effect.lease_expires_at,'result',effect.result,
+          'compensationResult',effect.compensation_result
+        ) AS effect
+        FROM external_effects effect
+        WHERE effect.consultation_id=c.id
+          AND effect.effect_kind='PARTICIPANT_EGRESS'
+          AND COALESCE(effect.result->>'error','') LIKE '%test fault denied PARTICIPANT_EGRESS%'
+        ORDER BY effect.created_at DESC
+        LIMIT 1
+      ) denied ON true
+      WHERE c.id='${consultationId}'`);
+    if (rows.length !== 1) throw new Error(`missing durable consultation ${consultationId}`);
+    return rows[0];
+  }
+
+  async function providerAttemptEvidence(consultationId, stage) {
+    return await queryJson(`
+      SELECT id,stage,operation_id AS "operationId",attempt_number AS "attemptNumber",
+        outcome,terminal_at AS "terminalAt",error_kind AS "errorKind",error_scope AS "errorScope",
+        provider_retry_advice AS "providerRetryAdvice",retry_of AS "retryOf",
+        retry_decision AS "retryDecision",accepted_input_watermark AS accepted,
+        received_output_watermark AS received,emitted_output_watermark AS emitted,
+        terminal_hash AS "terminalHash",num_nonnulls(raw_http,raw_websocket,raw_grpc) AS "rawRefs"
+      FROM provider_attempts
+      WHERE consultation_id='${consultationId}' AND stage='${stage}'
+      ORDER BY started_at`);
+  }
+
+  async function workerSupervisionEvidence(consultationId) {
+    const rows = await queryJson(`
+      SELECT c.generation,c.state,
+        COALESCE((SELECT json_agg(json_build_object(
+          'workerId',w.worker_id,'generation',w.generation,'epoch',w.epoch,
+          'fencedAt',w.fenced_at,'terminalOutcome',w.terminal_outcome,
+          'terminalAt',w.terminal_at,'terminalCheckpointId',w.terminal_checkpoint_id
+        ) ORDER BY w.epoch) FROM worker_job_epochs w WHERE w.consultation_id=c.id),'[]'::json) AS worker_epochs,
+        COALESCE((SELECT json_agg(json_build_object(
+          'workerId',r.worker_id,'generation',r.generation,'epoch',r.epoch,
+          'heartbeatAt',r.heartbeat_at,'leaseExpiresAt',r.lease_expires_at,
+          'fencedAt',r.fenced_at,'fenceReason',r.fence_reason
+        ) ORDER BY r.epoch) FROM worker_reservations r WHERE r.consultation_id=c.id),'[]'::json) AS reservations
+      FROM consultations c WHERE c.id='${consultationId}'`);
+    if (rows.length !== 1) throw new Error(`missing durable consultation ${consultationId}`);
+    return rows[0];
+  }
+
+  async function settlementObservation(consultationId) {
+    const rows = await queryJson(`
+      SELECT c.id,c.generation,c.state,a.state AS archive_state,
+        COALESCE((SELECT count(*) FROM outbox o
+          WHERE o.aggregate_id=c.id AND o.delivered_at IS NULL),0)::int AS pending_outbox,
+        COALESCE((SELECT count(*) FROM external_effects e WHERE e.consultation_id=c.id
+          AND e.state IN ('planned','calling','applied','compensating')),0)::int AS active_effects,
+        COALESCE((SELECT count(*) FROM expected_archive_artifacts x WHERE x.archive_id=a.id
+          AND x.disposition='expected' AND x.fulfilled_object_id IS NULL),0)::int AS unresolved_expectations,
+        COALESCE((SELECT count(*) FROM orchestration_deadlines d
+          WHERE d.consultation_id=c.id AND d.completed_at IS NULL),0)::int AS unfinished_deadlines,
+        COALESCE((SELECT count(*) FROM egress_jobs j WHERE j.consultation_id=c.id AND
+          (j.terminal_at IS NULL OR j.terminal_result IS NULL OR
+           j.state NOT IN ('EGRESS_COMPLETE','EGRESS_FAILED','EGRESS_ABORTED','EGRESS_LIMIT_REACHED'))),0)::int AS active_egress,
+        COALESCE((SELECT count(*) FROM worker_reservations r WHERE r.consultation_id=c.id
+          AND r.fenced_at IS NULL AND r.released_at IS NULL),0)::int AS unfenced_reservations,
+        COALESCE((SELECT count(*) FROM worker_job_epochs w WHERE w.consultation_id=c.id
+          AND w.terminal_at IS NULL),0)::int AS unterminated_worker_epochs,
+        COALESCE((SELECT count(*) FROM external_effects created WHERE created.consultation_id=c.id
+          AND created.effect_kind='WORKER_DISPATCH' AND created.result->>'remoteId' IS NOT NULL
+          AND created.compensation_result IS NULL AND NOT EXISTS (
+            SELECT 1 FROM external_effects removed WHERE removed.consultation_id=c.id
+              AND removed.effect_kind='DISPATCH_DELETE' AND removed.state='done'
+              AND removed.result->'plan'->>'dispatchId'=created.result->>'remoteId')),0)::int AS unclean_dispatches,
+        COALESCE((SELECT count(*) FROM external_effects created WHERE created.consultation_id=c.id
+          AND created.effect_kind='ROOM_CREATE' AND created.result->>'remoteId' IS NOT NULL
+          AND created.compensation_result IS NULL AND NOT EXISTS (
+            SELECT 1 FROM external_effects removed WHERE removed.consultation_id=c.id
+              AND removed.effect_kind='ROOM_DELETE' AND removed.state='done'
+              AND (removed.result->'plan'->>'resourceGeneration')::integer=created.generation)),0)::int AS unclean_rooms,
+        NOT EXISTS (SELECT 1 FROM external_effects created WHERE created.consultation_id=c.id
+          AND created.effect_kind='ROOM_CREATE' AND created.result->>'remoteId' IS NOT NULL
+          AND created.compensation_result IS NULL AND NOT EXISTS (
+            SELECT 1 FROM external_effects removed WHERE removed.consultation_id=c.id
+              AND removed.effect_kind='ROOM_DELETE' AND removed.state='done'
+              AND (removed.result->'plan'->>'resourceGeneration')::integer=created.generation)) AS room_cleanup_confirmed
+      FROM consultations c JOIN archives a ON a.consultation_id=c.id
+      WHERE c.id='${consultationId}'`);
+    if (rows.length !== 1) throw new Error(`missing durable consultation ${consultationId}`);
+    return rows[0];
+  }
+
   async function consultationEvidence(consultationId) {
     const rows = await queryJson(`
       SELECT c.id,c.generation,c.state,c.admission_fenced_at,
@@ -249,41 +386,44 @@ export function installSettlement(ctx) {
 
   async function settleConsultation(consultationId, { stopAtReconciliation = false } = {}) {
     for (let transition = 0; transition < 6; transition += 1) {
-      const evidence = await consultationEvidence(consultationId);
+      const evidence = await consultationStatus(consultationId);
       if (["ended", "cancelled", "deleted"].includes(evidence.state)) {
         if (stopAtReconciliation && evidence.archive_state === "reconciling") {
           return evidence;
         }
         let initialError;
         try {
-          return await waitFor(
+          await waitFor(
             `${consultationId} terminal resource settlement`,
             async () => {
-              const current = await consultationEvidence(consultationId);
+              const current = await settlementObservation(consultationId);
               return isCleanSettlement(current) ? current : null;
             },
             30_000,
           );
+          return await consultationEvidence(consultationId);
         } catch (error) {
           initialError = error;
         }
-        let current = await consultationEvidence(consultationId);
+        let current = await consultationStatus(consultationId);
         if (current.archive_state === "reconciling") {
           await forceArchiveReconciliationDeadline(consultationId, current.generation);
           try {
-            return await waitFor(
+            await waitFor(
               `${consultationId} forced terminal resource settlement`,
               async () => {
-                const forced = await consultationEvidence(consultationId);
+                const forced = await settlementObservation(consultationId);
                 return isCleanSettlement(forced) ? forced : null;
               },
               90_000,
             );
+            return await consultationEvidence(consultationId);
           } catch (error) {
             initialError = error;
             current = await consultationEvidence(consultationId);
           }
         }
+        if (!Array.isArray(current.effects)) current = await consultationEvidence(consultationId);
         throw new Error(
           `terminal resources did not settle: ${JSON.stringify(settlementSummary(current))}`,
           { cause: initialError },
@@ -318,7 +458,7 @@ export function installSettlement(ctx) {
         await waitFor(
           `${consultationId} cleanup from ${previousState}`,
           async () => {
-            const current = await consultationEvidence(consultationId);
+            const current = await consultationStatus(consultationId);
             return current.state !== previousState ? current : null;
           },
           90_000,
@@ -508,13 +648,11 @@ export function installSettlement(ctx) {
     const crashedEffect = await waitFor(
       `${scenario} durable boundary`,
       async () => {
-        const evidence = await consultationEvidence(run.consultationId);
+        const effects = await effectEvidence(run.consultationId, "ROOM_CREATE");
         return (
-          evidence.effects.find(
+          effects.find(
             (candidate) =>
-              candidate.kind === "ROOM_CREATE" &&
-              candidate.state === expectedState &&
-              typeof candidate.leaseOwner === "string",
+              candidate.state === expectedState && typeof candidate.leaseOwner === "string",
           ) ?? null
         );
       },
@@ -546,14 +684,15 @@ export function installSettlement(ctx) {
     if (completed.code !== 0) {
       throw new Error(`${scenario} consultation failed: ${completed.stderr}\n${completed.stdout}`);
     }
-    const evidence = await waitFor(
+    await waitFor(
       `${scenario} clean durable settlement`,
       async () => {
-        const current = await consultationEvidence(run.consultationId);
+        const current = await settlementObservation(run.consultationId);
         return isCleanSettlement(current) ? current : null;
       },
       120_000,
     );
+    const evidence = await consultationEvidence(run.consultationId);
     const recoveredEffect = evidence.effects.find(
       (candidate) =>
         candidate.kind === "ROOM_CREATE" &&
@@ -585,6 +724,12 @@ export function installSettlement(ctx) {
     sql,
     queryJson,
     consultationEvidence,
+    consultationStatus,
+    effectEvidence,
+    participantEgressDenialEvidence,
+    providerAttemptEvidence,
+    workerSupervisionEvidence,
+    settlementObservation,
     isCleanSettlement,
     settlementSummary,
     cancelBeforeStartForCleanup,

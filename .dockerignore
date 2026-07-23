@@ -3,6 +3,10 @@
 **/dist
 **/.venv
 **/__pycache__
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+**/.uv-cache
 .git
 .env
 .secrets

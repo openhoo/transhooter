@@ -1,7 +1,19 @@
 #!/bin/sh
 set -eu
-# ROOT is based on the top-level lifecycle script that sources this file.
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# Accept a validated repository root selected by nested wrappers; otherwise
+# initialize it from TRANSHOOTER_ROOT or the top-level lifecycle script path.
+if [ -n "${ROOT:-}" ] && [ -f "$ROOT/deploy/scripts/compose-lib.sh" ]; then
+  ROOT_CANDIDATE=$ROOT
+elif [ -n "${TRANSHOOTER_ROOT:-}" ] && [ -f "$TRANSHOOTER_ROOT/deploy/scripts/compose-lib.sh" ]; then
+  ROOT_CANDIDATE=$TRANSHOOTER_ROOT
+else
+  ROOT_CANDIDATE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+fi
+if [ ! -f "$ROOT_CANDIDATE/deploy/scripts/compose-lib.sh" ]; then
+  printf 'Invalid Transhooter repository root: %s\n' "$ROOT_CANDIDATE" >&2
+  return 2 2>/dev/null || exit 2
+fi
+ROOT=$(CDPATH= cd -- "$ROOT_CANDIDATE" && pwd)
 STATE_FILE="$ROOT/.secrets/compose-state"
 PROJECT_NAME=${COMPOSE_PROJECT_NAME:-transhooter}
 BASE_FILE="$ROOT/deploy/compose/compose.yml"
@@ -85,9 +97,11 @@ validate_profile_configuration() {
   environment=${1:-}
   public_base_url=${PUBLIC_BASE_URL:-}
   public_livekit_url=${PUBLIC_LIVEKIT_URL:-}
+  s3_public_endpoint=${S3_PUBLIC_ENDPOINT:-}
   if [ -n "$environment" ]; then
     public_base_url=$(profile_configuration_value "$environment" PUBLIC_BASE_URL)
     public_livekit_url=$(profile_configuration_value "$environment" PUBLIC_LIVEKIT_URL)
+    s3_public_endpoint=$(profile_configuration_value "$environment" S3_PUBLIC_ENDPOINT)
   fi
 
   case "$public_base_url" in
@@ -97,6 +111,14 @@ validate_profile_configuration() {
   case "$public_livekit_url" in
     wss://?*) ;;
     *) echo "PUBLIC_LIVEKIT_URL must be an explicit wss:// URL for production provider profiles" >&2; return 1 ;;
+  esac
+  case "$s3_public_endpoint" in
+    https://localhost | https://localhost/* | https://localhost:*)
+      echo "S3_PUBLIC_ENDPOINT must not use localhost for production provider profiles" >&2
+      return 1
+      ;;
+    https://?*) ;;
+    *) echo "S3_PUBLIC_ENDPOINT must be an explicit https:// URL for production provider profiles" >&2; return 1 ;;
   esac
 }
 
@@ -180,14 +202,14 @@ load_state() {
 }
 
 select_compose_command() {
+  if [ "${COMPOSE_COMMAND_AVAILABLE:-false}" = true ]; then
+    return 0
+  fi
   if ! docker compose version >/dev/null 2>&1; then
     echo "Docker Compose plugin is required." >&2
     return 127
   fi
-}
-
-invoke_compose() {
-  docker compose "$@"
+  COMPOSE_COMMAND_AVAILABLE=true
 }
 
 compose() {
@@ -203,7 +225,7 @@ compose() {
     set -- --env-file "$ROOT/.env" "$@"
   fi
 
-  invoke_compose "$@"
+  docker compose "$@"
 }
 
 failure_smoke_project_is_owned() {
@@ -252,13 +274,4 @@ failure_smoke_resource_is_owned() {
   resource_project_label=$3
   failure_smoke_project_is_owned "$project" "$owner" &&
     [ "$resource_project_label" = "$owner" ]
-}
-
-build_runtime_and_harness_images() {
-  compose build \
-    minio \
-    egress-ready \
-    translation-worker \
-    web \
-    "$@"
 }

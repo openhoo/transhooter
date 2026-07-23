@@ -60,6 +60,10 @@ export type ConsultationCommand =
       consultationId: UUID;
     }
   | {
+      kind: "consultation.lobby";
+      consultationId: UUID;
+    }
+  | {
       kind: "consultation.list";
     }
   | {
@@ -88,6 +92,9 @@ export type ConsultationCommand =
   | {
       kind: "consultation.options";
       providerProfileId: string;
+    }
+  | {
+      kind: "consultation.profileMetadata";
     }
   | {
       kind: "consultation.room";

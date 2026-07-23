@@ -179,6 +179,42 @@ class RetryingSttProvider:
 
 
 @pytest.mark.asyncio
+async def test_same_language_session_allocates_no_translation_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "test")
+    created: list[str] = []
+
+    class RejectAssembler:
+        def __init__(self, *_: object, **__: object) -> None:
+            created.append("assembler")
+
+    class RejectQueue:
+        def __init__(self, *_: object, **__: object) -> None:
+            created.append("queue")
+
+    monkeypatch.setattr(
+        "transhooter_worker.application.session.UtteranceAssembler", RejectAssembler
+    )
+    monkeypatch.setattr("transhooter_worker.application.session.OrderedStageQueue", RejectQueue)
+
+    session = DirectionSession(
+        DirectionSpec(uuid4(), uuid4(), "de-DE", "de-DE", None, True),
+        FixtureSttProvider(),
+        FixtureTranslationProvider(),
+        FixtureTtsProvider(),
+        ignore_sink,
+        ignore_sink,
+        ignore_sink,
+    )
+
+    assert created == []
+    assert session._assembler is None
+    assert session._stage_queue is None
+    assert session._stage_task is None
+
+
+@pytest.mark.asyncio
 async def test_finish_during_retry_open_cancels_replacement_without_hanging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

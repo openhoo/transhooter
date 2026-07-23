@@ -146,7 +146,12 @@ async def publish_complete_pcm_frames(
     try:
         while len(pending_pcm) - published_bytes >= frame_bytes:
             frame_end = published_bytes + frame_bytes
-            await sink(bytes(pending_pcm[published_bytes:frame_end]))
+            frame = memoryview(pending_pcm)[published_bytes:frame_end]
+            try:
+                payload = bytes(frame)
+            finally:
+                frame.release()
+            await sink(payload)
             published_bytes = frame_end
     finally:
         if published_bytes:

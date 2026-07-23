@@ -364,8 +364,10 @@ class ProviderRegistry:
             config.deepl_requests_minute,
             config.deepl_characters_minute,
         )
+        deepl = DeepLProvider(deepl_config, journal)
         return Providers(
             stt=DeepgramSttProvider(deepgram_config, journal),
-            translation=DeepLProvider(deepl_config, journal),
+            translation=deepl,
             tts=DeepgramTtsProvider(deepgram_config, journal),
+            _close=deepl.aclose,
         )

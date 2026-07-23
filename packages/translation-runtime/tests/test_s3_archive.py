@@ -25,6 +25,7 @@ class RecordingS3Client:
         self.upload_calls: list[tuple[str, int]] = []
         self.upload_finish_order: list[int] = []
         self.completion_part_numbers: list[int] = []
+        self.head_calls = 0
 
     def put_object(self, **kwargs: Any) -> dict[str, str]:
         self.objects[(kwargs["Key"], "v1")] = (
@@ -36,6 +37,7 @@ class RecordingS3Client:
         return {"VersionId": "v1", "ChecksumCRC64NVME": "crc"}
 
     def head_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.head_calls += 1
         if "VersionId" in kwargs:
             version = kwargs["VersionId"]
         else:
@@ -109,13 +111,6 @@ class RecordingS3Client:
         if self.completion_error is not None:
             raise self.completion_error
         return {"VersionId": "v2", "ChecksumCRC64NVME": "crc-multi"}
-
-    def get_object_attributes(self, **kwargs: Any) -> dict[str, Any]:
-        stored_body = self.objects[(kwargs["Key"], kwargs["VersionId"])][0]
-        return {
-            "ObjectSize": len(stored_body),
-            "Checksum": {"ChecksumCRC64NVME": "crc-multi"},
-        }
 
     def abort_multipart_upload(self, **kwargs: Any) -> None:
         upload_id = str(kwargs["UploadId"])
@@ -212,6 +207,31 @@ class FailOnePartOnceS3Client(RecordingS3Client):
                 self.upload_calls.append((str(kwargs["Key"]), part_number))
                 raise RuntimeError("injected multipart upload failure")
         return super().upload_part(**kwargs)
+
+
+class SliceRecordingBytes(bytes):
+    slice_threads: list[int]
+
+    def __new__(cls, body: bytes) -> SliceRecordingBytes:
+        instance = super().__new__(cls, body)
+        instance.slice_threads = []
+        return instance
+
+    def __getitem__(self, key: int | slice) -> int | bytes:
+        if isinstance(key, slice):
+            self.slice_threads.append(get_ident())
+        return super().__getitem__(key)
+
+
+class PlanRecordingArchive(S3Archive):
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.intended_parts: dict[int, Any] = {}
+
+    def _journal_intended_parts(self, *args: Any) -> dict[int, Any]:
+        intended = super()._journal_intended_parts(*args)
+        self.intended_parts = intended
+        return intended
 
 
 class OwnerThreadRecordingArchive(S3Archive):
@@ -329,6 +349,34 @@ def test_archive_multipart_persists_parts_and_verifies(
         S3Archive._crc64nvme(body[6:12]),
         S3Archive._crc64nvme(body[12:17]),
     ]
+    assert client.head_calls == 2
+
+
+def test_archive_multipart_plans_ranges_without_retaining_part_bodies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    client = RecordingS3Client()
+    archive = PlanRecordingArchive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
+    owner_thread = get_ident()
+    body = SliceRecordingBytes(b"abcdefghijklmnopq")
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/ranges.pcm"
+
+    archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert [
+        (plan.byte_start, plan.byte_end, plan.checksum) for plan in archive.intended_parts.values()
+    ] == [
+        (0, 6, S3Archive._crc64nvme(body[0:6])),
+        (6, 12, S3Archive._crc64nvme(body[6:12])),
+        (12, 17, S3Archive._crc64nvme(body[12:17])),
+    ]
+    assert all(not hasattr(plan, "body") for plan in archive.intended_parts.values())
+    upload_slice_threads = body.slice_threads[:-3]
+    assert len(upload_slice_threads) == 3
+    assert all(thread_id != owner_thread for thread_id in upload_slice_threads)
+    assert client.head_calls == 1
 
 
 def test_archive_bounds_parallel_multipart_uploads(

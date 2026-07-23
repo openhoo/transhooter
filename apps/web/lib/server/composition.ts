@@ -258,7 +258,6 @@ export function configuredApplication(): ConfiguredWebApplication {
       storage,
       livekitRooms: livekit.rooms,
       livekitTokens: livekit.tokens,
-      egress: livekit.egress,
       webhookVerifier: livekit.webhookVerifier,
       internalPrincipalVerifier: internalPrincipalVerifier(config, primitives),
       ...primitives,

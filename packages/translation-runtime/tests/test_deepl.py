@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from uuid import UUID, uuid4
 
@@ -110,3 +111,30 @@ async def test_deepl_429_normalizes_without_adapter_retry() -> None:
     assert outcome.terminal.error.retry_delay_ms == 1500
     assert outcome.terminal.accepted_input == 1
     assert outcome.terminal.received_output == 0
+
+
+@pytest.mark.asyncio
+async def test_deepl_injected_client_remains_caller_owned() -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+    provider = DeepLProvider(DeepLConfig("secret", uuid4()), MemoryJournal(), client)
+
+    await asyncio.gather(provider.aclose(), provider.aclose())
+
+    assert not client.is_closed
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_deepl_owned_client_closes_once_concurrently(monkeypatch: pytest.MonkeyPatch) -> None:
+    closes = 0
+
+    async def counted_close(self: httpx.AsyncClient) -> None:
+        nonlocal closes
+        closes += 1
+
+    monkeypatch.setattr(httpx.AsyncClient, "aclose", counted_close)
+    provider = DeepLProvider(DeepLConfig("secret", uuid4()), MemoryJournal())
+
+    await asyncio.gather(provider.aclose(), provider.aclose())
+
+    assert closes == 1

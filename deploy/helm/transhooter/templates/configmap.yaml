@@ -11,21 +11,7 @@ data:
   GOOGLE_APPLICATION_CREDENTIALS: "/run/secrets/google-adc.json"
   GOOGLE_CLOUD_PROJECT: {{ .Values.config.providers.googleEu.cloudProject | quote }}
   GOOGLE_QUOTA_PROJECT: {{ .Values.config.providers.googleEu.quotaProject | quote }}
-  GOOGLE_SPEECH_ENDPOINT: {{ .Values.config.providers.googleEu.speechEndpoint | quote }}
-  GOOGLE_SPEECH_RECOGNIZER: {{ .Values.config.providers.googleEu.speechRecognizer | quote }}
-  GOOGLE_SPEECH_MODEL: {{ .Values.config.providers.googleEu.speechModel | quote }}
-  GOOGLE_TRANSLATION_ENDPOINT: {{ .Values.config.providers.googleEu.translationEndpoint | quote }}
-  GOOGLE_TRANSLATION_PARENT: {{ .Values.config.providers.googleEu.translationParent | quote }}
-  GOOGLE_TRANSLATION_MODEL: {{ .Values.config.providers.googleEu.translationModel | quote }}
-  GOOGLE_TTS_ENDPOINT: {{ .Values.config.providers.googleEu.ttsEndpoint | quote }}
-  GOOGLE_TTS_MODEL: {{ .Values.config.providers.googleEu.ttsModel | quote }}
   GOOGLE_TTS_VOICE: {{ .Values.config.providers.googleEu.ttsVoice | quote }}
-  GOOGLE_STT_STREAMS: {{ .Values.config.providers.googleEu.sttStreams | quote }}
-  GOOGLE_STT_MESSAGES_MINUTE: {{ .Values.config.providers.googleEu.sttMessagesMinute | quote }}
-  GOOGLE_TRANSLATION_REQUESTS_MINUTE: {{ .Values.config.providers.googleEu.translationRequestsMinute | quote }}
-  GOOGLE_TRANSLATION_CHARACTERS_MINUTE: {{ .Values.config.providers.googleEu.translationCharactersMinute | quote }}
-  GOOGLE_TTS_SESSIONS: {{ .Values.config.providers.googleEu.ttsSessions | quote }}
-  GOOGLE_TTS_STARTS_MINUTE: {{ .Values.config.providers.googleEu.ttsStartsMinute | quote }}
   {{- else if eq .Values.config.providerProfile "google-speech-eu" }}
   GOOGLE_APPLICATION_CREDENTIALS: "/run/secrets/google-adc.json"
   GOOGLE_CLOUD_PROJECT: {{ .Values.config.providers.googleSpeechEu.cloudProject | quote }}
@@ -40,14 +26,8 @@ data:
   {{- else if eq .Values.config.providerProfile "deepgram-deepl-eu" }}
   DEEPGRAM_API_KEY_FILE: "/run/secrets/deepgram-api-key"
   DEEPL_API_KEY_FILE: "/run/secrets/deepl-api-key"
-  DEEPGRAM_LISTEN_ENDPOINT: {{ .Values.config.providers.deepgramDeeplEu.deepgramListenEndpoint | quote }}
-  DEEPGRAM_SPEAK_ENDPOINT: {{ .Values.config.providers.deepgramDeeplEu.deepgramSpeakEndpoint | quote }}
-  DEEPGRAM_STT_MODEL: {{ .Values.config.providers.deepgramDeeplEu.deepgramSttModel | quote }}
-  DEEPGRAM_TTS_MODEL: {{ .Values.config.providers.deepgramDeeplEu.deepgramTtsModel | quote }}
   DEEPGRAM_VOICE: {{ .Values.config.providers.deepgramDeeplEu.deepgramVoice | quote }}
   DEEPGRAM_APPROVED_VOICES: {{ join "," .Values.config.providers.deepgramDeeplEu.deepgramApprovedVoices | quote }}
-  DEEPL_ENDPOINT: {{ .Values.config.providers.deepgramDeeplEu.deeplEndpoint | quote }}
-  DEEPL_MODEL_TYPE: {{ .Values.config.providers.deepgramDeeplEu.deeplModelType | quote }}
   DEEPGRAM_STREAMS: {{ .Values.config.providers.deepgramDeeplEu.deepgramStreams | quote }}
   DEEPGRAM_AUDIO_SECONDS_MINUTE: {{ .Values.config.providers.deepgramDeeplEu.deepgramAudioSecondsMinute | quote }}
   DEEPL_REQUESTS_MINUTE: {{ .Values.config.providers.deepgramDeeplEu.deeplRequestsMinute | quote }}

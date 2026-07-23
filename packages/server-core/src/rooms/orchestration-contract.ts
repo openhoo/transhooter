@@ -34,9 +34,7 @@ export interface ParticipantEgressEffectRequest {
   resourceRoomName: string;
   participantIdentity: UUID;
   outputPrefix: string;
-  segmentedHls: true;
   resourceGeneration: number;
-  compensationIntent: "EGRESS_STOP";
 }
 
 export interface ParticipantRemoveEffectRequest {
@@ -44,7 +42,6 @@ export interface ParticipantRemoveEffectRequest {
   resourceRoomName: string;
   participantIdentity: UUID;
   resourceGeneration: number;
-  compensationIntent: "REMOVE_PARTICIPANT";
 }
 
 type GenericEffectKind = Exclude<

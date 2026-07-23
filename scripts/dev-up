@@ -21,9 +21,9 @@ fi
 if [ "$profile" = fixture ]; then
   export PUBLIC_BASE_URL=http://app.localhost:3000
   export PUBLIC_LIVEKIT_URL=ws://rtc.localhost:7880
+  export S3_PUBLIC_ENDPOINT=http://localhost:9000
 fi
 export RTC_ADVERTISED_IP="${RTC_ADVERTISED_IP:-${RTC_BRIDGE_IP:-10.254.231.10}}"
-export S3_PUBLIC_ENDPOINT="${S3_PUBLIC_ENDPOINT:-http://localhost:9000}"
 
 mkdir -p "$ROOT/.secrets"
 

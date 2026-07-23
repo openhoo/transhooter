@@ -4,8 +4,15 @@ import { Room } from "livekit-client";
 import type { FormEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, api } from "@/lib/browser/browser-api";
-import { describeLobbyPhase, type LobbyPhase, LobbyPreviewFence } from "@/lib/browser/lobby-phase";
-import { persistDevicePreference } from "./interface-state";
+import {
+  describeLobbyPhase,
+  type LobbyDeviceSelection,
+  type LobbyPhase,
+  LobbyPreviewFence,
+  lobbyPreferencesPayload,
+  lobbyPreviewConstraints,
+} from "@/lib/browser/lobby-phase";
+import { createWithDeviceFallback, persistDevicePreference } from "./interface-state";
 import styles from "./lobby.module.css";
 
 const CONSENT_COPY =
@@ -45,7 +52,7 @@ type PreferencesFormProps = {
   busy: boolean;
   devices: MediaDeviceInfo[];
   languages: LanguageOption[];
-  onPreview: () => Promise<void>;
+  onPreview: (selection: LobbyDeviceSelection, clearSelection: () => void) => Promise<void>;
   onSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void>;
   videoRef: RefObject<HTMLVideoElement | null>;
 };
@@ -166,80 +173,97 @@ function useLocalDevicePreview(setError: (message: string) => void) {
     };
   }, [stopPreview]);
 
-  const preview = useCallback(async () => {
-    setError("");
-    const fence = previewFence.current;
-    const request = fence.begin();
-    try {
-      if (videoRef.current) {
-        videoRef.current.srcObject = null;
+  const preview = useCallback(
+    async ({ microphoneId, cameraId }: LobbyDeviceSelection, clearSelection: () => void) => {
+      setError("");
+      const fence = previewFence.current;
+      const request = fence.begin();
+      try {
+        if (videoRef.current) {
+          videoRef.current.srcObject = null;
+        }
+      } catch {
+        // A superseded preview may already have lost its video element.
       }
-    } catch {
-      // A superseded preview may already have lost its video element.
-    }
-    let media: MediaStream;
+      let media: MediaStream;
 
-    try {
-      media = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: true,
-      });
-    } catch {
-      if (fence.settle(request)) {
-        setError(
-          "Camera or microphone access is blocked. Allow access in your browser, then try again.",
+      try {
+        media = await createWithDeviceFallback(
+          microphoneId || cameraId || undefined,
+          (selectedDeviceId) =>
+            navigator.mediaDevices.getUserMedia(
+              lobbyPreviewConstraints(
+                selectedDeviceId ? { microphoneId, cameraId } : { microphoneId: "", cameraId: "" },
+              ),
+            ),
+          () => {
+            if (!request.signal.aborted) {
+              clearSelection();
+              persistDevicePreference(() => window.sessionStorage, "transhooter.microphone", "");
+              persistDevicePreference(() => window.sessionStorage, "transhooter.camera", "");
+            }
+          },
         );
+      } catch {
+        if (fence.settle(request)) {
+          setError(
+            "Camera or microphone access is blocked. Allow access in your browser, then try again.",
+          );
+        }
+        return;
       }
-      return;
-    }
 
-    if (!fence.adopt(request, media)) {
-      return;
-    }
-
-    const settleOwnedPreview = (message: string) => {
-      if (fence.owns(request, media) && fence.settle(request)) {
-        setError(message);
+      if (!fence.adopt(request, media)) {
+        return;
       }
-    };
-    media.getTracks().forEach((track) => {
-      track.addEventListener(
-        "ended",
+
+      const settleOwnedPreview = (message: string) => {
+        if (fence.owns(request, media) && fence.settle(request)) {
+          setError(message);
+        }
+      };
+      media.getTracks().forEach((track) => {
+        track.addEventListener(
+          "ended",
+          () => {
+            settleOwnedPreview("Camera or microphone access ended. Preview again before joining.");
+          },
+          { once: true },
+        );
+      });
+      media.addEventListener(
+        "inactive",
         () => {
-          settleOwnedPreview("Camera or microphone access ended. Preview again before joining.");
+          settleOwnedPreview(
+            "Camera and microphone preview stopped. Preview again before joining.",
+          );
         },
         { once: true },
       );
-    });
-    media.addEventListener(
-      "inactive",
-      () => {
-        settleOwnedPreview("Camera and microphone preview stopped. Preview again before joining.");
-      },
-      { once: true },
-    );
 
-    try {
-      const video = videoRef.current;
-      if (!video || !fence.owns(request, media)) {
+      try {
+        const video = videoRef.current;
+        if (!video || !fence.owns(request, media)) {
+          fence.settle(request);
+          return;
+        }
+        video.srcObject = media;
+      } catch {
         fence.settle(request);
         return;
       }
-      video.srcObject = media;
-    } catch {
-      fence.settle(request);
-      return;
-    }
 
-    try {
-      const nextDevices = await navigator.mediaDevices.enumerateDevices();
-      if (fence.owns(request, media)) {
-        setDevices(nextDevices);
+      try {
+        const nextDevices = await navigator.mediaDevices.enumerateDevices();
+        if (fence.owns(request, media)) {
+          setDevices(nextDevices);
+        }
+      } catch {
+        // Preview remains usable when device enumeration is unavailable.
       }
-    } catch {
-      // Preview remains usable when device enumeration is unavailable.
-    }
-  }, [setError]);
+    },
+    [setError],
+  );
 
   const unlockAudio = useCallback(async () => {
     audioUnlockRoom.current ??= new Room();
@@ -305,6 +329,9 @@ function PreferencesForm({
   const microphones = devices.filter((device) => device.kind === "audioinput");
   const cameras = devices.filter((device) => device.kind === "videoinput");
 
+  const microphoneRef = useRef<HTMLSelectElement>(null);
+  const cameraRef = useRef<HTMLSelectElement>(null);
+
   return (
     <form
       aria-busy={busy}
@@ -338,7 +365,16 @@ function PreferencesForm({
           className="button secondary"
           type="button"
           onClick={() => {
-            void onPreview();
+            void onPreview(
+              {
+                microphoneId: microphoneRef.current?.value ?? "",
+                cameraId: cameraRef.current?.value ?? "",
+              },
+              () => {
+                if (microphoneRef.current) microphoneRef.current.value = "";
+                if (cameraRef.current) cameraRef.current.value = "";
+              },
+            );
           }}
         >
           Preview camera and microphone
@@ -372,7 +408,12 @@ function PreferencesForm({
         )}
         <div className="field">
           <label htmlFor="microphone">Microphone</label>
-          <select aria-describedby="device-preference-hint" id="microphone" name="microphone">
+          <select
+            aria-describedby="device-preference-hint"
+            id="microphone"
+            name="microphone"
+            ref={microphoneRef}
+          >
             <option value="">System default microphone</option>
             {microphones.map((device) => (
               <option value={device.deviceId} key={device.deviceId}>
@@ -383,7 +424,12 @@ function PreferencesForm({
         </div>
         <div className="field">
           <label htmlFor="camera">Camera</label>
-          <select aria-describedby="device-preference-hint" id="camera" name="camera">
+          <select
+            aria-describedby="device-preference-hint"
+            id="camera"
+            name="camera"
+            ref={cameraRef}
+          >
             <option value="">System default camera</option>
             {cameras.map((device) => (
               <option value={device.deviceId} key={device.deviceId}>
@@ -591,12 +637,7 @@ export function Lobby({ consultationId, initial }: LobbyProps) {
     try {
       const next = await api<LobbyState>(`/api/consultations/${consultationId}/preferences`, {
         method: "POST",
-        body: JSON.stringify({
-          displayName: values.get("displayName"),
-          language: values.get("language"),
-          microphoneId,
-          cameraId,
-        }),
+        body: JSON.stringify(lobbyPreferencesPayload(values)),
       });
       if (describeLobbyPhase(next.phase).contentKind !== phaseDescriptor.contentKind) {
         setFocusPhaseRequest((current) => current + 1);

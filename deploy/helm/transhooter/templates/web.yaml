@@ -32,7 +32,6 @@ spec:
           command: [bun, apps/web/.next/standalone/apps/web/server.js]
           envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" . }}}}]
           env:
-            - {name: INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
             - {name: SESSION_SECRET_FILE, value: /run/secrets/session-secret}
             - {name: CSRF_SECRET_FILE, value: /run/secrets/csrf-secret}
             - name: POD_NAMESPACE
@@ -54,7 +53,6 @@ spec:
           resources: {{- toYaml .Values.resources.web | nindent 12 }}
           volumeMounts:
             - {name: runtime-secrets, mountPath: /run/secrets, readOnly: true}
-            - {name: internal-token, mountPath: /var/run/secrets/transhooter, readOnly: true}
             - {name: tmp, mountPath: /tmp}
       volumes:
         - name: runtime-secrets
@@ -76,10 +74,6 @@ spec:
                   items:
                     - key: {{ required "magicLinkSealKeys.secretKey must name the keyring entry" .Values.magicLinkSealKeys.secretKey | quote }}
                       path: {{ base .Values.magicLinkSealKeys.mountPath | quote }}
-        - name: internal-token
-          projected:
-            sources:
-              - serviceAccountToken: {path: token, audience: {{ .Values.config.internalAudience | quote }}, expirationSeconds: 600}
         - {name: tmp, emptyDir: {}}
 ---
 apiVersion: v1

@@ -3,6 +3,8 @@ import {
   describeLobbyPhase,
   type LobbyPhase,
   LobbyPreviewFence,
+  lobbyPreferencesPayload,
+  lobbyPreviewConstraints,
   type PreviewStream,
 } from "./browser/lobby-phase";
 
@@ -42,6 +44,37 @@ describe("lobby phase descriptors", () => {
       expect(describeLobbyPhase(phase)).toEqual({ stage, polls, announcement, contentKind });
     },
   );
+});
+
+describe("lobby device selection", () => {
+  test("requests the explicitly selected microphone and camera", () => {
+    expect(lobbyPreviewConstraints({ microphoneId: "microphone-2", cameraId: "camera-3" })).toEqual(
+      {
+        audio: { deviceId: { exact: "microphone-2" } },
+        video: { deviceId: { exact: "camera-3" } },
+      },
+    );
+  });
+
+  test("uses browser defaults only for unselected device kinds", () => {
+    expect(lobbyPreviewConstraints({ microphoneId: "", cameraId: "camera-3" })).toEqual({
+      audio: true,
+      video: { deviceId: { exact: "camera-3" } },
+    });
+  });
+
+  test("preferences payload excludes local device identities", () => {
+    const values = new FormData();
+    values.set("displayName", "Customer");
+    values.set("language", "de-DE");
+    values.set("microphone", "microphone-2");
+    values.set("camera", "camera-3");
+
+    expect(lobbyPreferencesPayload(values)).toEqual({
+      displayName: "Customer",
+      language: "de-DE",
+    });
+  });
 });
 
 describe("lobby preview request fence", () => {

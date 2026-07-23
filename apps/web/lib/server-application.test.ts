@@ -44,6 +44,9 @@ const { DomainError } = await import("@transhooter/server-core");
 const { trustedClientIp } = await import("./server/composition");
 const { POST: heartbeatPOST } = await import("../app/api/internal/heartbeat/route");
 const { createRoute } = await import("../app/api/_route");
+const { WEB_OPERATIONS, boundedWebOperation, isWebOperation } = await import(
+  "./server/web-operations"
+);
 
 const report = {
   directionId: "00000000-0000-4000-8000-000000000001",
@@ -292,20 +295,20 @@ test("consultation list carries the authenticated viewer role into presentation"
   });
 });
 
-test("archive object presentation exposes only the public payload with response aliases", () => {
+test("archive object presentation exposes only the stable public payload", () => {
   const id = "00000000-0000-4000-8000-000000000023";
   expect(
     presentArchiveObjects({
       objects: [
         {
           id,
-          object_class: "participant_original",
+          objectClass: "participant_original",
           key: "v1/meetings/consultation/audio/original.ogg",
-          content_type: "audio/ogg",
+          contentType: "audio/ogg",
           size: "128",
           sha256: "a".repeat(64),
-          s3_checksum: "checksum-1",
-          version_id: "version-1",
+          s3Checksum: "checksum-1",
+          versionId: "version-1",
         },
       ],
       cursor: id,
@@ -339,13 +342,13 @@ test("archive object list uses the endpoint presentation dispatch", async () => 
         objects: [
           {
             id,
-            object_class: "caption_final_vtt",
+            objectClass: "caption_final_vtt",
             key: "v1/meetings/consultation/captions/final.vtt",
-            content_type: "text/vtt",
+            contentType: "text/vtt",
             size: "256",
             sha256: "b".repeat(64),
-            s3_checksum: "checksum-2",
-            version_id: "version-2",
+            s3Checksum: "checksum-2",
+            versionId: "version-2",
           },
         ],
         cursor: id,
@@ -377,6 +380,53 @@ test("archive object list uses the endpoint presentation dispatch", async () => 
     ],
     nextCursor: id,
   });
+});
+
+test("language catalog preserves its public snake-case response from normalized query DTOs", async () => {
+  const id = "00000000-0000-4000-8000-000000000025";
+  const profileId = "00000000-0000-4000-8000-000000000026";
+  const freshUntil = new Date("2026-08-01T00:00:00Z");
+
+  await expect(
+    present(
+      "languages.catalog",
+      [
+        {
+          id,
+          profileId,
+          sourceLocale: "en-US",
+          targetLocale: "de-DE",
+          mode: "translated",
+          snapshot: { region: "eu" },
+          profileName: "google-eu",
+          revision: 4,
+          freshUntil,
+        },
+      ],
+      {
+        request: new Request("http://localhost/api/languages"),
+        params: {},
+        query: {},
+        body: {},
+        rawBody: null,
+        sessionToken: null,
+        csrfToken: null,
+        exchangeNonce: null,
+      },
+    ),
+  ).resolves.toEqual([
+    {
+      id,
+      profile_id: profileId,
+      source_locale: "en-US",
+      target_locale: "de-DE",
+      mode: "translated",
+      snapshot: { region: "eu" },
+      profile_name: "google-eu",
+      revision: 4,
+      fresh_until: freshUntil,
+    },
+  ]);
 });
 
 test("shutdown countdown updates immediately on deadline-aligned boundaries through exact zero", () => {
@@ -589,6 +639,16 @@ test("native heartbeat route classifies invalid UTF-8 JSON bodies as HTTP 400", 
     code: "REQUEST_FAILED",
     message: "Request body is not valid JSON",
   });
+});
+
+test("web operation registry is authoritative and bounds external telemetry labels", () => {
+  expect(new Set(WEB_OPERATIONS).size).toBe(WEB_OPERATIONS.length);
+  for (const operation of WEB_OPERATIONS) {
+    expect(isWebOperation(operation)).toBe(true);
+    expect(boundedWebOperation(operation)).toBe(operation);
+  }
+  expect(isWebOperation("external.user-controlled-operation")).toBe(false);
+  expect(boundedWebOperation("external.user-controlled-operation")).toBe("unknown");
 });
 
 test("application failure logs identify the operation without exposing error or request data", async () => {

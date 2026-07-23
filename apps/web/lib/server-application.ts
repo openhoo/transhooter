@@ -18,6 +18,7 @@ import { z } from "zod";
 import { configuredApplication } from "./server/composition";
 import { webConfig } from "./server/config";
 import { withWebOperation } from "./server/telemetry";
+import type { WebOperation } from "./server/web-operations";
 import { durableConsultationDestination } from "./shared/consultation-routing";
 
 const UuidSchema = z.uuid();
@@ -265,7 +266,7 @@ export function adminLanguageUpdateCommand(
   };
 }
 
-function commandFor(operation: string, context: RequestContext): WebCommand {
+function commandFor(operation: WebOperation, context: RequestContext): WebCommand {
   const body = ObjectSchema.parse(context.body ?? {});
   switch (operation) {
     case "auth.magicLink.request":
@@ -290,15 +291,12 @@ function commandFor(operation: string, context: RequestContext): WebCommand {
     case "consultations.list":
       return { kind: "consultation.list" };
     case "consultations.create.options":
-      return {
-        kind: "consultation.options",
-        providerProfileId: z.string().parse(body.providerProfileId ?? webConfig().providerProfile),
-      };
+      return { kind: "consultation.profileMetadata" };
     case "consultations.create":
       return consultationCreateCommand(body);
     case "consultations.get":
       return {
-        kind: "consultation.get",
+        kind: "consultation.lobby",
         consultationId: requiredUuid(context.params.id, "id"),
       };
     case "consultations.preferences.update":
@@ -471,19 +469,19 @@ function commandFor(operation: string, context: RequestContext): WebCommand {
   }
 }
 
-function csrfAccepted(request: Request, cookieToken: string | undefined): boolean {
-  const url = new URL(request.url);
+function csrfAccepted(request: Request, requestUrl: URL, cookieToken: string | undefined): boolean {
   const bypassesCsrf =
     request.method === "GET" ||
     request.method === "HEAD" ||
-    url.pathname.startsWith("/api/internal/") ||
-    url.pathname === "/api/webhooks/livekit";
+    requestUrl.pathname.startsWith("/api/internal/") ||
+    requestUrl.pathname === "/api/webhooks/livekit";
   if (bypassesCsrf) {
     return true;
   }
+  const publicOrigin = new URL(webConfig().publicUrl).origin;
 
   const origin = request.headers.get("origin");
-  if ((origin && origin !== new URL(webConfig().publicUrl).origin) || !cookieToken) {
+  if ((origin && origin !== publicOrigin) || !cookieToken) {
     return false;
   }
   const headerToken = request.headers.get("x-csrf-token");
@@ -522,17 +520,16 @@ export function presentConsultationList(result: unknown) {
 }
 
 function presentProfileOptions(result: unknown) {
-  const rows = z.array(ObjectSchema).parse(result);
-  const unique = new Map<string, { id: string; name: string; revision: number }>();
-  for (const row of rows) {
-    const id = UuidSchema.parse(row.profile_id);
-    unique.set(id, {
-      id,
-      name: displayString(row.profile_name),
-      revision: z.coerce.number().int().positive().catch(1).parse(row.revision),
-    });
-  }
-  return { profiles: [...unique.values()] };
+  const profiles = z
+    .array(
+      z.object({
+        id: UuidSchema,
+        name: z.string().min(1),
+        revision: z.number().int().positive(),
+      }),
+    )
+    .parse(result);
+  return { profiles };
 }
 
 function consultationPhase(
@@ -560,13 +557,22 @@ function consultationPhase(
   return consultation.snapshotHash ? "consent" : "waiting";
 }
 
-async function presentConsultationLobby(
-  result: unknown,
-  context: RequestContext,
-): Promise<unknown> {
-  const consultation = ConsultationSchema.parse(result);
-  const auth = await authenticate(context.sessionToken);
-  const own = consultation.participants.find((slot) => slot.userId === auth.user.id);
+function presentConsultationLobby(result: unknown): unknown {
+  const aggregate = z
+    .object({
+      consultation: ConsultationSchema,
+      options: z.array(
+        z.object({
+          sourceLocale: z.string().min(1),
+          targetLocale: z.string().min(1),
+          profileName: z.string().min(1),
+        }),
+      ),
+      viewer: z.object({ userId: UuidSchema, staffRole: StaffRoleSchema.nullable() }),
+    })
+    .parse(result);
+  const { consultation, options, viewer } = aggregate;
+  const own = consultation.participants.find((slot) => slot.userId === viewer.userId);
   const directions =
     consultation.providerSelection?.directions.map((direction) => {
       const source = consultation.participants.find(
@@ -590,29 +596,18 @@ async function presentConsultationLobby(
         region: direction.stt.region,
       };
     }) ?? [];
-  const optionRows = z.array(ObjectSchema).parse(
-    await configuredApplication().execute(
-      {
-        kind: "consultation.options",
-        providerProfileId: consultation.providerProfileId,
-      },
-      context.sessionToken ? { sessionToken: context.sessionToken } : {},
-    ),
-  );
   const languageCodes = new Set(
-    optionRows
-      .flatMap((row) => [displayString(row.source_locale), displayString(row.target_locale)])
-      .filter(Boolean),
+    options.flatMap((row) => [row.sourceLocale, row.targetLocale]).filter(Boolean),
   );
   const redirectTo = durableConsultationDestination(consultation);
   return {
     state: consultation.state,
     phase: consultationPhase(consultation, own, redirectTo),
     snapshotHash: consultation.snapshotHash,
-    profileName: displayString(
-      optionRows[0]?.profile_name,
-      consultation.providerSelection?.profileId ?? consultation.providerProfileId,
-    ),
+    profileName:
+      options[0]?.profileName ??
+      consultation.providerSelection?.profileId ??
+      consultation.providerProfileId,
     profileRevision: consultation.providerProfileRevision,
     directions,
     languages: [...languageCodes].sort().map((code) => ({ code, label: code })),
@@ -654,13 +649,13 @@ export function presentArchiveObjects(result: unknown) {
       objects: z.array(
         z.object({
           id: UuidSchema,
-          object_class: z.string(),
+          objectClass: z.string(),
           key: z.string().min(1),
-          content_type: z.string(),
+          contentType: z.string(),
           size: z.coerce.number().nonnegative(),
           sha256: z.string(),
-          s3_checksum: z.string().min(1),
-          version_id: z.string(),
+          s3Checksum: z.string().min(1),
+          versionId: z.string(),
         }),
       ),
       cursor: z.string().nullable(),
@@ -669,34 +664,30 @@ export function presentArchiveObjects(result: unknown) {
   return {
     objects: page.objects.map((object) => ({
       id: object.id,
-      group: archiveObjectGroup(object.object_class),
-      label: object.object_class,
+      group: archiveObjectGroup(object.objectClass),
+      label: object.objectClass,
       key: object.key,
-      contentType: object.content_type,
+      contentType: object.contentType,
       size: object.size,
       sha256: object.sha256,
-      s3Checksum: object.s3_checksum,
-      versionId: object.version_id,
+      s3Checksum: object.s3Checksum,
+      versionId: object.versionId,
     })),
     nextCursor: page.cursor,
   };
 }
 
-async function presentArchive(result: unknown, context: RequestContext): Promise<unknown> {
-  const archive = ObjectSchema.parse(result);
-  const auth = await authenticate(context.sessionToken);
+function presentArchive(result: unknown): unknown {
+  const aggregate = z
+    .object({
+      archive: ObjectSchema,
+      objectPage: z.unknown(),
+      viewer: z.object({ staffRole: StaffRoleSchema.nullable() }),
+    })
+    .parse(result);
+  const archive = aggregate.archive;
   const archiveId = requiredUuid(z.string().parse(archive.id), "archiveId");
-  const page = presentArchiveObjects(
-    await configuredApplication().execute(
-      {
-        kind: "archive.objects",
-        archiveId,
-        cursor: context.query.cursor ?? null,
-        limit: 100,
-      },
-      context.sessionToken ? { sessionToken: context.sessionToken } : {},
-    ),
-  );
+  const page = presentArchiveObjects(aggregate.objectPage);
   const inventory =
     archive.inventory && typeof archive.inventory === "object"
       ? ObjectSchema.parse(archive.inventory)
@@ -742,7 +733,7 @@ async function presentArchive(result: unknown, context: RequestContext): Promise
       })),
     ],
     nextCursor: page.nextCursor,
-    canAdminister: auth.user.staffRole === "admin",
+    canAdminister: aggregate.viewer.staffRole === "admin",
     activeHolds,
     inventoryVersion: z.string().nullable().catch(null).parse(archive.inventoryVersionId),
     inventorySha256: z.string().nullable().catch(null).parse(archive.inventorySha256),
@@ -811,9 +802,9 @@ export function presentConsultationEnd(result: unknown): {
 }
 
 export async function present(
-  operation: string,
+  operation: WebOperation,
   result: unknown,
-  context: RequestContext,
+  _context: RequestContext,
 ): Promise<unknown> {
   if (operation === "consultations.list") {
     return presentConsultationList(result);
@@ -822,7 +813,7 @@ export async function present(
     return presentProfileOptions(result);
   }
   if (operation === "consultations.get" || operation === "consultations.preferences.update") {
-    return presentConsultationLobby(result, context);
+    return presentConsultationLobby(result);
   }
   if (operation === "consultations.join") {
     const joined = z
@@ -874,10 +865,38 @@ export async function present(
     return presentArchiveObjects(result);
   }
   if (operation === "archives.get") {
-    return presentArchive(result, context);
+    return presentArchive(result);
   }
   if (operation === "consultations.end") {
     return presentConsultationEnd(result);
+  }
+  if (operation === "languages.catalog") {
+    const rows = z
+      .array(
+        z.object({
+          id: UuidSchema,
+          profileId: UuidSchema,
+          sourceLocale: z.string(),
+          targetLocale: z.string(),
+          mode: z.enum(["translated", "same_language"]),
+          snapshot: z.unknown(),
+          profileName: z.string(),
+          revision: z.number().int().positive(),
+          freshUntil: z.date(),
+        }),
+      )
+      .parse(result);
+    return rows.map((row) => ({
+      id: row.id,
+      profile_id: row.profileId,
+      source_locale: row.sourceLocale,
+      target_locale: row.targetLocale,
+      mode: row.mode,
+      snapshot: row.snapshot,
+      profile_name: row.profileName,
+      revision: row.revision,
+      fresh_until: row.freshUntil,
+    }));
   }
   if (operation === "archives.object.download") {
     return { url: z.url().parse(result) };
@@ -959,7 +978,7 @@ export function statusFor(error: DomainError): number {
   return 400;
 }
 
-async function dispatch(operation: string, context: RequestContext): Promise<unknown> {
+async function dispatch(operation: WebOperation, context: RequestContext): Promise<unknown> {
   if (operation === "webhooks.livekit.receive") {
     if (context.rawBody === null) {
       throw new DomainError("INVALID_WEBHOOK");
@@ -1013,7 +1032,7 @@ async function readLimitedBody(request: Request, limit: number): Promise<Uint8Ar
 }
 
 export async function parseRequestPayload(
-  operation: string,
+  operation: WebOperation,
   request: Request,
 ): Promise<{ body: unknown; rawBody: Uint8Array | null }> {
   const hasBody =
@@ -1054,7 +1073,7 @@ function applicationResponse(payload: unknown): Response {
   });
 }
 
-export function normalizeAuthFlowError(operation: string, error: DomainError): DomainError {
+export function normalizeAuthFlowError(operation: WebOperation, error: DomainError): DomainError {
   const isExchangeOperation =
     operation === "auth.exchange.prepare" || operation === "auth.exchange.verify";
   if (
@@ -1091,7 +1110,7 @@ function errorResponse(error: DomainError | z.ZodError): Response {
   );
 }
 
-function applicationFailureResponse(operation: string, error: unknown): Response {
+function applicationFailureResponse(operation: WebOperation, error: unknown): Response {
   const summary: { operation: string; name: string; code?: string; status?: number } = {
     operation,
     name: error instanceof Error ? error.name : typeof error,
@@ -1126,13 +1145,14 @@ function applicationFailureResponse(operation: string, error: unknown): Response
 }
 
 async function executeApplication(
-  operation: string,
+  operation: WebOperation,
   request: Request,
   params: Record<string, string> = {},
 ): Promise<Response> {
+  const requestUrl = new URL(request.url);
   const cookieStore = await cookies();
   const csrfToken = cookieStore.get("csrf")?.value;
-  if (!csrfAccepted(request, csrfToken)) {
+  if (!csrfAccepted(request, requestUrl, csrfToken)) {
     return Response.json(
       { code: "CSRF_REJECTED", message: "Security validation failed" },
       {
@@ -1143,12 +1163,11 @@ async function executeApplication(
   }
 
   try {
-    const url = new URL(request.url);
     const payload = await parseRequestPayload(operation, request);
     const context: RequestContext = {
       request,
       params,
-      query: Object.fromEntries(url.searchParams.entries()),
+      query: Object.fromEntries(requestUrl.searchParams.entries()),
       body: payload.body,
       rawBody: payload.rawBody,
       sessionToken: cookieStore.get("session")?.value ?? null,
@@ -1253,7 +1272,7 @@ async function executeApplication(
 }
 
 export async function execute(
-  operation: string,
+  operation: WebOperation,
   request: Request,
   params: Record<string, string> = {},
 ): Promise<Response> {
@@ -1279,7 +1298,7 @@ export async function execute(
 }
 
 async function requirePageDataApplication<T>(
-  operation: string,
+  operation: WebOperation,
   params: Record<string, string> = {},
   query: Record<string, string> = {},
 ): Promise<T> {
@@ -1301,8 +1320,8 @@ async function requirePageDataApplication<T>(
   try {
     const result = await dispatch(operation, context);
     if (operation === "consultations.get") {
-      const consultation = ConsultationSchema.parse(result);
-      const destination = durableConsultationDestination(consultation);
+      const aggregate = z.object({ consultation: ConsultationSchema }).parse(result);
+      const destination = durableConsultationDestination(aggregate.consultation);
       if (destination) {
         redirect(destination);
       }
@@ -1320,7 +1339,7 @@ async function requirePageDataApplication<T>(
 }
 
 export function requirePageData<T>(
-  operation: string,
+  operation: WebOperation,
   params: Record<string, string> = {},
   query: Record<string, string> = {},
 ): Promise<T> {

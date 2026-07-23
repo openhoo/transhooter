@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -307,15 +306,18 @@ def upload_committed_objects(
     register: Callable[[UUID, UUID, str, ObjectRecord], None],
     meeting_id: UUID | None = None,
 ) -> None:
-    pcm_stages = {"stt-input", "tts-output", "livekit-output"}
     retryable_failures: list[Exception] = []
-    for spool_ref, _ in spool.committed():
-        meeting, attempt, stage, ordinal, media_type = spool.context(spool_ref.object_id)
-        if (
-            (meeting_id is not None and meeting != meeting_id)
-            or stage in pcm_stages
-            or stage == "checkpoint"
-        ):
+    records = (
+        spool.committed_drainable(meeting_id)
+        if meeting_id is not None
+        else (
+            (spool_ref, sample_range, spool.context(spool_ref.object_id))
+            for spool_ref, sample_range in spool.committed()
+        )
+    )
+    for spool_ref, _, context in records:
+        meeting, attempt, stage, ordinal, media_type = context
+        if stage in {"stt-input", "tts-output", "livekit-output", "checkpoint"}:
             continue
         suffix = "json" if "json" in media_type else "bin"
         key = f"v1/meetings/{meeting}/pipeline/{stage}/raw/{attempt}/{ordinal:020d}.{suffix}"
@@ -324,7 +326,7 @@ def upload_committed_objects(
             key,
             body,
             media_type,
-            hashlib.sha256(body).hexdigest(),
+            spool_ref.sha256,
         )
         object_class = _object_class(stage)
         try:

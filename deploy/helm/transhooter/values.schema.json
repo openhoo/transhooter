@@ -1,7 +1,48 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "definitions": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "minLength": 1, "not": { "const": "latest" } },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": { "type": "string", "minLength": 1 },
+            "memory": { "type": "string", "minLength": 1 }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": { "type": "string", "minLength": 1 },
+            "memory": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  },
   "type": "object",
+  "additionalProperties": false,
   "required": [
+    "nameOverride",
+    "fullnameOverride",
+    "imagePullSecrets",
     "images",
     "existingSecret",
     "migratorSecret",
@@ -11,7 +52,12 @@
     "config",
     "rollout",
     "telemetry",
-    "ingress"
+    "replicas",
+    "service",
+    "ingress",
+    "egress",
+    "resources",
+    "podAnnotations"
   ],
   "oneOf": [
     {
@@ -122,6 +168,23 @@
     }
   ],
   "properties": {
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
     "existingSecret": { "type": "string", "minLength": 1 },
     "migratorSecret": {
       "type": "object",
@@ -177,18 +240,15 @@
       }
     },
     "images": {
-      "propertyNames": {
-        "enum": ["web", "controlWorker", "translationWorker", "spoolDrainer", "egress"]
-      },
       "type": "object",
-      "additionalProperties": {
-        "type": "object",
-        "required": ["repository", "tag", "pullPolicy"],
-        "properties": {
-          "repository": { "type": "string", "minLength": 1 },
-          "tag": { "type": "string", "minLength": 1, "not": { "const": "latest" } },
-          "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
-        }
+      "additionalProperties": false,
+      "required": ["web", "controlWorker", "translationWorker", "spoolDrainer", "egress"],
+      "properties": {
+        "web": { "$ref": "#/definitions/image" },
+        "controlWorker": { "$ref": "#/definitions/image" },
+        "translationWorker": { "$ref": "#/definitions/image" },
+        "spoolDrainer": { "$ref": "#/definitions/image" },
+        "egress": { "$ref": "#/definitions/image" }
       }
     },
     "telemetry": {
@@ -266,9 +326,40 @@
         }
       }
     },
-    "replicas": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 } },
+    "replicas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["web", "controlWorker", "translationWorker", "spoolDrainer"],
+      "properties": {
+        "web": { "type": "integer", "minimum": 1 },
+        "controlWorker": { "type": "integer", "minimum": 1 },
+        "translationWorker": { "type": "integer", "minimum": 1 },
+        "spoolDrainer": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "port"],
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["web", "controlWorker", "translationWorker", "spoolDrainer"],
+      "properties": {
+        "web": { "$ref": "#/definitions/resources" },
+        "controlWorker": { "$ref": "#/definitions/resources" },
+        "translationWorker": { "$ref": "#/definitions/resources" },
+        "spoolDrainer": { "$ref": "#/definitions/resources" }
+      }
+    },
     "spool": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["existingClaim"],
       "properties": { "existingClaim": { "type": "string", "minLength": 1 } }
     },
@@ -329,53 +420,12 @@
           "properties": {
             "googleEu": {
               "type": "object",
-              "required": [
-                "cloudProject",
-                "quotaProject",
-                "speechEndpoint",
-                "speechRecognizer",
-                "speechModel",
-                "translationEndpoint",
-                "translationParent",
-                "translationModel",
-                "ttsEndpoint",
-                "ttsModel",
-                "ttsVoice",
-                "sttStreams",
-                "sttMessagesMinute",
-                "translationRequestsMinute",
-                "translationCharactersMinute",
-                "ttsSessions",
-                "ttsStartsMinute"
-              ],
+              "required": ["cloudProject", "quotaProject", "ttsVoice"],
               "additionalProperties": false,
               "properties": {
                 "cloudProject": { "type": "string", "minLength": 1 },
                 "quotaProject": { "type": "string", "minLength": 1 },
-                "speechEndpoint": { "const": "eu-speech.googleapis.com" },
-                "speechRecognizer": {
-                  "type": "string",
-                  "pattern": "^projects/[^/]+/locations/eu/recognizers/_$"
-                },
-                "speechModel": { "type": "string", "minLength": 1 },
-                "translationEndpoint": { "const": "translate-eu.googleapis.com" },
-                "translationParent": {
-                  "type": "string",
-                  "pattern": "^projects/[^/]+/locations/eu$"
-                },
-                "translationModel": {
-                  "type": "string",
-                  "pattern": "^projects/[^/]+/locations/eu/models/general/nmt$"
-                },
-                "ttsEndpoint": { "const": "eu-texttospeech.googleapis.com" },
-                "ttsModel": { "type": "string", "minLength": 1 },
-                "ttsVoice": { "type": "string", "minLength": 1 },
-                "sttStreams": { "type": "integer", "minimum": 1 },
-                "sttMessagesMinute": { "type": "integer", "minimum": 1 },
-                "translationRequestsMinute": { "type": "integer", "minimum": 1 },
-                "translationCharactersMinute": { "type": "integer", "minimum": 1 },
-                "ttsSessions": { "type": "integer", "minimum": 1 },
-                "ttsStartsMinute": { "type": "integer", "minimum": 1 }
+                "ttsVoice": { "type": "string", "minLength": 1 }
               }
             },
             "googleSpeechEu": {
@@ -407,14 +457,8 @@
             "deepgramDeeplEu": {
               "type": "object",
               "required": [
-                "deepgramListenEndpoint",
-                "deepgramSpeakEndpoint",
-                "deepgramSttModel",
-                "deepgramTtsModel",
                 "deepgramVoice",
                 "deepgramApprovedVoices",
-                "deeplEndpoint",
-                "deeplModelType",
                 "deepgramStreams",
                 "deepgramAudioSecondsMinute",
                 "deeplRequestsMinute",
@@ -422,10 +466,6 @@
               ],
               "additionalProperties": false,
               "properties": {
-                "deepgramListenEndpoint": { "const": "wss://api.eu.deepgram.com/v1/listen" },
-                "deepgramSpeakEndpoint": { "const": "wss://api.eu.deepgram.com/v1/speak" },
-                "deepgramSttModel": { "const": "nova-3" },
-                "deepgramTtsModel": { "const": "aura-2" },
                 "deepgramVoice": { "type": "string", "minLength": 1 },
                 "deepgramApprovedVoices": {
                   "type": "array",
@@ -433,8 +473,6 @@
                   "minItems": 1,
                   "uniqueItems": true
                 },
-                "deeplEndpoint": { "const": "https://api.deepl.com" },
-                "deeplModelType": { "enum": ["latency_optimized", "quality_optimized"] },
                 "deepgramStreams": { "type": "integer", "minimum": 1 },
                 "deepgramAudioSecondsMinute": { "type": "integer", "minimum": 1 },
                 "deeplRequestsMinute": { "type": "integer", "minimum": 1 },
@@ -595,7 +633,16 @@
     },
     "egress": {
       "type": "object",
-      "required": ["enabled", "replicas", "seccomp", "resources"],
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "replicas",
+        "seccomp",
+        "resources",
+        "nodeSelector",
+        "tolerations",
+        "affinity"
+      ],
       "properties": {
         "enabled": { "type": "boolean" },
         "replicas": { "type": "integer", "minimum": 1 },
@@ -616,7 +663,17 @@
               }
             }
           ]
-        }
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "nodeSelector": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "tolerations": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "affinity": { "type": "object" }
       }
     }
   }

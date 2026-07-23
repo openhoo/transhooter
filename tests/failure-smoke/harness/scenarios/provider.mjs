@@ -6,7 +6,8 @@ export async function runProviderScenarios(ctx, proof) {
     runConsultation,
     setFaults,
     waitFor,
-    consultationEvidence,
+    participantEgressDenialEvidence,
+    providerAttemptEvidence,
     cancelBeforeStartForCleanup,
     settleConsultation,
     checkpointScenario,
@@ -35,16 +36,8 @@ export async function runProviderScenarios(ctx, proof) {
     const deniedEvidence = await waitFor(
       "fenced durable Participant Egress failure",
       async () => {
-        const evidence = await consultationEvidence(deniedConsultationId);
-        return evidence.admission_fenced_at != null &&
-          evidence.effects.some(
-            (effect) =>
-              effect.kind === "PARTICIPANT_EGRESS" &&
-              effect.attempts >= 1 &&
-              String(effect.result?.error ?? "").includes("test fault denied PARTICIPANT_EGRESS"),
-          )
-          ? evidence
-          : null;
+        const evidence = await participantEgressDenialEvidence(deniedConsultationId);
+        return evidence.admission_fenced_at != null && evidence.denied_effect ? evidence : null;
       },
       120_000,
     );
@@ -61,11 +54,7 @@ export async function runProviderScenarios(ctx, proof) {
         })}`,
       );
     }
-    const deniedEffect = deniedEvidence.effects.find(
-      (effect) =>
-        effect.kind === "PARTICIPANT_EGRESS" &&
-        String(effect.result?.error ?? "").includes("test fault denied PARTICIPANT_EGRESS"),
-    );
+    const deniedEffect = deniedEvidence.denied_effect;
     if (!deniedEffect?.result || deniedEffect.attempts < 1)
       throw new Error(
         `Participant Egress failure lacks durable terminal detail: ${JSON.stringify(deniedEffect)}`,
@@ -74,8 +63,7 @@ export async function runProviderScenarios(ctx, proof) {
       name: "participant-egress-denied",
       consultationId: deniedConsultationId,
       publicationBlocked: true,
-      effectAttempts: deniedEffect.attempts,
-      durableTerminal: deniedEffect.result,
+      admissionBarrierEvidence: deniedEvidence,
     });
     await settleConsultation(deniedConsultationId);
 
@@ -94,15 +82,14 @@ export async function runProviderScenarios(ctx, proof) {
     const evidence = await waitFor(
       `${failure} provider terminal`,
       async () => {
-        const current = await consultationEvidence(consultationId);
-        const attempts = current.attempts
-          .filter((attempt) => attempt.stage === "translation" && attempt.errorKind === failure)
+        const attempts = (await providerAttemptEvidence(consultationId, "translation"))
+          .filter((attempt) => attempt.errorKind === failure)
           .toSorted((left, right) => Number(left.attemptNumber) - Number(right.attemptNumber));
         if (attempts.length === 0) return null;
         const lastAttempt = attempts.at(-1);
         return !expected.expectRetry ||
           (attempts.length >= 2 && lastAttempt?.retryDecision?.action !== "retry")
-          ? current
+          ? { attempts }
           : null;
       },
       90_000,
@@ -132,14 +119,11 @@ export async function runProviderScenarios(ctx, proof) {
     const partialEvidence = await waitFor(
       "partial TTS terminal evidence",
       async () => {
-        const evidence = await consultationEvidence(partialConsultationId);
-        return evidence.attempts.some(
-          (attempt) =>
-            attempt.stage === "tts" &&
-            attempt.outcome === "failed" &&
-            Number(attempt.received ?? 0) > 0,
+        const attempts = await providerAttemptEvidence(partialConsultationId, "tts");
+        return attempts.some(
+          (attempt) => attempt.outcome === "failed" && Number(attempt.received ?? 0) > 0,
         )
-          ? evidence
+          ? { attempts }
           : null;
       },
       90_000,

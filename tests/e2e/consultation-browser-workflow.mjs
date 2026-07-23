@@ -259,7 +259,6 @@ export async function runConsultationBrowserWorkflow({
   };
   let completed = false;
   let closed = false;
-  const waitCleanups = new Set();
   let result;
   let primaryError;
   try {
@@ -537,6 +536,7 @@ export async function runConsultationBrowserWorkflow({
       proof,
       employeePage,
       customerPage,
+      close,
     };
   } catch (error) {
     primaryError = new Error(
@@ -553,8 +553,6 @@ export async function runConsultationBrowserWorkflow({
     closed = true;
     if (browserDeadlineCancellation !== null) clearTimeout(browserDeadlineCancellation);
     browserDeadlineCancellation = null;
-    for (const cleanup of waitCleanups) cleanup();
-    waitCleanups.clear();
     const cleanupIds = [
       ...(scenarioState.admissionFixtureConsultationId
         ? [scenarioState.admissionFixtureConsultationId]
@@ -591,42 +589,5 @@ export async function runConsultationBrowserWorkflow({
     } else browsers.forEach(closeIgnoringFailure);
   }
 
-  function waitForWindowClose(signal) {
-    return new Promise((resolve) => {
-      let finished = false;
-      const finish = () => {
-        if (finished) return;
-        finished = true;
-        cleanup();
-        resolve();
-      };
-      const cleanup = () => {
-        result.employeePage.off("close", finish);
-        result.customerPage.off("close", finish);
-        employeeBrowser.off("disconnected", finish);
-        customerBrowser.off("disconnected", finish);
-        signal?.removeEventListener("abort", finish);
-        waitCleanups.delete(cleanup);
-      };
-      waitCleanups.add(cleanup);
-      result.employeePage.once("close", finish);
-      result.customerPage.once("close", finish);
-      employeeBrowser.once("disconnected", finish);
-      customerBrowser.once("disconnected", finish);
-      signal?.addEventListener("abort", finish, { once: true });
-      if (
-        closed ||
-        result.employeePage.isClosed() ||
-        result.customerPage.isClosed() ||
-        !employeeBrowser.isConnected() ||
-        !customerBrowser.isConnected() ||
-        signal?.aborted
-      ) {
-        finish();
-      }
-    });
-  }
-
-  result = { ...result, waitForWindowClose, close };
   return result;
 }

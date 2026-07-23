@@ -1,6 +1,7 @@
 import "server-only";
 import type { NodeTelemetryHandle } from "@transhooter/telemetry";
 import { boundedErrorKind, startNodeTelemetry } from "@transhooter/telemetry";
+import { boundedWebOperation } from "./web-operations";
 
 const SERVICE_NAME = "transhooter-web";
 const SERVICE_VERSION = "0.1.0";
@@ -8,47 +9,6 @@ const STATE_KEY = Symbol.for("@transhooter/web.telemetry.state");
 const OPERATION_DURATION = "transhooter.web.operation.duration";
 const OPERATION_TOTAL = "transhooter.web.operation.total";
 const FRAMEWORK_ERROR_TOTAL = "transhooter.web.framework.error.total";
-
-const OPERATIONS: Record<string, true> = {
-  "auth.magicLink.request": true,
-  "auth.exchange.prepare": true,
-  "auth.exchange.verify": true,
-  "auth.logout": true,
-  "auth.archiveDeleteReauth.request": true,
-  "consultations.list": true,
-  "consultations.create.options": true,
-  "consultations.create": true,
-  "consultations.get": true,
-  "consultations.preferences.update": true,
-  "consultations.consent.record": true,
-  "consultations.join": true,
-  "consultations.livekitToken": true,
-  "consultations.room": true,
-  "consultations.end": true,
-  "consultations.cancel": true,
-  "consultations.invitation.resend": true,
-  "archives.list": true,
-  "archives.get": true,
-  "archives.objects.list": true,
-  "archives.object.download": true,
-  "archives.hold.update": true,
-  "archives.delete": true,
-  "languages.catalog": true,
-  "admin.failures.list": true,
-  "admin.languages.list": true,
-  "admin.languages.update": true,
-  "internal.capabilities.update": true,
-  "internal.worker.heartbeat": true,
-  "internal.archive.checkpoint": true,
-  "internal.providerAttempt": true,
-  "internal.failure": true,
-  "internal.archiveObject": true,
-  "internal.archive.finalize": true,
-  "internal.egressLayout.authorize": true,
-  "internal.archiveRecording": true,
-  "internal.deleteDrain": true,
-  "webhooks.livekit.receive": true,
-};
 
 const HEALTH_OPERATIONS: Record<string, true> = {
   health: true,
@@ -125,7 +85,7 @@ export function shutdownWebTelemetry(): Promise<void> {
 }
 
 function normalizedOperation(operation: string): string {
-  return OPERATIONS[operation] === true ? operation : "unknown";
+  return boundedWebOperation(operation);
 }
 
 function statusClass(status: number): StatusClass {

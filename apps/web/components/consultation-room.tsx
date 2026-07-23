@@ -30,6 +30,7 @@ import {
   acceptsCaption,
   acceptsStatus,
   audioGains,
+  CaptionRevisionPolicy,
   releaseLocalTrack,
 } from "@/lib/browser/room-policy";
 import {
@@ -80,7 +81,7 @@ type RoomControllerState = {
 };
 
 type CaptionHandlerContext = {
-  captions: MutableRefObject<Map<string, CaptionPacket>>;
+  captionRevisions: MutableRefObject<CaptionRevisionPolicy>;
   initial: InitialRoom;
   participant: RemoteParticipant | undefined;
   setCaption: (caption: CaptionPacket) => void;
@@ -110,21 +111,21 @@ function handleCaptionPacket(decoded: unknown, context: CaptionHandlerContext) {
     return;
   }
 
-  const accepted = acceptsCaption(
-    parsed.data,
-    context.captions.current.get(parsed.data.utteranceId),
-    {
-      consultationId: context.initial.consultationId,
-      destinationParticipantId: context.initial.participantId,
-      sourceParticipantId: context.initial.otherParticipantId,
-    },
-    context.participant?.isAgent === true,
-  );
+  const accepted =
+    acceptsCaption(
+      parsed.data,
+      undefined,
+      {
+        consultationId: context.initial.consultationId,
+        destinationParticipantId: context.initial.participantId,
+        sourceParticipantId: context.initial.otherParticipantId,
+      },
+      context.participant?.isAgent === true,
+    ) && context.captionRevisions.current.accepts(parsed.data);
   if (!accepted) {
     return;
   }
 
-  context.captions.current.set(parsed.data.utteranceId, parsed.data);
   const visible = context.visibleCaption.current;
   const shouldShow =
     !visible ||
@@ -380,7 +381,7 @@ function useRoomMediaController(
   const leaving = useRef(false);
   const reconnectTimer = useRef<number | null>(null);
   const reconnect = useRef<(() => Promise<void>) | null>(null);
-  const captions = useRef(new Map<string, CaptionPacket>());
+  const captionRevisions = useRef(new CaptionRevisionPolicy());
   const visibleCaption = useRef<CaptionPacket | null>(null);
 
   const shouldSubscribe = useCallback(
@@ -604,7 +605,7 @@ function useRoomMediaController(
 
         if (topic === CAPTION_TOPIC) {
           handleCaptionPacket(decoded, {
-            captions,
+            captionRevisions,
             initial,
             participant,
             setCaption: state.setCaption,

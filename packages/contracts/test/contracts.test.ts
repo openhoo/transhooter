@@ -35,6 +35,11 @@ import {
   WorkerCheckpointSchema,
   WorkerJobMetadataSchema,
 } from "../src/index";
+import {
+  ProviderOutcomeSchema,
+  ProviderRetryActionSchema,
+  ProviderRetryAdviceSchema,
+} from "../src/provider";
 
 const consultationId = "018f1f3c-0f63-7d65-8eb1-1f250f9f9891";
 const employeeId = "018f1f3c-0f63-7d65-8eb1-1f250f9f9892";
@@ -1077,6 +1082,12 @@ test("generated artifact registers every public transport and raw evidence schem
   ]) {
     assert.ok(generatedBundle.schemas[name], `${name} missing from generated artifact`);
   }
+});
+
+test("provider module owns outcome and retry literals", () => {
+  assert.deepEqual(ProviderOutcomeSchema.options, ["succeeded", "failed", "cancelled"]);
+  assert.deepEqual(ProviderRetryAdviceSchema.options, ["never", "retry_after", "unspecified"]);
+  assert.deepEqual(ProviderRetryActionSchema.options, ["retry", "do_not_retry", "degrade"]);
 });
 
 test("database literal schemas reject unapproved states and roles", () => {

@@ -404,3 +404,26 @@ async def test_google_registry_close_before_first_use_does_not_create_channels(
     await providers.aclose()
 
     assert creations == 0
+
+
+@pytest.mark.asyncio
+async def test_alternate_registry_closes_owned_deepl_client_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    closes = 0
+
+    async def counted_close(_client: object) -> None:
+        nonlocal closes
+        closes += 1
+
+    monkeypatch.setattr("httpx.AsyncClient.aclose", counted_close)
+    providers = ProviderRegistry.construct(
+        alternate_profile(tmp_path),
+        UUID(int=8),
+        DeterministicJournal(),
+    )
+
+    await asyncio.gather(providers.aclose(), providers.aclose())
+
+    assert closes == 1

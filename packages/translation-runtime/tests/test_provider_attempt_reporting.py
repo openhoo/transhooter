@@ -30,11 +30,11 @@ from transhooter_worker.domain.models import (
     Transport,
 )
 from transhooter_worker.runtime.control_client import ControlClient
-from transhooter_worker.runtime.job import (
+from transhooter_worker.runtime.job import _build_provider_terminal_sink
+from transhooter_worker.runtime.job_metadata import (
     DirectionMetadata,
     JobMetadata,
     RoomProviderSelectionMetadata,
-    _build_provider_terminal_sink,
 )
 
 

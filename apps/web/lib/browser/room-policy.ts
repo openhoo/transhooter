@@ -18,6 +18,72 @@ type ExpectedStatusRoute = {
   generation: number;
 };
 
+type CaptionRevision = Pick<CaptionPacket, "finality" | "revision" | "sourceSampleStart">;
+
+export const CAPTION_REVISION_RECENT_LIMIT = 128;
+export const CAPTION_REVISION_TOMBSTONE_LIMIT = 128;
+
+export class CaptionRevisionPolicy {
+  readonly #recent = new Map<string, CaptionRevision>();
+  readonly #tombstones = new Map<string, CaptionRevision>();
+  #evictionWatermarkSample = Number.NEGATIVE_INFINITY;
+
+  accepts(candidate: CaptionPacket): boolean {
+    const current =
+      this.#recent.get(candidate.utteranceId) ?? this.#tombstones.get(candidate.utteranceId);
+
+    if (current) {
+      if (candidate.revision <= current.revision) {
+        return false;
+      }
+      if (current.finality === "final" && candidate.finality !== "final") {
+        return false;
+      }
+    } else if (candidate.sourceSampleStart <= this.#evictionWatermarkSample) {
+      return false;
+    }
+
+    this.#tombstones.delete(candidate.utteranceId);
+    this.#recent.delete(candidate.utteranceId);
+    this.#recent.set(candidate.utteranceId, {
+      finality: candidate.finality,
+      sourceSampleStart: candidate.sourceSampleStart,
+      revision: candidate.revision,
+    });
+    this.#trim();
+    return true;
+  }
+
+  get trackedUtteranceCount(): number {
+    return this.#recent.size + this.#tombstones.size;
+  }
+
+  #trim() {
+    while (this.#recent.size > CAPTION_REVISION_RECENT_LIMIT) {
+      const oldest = this.#recent.entries().next().value;
+      if (!oldest) {
+        break;
+      }
+      const [utteranceId, revision] = oldest;
+      this.#recent.delete(utteranceId);
+      this.#tombstones.set(utteranceId, revision);
+    }
+
+    while (this.#tombstones.size > CAPTION_REVISION_TOMBSTONE_LIMIT) {
+      const oldest = this.#tombstones.entries().next().value;
+      if (!oldest) {
+        break;
+      }
+      const [utteranceId, revision] = oldest;
+      this.#tombstones.delete(utteranceId);
+      this.#evictionWatermarkSample = Math.max(
+        this.#evictionWatermarkSample,
+        revision.sourceSampleStart,
+      );
+    }
+  }
+}
+
 type ReleasableLocalTrack = {
   detach(): unknown;
   stop(): unknown;
@@ -44,7 +110,7 @@ export function audioGains(
 
 export function acceptsCaption(
   candidate: CaptionPacket,
-  current: CaptionPacket | undefined,
+  current: CaptionRevision | undefined,
   expected: ExpectedCaptionRoute,
   senderIsAgent: boolean,
 ): boolean {

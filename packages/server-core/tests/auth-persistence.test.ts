@@ -84,6 +84,68 @@ describe("PrismaAuthRepository bounded storage", () => {
     expect($queryRaw).toHaveBeenCalledTimes(1);
   });
 });
+describe("PrismaAuthRepository authentication lookup", () => {
+  it("loads only a live unrevoked session with its required user in one read", async () => {
+    const user = {
+      id: "00000000-0000-4000-8000-000000000010",
+      email: "admin@example.com",
+      displayName: "Admin",
+      staffRole: "admin" as const,
+      createdAt: NOW,
+    };
+    const session = {
+      id: "00000000-0000-4000-8000-000000000011",
+      userId: user.id,
+      tokenHash: "hash",
+      csrfHash: "csrf",
+      expiresAt: new Date("2026-01-01T01:00:00Z"),
+      reauthenticatedAt: null,
+      reauthConsultationId: null,
+      revokedAt: null,
+      replacedBy: null,
+      createdAt: NOW,
+      user,
+    };
+    const findFirst = mock(async () => session);
+    const repository = new PrismaAuthRepository({
+      session: { findFirst },
+    } as never);
+
+    await expect(repository.findAuthenticatedSessionByTokenHash("hash", NOW)).resolves.toEqual({
+      session: {
+        id: session.id,
+        userId: user.id,
+        tokenHash: "hash",
+        csrfHash: "csrf",
+        expiresAt: session.expiresAt,
+        reauthenticatedAt: null,
+        reauthConsultationId: null,
+      },
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.displayName,
+        staffRole: "admin",
+      },
+    });
+    expect(findFirst).toHaveBeenCalledTimes(1);
+    expect(findFirst).toHaveBeenCalledWith({
+      where: { tokenHash: "hash", revokedAt: null, expiresAt: { gt: NOW } },
+      include: { user: true },
+    });
+  });
+
+  it("returns null when no session satisfies expiry and revocation filters", async () => {
+    const findFirst = mock(async () => null);
+    const repository = new PrismaAuthRepository({ session: { findFirst } } as never);
+
+    await expect(repository.findAuthenticatedSessionByTokenHash("hash", NOW)).resolves.toBeNull();
+    expect(findFirst).toHaveBeenCalledWith({
+      where: { tokenHash: "hash", revokedAt: null, expiresAt: { gt: NOW } },
+      include: { user: true },
+    });
+  });
+});
 
 const capabilityIntegrationEnabled = process.env.POSTGRES_CAPABILITY_INTEGRATION === "1";
 

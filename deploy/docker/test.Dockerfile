@@ -28,6 +28,5 @@ COPY --chown=transhooter:transhooter . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --project packages/translation-runtime --frozen --offline \
     && chown -R transhooter:transhooter packages/translation-runtime/.venv
-COPY --chown=transhooter:transhooter deploy/scripts/run-tests.sh /opt/transhooter/run-tests
 USER transhooter
-ENTRYPOINT ["/opt/transhooter/run-tests"]
+ENTRYPOINT ["/workspace/deploy/scripts/run-tests.sh"]

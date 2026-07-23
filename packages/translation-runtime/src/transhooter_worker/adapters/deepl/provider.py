@@ -193,7 +193,23 @@ class DeepLProvider:
     ) -> None:
         self._config = config
         self._journal = journal
+        self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=20, follow_redirects=False)
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def aclose(self) -> None:
+        if not self._owns_client:
+            return
+        async with self._close_lock:
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(self._client.aclose())
+            close_task = self._close_task
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await close_task
+            raise
 
     async def capabilities(self) -> StageCapabilities:
         attempt_id = uuid4()

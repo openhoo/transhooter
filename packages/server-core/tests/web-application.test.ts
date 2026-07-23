@@ -78,26 +78,54 @@ function fixture(principal: InternalPrincipal = CONTROL_PRINCIPAL) {
   const providerAttempt = mock(async () => true);
   const workerFailure = mock(async () => true);
   const verify = mock(async () => principal);
+  const authenticate = mock(async () => ({ session: SESSION, user: USER }));
+  const consultations = {
+    get: mock(async () => ({
+      id: CONSULTATION,
+      providerProfileId: "google-eu",
+    })),
+    setPreferences: mock(async () => ({
+      id: CONSULTATION,
+      providerProfileId: "google-eu",
+    })),
+  };
+  const operations = {
+    archivePresentation: mock(async () => ({ archive: { id: CONSULTATION }, objectPage: {} })),
+    consultationOptions: mock(async () => []),
+    providerProfileMetadata: mock(async () => []),
+    providerAttempt,
+    workerFailure,
+  };
   const app = createWebApplication({
     auth: {
       requestMagicLink,
-      authenticateMutation: async () => ({ session: SESSION, user: USER }),
-      authenticate: async () => ({ session: SESSION, user: USER }),
+      authenticateMutation: authenticate,
+      authenticate,
     } as never,
-    consultations: {} as never,
+    consultations: consultations as never,
     archives: {
       beginDelete,
       drainDeletion: async () => true,
     } as never,
     languages: {} as never,
-    operations: { providerAttempt, workerFailure } as never,
+    operations: operations as never,
     internalPrincipalVerifier: { verify } as InternalPrincipalVerifier,
     publicBaseUrl: PUBLIC_BASE_URL,
     clientIp: () => "127.0.0.1",
     ready: async () => true,
   });
 
-  return { app, beginDelete, providerAttempt, requestMagicLink, verify, workerFailure };
+  return {
+    app,
+    authenticate,
+    beginDelete,
+    consultations,
+    operations,
+    providerAttempt,
+    requestMagicLink,
+    verify,
+    workerFailure,
+  };
 }
 
 describe("WebApplication authentication boundary", () => {
@@ -117,6 +145,51 @@ describe("WebApplication authentication boundary", () => {
     );
 
     expect(beginDelete).toHaveBeenCalledWith(CONSULTATION, SESSION, "retention elapsed");
+  });
+
+  it("authenticates once while loading an authorized lobby aggregate", async () => {
+    const { app, authenticate, consultations, operations } = fixture();
+
+    const result = await app.execute(
+      { kind: "consultation.lobby", consultationId: CONSULTATION },
+      { sessionToken: "opaque" },
+    );
+
+    expect(authenticate).toHaveBeenCalledTimes(1);
+    expect(consultations.get).toHaveBeenCalledWith(CONSULTATION, USER.id);
+    expect(operations.consultationOptions).toHaveBeenCalledWith("google-eu");
+    expect(result).toMatchObject({
+      consultation: { id: CONSULTATION },
+      viewer: { userId: USER.id, staffRole: "admin" },
+    });
+  });
+
+  it("authenticates once while loading authorized archive detail and its first object page", async () => {
+    const { app, authenticate, operations } = fixture();
+
+    const result = await app.execute(
+      { kind: "archive.get", archiveId: CONSULTATION },
+      { sessionToken: "opaque" },
+    );
+
+    expect(authenticate).toHaveBeenCalledTimes(1);
+    expect(operations.archivePresentation).toHaveBeenCalledWith(
+      { userId: USER.id, role: "admin" },
+      CONSULTATION,
+      null,
+      100,
+    );
+    expect(result).toMatchObject({ viewer: { staffRole: "admin" } });
+  });
+
+  it("loads only provider profile metadata for the staff new-consultation page", async () => {
+    const { app, authenticate, operations } = fixture();
+
+    await app.execute({ kind: "consultation.profileMetadata" }, { sessionToken: "opaque" });
+
+    expect(authenticate).toHaveBeenCalledTimes(1);
+    expect(operations.providerProfileMetadata).toHaveBeenCalledTimes(1);
+    expect(operations.consultationOptions).not.toHaveBeenCalled();
   });
 
   it("derives internal principal exclusively from verified headers", async () => {

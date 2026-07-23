@@ -12,11 +12,9 @@ import {
   type UUID,
 } from "../domain/model";
 import type {
-  AuditPort,
   ConsultationRepository,
   EffectRepository,
   EgressEventEarlySource,
-  EgressPort,
   LiveKitRoomPort,
   OutboxMessage,
   Transaction,
@@ -77,9 +75,7 @@ export class RoomService {
     private readonly consultations: ConsultationRepository,
     private readonly effects: EffectRepository,
     private readonly livekit: LiveKitRoomPort,
-    _egress: EgressPort,
     private readonly verifier: WebhookVerifier,
-    _audit: AuditPort,
     private readonly clock: Clock,
     private readonly ids: IdGenerator,
     private readonly hasher: TokenHasher,
@@ -175,7 +171,12 @@ export class RoomService {
 
       const next = finishConsultation(current, this.clock.now());
       await this.save(current, next, tx);
-      await this.enqueue(tx, next, "archive.reconciliation_forced", { consultationId });
+      await this.enqueue(tx, next, "archive.reconciliation_forced", {
+        consultationId: next.id,
+        generation: next.generation,
+        subjectId: next.id,
+        resourceGeneration: next.generation,
+      });
     });
   }
 
@@ -283,9 +284,7 @@ export class RoomService {
           resourceRoomName: event.roomName,
           participantIdentity: event.identity,
           outputPrefix: `v1/meetings/${current.id}/media/participants/${participant.id}/${String(current.generation)}`,
-          segmentedHls: true,
           resourceGeneration: current.generation,
-          compensationIntent: "EGRESS_STOP",
         },
       } satisfies EffectPlanRequested);
     }
@@ -312,7 +311,6 @@ export class RoomService {
         resourceRoomName: roomName,
         participantIdentity,
         resourceGeneration,
-        compensationIntent: "REMOVE_PARTICIPANT",
       },
     } satisfies EffectPlanRequested);
   }
@@ -420,8 +418,12 @@ export class RoomService {
       }
       const next = beginFencedRoomFinalization(locked, this.clock.now());
       await this.save(locked, next, tx);
-      await this.enqueue(tx, next, "consultation.finalization_requested", {
-        reason: "both_absent",
+      await this.enqueue(tx, next, ORCHESTRATION_TOPICS.finalizationRequested, {
+        consultationId: next.id,
+        generation: next.generation,
+        subjectId: next.id,
+        shutdownAtMs: this.clock.now().getTime() + 5_000,
+        resourceGeneration: candidate.generation,
       });
       return true;
     });

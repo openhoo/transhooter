@@ -22,23 +22,31 @@ from transhooter_worker.runtime.publisher import PreservedAudioPublisher
 
 
 @dataclass(frozen=True, slots=True)
+class CheckpointWatermark:
+    input_sequence: int
+    input_sample: int
+    provider_output_sample: int
+    output_sample: int
+    terminal: bool
+
+
+ZERO_CHECKPOINT_WATERMARK = CheckpointWatermark(0, 0, 0, 0, False)
+
+
+@dataclass(frozen=True, slots=True)
 class PendingCheckpoint:
     checkpoint_id: UUID
     control_event_id: UUID
     checkpoint: dict[str, object]
     body: bytes
     digest: str
-    input_sample: int
-    input_sequence: int
-    provider_output_sample: int
-    output_sample: int
-    terminal: bool
+    watermark: CheckpointWatermark
 
 
 @dataclass(slots=True)
 class CheckpointChainState:
     hashes: dict[UUID, str]
-    watermarks: dict[UUID, tuple[int, int, int, int, bool]]
+    watermarks: dict[UUID, CheckpointWatermark]
     pending: dict[UUID, PendingCheckpoint]
     locks: dict[UUID, asyncio.Lock]
 
@@ -99,12 +107,12 @@ async def _persist_checkpoint(
     provider_output_sample = (
         output_sample if provider_output_sample is None else provider_output_sample
     )
-    requested = (
-        input_sequence,
-        input_sample,
-        provider_output_sample,
-        output_sample,
-        terminal,
+    requested = CheckpointWatermark(
+        input_sequence=input_sequence,
+        input_sample=input_sample,
+        provider_output_sample=provider_output_sample,
+        output_sample=output_sample,
+        terminal=terminal,
     )
     async with state.lock_for(source_id):
         pending = state.pending.get(source_id)
@@ -112,13 +120,7 @@ async def _persist_checkpoint(
             await _deliver_checkpoint(metadata, spool, archive, control, pending)
             state.hashes[source_id] = pending.digest
             del state.pending[source_id]
-            state.watermarks[source_id] = (
-                pending.input_sequence,
-                pending.input_sample,
-                pending.provider_output_sample,
-                pending.output_sample,
-                pending.terminal,
-            )
+            state.watermarks[source_id] = pending.watermark
             if requested == state.watermarks[source_id]:
                 return
 
@@ -126,20 +128,13 @@ async def _persist_checkpoint(
         if requested == predecessor:
             return
         if predecessor is not None:
-            (
-                previous_sequence,
-                previous_input,
-                previous_provider_output,
-                previous_output,
-                previous_terminal,
-            ) = predecessor
-            if previous_terminal:
+            if predecessor.terminal:
                 raise RuntimeError("cannot append after a terminal checkpoint")
             if (
-                input_sequence < previous_sequence
-                or input_sample < previous_input
-                or provider_output_sample < previous_provider_output
-                or output_sample < previous_output
+                input_sequence < predecessor.input_sequence
+                or input_sample < predecessor.input_sample
+                or provider_output_sample < predecessor.provider_output_sample
+                or output_sample < predecessor.output_sample
             ):
                 raise RuntimeError("checkpoint watermarks cannot regress")
 
@@ -268,11 +263,13 @@ def _pending_checkpoint(delivery: SpoolCheckpointDelivery) -> PendingCheckpoint:
         checkpoint=checkpoint,
         body=delivery.body,
         digest=delivery.checkpoint_hash,
-        input_sample=input_sample,
-        input_sequence=input_sequence,
-        provider_output_sample=provider_output_sample,
-        output_sample=output_sample,
-        terminal=terminal,
+        watermark=CheckpointWatermark(
+            input_sequence=input_sequence,
+            input_sample=input_sample,
+            provider_output_sample=provider_output_sample,
+            output_sample=output_sample,
+            terminal=terminal,
+        ),
     )
 
 
@@ -301,33 +298,21 @@ def _restore_checkpoint_state(
             raise RuntimeError("checkpoint delivery chain is discontinuous")
         predecessor_watermarks = state.watermarks.get(delivery.source_id)
         if predecessor_watermarks is not None:
-            (
-                previous_sequence,
-                previous_input,
-                previous_provider_output,
-                previous_output,
-                previous_terminal,
-            ) = predecessor_watermarks
-            if previous_terminal:
+            if predecessor_watermarks.terminal:
                 raise RuntimeError("checkpoint delivery follows a terminal checkpoint")
             if (
-                pending.input_sequence < previous_sequence
-                or pending.input_sample < previous_input
-                or pending.provider_output_sample < previous_provider_output
-                or pending.output_sample < previous_output
+                pending.watermark.input_sequence < predecessor_watermarks.input_sequence
+                or pending.watermark.input_sample < predecessor_watermarks.input_sample
+                or pending.watermark.provider_output_sample
+                < predecessor_watermarks.provider_output_sample
+                or pending.watermark.output_sample < predecessor_watermarks.output_sample
             ):
                 raise RuntimeError("checkpoint delivery watermarks regress")
         if delivery.acknowledged:
             if delivery.source_id in state.pending:
                 raise RuntimeError("acknowledged checkpoint follows a pending delivery")
             state.hashes[delivery.source_id] = pending.digest
-            state.watermarks[delivery.source_id] = (
-                pending.input_sequence,
-                pending.input_sample,
-                pending.provider_output_sample,
-                pending.output_sample,
-                pending.terminal,
-            )
+            state.watermarks[delivery.source_id] = pending.watermark
             continue
         if delivery.source_id in state.pending:
             raise RuntimeError("multiple pending checkpoints exist for one source")
@@ -347,13 +332,7 @@ async def _replay_pending_checkpoints(
             pending = state.pending[source_id]
             await _deliver_checkpoint(metadata, spool, archive, control, pending)
             state.hashes[source_id] = pending.digest
-            state.watermarks[source_id] = (
-                pending.input_sequence,
-                pending.input_sample,
-                pending.provider_output_sample,
-                pending.output_sample,
-                pending.terminal,
-            )
+            state.watermarks[source_id] = pending.watermark
             del state.pending[source_id]
 
 
@@ -432,26 +411,6 @@ def _compact_terminal_pcm(
     return tuple(compacted)
 
 
-def _acknowledge_compacted_pcm(
-    spool: EncryptedSpool,
-    compacted: CompactedPcm,
-    terminal_checkpoint: UUID,
-) -> None:
-    if not spool.checkpoint_covers(
-        terminal_checkpoint,
-        compacted.stage,
-        compacted.direction,
-        compacted.samples.end,
-    ):
-        raise ValueError("checkpoint is absent or does not durably cover compacted samples")
-    for ref in compacted.source_refs:
-        spool.mark_uploaded(
-            ref.object_id,
-            compacted.pcm.version_id,
-            compacted.pcm.s3_checksum,
-        )
-
-
 async def _record_terminal_pcm(
     metadata: JobMetadata,
     spool: EncryptedSpool,
@@ -465,8 +424,9 @@ async def _record_terminal_pcm(
         ):
             await _record_compacted_pcm(metadata, control, closed_object)
             await owner.run(
-                _acknowledge_compacted_pcm,
-                spool,
+                PcmCompactor(
+                    spool, archive, metadata.consultation_id
+                ).acknowledge_covering_checkpoint,
                 closed_object,
                 terminal_checkpoint,
             )
@@ -562,7 +522,7 @@ async def _deliver_checkpoint(
             },
             event_id=pending.checkpoint_id,
         )
-        if pending.terminal:
+        if pending.watermark.terminal:
             if owner is None:
                 raise RuntimeError("terminal checkpoint delivery requires an executor")
             await upload_committed_objects_async(
@@ -591,7 +551,7 @@ async def _deliver_checkpoint(
     if executor is not None:
         await deliver(executor)
         return
-    if pending.terminal:
+    if pending.watermark.terminal:
         async with ArchiveDeliveryExecutor() as owner:
             await deliver(owner)
         return

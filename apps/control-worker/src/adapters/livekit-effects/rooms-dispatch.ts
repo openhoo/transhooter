@@ -50,7 +50,11 @@ export class RoomDispatchEffects {
         remoteId: effect.id,
         matchesRequest: true,
         terminal: true,
-        result: { roomClosed: true, adopted: true, egressTerminals: terminals },
+        result: {
+          roomClosed: true,
+          adopted: true,
+          egressTerminals: terminals.map(terminalEgressResult),
+        },
       };
     }
     if (effect.kind === "ROOM_DELETE") {

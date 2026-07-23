@@ -30,6 +30,14 @@ const baseEnvironment: NodeJS.ProcessEnv = {
   POD_NAMESPACE: "transhooter",
 };
 
+test("remote JWKS authentication does not require a web caller token", () => {
+  const parsed = parseWebEnvironment(baseEnvironment);
+
+  expect(parsed.INTERNAL_JWT_ISSUER).toBe("https://kubernetes.default.svc");
+  expect(parsed.INTERNAL_JWT_AUDIENCE).toBe("transhooter-internal");
+  expect(parsed.POD_NAMESPACE).toBe("transhooter");
+});
+
 test("production supports direct-local admission when no trusted ingress boundary is configured", () => {
   expect(parseWebEnvironment(baseEnvironment).TRUSTED_CLIENT_IP_HEADER).toBe(undefined);
 });

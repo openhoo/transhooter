@@ -300,6 +300,63 @@ test("serializes overlapping lease renewals and never requests an earlier expiry
   }
 });
 
+test("waits for every claimed effect before propagating a batch failure", async () => {
+  const failed = {
+    ...effect,
+    id: "10000000-0000-4000-8000-000000000010",
+    state: "applied" as const,
+  };
+  const pending = {
+    ...effect,
+    id: "10000000-0000-4000-8000-000000000011",
+    state: "applied" as const,
+  };
+  const pendingStarted = Promise.withResolvers<void>();
+  const releasePending = Promise.withResolvers<void>();
+  let pendingCompleted = false;
+  const store = {
+    claimEffects: async () => [failed, pending],
+    renewEffectLease: async () => true,
+    currentGeneration: async () => effect.generation,
+    markDone: async (id: string) => {
+      if (id === failed.id) {
+        throw new Error("first claimed effect failed");
+      }
+      pendingStarted.resolve();
+      await releasePending.promise;
+      pendingCompleted = true;
+    },
+  } as unknown as DurableStore;
+  const runner = new EffectRunner(
+    store,
+    {} as RemoteEffects,
+    { now: () => new Date(1_000) },
+    {
+      owner: "10000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 2,
+    },
+  );
+
+  const tick = runner.tick();
+  await pendingStarted.promise;
+  let settled = false;
+  void tick.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await Promise.resolve();
+  assert.equal(settled, false);
+
+  releasePending.resolve();
+  await assert.rejects(() => tick, /first claimed effect failed/);
+  assert.equal(pendingCompleted, true);
+});
+
 test("only starting and active Egress states are viable for adoption", () => {
   for (const status of [EgressStatus.EGRESS_STARTING, EgressStatus.EGRESS_ACTIVE]) {
     assert.equal(isViableEgressAdoption(status), true);

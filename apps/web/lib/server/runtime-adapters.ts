@@ -13,18 +13,11 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import {
-  DataPacket_Kind,
-  EgressStatus,
-  S3Upload,
-  SegmentedFileOutput,
-  SegmentedFileProtocol,
-} from "@livekit/protocol";
+import { DataPacket_Kind } from "@livekit/protocol";
 import type { MagicLinkPurpose } from "@transhooter/contracts";
 import {
   type ActiveMagicLink,
   DomainError,
-  type EgressPort,
   type LiveKitRoomPort,
   type LiveKitTokenPort,
   type MagicLinkRecord,
@@ -38,7 +31,6 @@ import {
 import {
   AccessToken,
   authorizeHeader,
-  EgressClient,
   RoomServiceClient,
   WebhookReceiver,
 } from "livekit-server-sdk";
@@ -567,71 +559,6 @@ function createTokenPort(credentials: z.infer<typeof LiveKitCredentialsSchema>):
   };
 }
 
-function createSegmentedOutput(config: WebConfig): (prefix: string) => SegmentedFileOutput {
-  const credentials = config.s3Credentials
-    ? S3CredentialsSchema.parse(JSON.parse(config.s3Credentials) as unknown)
-    : null;
-  const s3 = new S3Upload({
-    accessKey: credentials?.accessKeyId ?? "",
-    secret: credentials?.secretAccessKey ?? "",
-    sessionToken: credentials?.sessionToken ?? "",
-    region: config.s3Region,
-    endpoint: config.s3Endpoint,
-    bucket: config.s3Bucket,
-    forcePathStyle: true,
-  });
-  return (prefix) =>
-    new SegmentedFileOutput({
-      protocol: SegmentedFileProtocol.HLS_PROTOCOL,
-      filenamePrefix: prefix,
-      playlistName: "index.m3u8",
-      segmentDuration: 2,
-      output: { case: "s3", value: s3 },
-    });
-}
-
-function createEgressPort(
-  egressClient: EgressClient,
-  output: (prefix: string) => SegmentedFileOutput,
-): EgressPort {
-  return {
-    async startRoomComposite(input) {
-      const info = await egressClient.startRoomCompositeEgress(
-        input.roomName,
-        output(input.outputPrefix),
-        { customBaseUrl: input.layoutUrl },
-      );
-      return {
-        egressId: info.egressId,
-        state: EgressStatus[info.status],
-      };
-    },
-    async startParticipant(input) {
-      const info = await egressClient.startParticipantEgress(input.roomName, input.identity, {
-        segments: output(input.outputPrefix),
-      });
-      return {
-        egressId: info.egressId,
-        state: EgressStatus[info.status],
-      };
-    },
-    async get(egressId) {
-      const info = (await egressClient.listEgress({ egressId }))[0];
-      if (!info) {
-        throw new Error(`Unknown Egress ${egressId}`);
-      }
-      return {
-        egressId: info.egressId,
-        state: EgressStatus[info.status],
-        output: info,
-      };
-    },
-    async stop(egressId) {
-      await egressClient.stopEgress(egressId);
-    },
-  };
-}
-
 function createWebhookVerifier(webhookReceiver: WebhookReceiver): WebhookVerifier {
   return {
     async verify(rawBody, headers): Promise<VerifiedWebhook> {
@@ -761,7 +688,6 @@ function createWebhookVerifier(webhookReceiver: WebhookReceiver): WebhookVerifie
 export function liveKitAdapters(config: WebConfig): {
   rooms: LiveKitRoomPort;
   tokens: LiveKitTokenPort;
-  egress: EgressPort;
   webhookVerifier: WebhookVerifier;
   ready: () => Promise<boolean>;
 } {
@@ -787,17 +713,11 @@ export function liveKitAdapters(config: WebConfig): {
     credentials.apiKey,
     credentials.apiSecret,
   );
-  const egressClient = new EgressClient(
-    apiUrl.toString(),
-    credentials.apiKey,
-    credentials.apiSecret,
-  );
   const webhookReceiver = new WebhookReceiver(credentials.apiKey, credentials.apiSecret);
 
   return {
     rooms: createRoomsPort(roomsClient),
     tokens: createTokenPort(credentials),
-    egress: createEgressPort(egressClient, createSegmentedOutput(config)),
     webhookVerifier: createWebhookVerifier(webhookReceiver),
     ready: async () => {
       await roomsClient.listRooms([]);

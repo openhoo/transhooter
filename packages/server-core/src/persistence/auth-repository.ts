@@ -2,6 +2,7 @@ import { DomainError, type Instant, type UUID } from "../domain/model";
 import type { MagicLink, PendingExchange, Session, User } from "../generated/prisma/client.js";
 import type {
   ActiveMagicLink,
+  AuthenticatedSessionRecord,
   AuthRepository,
   MagicLinkCandidate,
   MagicLinkIdentity,
@@ -47,11 +48,15 @@ export class PrismaAuthRepository implements AuthRepository {
     return mapUser(row);
   }
 
-  async findSessionByTokenHash(hash: string): Promise<SessionRecord | null> {
+  async findAuthenticatedSessionByTokenHash(
+    hash: string,
+    now: Instant,
+  ): Promise<AuthenticatedSessionRecord | null> {
     const row = await this.database.session.findFirst({
-      where: { tokenHash: hash, revokedAt: null },
+      where: { tokenHash: hash, revokedAt: null, expiresAt: { gt: now } },
+      include: { user: true },
     });
-    return row ? mapSession(row) : null;
+    return row ? { session: mapSession(row), user: mapUser(row.user) } : null;
   }
 
   async getOrCreateActiveMagicLink(

@@ -48,7 +48,6 @@ function createConsultationFixture() {
       aggregate = value;
       return true;
     },
-    isCurrentEgress: async () => false,
   } as unknown as ConsultationRepository;
   const revokeConsultationLinks = mock(async () => undefined);
   const authRepository = {

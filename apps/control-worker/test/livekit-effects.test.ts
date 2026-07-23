@@ -1,7 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { TrackSource } from "@livekit/protocol";
-import { EgressStatus } from "livekit-server-sdk";
+import { EgressStatus, ServerError } from "livekit-server-sdk";
 import { LiveKitEffects } from "../src/adapters/livekit-effects";
 import { egressStatusName, isViableEgressAdoption } from "../src/adapters/livekit-effects/egress";
 import type { Effect } from "../src/orchestration/model";
@@ -275,7 +275,7 @@ test("status delivery is terminal once its room is absent", async () => {
   });
 });
 
-test("room drain adoption waits for every Egress terminal", async () => {
+test("room drain adoption waits for terminal Egress and persists only terminal projections", async () => {
   const adapter = createAdapter();
   let status = EgressStatus.EGRESS_ACTIVE;
   Object.assign(adapter, {
@@ -283,7 +283,28 @@ test("room drain adoption waits for every Egress terminal", async () => {
       listRooms: async () => [],
     },
     egress: {
-      listEgress: async () => [{ status }],
+      listEgress: async () => [
+        {
+          egressId: "EG_drain",
+          status,
+          error: "",
+          errorCode: 0,
+          details: "completed",
+          fileResults: [{ filename: "archive/composite.mp4" }],
+          segmentResults: [{ playlistName: "archive/composite.m3u8" }],
+          request: {
+            roomName: "private-room",
+            segmentOutputs: [
+              {
+                s3: {
+                  accessKey: "must-not-persist",
+                  secret: "must-not-persist",
+                },
+              },
+            ],
+          },
+        },
+      ],
     },
   });
   const drain = {
@@ -296,7 +317,26 @@ test("room drain adoption waits for every Egress terminal", async () => {
 
   assert.equal(await adapter.adopt(drain, drain.plan), null);
   status = EgressStatus.EGRESS_COMPLETE;
-  assert.equal((await adapter.adopt(drain, drain.plan))?.matchesRequest, true);
+  assert.deepEqual(await adapter.adopt(drain, drain.plan), {
+    remoteId: effect.id,
+    matchesRequest: true,
+    terminal: true,
+    result: {
+      roomClosed: true,
+      adopted: true,
+      egressTerminals: [
+        {
+          egressId: "EG_drain",
+          status: "EGRESS_COMPLETE",
+          error: "",
+          errorCode: 0,
+          details: "completed",
+          fileResults: [{ filename: "archive/composite.mp4" }],
+          segmentResults: [{ playlistName: "archive/composite.m3u8" }],
+        },
+      ],
+    },
+  });
 });
 
 test("participant Egress adoption uses the persisted resource room and Egress identity", async () => {
@@ -423,6 +463,39 @@ test("participant grant compensation revokes the exact persisted identity", asyn
       },
     },
   ]);
+});
+
+test("participant grant compensation suppresses only explicit LiveKit absence", async () => {
+  const roomName = "50000000-0000-4000-8000-000000000003";
+  const participantIdentity = "50000000-0000-4000-8000-000000000004";
+  const compensated = {
+    ...effect,
+    kind: "PARTICIPANT_GRANT" as const,
+    plan: { roomName, participantIdentity },
+  };
+  const notFound = createAdapter();
+  Object.assign(notFound, {
+    rooms: {
+      getParticipant: async () => {
+        throw new ServerError("Not Found", "participant does not exist", 404, "not_found");
+      },
+      updateParticipant: async () => {
+        throw new Error("absence must not trigger an update");
+      },
+    },
+  });
+  await notFound.compensate(compensated);
+
+  const unavailable = new ServerError("Unavailable", "LiveKit unavailable", 503, "unavailable");
+  const failing = createAdapter();
+  Object.assign(failing, {
+    rooms: {
+      getParticipant: async () => {
+        throw unavailable;
+      },
+    },
+  });
+  await assert.rejects(failing.compensate(compensated), (error: unknown) => error === unavailable);
 });
 
 test("participant removal targets the persisted resource room", async () => {

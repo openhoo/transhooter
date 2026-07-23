@@ -1,9 +1,10 @@
 import {
+  type ParticipantInfo,
   ParticipantPermission,
   RoomParticipantIdentity,
   UpdateParticipantRequest,
 } from "@livekit/protocol";
-import { type RoomServiceClient, TrackSource } from "livekit-server-sdk";
+import { type RoomServiceClient, ServerError, TrackSource } from "livekit-server-sdk";
 import type { Effect } from "../../orchestration/model";
 import type { Adoption, RemoteResult } from "../../orchestration/remote";
 import { requiredString, roomNameFor, twirpBytes } from "./shared";
@@ -43,10 +44,14 @@ export class ParticipantEffects {
     if (effect.kind === "PARTICIPANT_GRANT") {
       const roomName = requiredString(request, "roomName");
       const participantIdentity = requiredString(request, "participantIdentity");
-      const participant = await this.getRooms()
-        .getParticipant(roomName, participantIdentity)
-        .catch(() => undefined);
-      if (participant === undefined || !hasExactCaptureGrant(participant.permission)) return null;
+      let participant: ParticipantInfo;
+      try {
+        participant = await this.getRooms().getParticipant(roomName, participantIdentity);
+      } catch (error) {
+        if (error instanceof ServerError && error.code === "not_found") return null;
+        throw error;
+      }
+      if (!hasExactCaptureGrant(participant.permission)) return null;
       return { remoteId: participant.sid, matchesRequest: true, terminal: false };
     }
     const participantIdentity = requiredString(request, "participantIdentity");
@@ -117,18 +122,19 @@ export class ParticipantEffects {
   async compensate(effect: Effect): Promise<void> {
     const roomName = requiredString(effect.plan, "roomName");
     const participantIdentity = requiredString(effect.plan, "participantIdentity");
-    const participant = await this.getRooms()
-      .getParticipant(roomName, participantIdentity)
-      .catch(() => undefined);
-    if (participant !== undefined) {
-      await this.getRooms().updateParticipant(roomName, participantIdentity, {
-        permission: {
-          canSubscribe: false,
-          canPublish: false,
-          canPublishData: false,
-          canPublishSources: [],
-        },
-      });
+    try {
+      await this.getRooms().getParticipant(roomName, participantIdentity);
+    } catch (error) {
+      if (error instanceof ServerError && error.code === "not_found") return;
+      throw error;
     }
+    await this.getRooms().updateParticipant(roomName, participantIdentity, {
+      permission: {
+        canSubscribe: false,
+        canPublish: false,
+        canPublishData: false,
+        canPublishSources: [],
+      },
+    });
   }
 }

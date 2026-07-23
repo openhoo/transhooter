@@ -177,6 +177,172 @@ async function run(
   return planned;
 }
 
+test("unsupported durable outbox topics are retried instead of completed", async () => {
+  const unsupported: OutboxItem = {
+    id: "20000000-0000-4000-8000-000000000030",
+    aggregateId: consultationId,
+    generation: 7,
+    type: "unsupported.topic",
+    attempts: 0,
+    payload: {},
+  };
+  let completions = 0;
+  let retryMessage = "";
+  const store = {
+    claimOutbox: async () => [unsupported],
+    claimDeadlines: async () => [],
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+    completeOutbox: async () => {
+      completions += 1;
+    },
+    retryOutbox: async (_id: string, _owner: string, error: string) => {
+      retryMessage = error;
+    },
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    { areHumansAbsent: async () => true, notifyArchiveRecording: async () => undefined },
+    { reserve: async () => true, renew: async () => true, release: async () => undefined },
+  );
+
+  assert.equal(await coordinator.tick(), 1);
+  assert.equal(completions, 0);
+  assert.equal(retryMessage, "unsupported durable outbox topic: unsupported.topic");
+});
+
+test("waits for every coordinator claim before propagating failure", async () => {
+  const releaseDeadlineClaim = Promise.withResolvers<void>();
+  const deadlineClaimStarted = Promise.withResolvers<void>();
+  let deadlineClaimCompleted = false;
+  const store = {
+    claimOutbox: async () => {
+      throw new Error("outbox claim failed");
+    },
+    claimDeadlines: async () => {
+      deadlineClaimStarted.resolve();
+      await releaseDeadlineClaim.promise;
+      deadlineClaimCompleted = true;
+      return [];
+    },
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    { areHumansAbsent: async () => true, notifyArchiveRecording: async () => undefined },
+    { reserve: async () => true, renew: async () => true, release: async () => undefined },
+  );
+
+  const tick = coordinator.tick();
+  await deadlineClaimStarted.promise;
+  let settled = false;
+  void tick.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await Promise.resolve();
+  assert.equal(settled, false);
+
+  releaseDeadlineClaim.resolve();
+  await assert.rejects(() => tick, /outbox claim failed/);
+  assert.equal(deadlineClaimCompleted, true);
+});
+
+test("waits for every claimed coordinator operation before propagating failure", async () => {
+  const otherConsultationId = "20000000-0000-4000-8000-000000000032";
+  const deadlines: Deadline[] = [
+    { consultationId, generation: 7, kind: "finalize", dueAt: new Date(4_000) },
+    {
+      consultationId: otherConsultationId,
+      generation: 7,
+      kind: "finalize",
+      dueAt: new Date(4_000),
+    },
+  ];
+  const secondStarted = Promise.withResolvers<void>();
+  const releaseSecond = Promise.withResolvers<void>();
+  let secondCompleted = false;
+  const store = {
+    claimOutbox: async () => [],
+    claimDeadlines: async () => deadlines,
+    claimStaleReservations: async () => [],
+    preparePendingArchiveDeletes: async () => undefined,
+    currentGeneration: async () => 7,
+    consultationState: async () => "finalizing" as const,
+    scheduleEffect: async (planned: PlannedEffect) => {
+      if (planned.consultationId === consultationId) {
+        throw new Error("first claimed operation failed");
+      }
+      secondStarted.resolve();
+      await releaseSecond.promise;
+      secondCompleted = true;
+    },
+    roomDrainPlan: async () => ({
+      dispatchIds: [],
+      egressIds: [],
+      participantIds: [],
+      roomCreated: false,
+      resourceRoomName: null,
+    }),
+    completeDeadline: async () => undefined,
+  } as unknown as DurableStore;
+  const coordinator = new Coordinator(
+    store,
+    { now: () => new Date(5_000) },
+    { owner, leaseMs: 1_000, batchSize: 4 },
+    { areHumansAbsent: async () => true, notifyArchiveRecording: async () => undefined },
+    { reserve: async () => true, renew: async () => true, release: async () => undefined },
+  );
+
+  const tick = coordinator.tick();
+  await secondStarted.promise;
+  let settled = false;
+  void tick.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await Promise.resolve();
+  assert.equal(settled, false);
+
+  releaseSecond.resolve();
+  await assert.rejects(() => tick, /first claimed operation failed/);
+  assert.equal(secondCompleted, true);
+});
+
+test("forced archive reconciliation schedules the established durable effect", async () => {
+  const planned = await run({
+    id: "20000000-0000-4000-8000-000000000031",
+    aggregateId: consultationId,
+    generation: 7,
+    type: "archive.reconciliation_forced",
+    attempts: 0,
+    payload: {
+      consultationId,
+      generation: 7,
+      subjectId: consultationId,
+      resourceGeneration: 6,
+    },
+  });
+
+  assert.equal(planned.length, 1);
+  assert.equal(planned[0]?.kind, "ARCHIVE_RECONCILE");
+  assert.equal(planned[0]?.plan.forceIncomplete, true);
+  assert.equal(planned[0]?.plan.resourceGeneration, 6);
+});
+
 test("absence deadline remains claimable while humans are still present", async () => {
   const deadline: Deadline = {
     consultationId,

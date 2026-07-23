@@ -79,7 +79,6 @@ const EnvironmentSchema = z
     ARCHIVE_REQUIRE_KMS: z.enum(["true", "false"]).default("false"),
     INTERNAL_JWT_ISSUER: z.string().min(1).optional(),
     INTERNAL_JWT_AUDIENCE: z.string().min(1).optional(),
-    INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE: z.string().min(1).optional(),
     POD_NAMESPACE: z.string().min(1).optional(),
     TRUSTED_CLIENT_IP_HEADER: z
       .string()
@@ -129,7 +128,6 @@ export type WebConfig = {
   publicUrl: string;
   internalJwtIssuer: string | null;
   internalJwtAudience: string | null;
-  internalServiceAccountToken: string | null;
   podNamespace: string | null;
   trustedClientIpHeader: string | null;
 };
@@ -226,9 +224,6 @@ export function webConfig(): WebConfig {
     publicUrl: environment.PUBLIC_BASE_URL,
     internalJwtIssuer: environment.INTERNAL_JWT_ISSUER ?? null,
     internalJwtAudience: environment.INTERNAL_JWT_AUDIENCE ?? null,
-    internalServiceAccountToken: readOptionalSecret(
-      environment.INTERNAL_SERVICE_ACCOUNT_TOKEN_FILE,
-    ),
     podNamespace: environment.POD_NAMESPACE ?? null,
     trustedClientIpHeader: environment.TRUSTED_CLIENT_IP_HEADER ?? null,
   };

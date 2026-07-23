@@ -16,6 +16,9 @@ export async function runStorageScenarios(ctx, proof) {
     assertServiceHealthy,
     resetAuthenticationThrottle,
     consultationEvidence,
+    consultationStatus,
+    effectEvidence,
+    settlementObservation,
     isCleanSettlement,
     settlementSummary,
     queryJson,
@@ -31,24 +34,23 @@ export async function runStorageScenarios(ctx, proof) {
       faults: { holdAfterPersistCalling: ["ARCHIVE_RECONCILE"] },
     });
     const reconciliationHoldMarker = `${faultFile}.${run.consultationId}.ARCHIVE_RECONCILE.calling-owner`;
-    const reconciling = await waitFor(
+    await waitFor(
       "archive reconciliation held before its remote call",
       async () => {
-        const evidence = await consultationEvidence(run.consultationId);
-        if (evidence.archive_state !== "reconciling") return null;
+        const status = await consultationStatus(run.consultationId);
+        if (status.archive_state !== "reconciling") return null;
         try {
           await stat(reconciliationHoldMarker);
-          return evidence;
+          return status;
         } catch {
           return null;
         }
       },
       120_000,
     );
+    const reconciliationEffects = await effectEvidence(run.consultationId, "ARCHIVE_RECONCILE");
     const reconciliationAttemptsBeforeOutage = new Map(
-      reconciling.effects
-        .filter((effect) => effect.kind === "ARCHIVE_RECONCILE")
-        .map((effect) => [effect.id, effect.attempts]),
+      reconciliationEffects.map((effect) => [effect.id, effect.attempts]),
     );
     const minioId = await stop("minio");
     await setFaults(run.consultationId);
@@ -70,19 +72,17 @@ export async function runStorageScenarios(ctx, proof) {
       },
       60_000,
     );
-    const outageEvidence = await consultationEvidence(run.consultationId);
+    const outageEvidence = await consultationStatus(run.consultationId);
     if (outageEvidence.archive_state !== "reconciling") {
       throw new Error("archive completed before the MinIO outage could exercise reconciliation");
     }
     const failedReconciliation = await waitFor(
       "archive reconciliation retries after the MinIO outage",
       async () => {
-        const evidence = await consultationEvidence(run.consultationId);
+        const effects = await effectEvidence(run.consultationId, "ARCHIVE_RECONCILE");
         return (
-          evidence.effects.find(
-            (effect) =>
-              effect.kind === "ARCHIVE_RECONCILE" &&
-              effect.attempts > (reconciliationAttemptsBeforeOutage.get(effect.id) ?? 0),
+          effects.find(
+            (effect) => effect.attempts > (reconciliationAttemptsBeforeOutage.get(effect.id) ?? 0),
           ) ?? null
         );
       },
@@ -109,14 +109,15 @@ export async function runStorageScenarios(ctx, proof) {
         `MinIO recovery consultation failed: ${completed.stderr}\n${completed.stdout}`,
       );
     }
-    const settled = await waitFor(
+    await waitFor(
       "MinIO recovery clean settlement",
       async () => {
-        const evidence = await consultationEvidence(run.consultationId);
-        return isCleanSettlement(evidence) ? evidence : null;
+        const observation = await settlementObservation(run.consultationId);
+        return isCleanSettlement(observation) ? observation : null;
       },
       120_000,
     );
+    const settled = await consultationEvidence(run.consultationId);
     const [objects, pendingMultipart] = await Promise.all([
       queryJson(`
           SELECT count(*)::int AS object_count,

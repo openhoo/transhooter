@@ -67,7 +67,9 @@ export async function pollWithinDeadline(
       });
       if (value) return value;
     } catch (error) {
-      if (error instanceof ScenarioDeadlineError) throw error;
+      if (error instanceof ScenarioDeadlineError) {
+        throw new ScenarioDeadlineError(`Timed out waiting for ${label}`, deadlineEpochMs);
+      }
       // Transient attempt failures are retried until the one absolute deadline.
     }
 

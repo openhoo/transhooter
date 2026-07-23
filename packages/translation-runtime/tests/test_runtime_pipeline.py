@@ -457,6 +457,50 @@ async def test_same_language_direction_bypasses_translation_and_tts(
 
 
 @pytest.mark.asyncio
+async def test_same_language_direction_does_not_allocate_translation_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "test")
+    created: list[str] = []
+
+    class RejectAssembler:
+        def __init__(self, *_: object, **__: object) -> None:
+            created.append("assembler")
+
+    class RejectQueue:
+        def __init__(self, *_: object, **__: object) -> None:
+            created.append("queue")
+
+    monkeypatch.setattr(
+        "transhooter_worker.application.session.UtteranceAssembler", RejectAssembler
+    )
+    monkeypatch.setattr("transhooter_worker.application.session.OrderedStageQueue", RejectQueue)
+
+    async def ignore(*_: object) -> None:
+        return None
+
+    session = DirectionSession(
+        DirectionSpec(uuid4(), uuid4(), "de-DE", "de-DE", None, True),
+        FixtureSttProvider(),
+        FixtureTranslationProvider(),
+        FixtureTtsProvider(),
+        ignore,
+        ignore,
+        ignore,
+    )
+    await session.start()
+
+    assert created == []
+    assert session._assembler is None
+    assert session._stage_queue is None
+    assert session._stage_task is None
+    assert session._boundary_task is not None
+    assert not session._boundary_task.done()
+
+    await session.cancel()
+
+
+@pytest.mark.asyncio
 async def test_pcm_framing_removes_consumed_prefix_and_preserves_remainder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -106,10 +106,9 @@ class PcmCompactor:
             direction,
         )
 
-    def acknowledge_covering_checkpoint(self, compacted: CompactedPcm, checkpoint_id: str) -> None:
-        checkpoint_uuid = UUID(checkpoint_id)
+    def acknowledge_covering_checkpoint(self, compacted: CompactedPcm, checkpoint_id: UUID) -> None:
         if not self._spool.checkpoint_covers(
-            checkpoint_uuid, compacted.stage, compacted.direction, compacted.samples.end
+            checkpoint_id, compacted.stage, compacted.direction, compacted.samples.end
         ):
             raise ValueError("checkpoint is absent or does not durably cover compacted samples")
         for ref in compacted.source_refs:

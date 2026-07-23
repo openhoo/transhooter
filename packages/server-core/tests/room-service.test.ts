@@ -102,9 +102,7 @@ function webhookFixture(
     consultations,
     effects,
     {} as never,
-    {} as never,
     { verify: async () => event },
-    {} as never,
     { now: () => NOW },
     { uuid: () => OTHER },
     { sha256: () => "a".repeat(64) },
@@ -132,7 +130,7 @@ describe("RoomService webhook fences", () => {
     expect(fixture.save).not.toHaveBeenCalled();
   });
 
-  it("journals participant capture with immutable resource and compensation identities", async () => {
+  it("journals participant capture with immutable resource identities", async () => {
     const fixture = webhookFixture({
       id: "joined-customer",
       consultationId: ID,
@@ -161,9 +159,7 @@ describe("RoomService webhook fences", () => {
             resourceRoomName: ROOM_NAME,
             participantIdentity: OTHER,
             outputPrefix: `v1/meetings/${ID}/media/participants/${OTHER}/2`,
-            segmentedHls: true,
             resourceGeneration: 2,
-            compensationIntent: "EGRESS_STOP",
           },
         },
       }),
@@ -358,13 +354,11 @@ describe("RoomService webhook fences", () => {
       consultations,
       { enqueue: async () => undefined } as unknown as EffectRepository,
       { listAllowedParticipants } as never,
-      {} as never,
       {
         verify: async () => {
           throw new Error("unused");
         },
       },
-      {} as never,
       { now: () => now },
       { uuid: () => OTHER },
       { sha256: () => "a".repeat(64) },
@@ -406,13 +400,11 @@ describe("RoomService webhook fences", () => {
       consultations,
       { enqueue: async () => undefined } as unknown as EffectRepository,
       { listAllowedParticipants: async () => [ID] } as never,
-      {} as never,
       {
         verify: async () => {
           throw new Error("unused");
         },
       },
-      {} as never,
       { now: () => NOW },
       { uuid: () => OTHER },
       { sha256: () => "a".repeat(64) },
@@ -439,7 +431,6 @@ describe("RoomService webhook fences", () => {
         enqueue,
       } as unknown as EffectRepository,
       {} as never,
-      {} as never,
       {
         verify: async () => ({
           id: "join",
@@ -452,7 +443,6 @@ describe("RoomService webhook fences", () => {
           payload: {},
         }),
       },
-      {} as never,
       { now: () => NOW },
       { uuid: () => OTHER },
       { sha256: () => "a".repeat(64) },
@@ -474,7 +464,6 @@ describe("RoomService webhook fences", () => {
             resourceRoomName: ROOM_NAME,
             participantIdentity: ID,
             resourceGeneration: 2,
-            compensationIntent: "REMOVE_PARTICIPANT",
           },
         }),
       }),
@@ -493,7 +482,6 @@ describe("RoomService webhook fences", () => {
       } as unknown as ConsultationRepository,
       { acceptInbox: async () => true, enqueue } as unknown as EffectRepository,
       {} as never,
-      {} as never,
       {
         verify: async () => ({
           id: "stale-join",
@@ -506,7 +494,6 @@ describe("RoomService webhook fences", () => {
           payload: {},
         }),
       },
-      {} as never,
       { now: () => NOW },
       { uuid: () => OTHER },
       { sha256: () => "a".repeat(64) },

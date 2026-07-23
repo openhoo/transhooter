@@ -253,18 +253,6 @@ export class PrismaEffectRepository implements EffectRepository {
     `);
   }
 
-  async markOutboxDone(id: UUID, owner: UUID, at: Instant, tx: Transaction): Promise<boolean> {
-    const rows = await unwrap(tx).$queryRaw<IdRow[]>(Prisma.sql`
-      UPDATE outbox
-      SET delivered_at = ${at}, lease_owner = NULL, lease_expires_at = NULL
-      WHERE id = ${id}
-        AND lease_owner = ${owner}
-        AND lease_expires_at > ${at}
-      RETURNING id
-    `);
-    return rows.length === 1;
-  }
-
   async acceptInbox(
     source: string,
     eventId: string,

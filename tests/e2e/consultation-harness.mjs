@@ -111,6 +111,7 @@ export function createConsultationHarness(argv = process.argv, environment = pro
   const allowedProvidersByProfile = {
     fixture: new Set(["fixture"]),
     "google-eu": new Set(["google"]),
+    "google-speech-eu": new Set(["google"]),
     "deepgram-deepl-eu": new Set(["deepgram", "deepl"]),
   };
   const emitProof = parsedFlags.has("--emit-proof-json") || environment.EMIT_PROOF_JSON === "true";

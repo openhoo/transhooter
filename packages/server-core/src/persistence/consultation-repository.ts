@@ -37,12 +37,14 @@ export class PrismaConsultationRepository
     creationIdempotencyKey: UUID,
     tx: Transaction,
   ): Promise<Consultation | null> {
-    const database = unwrap(tx);
-    const row = await database.consultation.findFirst({
+    const row = await unwrap(tx).consultation.findFirst({
       where: { employeeUserId, creationIdempotencyKey },
-      select: { id: true },
+      include: {
+        archive: { select: { state: true } },
+        participants: { orderBy: { role: "asc" } },
+      },
     });
-    return row ? this.load(row.id, database) : null;
+    return row ? mapConsultation(row) : null;
   }
 
   async listForUser(userId: UUID): Promise<readonly Consultation[]> {
@@ -266,31 +268,6 @@ export class PrismaConsultationRepository
       WHERE consultation_id = ${value.id}::uuid
     `);
     return true;
-  }
-
-  async isCurrentEgress(
-    consultationId: UUID,
-    generation: number,
-    egressId: string,
-    tx: Transaction,
-  ): Promise<boolean> {
-    const database = unwrap(tx);
-    const job = await database.egressJob.findFirst({
-      where: { consultationId, generation, egressId },
-      select: { id: true },
-    });
-    if (job) {
-      return true;
-    }
-    const participant = await database.consultationParticipant.findFirst({
-      where: {
-        consultationId,
-        participantEgressId: egressId,
-        consultation: { generation },
-      },
-      select: { id: true },
-    });
-    return participant !== null;
   }
 
   async resolveCurrentEgressSubject(

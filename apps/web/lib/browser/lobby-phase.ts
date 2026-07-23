@@ -70,6 +70,30 @@ type PreviewTrack = {
 export type PreviewStream = {
   getTracks: () => PreviewTrack[];
 };
+export type LobbyDeviceSelection = {
+  microphoneId: string;
+  cameraId: string;
+};
+
+export function lobbyPreviewConstraints({
+  microphoneId,
+  cameraId,
+}: LobbyDeviceSelection): MediaStreamConstraints {
+  return {
+    audio: microphoneId ? { deviceId: { exact: microphoneId } } : true,
+    video: cameraId ? { deviceId: { exact: cameraId } } : true,
+  };
+}
+
+export function lobbyPreferencesPayload(values: FormData): {
+  displayName: FormDataEntryValue | null;
+  language: FormDataEntryValue | null;
+} {
+  return {
+    displayName: values.get("displayName"),
+    language: values.get("language"),
+  };
+}
 
 export type LobbyPreviewRequest = {
   readonly generation: number;

@@ -5,6 +5,10 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 WRAPPER="$ROOT/scripts/demo-consultation"
 fail() { printf 'demo wrapper contract failure: %s\n' "$1" >&2; exit 1; }
 assert_contains() { grep -F -- "$2" "$1" >/dev/null || fail "missing '$2' in $1"; }
+assert_count() {
+  actual=$(grep -F -c -- "$2" "$1" || true)
+  [ "$actual" -eq "$3" ] || fail "expected $3 occurrences of '$2' in $1, found $actual"
+}
 sh -n "$WRAPPER" || fail 'wrapper syntax is invalid'
 TEST_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/demo-wrapper-contract.XXXXXXXX")
 trap 'rm -rf -- "$TEST_DIRECTORY"' 0 HUP INT TERM
@@ -27,6 +31,20 @@ cat > "$TEST_DIRECTORY/bin/bun" <<'STUB'
 #!/bin/sh
 printf 'bun %s\n' "$*" >> "$CALLS"
 if [ "${1:-}" = -e ]; then
+  case "${2:-}" in
+    *'JSON.parse'*)
+      cat >/dev/null
+      case "${MOCK_PROBE:-}" in
+        no-video) printf 'no-video audio duration 12.5\n' ;;
+        no-audio) printf 'video no-audio duration 12.5\n' ;;
+        invalid-duration | non-numeric-duration) printf 'video audio invalid-duration\n' ;;
+        malformed) exit 1 ;;
+        short) printf 'video audio duration 0.5\n' ;;
+        *) printf 'video audio duration 12.5\n' ;;
+      esac
+      exit 0
+      ;;
+  esac
   [ "${MOCK_BROWSER_MISSING:-false}" = true ] && exit 1
   printf '%s\n' "${MOCK_CHROMIUM_PATH:?}"
   exit 0
@@ -61,12 +79,16 @@ STUB
 cat > "$TEST_DIRECTORY/bin/ffprobe" <<'STUB'
 #!/bin/sh
 printf 'ffprobe %s\n' "$*" >> "$CALLS"
-case " $* " in
-  *' -select_streams v:0 '*) [ "${MOCK_PROBE:-}" = no-video ] || printf '0\n' ;;
-  *' -select_streams a:0 '*) [ "${MOCK_PROBE:-}" = no-audio ] || printf '1\n' ;;
-  *' format=duration '*) [ "${MOCK_PROBE:-}" = short ] && printf '0.5\n' || printf '12.5\n' ;;
+case "${MOCK_PROBE:-}" in
+  decode) exit 1 ;;
+  malformed) printf '{not-json\n' ;;
+  no-video) printf '{"streams":[{"codec_type":"audio"}],"format":{"duration":"12.5"}}\n' ;;
+  no-audio) printf '{"streams":[{"codec_type":"video"}],"format":{"duration":"12.5"}}\n' ;;
+  invalid-duration) printf '{"streams":[{"codec_type":"video"},{"codec_type":"audio"}],"format":{}}\n' ;;
+  non-numeric-duration) printf '{"streams":[{"codec_type":"video"},{"codec_type":"audio"}],"format":{"duration":"unknown"}}\n' ;;
+  short) printf '{"streams":[{"codec_type":"video"},{"codec_type":"audio"}],"format":{"duration":"0.5"}}\n' ;;
+  *) printf '{"streams":[{"codec_type":"video"},{"codec_type":"audio"}],"format":{"duration":"12.5"}}\n' ;;
 esac
-[ "${MOCK_PROBE:-}" = decode ] && exit 1
 exit 0
 STUB
 cat > "$TEST_DIRECTORY/bin/ffmpeg" <<'STUB'
@@ -131,6 +153,14 @@ export MOCK_BROWSER_MISSING
 expect_failure browser-missing 'Run: bunx playwright install chromium' --employee-video "$TEST_DIRECTORY/employee.mp4" --customer-video "$TEST_DIRECTORY/customer.mp4"
 unset MOCK_BROWSER_MISSING
 
+MOCK_PROBE=decode; export MOCK_PROBE
+expect_failure probe-failure 'employee input cannot be decoded' --employee-video "$TEST_DIRECTORY/employee.mp4" --customer-video "$TEST_DIRECTORY/customer.mp4"
+MOCK_PROBE=malformed; export MOCK_PROBE
+expect_failure malformed-probe 'employee input cannot be decoded' --employee-video "$TEST_DIRECTORY/employee.mp4" --customer-video "$TEST_DIRECTORY/customer.mp4"
+MOCK_PROBE=invalid-duration; export MOCK_PROBE
+expect_failure invalid-duration 'employee input has invalid or non-numeric duration' --employee-video "$TEST_DIRECTORY/employee.mp4" --customer-video "$TEST_DIRECTORY/customer.mp4"
+MOCK_PROBE=non-numeric-duration; export MOCK_PROBE
+expect_failure non-numeric-duration 'employee input has invalid or non-numeric duration' --employee-video "$TEST_DIRECTORY/employee.mp4" --customer-video "$TEST_DIRECTORY/customer.mp4"
 MOCK_PROBE=no-video; export MOCK_PROBE
 expect_failure no-video 'employee input has no decodable video stream' --employee-video "$TEST_DIRECTORY/employee.mp4" --customer-video "$TEST_DIRECTORY/customer.mp4"
 MOCK_PROBE=no-audio; export MOCK_PROBE
@@ -147,6 +177,8 @@ expect_failure google-setting 'missing provider setting: GOOGLE_CLOUD_PROJECT' -
 output="$TEST_DIRECTORY/happy.out"
 run_demo "$output" --employee-video "$TEST_DIRECTORY/employee.mp4" --customer-video "$TEST_DIRECTORY/customer.mp4"
 assert_contains "$CALLS" 'PROVIDER_PROFILE=fixture'
+assert_count "$CALLS" 'ffprobe ' 2
+assert_count "$CALLS" '-show_entries stream=codec_type:format=duration -of json' 2
 assert_contains "$CALLS" "-t 30 -an -vf scale=w='min(640,iw)':h='min(360,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=15,format=yuv420p -f yuv4mpegpipe"
 assert_contains "$CALLS" '-t 30 -vn -ac 1 -ar 48000 -c:a pcm_s16le'
 assert_contains "$CALLS" 'compose.demo.fixture.yml -f'

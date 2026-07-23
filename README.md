@@ -337,12 +337,14 @@ Standardprofil von `./scripts/dev-up`. Erforderlich:
 - `GOOGLE_QUOTA_PROJECT`
 - `SMTP_URL`
 - `RTC_ADVERTISED_IP`
-- `S3_PUBLIC_ENDPOINT`
+- `S3_PUBLIC_ENDPOINT` als explizite, vom Browser erreichbare `https://`-URL
 - `PUBLIC_BASE_URL` als `https://`-URL
 - `PUBLIC_LIVEKIT_URL` als `wss://`-URL
 
-Das Overlay verwendet die EU-Endpunkte für Speech und Translation. Die
-Credentials-Datei wird read-only nach `/run/secrets/google-adc.json` gemountet.
+Das Overlay verwendet die im Runtimeprofil festgelegten EU-Endpunkte und
+Modelle für Speech und Translation. Nur Projekt, Quotenprojekt und TTS-Stimme
+werden konfiguriert; die Credentials-Datei wird read-only nach
+`/run/secrets/google-adc.json` gemountet.
 
 ### `google-speech-eu`
 
@@ -478,7 +480,7 @@ Subnetzkollisionen müssen `RTC_SUBNET`, `RTC_ADVERTISED_IP` beziehungsweise
 | `PROVIDER_PROFILE` | `google-eu`, `google-speech-eu`, `deepgram-deepl-eu` oder `fixture`. Der Wrapper-Parameter ist maßgeblich. |
 | `SMTP_URL` | SMTP-Verbindung für Magic Links; in echten Providerprofilen Pflicht. |
 | `RTC_ADVERTISED_IP` | Von LiveKit extern annoncierte RTC-Adresse. |
-| `S3_PUBLIC_ENDPOINT` | Vom Browser erreichbarer S3-Endpunkt. |
+| `S3_PUBLIC_ENDPOINT` | Vom Browser erreichbarer S3-Endpunkt. Echte Providerprofile verlangen eine explizite HTTPS-URL; nur das Fixture behält `http://localhost:9000`. |
 | `PUBLIC_BASE_URL` | Öffentliche Web-URL; echte Providerprofile verlangen HTTPS. |
 | `PUBLIC_LIVEKIT_URL` | Öffentliche LiveKit-URL; echte Providerprofile verlangen WSS. |
 | `BOOTSTRAP_ADMIN_EMAIL` | E-Mail des initialen Administrators. |
@@ -497,8 +499,13 @@ Subnetzkollisionen müssen `RTC_SUBNET`, `RTC_ADVERTISED_IP` beziehungsweise
 | `DEEPGRAM_AUDIO_SECONDS_MINUTE` | Deepgram-Audiobudget pro Minute. |
 | `DEEPL_REQUESTS_MINUTE` | DeepL-Requestbudget pro Minute. |
 | `DEEPL_CHARACTERS_MINUTE` | DeepL-Zeichenbudget pro Minute. |
-| `ARCHIVE_REQUIRE_KMS` | Verlangt KMS-gestützte S3-Verschlüsselung. Lokal standardmäßig `false`, in Helm-Produktion zwingend `true`. |
 | `MAGIC_LINK_SEAL_KEYS_FILE` | Pfad zum versionierten Magic-Link-Keyring. |
+
+Die Compose-Providerprofile verwenden den gebündelten lokalen MinIO ohne KMS
+und setzen `ARCHIVE_REQUIRE_KMS` deshalb fest auf `false`; diese Einstellung ist
+nicht über `.env` konfigurierbar. Das Produktions-Helm-Chart erzwingt dagegen
+`config.archiveRequireKms: true` zusammen mit einer nichtleeren
+`config.s3KmsKeyId`.
 
 ### Zusätzliche Compose-Tunables
 
@@ -638,13 +645,13 @@ mindestens Folgendes festlegen:
 - `config.appEnv: production`,
 - `config.providerProfile: google-eu`, `google-speech-eu` oder `deepgram-deepl-eu`,
 - HTTPS für Web und S3 sowie WSS für LiveKit,
-- `config.archiveRequireKms: true` und eine nichtleere `s3KmsKeyId`,
-- Runtime-, Migrator-, Provider- und Egress-Config-Secrets,
+- `config.archiveRequireKms: true` und eine nichtleere `config.s3KmsKeyId`,
+- reale Providerprojekte, Stimmen und Quoten; beim Profil `google-speech-eu`
+  außerdem die fest unterstützten Locations und Modelle, aus denen die
+  Endpunkte kanonisch abgeleitet werden,
 - vorhandenen Spool-PVC unter `spool.existingClaim`, der von Translation-Worker
   und Spool Drainer gleichzeitig nutzbar ist; typischerweise `ReadWriteMany`
   oder eine ausdrücklich sichergestellte gemeinsame Node-/Storage-Topologie,
-- reale Providerprojekte, Locations, Modelle und Quoten; Endpunkte des Profils
-  `google-speech-eu` werden aus den Locations abgeleitet,
 - passende Ressourcen, Replikate, Ingress und Telemetrie.
 
 Benötigte Secret-Grenzen:

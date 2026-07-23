@@ -14,8 +14,10 @@ import type {
 const readCommandKinds: readonly WebCommand["kind"][] = [
   "auth.authenticate",
   "consultation.get",
+  "consultation.lobby",
   "consultation.list",
   "consultation.options",
+  "consultation.profileMetadata",
   "consultation.room",
   "archive.list",
   "archive.get",

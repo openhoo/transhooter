@@ -55,6 +55,13 @@ class _MultipartPartMismatch(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _MultipartPartPlan:
+    byte_start: int
+    byte_end: int
+    checksum: str
+
+
 @dataclass(slots=True)
 class S3Archive:
     client: Any
@@ -143,7 +150,6 @@ class S3Archive:
         except ClientError as exc:
             recovered = self._recover_ambiguous(key, len(body), sha256, content_type)
             if recovered is not None:
-                self._verify_multipart_size(recovered, len(body))
                 self._persist_completed_record(database, recovered)
                 return recovered
             if allow_restart and self._is_missing_upload(exc):
@@ -162,6 +168,7 @@ class S3Archive:
                 database=database,
                 key=key,
                 upload_id=upload_id,
+                body=body,
                 intended=intended,
                 remote_parts=remote_parts,
             )
@@ -181,7 +188,6 @@ class S3Archive:
         except ClientError as exc:
             recovered = self._recover_ambiguous(key, len(body), sha256, content_type)
             if recovered is not None:
-                self._verify_multipart_size(recovered, len(body))
                 self._persist_completed_record(database, recovered)
                 return recovered
             status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
@@ -194,13 +200,11 @@ class S3Archive:
         except Exception:
             recovered = self._recover_ambiguous(key, len(body), sha256, content_type)
             if recovered is not None:
-                self._verify_multipart_size(recovered, len(body))
                 self._persist_completed_record(database, recovered)
                 return recovered
             raise
 
         record = self._verified_record(key, len(body), sha256, content_type, response)
-        self._verify_multipart_size(record, len(body))
         self._persist_completed_record(database, record)
         return record
 
@@ -295,18 +299,20 @@ class S3Archive:
         database: sqlite3.Connection,
         key: str,
         upload_id: str,
-        intended: dict[int, tuple[int, int, bytes, str]],
+        body: bytes,
+        intended: dict[int, _MultipartPartPlan],
         remote_parts: dict[int, dict[str, Any]],
     ) -> list[dict[str, Any]]:
         uploaded, upload_failures = self._upload_missing_multipart_parts(
             key=key,
             upload_id=upload_id,
+            body=body,
             intended=intended,
             remote_parts=remote_parts,
         )
         completion_parts: list[dict[str, Any]] = []
         for part_number in sorted(intended):
-            _, _, _, checksum = intended[part_number]
+            checksum = intended[part_number].checksum
             remote = remote_parts.get(part_number, uploaded.get(part_number))
             if remote is None:
                 continue
@@ -330,7 +336,8 @@ class S3Archive:
         *,
         key: str,
         upload_id: str,
-        intended: dict[int, tuple[int, int, bytes, str]],
+        body: bytes,
+        intended: dict[int, _MultipartPartPlan],
         remote_parts: dict[int, dict[str, Any]],
     ) -> tuple[dict[int, dict[str, Any]], dict[int, BaseException]]:
         missing = [
@@ -348,14 +355,16 @@ class S3Archive:
             thread_name_prefix="transhooter-s3-multipart",
         ) as executor:
             for part_number in missing:
-                _, _, part, checksum = intended[part_number]
+                plan = intended[part_number]
                 futures[part_number] = executor.submit(
                     self._upload_multipart_part,
                     key=key,
                     upload_id=upload_id,
                     part_number=part_number,
-                    part=part,
-                    checksum=checksum,
+                    body=body,
+                    byte_start=plan.byte_start,
+                    byte_end=plan.byte_end,
+                    checksum=plan.checksum,
                 )
             done, pending = wait(futures.values(), return_when=FIRST_EXCEPTION)
             if any(future.exception() is not None for future in done):
@@ -380,7 +389,9 @@ class S3Archive:
         key: str,
         upload_id: str,
         part_number: int,
-        part: bytes,
+        body: bytes,
+        byte_start: int,
+        byte_end: int,
         checksum: str,
     ) -> dict[str, Any]:
         response: dict[str, Any] = self.client.upload_part(
@@ -388,7 +399,7 @@ class S3Archive:
             Key=key,
             UploadId=upload_id,
             PartNumber=part_number,
-            Body=part,
+            Body=body[byte_start:byte_end],
             ChecksumCRC64NVME=checksum,
         )
         return response
@@ -465,16 +476,16 @@ class S3Archive:
 
     def _journal_intended_parts(
         self, database: sqlite3.Connection, key: str, body: bytes
-    ) -> dict[int, tuple[int, int, bytes, str]]:
-        intended: dict[int, tuple[int, int, bytes, str]] = {}
+    ) -> dict[int, _MultipartPartPlan]:
+        intended: dict[int, _MultipartPartPlan] = {}
         database.execute("BEGIN IMMEDIATE")
         try:
             for start in range(0, len(body), self.PART_SIZE):
                 part_number = start // self.PART_SIZE + 1
                 end = min(start + self.PART_SIZE, len(body))
-                part = body[start:end]
+                part = memoryview(body)[start:end]
                 checksum = self._crc64nvme(part)
-                intended[part_number] = (start, end, part, checksum)
+                intended[part_number] = _MultipartPartPlan(start, end, checksum)
                 database.execute(
                     """
                     INSERT INTO multipart_parts(
@@ -486,7 +497,7 @@ class S3Archive:
                         byte_start = excluded.byte_start,
                         byte_end = excluded.byte_end
                     """,
-                    (key, part_number, checksum, len(part), start, end),
+                    (key, part_number, checksum, end - start, start, end),
                 )
             placeholders = ",".join("?" for _ in intended)
             database.execute(
@@ -505,21 +516,21 @@ class S3Archive:
     @staticmethod
     def _remote_parts_match(
         remote_parts: dict[int, dict[str, Any]],
-        intended: dict[int, tuple[int, int, bytes, str]],
+        intended: dict[int, _MultipartPartPlan],
     ) -> bool:
         if set(remote_parts) - set(intended):
             return False
         for number, remote in remote_parts.items():
-            _, _, part, checksum = intended[number]
+            plan = intended[number]
             if (
-                int(remote.get("Size", -1)) != len(part)
-                or remote.get("ChecksumCRC64NVME") != checksum
+                int(remote.get("Size", -1)) != plan.byte_end - plan.byte_start
+                or remote.get("ChecksumCRC64NVME") != plan.checksum
             ):
                 return False
         return True
 
     @staticmethod
-    def _crc64nvme(body: bytes) -> str:
+    def _crc64nvme(body: bytes | memoryview) -> str:
         crc = 0xFFFFFFFFFFFFFFFF
         polynomial = 0x9A6C9329AC4BC9B5
         for byte in body:
@@ -651,16 +662,6 @@ class S3Archive:
             database.execute("ROLLBACK")
             raise
         database.execute("COMMIT")
-
-    def _verify_multipart_size(self, record: ObjectRecord, expected_size: int) -> None:
-        attributes = self.client.get_object_attributes(
-            Bucket=self.bucket,
-            Key=record.key,
-            VersionId=record.version_id,
-            ObjectAttributes=["ObjectSize", "Checksum"],
-        )
-        if int(attributes.get("ObjectSize", -1)) != expected_size:
-            raise RuntimeError("multipart object attribute size mismatch")
 
     @staticmethod
     def _now_ms() -> int:

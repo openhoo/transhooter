@@ -58,6 +58,10 @@ const lifecycleSchema = z.object({
 });
 const finalizationSchema = lifecycleRequestSchema.extend({
   shutdownAtMs: z.number().int().nonnegative(),
+  resourceGeneration: z.number().int().nonnegative().optional(),
+});
+const forcedReconciliationSchema = lifecycleRequestSchema.extend({
+  resourceGeneration: z.number().int().nonnegative(),
 });
 const cancellationSchema = z.object({
   consultationId: uuid,
@@ -132,17 +136,22 @@ export class Coordinator {
       leaseMs: this.options.leaseMs,
       limit: this.options.batchSize,
     };
-    const [outbox, deadlines, staleReservations] = await Promise.all([
-      this.store.claimOutbox(claim),
-      this.store.claimDeadlines(claim),
-      this.store.claimStaleReservations(claim),
-      this.store.preparePendingArchiveDeletes(claim),
-    ]);
+    const [outboxResult, deadlinesResult, staleReservationsResult, archiveDeletesResult] =
+      await Promise.allSettled([
+        this.store.claimOutbox(claim),
+        this.store.claimDeadlines(claim),
+        this.store.claimStaleReservations(claim),
+        this.store.preparePendingArchiveDeletes(claim),
+      ] as const);
+    const outbox = settledValue(outboxResult);
+    const deadlines = settledValue(deadlinesResult);
+    const staleReservations = settledValue(staleReservationsResult);
+    settledValue(archiveDeletesResult);
     recordWorkClaimed("coordinator_outbox", outbox.length);
     recordWorkClaimed("coordinator_deadline", deadlines.length);
     recordWorkClaimed("coordinator_stale_reservation", staleReservations.length);
 
-    await Promise.all([
+    await settledBarrier([
       ...outbox.map(async (item) => this.consumeOutbox(item)),
       ...deadlines.map(async (deadline) =>
         this.durableOperation(
@@ -218,6 +227,18 @@ export class Coordinator {
       );
       return;
     }
+    if (item.type === "archive.reconciliation_forced") {
+      const reconciliation = forcedReconciliationSchema.parse(item.payload);
+      await this.plan(
+        reconciliation.consultationId,
+        reconciliation.generation,
+        "ARCHIVE_RECONCILE",
+        reconciliation.subjectId,
+        { forceIncomplete: true, resourceGeneration: reconciliation.resourceGeneration },
+        "archive-reconcile",
+      );
+      return;
+    }
     if (item.type === "consultation.cancelled") {
       await this.durableOperation("consultation", "cancel", async () =>
         this.handleCancellation(item),
@@ -242,7 +263,9 @@ export class Coordinator {
     }
     if (item.type === "worker.failure" || item.type === "egress.failure") {
       await this.handleWorkerOrEgressFailure(item);
+      return;
     }
+    throw new Error(`unsupported durable outbox topic: ${item.type}`);
   }
 
   private async handleHeartbeat(item: OutboxItem): Promise<void> {
@@ -369,7 +392,7 @@ export class Coordinator {
     await this.scheduleDrainEffects(
       lifecycle.consultationId,
       lifecycle.generation,
-      lifecycle.generation,
+      lifecycle.resourceGeneration ?? lifecycle.generation,
       status.id,
       lifecycle.shutdownAtMs,
     );
@@ -577,7 +600,6 @@ export class Coordinator {
       {
         participantIdentity: capture.participantIdentity,
         outputPrefix: `v1/meetings/${item.aggregateId}/media/participants/${capture.participantIdentity}/${String(item.generation)}`,
-        segmentedHls: true,
       },
     );
   }
@@ -712,7 +734,6 @@ export class Coordinator {
     await this.plan(event.consultationId, generation, "PARTICIPANT_EGRESS", participantId, {
       participantIdentity: participantId,
       outputPrefix: `v1/meetings/${event.consultationId}/media/participants/${participantId}/${String(generation)}`,
-      segmentedHls: true,
     });
   }
 
@@ -1168,6 +1189,23 @@ export class Coordinator {
     await this.store.scheduleEffect(effect);
   }
 }
+function settledValue<T>(result: PromiseSettledResult<T>): T {
+  if (result.status === "rejected") {
+    throw result.reason;
+  }
+  return result.value;
+}
+
+async function settledBarrier(operations: readonly Promise<unknown>[]): Promise<void> {
+  const results = await Promise.allSettled(operations);
+  const failure = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failure) {
+    throw failure.reason;
+  }
+}
+
 const OUTBOX_OPERATIONS: Readonly<Record<string, string>> = {
   "worker.heartbeat": "heartbeat",
   "livekit.webhook.verified": "webhook",
@@ -1181,6 +1219,7 @@ const OUTBOX_OPERATIONS: Readonly<Record<string, string>> = {
   "translation.same-language-bypass": "same_language_bypass",
   "worker.failure": "worker_failure",
   "egress.failure": "egress_failure",
+  "archive.reconciliation_forced": "archive_reconcile_forced",
 };
 
 function outboxOperation(topic: string): string {

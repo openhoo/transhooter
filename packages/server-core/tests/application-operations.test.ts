@@ -391,6 +391,36 @@ describe("PrismaConsultationRepository listing", () => {
     });
   });
 });
+describe("PrismaConsultationRepository idempotency lookup", () => {
+  it("loads the aggregate in one relational query", async () => {
+    const row = consultationListRow("00000000-0000-4000-8000-000000000042");
+    const findFirst = mock(async () => row);
+    const transactionClient = {
+      consultation: { findFirst },
+    } as unknown as Prisma.TransactionClient;
+    const repository = new PrismaConsultationRepository({} as PrismaClient);
+
+    const consultation = await repository.findByCreationIdempotencyKey(
+      LIST_USER_ID,
+      "00000000-0000-4000-8000-000000000043",
+      new TransactionHandle(transactionClient),
+    );
+
+    expect(findFirst).toHaveBeenCalledTimes(1);
+    expect(findFirst).toHaveBeenCalledWith({
+      where: {
+        employeeUserId: LIST_USER_ID,
+        creationIdempotencyKey: "00000000-0000-4000-8000-000000000043",
+      },
+      include: {
+        archive: { select: { state: true } },
+        participants: { orderBy: { role: "asc" } },
+      },
+    });
+    expect(consultation?.id).toBe(row.id);
+    expect(consultation?.participants.map(({ role }) => role)).toEqual(["employee", "customer"]);
+  });
+});
 
 describe("ApplicationOperations typed views", () => {
   it("returns enabled and disabled current profile directions", async () => {
@@ -404,6 +434,24 @@ describe("ApplicationOperations typed views", () => {
     expect(rows.every((row) => row.profileId === "00000000-0000-4000-8000-000000000010")).toBe(
       true,
     );
+  });
+
+  it("normalizes consultation option rows before application presentation", async () => {
+    const { operations } = createOperations([ENABLED_DIRECTION_ROW]);
+
+    await expect(operations.consultationOptions("google-eu")).resolves.toEqual([
+      {
+        id: ENABLED_DIRECTION_ROW.id,
+        profileId: ENABLED_DIRECTION_ROW.profile_id,
+        sourceLocale: "en-US",
+        targetLocale: "de-DE",
+        mode: "translated",
+        snapshot: { stt: {} },
+        profileName: "google-eu",
+        revision: 4,
+        freshUntil: PROFILE_FRESH_UNTIL,
+      },
+    ]);
   });
 
   it("accepts heartbeats only for an active unfenced reservation and job epoch", async () => {
@@ -448,7 +496,7 @@ describe("ApplicationOperations typed views", () => {
     expect(detail.providerAttemptGroups[0]?.attemptIds).toEqual(detail.providerAttemptIds);
   });
 
-  it("lists finalized archive objects with download identity and integrity evidence", async () => {
+  it("lists finalized archive objects with normalized download identity and integrity evidence", async () => {
     const objectId = "00000000-0000-4000-8000-000000000023";
     const { queryRaw, operations } = createOperations([
       {
@@ -479,17 +527,38 @@ describe("ApplicationOperations typed views", () => {
       objects: [
         {
           id: objectId,
-          object_class: "final_inventory",
+          objectClass: "final_inventory",
           key: "v1/meetings/consultation/inventory/final.json",
-          content_type: "application/json",
+          contentType: "application/json",
           size: "128",
           sha256: "a".repeat(64),
-          s3_checksum: "checksum-1",
-          version_id: "version-1",
+          s3Checksum: "checksum-1",
+          versionId: "version-1",
         },
       ],
       cursor: null,
     });
+  });
+
+  it("loads provider profile metadata without capability snapshots", async () => {
+    const { queryRaw, operations } = createOperations([
+      {
+        id: "00000000-0000-4000-8000-000000000010",
+        name: "google-eu",
+        current_revision: 4,
+      },
+    ]);
+
+    await expect(operations.providerProfileMetadata()).resolves.toEqual([
+      {
+        id: "00000000-0000-4000-8000-000000000010",
+        name: "google-eu",
+        revision: 4,
+      },
+    ]);
+    const query = inspectSql(queryRaw.mock.calls[0]?.[0]).text;
+    expect(query).toContain("SELECT p.id,p.name,p.current_revision");
+    expect(query).not.toContain("l.snapshot");
   });
 
   it("persists a fenced immutable provider terminal and accepts only an exact replay", async () => {

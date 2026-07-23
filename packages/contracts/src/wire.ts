@@ -14,15 +14,6 @@ export type InterpretationTrackName = z.infer<typeof InterpretationTrackNameSche
 export const CaptionFinalitySchema = z.enum(["provisional", "final"]);
 export type CaptionFinality = z.infer<typeof CaptionFinalitySchema>;
 
-export const ProviderOutcomeSchema = z.enum(["succeeded", "failed", "cancelled"]);
-export type ProviderOutcome = z.infer<typeof ProviderOutcomeSchema>;
-
-export const ProviderRetryAdviceSchema = z.enum(["never", "retry_after", "unspecified"]);
-export type ProviderRetryAdvice = z.infer<typeof ProviderRetryAdviceSchema>;
-
-export const ProviderRetryActionSchema = z.enum(["retry", "do_not_retry", "degrade"]);
-export type ProviderRetryAction = z.infer<typeof ProviderRetryActionSchema>;
-
 export const CaptionPacketSchema = z
   .object({
     schemaVersion: z.literal(1),

@@ -16,6 +16,9 @@ export async function runControlScenarios(ctx, proof) {
     resetAuthenticationThrottle,
     raceArchiveHoldAndDelete,
     consultationEvidence,
+    consultationStatus,
+    effectEvidence,
+    settlementObservation,
     isCleanSettlement,
     controlWorkerBaselines,
     runEffectBoundaryCrash,
@@ -58,15 +61,15 @@ export async function runControlScenarios(ctx, proof) {
     const crashedEffect = await waitFor(
       "persisted ROOM_CREATE crash owner",
       async () => {
-        const evidence = await consultationEvidence(crashRun.consultationId);
-        const effect = evidence.effects.find(
-          (candidate) =>
-            candidate.kind === "ROOM_CREATE" &&
-            candidate.state === "calling" &&
-            candidate.attempts === 1 &&
-            typeof candidate.leaseOwner === "string",
+        const effects = await effectEvidence(crashRun.consultationId, "ROOM_CREATE");
+        return (
+          effects.find(
+            (candidate) =>
+              candidate.state === "calling" &&
+              candidate.attempts === 1 &&
+              typeof candidate.leaseOwner === "string",
+          ) ?? null
         );
-        return effect ?? null;
       },
       30_000,
     );
@@ -108,14 +111,15 @@ export async function runControlScenarios(ctx, proof) {
         ) {
           return null;
         }
-        const evidence = await consultationEvidence(crashRun.consultationId);
-        const scopedEffect = evidence.effects.find(
+        const [status, effects] = await Promise.all([
+          consultationStatus(crashRun.consultationId),
+          effectEvidence(crashRun.consultationId, "ROOM_CREATE"),
+        ]);
+        const scopedEffect = effects.find(
           (effect) =>
-            effect.kind === "ROOM_CREATE" &&
-            Number(effect.generation) === Number(evidence.generation) &&
-            effect.attempts >= 1,
+            Number(effect.generation) === Number(status.generation) && effect.attempts >= 1,
         );
-        return scopedEffect ? { ...observation, generation: evidence.generation } : null;
+        return scopedEffect ? { ...observation, generation: status.generation } : null;
       },
       30_000,
     );
@@ -235,14 +239,10 @@ export async function runControlScenarios(ctx, proof) {
     const held = await waitFor(
       "first replica held after remote ROOM_CREATE success",
       async () => {
-        const evidence = await consultationEvidence(run.consultationId);
-        const candidate = evidence.effects.find(
-          (effect) =>
-            effect.kind === "ROOM_CREATE" &&
-            effect.state === "calling" &&
-            typeof effect.leaseOwner === "string",
+        const effects = await effectEvidence(run.consultationId, "ROOM_CREATE");
+        const candidate = effects.find(
+          (effect) => effect.state === "calling" && typeof effect.leaseOwner === "string",
         );
-        if (!candidate) return null;
         try {
           await stat(`${faultFile}.${run.consultationId}.ROOM_CREATE.remote-success-owner`);
           return candidate;
@@ -273,8 +273,8 @@ export async function runControlScenarios(ctx, proof) {
     const stolen = await waitFor(
       "designated successor replica ownership of expired effect lease",
       async () => {
-        const evidence = await consultationEvidence(run.consultationId);
-        const candidate = evidence.effects.find((effect) => effect.id === held.id);
+        const effects = await effectEvidence(run.consultationId, "ROOM_CREATE");
+        const candidate = effects.find((effect) => effect.id === held.id);
         return candidate?.attempts >= 2 &&
           (candidate.leaseOwner === successor.workerId ||
             (candidate.state === "done" && typeof candidate.result?.remoteId === "string"))
@@ -290,15 +290,16 @@ export async function runControlScenarios(ctx, proof) {
         `stale-owner fencing consultation failed: ${completed.stderr}\n${completed.stdout}`,
       );
     }
-    const settled = await waitFor(
+    await waitFor(
       "stale-owner fencing clean settlement",
       async () => {
-        const evidence = await consultationEvidence(run.consultationId);
-        return isCleanSettlement(evidence) ? evidence : null;
+        const observation = await settlementObservation(run.consultationId);
+        return isCleanSettlement(observation) ? observation : null;
       },
       120_000,
     );
-    const outcome = settled.effects.find(
+    const settledEvidence = await consultationEvidence(run.consultationId);
+    const outcome = settledEvidence.effects.find(
       (effect) =>
         effect.id === held.id &&
         effect.state === "done" &&

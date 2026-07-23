@@ -3,6 +3,10 @@ import type {
   ArchiveDetail,
   ArchiveDetailProof,
   ArchiveObjectPage,
+  ArchiveObjectRow,
+  ArchivePresentation,
+  ConsultationOptionRow,
+  ProviderProfileMetadata,
   StaffPrincipal,
 } from "./application-operations";
 import { DomainError, type UUID } from "./domain/model";
@@ -61,8 +65,29 @@ function mapAdminLanguage(row: Record<string, unknown>): AdminLanguageRow {
     enabled: Boolean(row.enabled),
   };
 }
+function mapConsultationOption(row: Record<string, unknown>): ConsultationOptionRow {
+  return {
+    id: row.id as UUID,
+    profileId: row.profile_id as UUID,
+    sourceLocale: String(row.source_locale),
+    targetLocale: String(row.target_locale),
+    mode: row.mode as ConsultationOptionRow["mode"],
+    snapshot: row.snapshot,
+    profileName: String(row.profile_name),
+    revision: Number(row.revision),
+    freshUntil: row.fresh_until as Date,
+  };
+}
 
-type ArchiveObjectRow = {
+function mapProviderProfileMetadata(row: Record<string, unknown>): ProviderProfileMetadata {
+  return {
+    id: row.id as UUID,
+    name: String(row.name),
+    revision: Number(row.current_revision),
+  };
+}
+
+type RawArchiveObjectRow = {
   id: UUID;
   object_class: string;
   key: string;
@@ -73,32 +98,21 @@ type ArchiveObjectRow = {
   version_id: string;
 };
 
-interface ArchiveObjectPresentation extends Record<string, unknown> {
-  id: UUID;
-  object_class: string;
-  key: string;
-  content_type: string;
-  size: string;
-  sha256: string;
-  s3_checksum: string;
-  version_id: string;
-}
-
-function mapArchiveObject(row: ArchiveObjectRow): ArchiveObjectPresentation {
+function mapArchiveObject(row: RawArchiveObjectRow): ArchiveObjectRow {
   return {
     id: row.id,
-    object_class: row.object_class,
+    objectClass: row.object_class,
     key: row.key,
-    content_type: row.content_type,
+    contentType: row.content_type,
     size: row.size.toString(),
     sha256: row.sha256,
-    s3_checksum: row.s3_checksum,
-    version_id: row.version_id,
+    s3Checksum: row.s3_checksum,
+    versionId: row.version_id,
   };
 }
 
 function presentArchiveObjectPage(
-  rows: readonly ArchiveObjectPresentation[],
+  rows: readonly ArchiveObjectRow[],
   limit: number,
 ): ArchiveObjectPage {
   const hasMore = rows.length > limit;
@@ -115,11 +129,18 @@ export class ApplicationOperationsQueries {
     private readonly storage: ObjectStoragePort,
   ) {}
 
-  async consultationOptions(profileId: string): Promise<readonly Record<string, unknown>[]> {
+  async consultationOptions(profileId: string): Promise<readonly ConsultationOptionRow[]> {
     const rows = await this.database.$queryRaw<Record<string, unknown>[]>(
       Prisma.sql`SELECT l.id,p.id AS profile_id,l.source_locale,l.target_locale,l.mode,l.snapshot,p.name AS profile_name,l.revision,l.fresh_until FROM language_capabilities l JOIN provider_profiles p ON p.id=l.profile_id WHERE (p.id::text=${profileId} OR p.name=${profileId}) AND p.enabled AND l.enabled AND l.revision=p.current_revision AND l.fresh_until>now() ORDER BY l.source_locale,l.target_locale`,
     );
-    return mapDatabaseRows(rows);
+    return rows.map(mapConsultationOption);
+  }
+
+  async providerProfileMetadata(): Promise<readonly ProviderProfileMetadata[]> {
+    const rows = await this.database.$queryRaw<Record<string, unknown>[]>(
+      Prisma.sql`SELECT p.id,p.name,p.current_revision FROM provider_profiles p WHERE p.enabled AND EXISTS (SELECT 1 FROM language_capabilities l WHERE l.profile_id=p.id AND l.enabled AND l.revision=p.current_revision AND l.fresh_until>now()) ORDER BY p.name,p.id`,
+    );
+    return rows.map(mapProviderProfileMetadata);
   }
 
   async consultationRoom(consultationId: UUID, userId: UUID): Promise<Record<string, unknown>> {
@@ -172,10 +193,22 @@ export class ApplicationOperationsQueries {
     limit: number,
   ): Promise<ArchiveObjectPage> {
     const boundedLimit = Math.max(1, Math.min(limit, 100));
-    const rows = await this.database.$queryRaw<ArchiveObjectRow[]>(
+    const rows = await this.database.$queryRaw<RawArchiveObjectRow[]>(
       Prisma.sql`SELECT o.id,o.object_class,o.key,o.content_type,o.size,o.sha256,o.s3_checksum,o.version_id FROM archive_objects o JOIN archives a ON a.id=o.archive_id JOIN final_inventories f ON f.archive_id=a.id LEFT JOIN consultation_participants p ON p.consultation_id=a.consultation_id AND p.user_id=${principal.userId} AND p.role='employee' WHERE (a.id=${routeId} OR a.consultation_id=${routeId}) AND a.state IN ('complete','incomplete') AND (${principal.role}='admin' OR p.id IS NOT NULL) AND (${cursor}::uuid IS NULL OR o.id>${cursor}::uuid) ORDER BY o.id LIMIT ${boundedLimit + 1}`,
     );
     return presentArchiveObjectPage(rows.map(mapArchiveObject), boundedLimit);
+  }
+  async archivePresentation(
+    principal: StaffPrincipal,
+    routeId: UUID,
+    cursor: string | null,
+    limit: number,
+  ): Promise<ArchivePresentation> {
+    const archive = await this.archiveGet(principal, routeId);
+    return {
+      archive,
+      objectPage: await this.archiveObjects(principal, archive.id, cursor, limit),
+    };
   }
 
   async archiveDownload(principal: StaffPrincipal, routeId: UUID, objectId: UUID): Promise<string> {

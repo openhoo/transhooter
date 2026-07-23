@@ -11,17 +11,20 @@ from jsonschema.exceptions import ValidationError
 
 from transhooter_worker.adapters.spool import SpoolUnavailable
 from transhooter_worker.domain.models import StageCapabilities
+from transhooter_worker.runtime.consultation import SourceTrackTimeline
 from transhooter_worker.runtime.job import (
     InitializationContext,
     QuotaGateLifecycle,
-    SourceTrackTimeline,
-    SttStage,
     _heartbeat_loop,
     _reported_preflight,
     _supervise_runtime,
     _validate_frozen_stage,
-    _validated_job_metadata,
     consultation_entrypoint,
+)
+from transhooter_worker.runtime.job_metadata import (
+    SttStage,
+    _validated_job_metadata,
+    _worker_job_metadata_validator,
 )
 
 
@@ -348,6 +351,128 @@ async def test_initialization_cleanup_stops_sessions_before_releasing_and_closin
         "gate:close",
         "control:report",
     ]
+
+
+@pytest.mark.asyncio
+async def test_initialization_failure_reports_once_and_preserves_cleanup_failures() -> None:
+    events: list[str] = []
+    initialization_error = RuntimeError("initialization failed")
+
+    class Session:
+        async def cancel(self) -> None:
+            events.append("session:cancel")
+            raise RuntimeError("session cleanup failed")
+
+    class ProviderSet:
+        async def aclose(self) -> None:
+            events.append("provider:close")
+            raise RuntimeError("provider cleanup failed")
+
+    class QuotaLifecycle:
+        async def cleanup(self) -> None:
+            events.append("quota:cleanup")
+            raise RuntimeError("quota cleanup failed")
+
+    class Control:
+        async def report_failure(self, report: dict[str, object]) -> None:
+            events.append("control:report")
+            assert report["kind"] == "RuntimeError"
+            assert report["message"] == "initialization failed"
+            raise RuntimeError("report failed")
+
+    initialization = InitializationContext(
+        SimpleNamespace(room=SimpleNamespace()),  # type: ignore[arg-type]
+        Control(),  # type: ignore[arg-type]
+        {uuid4(): Session()},  # type: ignore[dict-item]
+        {},
+        QuotaLifecycle(),  # type: ignore[arg-type]
+        {},
+        [ProviderSet()],  # type: ignore[list-item]
+    )
+
+    async def fail_initialization() -> None:
+        raise initialization_error
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await initialization.await_effect(fail_initialization())
+
+    assert raised.value.exceptions[0] is initialization_error
+    cleanup_group = raised.value.exceptions[1]
+    assert isinstance(cleanup_group, BaseExceptionGroup)
+    assert [str(error) for error in cleanup_group.exceptions] == [
+        "session cleanup failed",
+        "provider cleanup failed",
+        "quota cleanup failed",
+        "report failed",
+    ]
+    assert events == [
+        "session:cancel",
+        "provider:close",
+        "quota:cleanup",
+        "control:report",
+    ]
+
+    repeated = await asyncio.gather(
+        initialization.cleanup(RuntimeError("ignored")),
+        initialization.cleanup(RuntimeError("also ignored")),
+        return_exceptions=True,
+    )
+    assert all(isinstance(result, BaseExceptionGroup) for result in repeated)
+    assert events.count("control:report") == 1
+
+
+def test_metadata_validator_is_cached_per_resolved_schema_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    schema_path = Path(__file__).parents[3] / "packages/contracts/generated/contracts.schema.json"
+    first_path = tmp_path / "first.json"
+    second_path = tmp_path / "second.json"
+    schema = schema_path.read_text("utf-8")
+    first_path.write_text(schema, "utf-8")
+    second_path.write_text(schema, "utf-8")
+    _worker_job_metadata_validator.cache_clear()
+
+    monkeypatch.setenv("CONTRACTS_SCHEMA_FILE", str(first_path))
+    _validated_job_metadata(json.dumps(job_metadata_payload()))
+    _validated_job_metadata(json.dumps(job_metadata_payload()))
+    first_cache = _worker_job_metadata_validator.cache_info()
+
+    monkeypatch.setenv("CONTRACTS_SCHEMA_FILE", str(second_path))
+    _validated_job_metadata(json.dumps(job_metadata_payload()))
+    second_cache = _worker_job_metadata_validator.cache_info()
+
+    assert first_cache.hits == 1
+    assert first_cache.misses == 1
+    assert second_cache.misses == 2
+    assert second_cache.currsize == 2
+
+
+@pytest.mark.asyncio
+async def test_initialization_cleanup_reports_after_unpublish_setup_failure() -> None:
+    events: list[str] = []
+
+    class Participant:
+        def unpublish_track(self, _sid: str) -> object:
+            events.append("track:unpublish")
+            raise RuntimeError("unpublish setup failed")
+
+    class Control:
+        async def report_failure(self, _report: dict[str, object]) -> None:
+            events.append("control:report")
+
+    initialization = InitializationContext(
+        SimpleNamespace(room=SimpleNamespace(local_participant=Participant())),  # type: ignore[arg-type]
+        Control(),  # type: ignore[arg-type]
+        {},
+        {"track": (object(), SimpleNamespace(sid="publication"))},  # type: ignore[dict-item]
+        QuotaGateLifecycle(),
+        {},
+    )
+
+    with pytest.raises(RuntimeError, match="unpublish setup failed"):
+        await initialization.cleanup(RuntimeError("initialization failed"))
+
+    assert events == ["track:unpublish", "control:report"]
 
 
 def test_metadata_is_validated_against_generated_contract(

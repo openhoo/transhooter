@@ -25,7 +25,7 @@ const SESSION_TTL_MS = 12 * 60 * 60_000;
 export interface MagicLinkRequest {
   email: string;
   ip: string;
-  purpose: MagicLinkPurpose;
+  purpose: Extract<MagicLinkPurpose, "sign_in" | "consultation_invite">;
   consultationId?: UUID;
   sessionId?: UUID;
   publicBaseUrl: string;
@@ -88,10 +88,6 @@ export class AuthService {
   ) {}
 
   async requestMagicLink(input: MagicLinkRequest): Promise<void> {
-    if (input.purpose === "archive_delete_reauth") {
-      return;
-    }
-
     const now = this.clock.now();
     let email: string;
     try {
@@ -292,17 +288,15 @@ export class AuthService {
     }
 
     const tokenHash = this.hasher.sha256(token);
-    const session = await this.repository.findSessionByTokenHash(tokenHash);
-    if (!session || session.expiresAt <= this.clock.now()) {
+    const authenticated = await this.repository.findAuthenticatedSessionByTokenHash(
+      tokenHash,
+      this.clock.now(),
+    );
+    if (!authenticated) {
       throw new DomainError("UNAUTHENTICATED");
     }
 
-    const user = await this.repository.findUserById(session.userId);
-    if (!user) {
-      throw new DomainError("UNAUTHENTICATED");
-    }
-
-    return { session, user };
+    return authenticated;
   }
 
   async authenticateMutation(

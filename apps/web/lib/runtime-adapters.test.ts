@@ -55,11 +55,6 @@ mock.module("livekit-server-sdk", () => ({
     }
   },
   authorizeHeader: () => "authorization",
-  EgressClient: class {
-    constructor(url: string) {
-      liveKitClientUrls.push(url);
-    }
-  },
   RoomServiceClient: class {
     constructor(url: string) {
       liveKitClientUrls.push(url);
@@ -103,7 +98,6 @@ const config = {
   publicUrl: "https://app.example.test",
   internalJwtIssuer: null,
   internalJwtAudience: null,
-  internalServiceAccountToken: null,
   podNamespace: null,
   trustedClientIpHeader: null,
 } satisfies WebConfig;
@@ -158,7 +152,7 @@ describe("LiveKit internal API URLs", () => {
         }),
       });
 
-      expect(liveKitClientUrls).toEqual([sdkUrl, sdkUrl]);
+      expect(liveKitClientUrls).toEqual([sdkUrl]);
     });
   }
 

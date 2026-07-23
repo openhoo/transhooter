@@ -9,8 +9,10 @@ import {
   isTransientPollError,
   pollUntil,
   restartCountIncremented,
+  resumedSelectionFullyComplete,
   runWithDeadline,
   settlementProblems,
+  shouldEmitFailureSmokeProof,
   workerCrashMatches,
 } from "./harness-contracts.mjs";
 
@@ -133,6 +135,75 @@ describe("failure-smoke proof contracts", () => {
     ).toBe(false);
   });
 
+  it("skips capability refresh only for a fully completed resumed selection", () => {
+    const selectedScenarios = new Set(["recovery-hold", "remote-success-crash"]);
+    expect(
+      resumedSelectionFullyComplete({
+        resumeRequested: true,
+        selectedScenarios,
+        completedScenarios: new Set(selectedScenarios),
+      }),
+    ).toBe(true);
+    expect(
+      resumedSelectionFullyComplete({
+        resumeRequested: false,
+        selectedScenarios,
+        completedScenarios: new Set(selectedScenarios),
+      }),
+    ).toBe(false);
+    expect(
+      resumedSelectionFullyComplete({
+        resumeRequested: true,
+        selectedScenarios,
+        completedScenarios: new Set(["recovery-hold"]),
+      }),
+    ).toBe(false);
+    expect(
+      resumedSelectionFullyComplete({
+        resumeRequested: true,
+        selectedScenarios: new Set(),
+        completedScenarios: new Set(),
+      }),
+    ).toBe(false);
+  });
+  it("retains proof when a resumed selection is already fully complete", async () => {
+    expect(
+      shouldEmitFailureSmokeProof({
+        resumedSelectionAlreadyComplete: true,
+        scenarioCount: 0,
+      }),
+    ).toBe(false);
+    expect(
+      shouldEmitFailureSmokeProof({
+        resumedSelectionAlreadyComplete: false,
+        scenarioCount: 1,
+      }),
+    ).toBe(true);
+    expect(() =>
+      shouldEmitFailureSmokeProof({
+        resumedSelectionAlreadyComplete: false,
+        scenarioCount: 0,
+      }),
+    ).toThrow("failure-smoke produced no scenario evidence");
+
+    const entrypoint = await readFile(new URL("./failure-smoke.mjs", import.meta.url), "utf8");
+    const reapIndex = entrypoint.indexOf("await reapExpiredOwners()");
+    const ownerLeaseIndex = entrypoint.indexOf("await persistOwnerLease()", reapIndex);
+    const proofDecisionIndex = entrypoint.indexOf("shouldEmitFailureSmokeProof({", ownerLeaseIndex);
+    const emitIndex = entrypoint.indexOf(
+      "await emitProof(ctx, proof, startedAt)",
+      proofDecisionIndex,
+    );
+    const finalizeIndex = entrypoint.indexOf("await finalizeHarness(ctx", emitIndex);
+
+    expect(reapIndex).toBeGreaterThan(-1);
+    expect(ownerLeaseIndex).toBeGreaterThan(reapIndex);
+    expect(proofDecisionIndex).toBeGreaterThan(ownerLeaseIndex);
+    expect(emitIndex).toBeGreaterThan(proofDecisionIndex);
+    expect(finalizeIndex).toBeGreaterThan(emitIndex);
+    expect(entrypoint).toContain("retaining the existing proof artifact");
+  });
+
   it("does not release the hold/delete race before both lock levels visibly block", () => {
     expect(
       archiveLockHierarchyBlocked([
@@ -216,11 +287,51 @@ describe("failure-smoke proof contracts", () => {
     const second = (async () => {
       events.push("second-ready");
       await barrier.arrive();
+
       events.push("second-released");
     })();
     await Promise.all([first, second]);
     expect(events.slice(0, 2)).toEqual(["first-ready", "second-ready"]);
     expect(events.slice(2).sort()).toEqual(["first-released", "second-released"]);
+  });
+
+  it("keeps final proof and checkpoint settlement on full consultation evidence", async () => {
+    const settlement = await readFile(new URL("./harness/settlement.mjs", import.meta.url), "utf8");
+    const runtime = await readFile(new URL("./harness/runtime.mjs", import.meta.url), "utf8");
+    const entrypoint = await readFile(new URL("./failure-smoke.mjs", import.meta.url), "utf8");
+
+    expect(settlement).toContain("return await consultationEvidence(consultationId)");
+    expect(settlement).toContain("const evidence = await consultationEvidence(run.consultationId)");
+    expect(runtime).toContain("clean: isCleanSettlement(await consultationEvidence(id))");
+    expect(entrypoint).toContain("await reapExpiredOwners()");
+    expect(
+      entrypoint.indexOf(
+        "if (!resumedSelectionAlreadyComplete) await refreshFixtureCapabilities()",
+      ),
+    ).toBeLessThan(entrypoint.indexOf("await reapExpiredOwners()"));
+  });
+
+  it("observes Participant Egress denial and admission barriers in one SQL snapshot", async () => {
+    const settlement = await readFile(new URL("./harness/settlement.mjs", import.meta.url), "utf8");
+    const provider = await readFile(
+      new URL("./harness/scenarios/provider.mjs", import.meta.url),
+      "utf8",
+    );
+    const helperStart = settlement.indexOf("async function participantEgressDenialEvidence");
+    const helperEnd = settlement.indexOf("async function providerAttemptEvidence", helperStart);
+    const helper = settlement.slice(helperStart, helperEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helperEnd).toBeGreaterThan(helperStart);
+    expect(helper).toContain("SELECT c.admission_fenced_at");
+    expect(helper).toContain("AS publication_grants");
+    expect(helper).toContain("AS participant_grant_effects");
+    expect(helper).toContain("AS capture_ready_packets");
+    expect(helper).toContain("AS denied_effect");
+    expect(helper).toContain("effect.effect_kind='PARTICIPANT_EGRESS'");
+    expect(provider).toContain("await participantEgressDenialEvidence(deniedConsultationId)");
+    expect(provider).toContain("admissionBarrierEvidence: deniedEvidence");
+    expect(provider).not.toContain('effectEvidence(deniedConsultationId, "PARTICIPANT_EGRESS")');
   });
 
   it("accepts exactly one admitted archive operation with matching durable outcome", () => {

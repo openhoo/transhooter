@@ -33,6 +33,10 @@ export interface SessionRecord {
   reauthenticatedAt: Instant | null;
   reauthConsultationId: UUID | null;
 }
+export interface AuthenticatedSessionRecord {
+  session: SessionRecord;
+  user: UserRecord;
+}
 
 export interface MagicLinkRecord {
   id: UUID;
@@ -81,7 +85,10 @@ export interface AuthRepository extends TransactionManager {
     displayName: string,
     createdAt: Instant,
   ): Promise<UserRecord>;
-  findSessionByTokenHash(hash: string): Promise<SessionRecord | null>;
+  findAuthenticatedSessionByTokenHash(
+    hash: string,
+    now: Instant,
+  ): Promise<AuthenticatedSessionRecord | null>;
   getOrCreateActiveMagicLink(
     identity: MagicLinkIdentity,
     candidate: MagicLinkCandidate,
@@ -147,12 +154,6 @@ export interface ConsultationRepository extends TransactionManager {
     value: Consultation,
     employeeUserId: UUID,
     creationIdempotencyKey: UUID,
-    tx: Transaction,
-  ): Promise<boolean>;
-  isCurrentEgress(
-    consultationId: UUID,
-    generation: number,
-    egressId: string,
     tx: Transaction,
   ): Promise<boolean>;
   resolveCurrentEgressSubject(
@@ -350,27 +351,6 @@ export interface LiveKitTokenPort {
       canSubscribe: true;
     };
   }): Promise<string>;
-}
-
-export interface EgressPort {
-  startRoomComposite(input: {
-    roomName: string;
-    outputPrefix: string;
-    layoutUrl: string;
-    requestIdentity: string;
-  }): Promise<{ egressId: string; state: string }>;
-  startParticipant(input: {
-    roomName: string;
-    identity: UUID;
-    outputPrefix: string;
-    requestIdentity: string;
-  }): Promise<{ egressId: string; state: string }>;
-  get(egressId: string): Promise<{
-    egressId: string;
-    state: string;
-    output: unknown;
-  }>;
-  stop(egressId: string): Promise<void>;
 }
 
 export interface DispatchPort {

@@ -2,8 +2,8 @@
 set -eu
 
 PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-. "$PROJECT_ROOT/deploy/scripts/compose-lib.sh"
 ROOT=$PROJECT_ROOT
+. "$ROOT/deploy/scripts/compose-lib.sh"
 
 fail() {
   printf 'wrapper contract failure: %s\n' "$1" >&2
@@ -110,6 +110,7 @@ case " $* " in
     done
     [ -z "${PUBLIC_BASE_URL:-}" ] || printf 'PUBLIC_BASE_URL=%s\n' "$PUBLIC_BASE_URL"
     [ -z "${PUBLIC_LIVEKIT_URL:-}" ] || printf 'PUBLIC_LIVEKIT_URL=%s\n' "$PUBLIC_LIVEKIT_URL"
+    [ -z "${S3_PUBLIC_ENDPOINT:-}" ] || printf 'S3_PUBLIC_ENDPOINT=%s\n' "$S3_PUBLIC_ENDPOINT"
     exit 0
     ;;
 esac
@@ -188,6 +189,42 @@ esac
 exit 0
 MOCK
 chmod +x "$TEST_DIRECTORY/bin/docker"
+
+COMPOSE_LIBRARY_ROOT="$TEST_DIRECTORY/compose-library-root"
+mkdir -p "$COMPOSE_LIBRARY_ROOT/deploy/scripts"
+cp "$ROOT/deploy/scripts/compose-lib.sh" "$COMPOSE_LIBRARY_ROOT/deploy/scripts/compose-lib.sh"
+resolved_root=$(
+  ROOT="$COMPOSE_LIBRARY_ROOT"
+  TRANSHOOTER_ROOT=/not/the/selected/root
+  . "$PROJECT_ROOT/deploy/scripts/compose-lib.sh"
+  printf '%s\n' "$ROOT"
+)
+[ "$resolved_root" = "$COMPOSE_LIBRARY_ROOT" ] ||
+  fail 'compose library replaced an explicit valid caller root'
+resolved_root=$(
+  ROOT=/not/a/repository
+  TRANSHOOTER_ROOT="$COMPOSE_LIBRARY_ROOT"
+  . "$PROJECT_ROOT/deploy/scripts/compose-lib.sh"
+  printf '%s\n' "$ROOT"
+)
+[ "$resolved_root" = "$COMPOSE_LIBRARY_ROOT" ] ||
+  fail 'compose library did not retain the TRANSHOOTER_ROOT direct-invocation fallback'
+
+: > "$CALLS"
+(
+  PATH="$TEST_DIRECTORY/bin:$PATH"
+  ROOT="$PROJECT_ROOT"
+  unset COMPOSE_COMMAND_AVAILABLE
+  . "$PROJECT_ROOT/deploy/scripts/compose-lib.sh"
+  select_compose_command
+  select_compose_command
+)
+[ "$(grep -c ' compose version ' "$CALLS")" -eq 1 ] ||
+  fail 'successful Docker Compose detection was not cached in the wrapper process'
+if [ "${WRAPPER_CONTRACT_SCOPE:-}" = compose-lib ]; then
+  printf 'compose library wrapper contracts passed\n'
+  exit 0
+fi
 cat > "$TEST_DIRECTORY/bin/mv" <<'MOCK'
 #!/bin/sh
 if [ "${MOCK_ARTIFACT_RENAME_FAILURE:-}" = true ]; then
@@ -521,7 +558,10 @@ printf '{}\n' > "$DEV_ROOT/.secrets/google-adc.json"
 : > "$CALLS"
 
 : > "$CALLS"
-if ! PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" --provider-profile fixture \
+if ! APP_ENV=test \
+  PROVIDER_PROFILE=fixture \
+  TRANSHOOTER_ROOT="$DEV_ROOT" \
+  PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" --provider-profile fixture \
   > "$TEST_DIRECTORY/dev-up-fixture-output" 2>&1; then
   fail 'fixture dev-up local-default wrapper run failed'
 fi
@@ -530,12 +570,15 @@ grep -F 'APP_ENV=test SMTP_URL= RTC_ADVERTISED_IP=10.254.231.10 S3_PUBLIC_ENDPOI
 
 : > "$CALLS"
 if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
+  APP_ENV=development \
+  PROVIDER_PROFILE=google-eu \
+  TRANSHOOTER_ROOT="$DEV_ROOT" \
   SMTP_URL=smtp://custom-mail:2525 \
   RTC_ADVERTISED_IP=192.0.2.44 \
   S3_PUBLIC_ENDPOINT=https://objects.dev.example \
   PUBLIC_BASE_URL=https://app.dev.example \
   PUBLIC_LIVEKIT_URL=wss://rtc.dev.example \
-  "$DEV_ROOT/scripts/dev-up" > "$TEST_DIRECTORY/dev-up-custom-output" 2>&1; then
+  "$DEV_ROOT/scripts/dev-up" --provider-profile google-eu > "$TEST_DIRECTORY/dev-up-custom-output" 2>&1; then
   fail 'dev-up configured-endpoint wrapper run failed'
 fi
 grep -F 'APP_ENV=development SMTP_URL=smtp://custom-mail:2525 RTC_ADVERTISED_IP=192.0.2.44 S3_PUBLIC_ENDPOINT=https://objects.dev.example PUBLIC_BASE_URL=https://app.dev.example PUBLIC_LIVEKIT_URL=wss://rtc.dev.example S3_KMS_KEY_ID=' \
@@ -543,8 +586,12 @@ grep -F 'APP_ENV=development SMTP_URL=smtp://custom-mail:2525 RTC_ADVERTISED_IP=
 
 : > "$CALLS"
 if ! PATH="$TEST_DIRECTORY/bin:$PATH" \
+  APP_ENV=development \
+  PROVIDER_PROFILE=google-speech-eu \
+  TRANSHOOTER_ROOT="$DEV_ROOT" \
   PUBLIC_BASE_URL=https://app.dev.example \
   PUBLIC_LIVEKIT_URL=wss://rtc.dev.example \
+  S3_PUBLIC_ENDPOINT=https://objects.dev.example \
   "$DEV_ROOT/scripts/dev-up" --provider-profile google-speech-eu \
   > "$TEST_DIRECTORY/dev-up-google-speech-output" 2>&1; then
   fail 'google-speech-eu dev-up wrapper run failed with ADC present'
@@ -555,8 +602,12 @@ grep -F 'compose.google-speech.yml' "$CALLS" >/dev/null ||
 mv "$DEV_ROOT/.secrets/google-adc.json" "$DEV_ROOT/.secrets/google-adc.missing"
 : > "$CALLS"
 if PATH="$TEST_DIRECTORY/bin:$PATH" \
+  APP_ENV=development \
+  PROVIDER_PROFILE=google-speech-eu \
+  TRANSHOOTER_ROOT="$DEV_ROOT" \
   PUBLIC_BASE_URL=https://app.dev.example \
   PUBLIC_LIVEKIT_URL=wss://rtc.dev.example \
+  S3_PUBLIC_ENDPOINT=https://objects.dev.example \
   "$DEV_ROOT/scripts/dev-up" --provider-profile google-speech-eu \
   > "$TEST_DIRECTORY/dev-up-google-speech-missing-adc-output" 2>&1; then
   fail 'google-speech-eu dev-up accepted a missing ADC file'
@@ -569,25 +620,37 @@ mv "$DEV_ROOT/.secrets/google-adc.missing" "$DEV_ROOT/.secrets/google-adc.json"
 cat > "$DEV_ROOT/.env" <<'ENV'
 PUBLIC_BASE_URL=https://app.env.example
 PUBLIC_LIVEKIT_URL=wss://rtc.env.example
+S3_PUBLIC_ENDPOINT=https://objects.env.example
 ENV
-if ! env -u PUBLIC_BASE_URL -u PUBLIC_LIVEKIT_URL PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" \
+if ! env -u PUBLIC_BASE_URL -u PUBLIC_LIVEKIT_URL -u S3_PUBLIC_ENDPOINT \
+  APP_ENV=development \
+  PROVIDER_PROFILE=google-eu \
+  TRANSHOOTER_ROOT="$DEV_ROOT" \
+  PATH="$TEST_DIRECTORY/bin:$PATH" "$DEV_ROOT/scripts/dev-up" --provider-profile google-eu \
   > "$TEST_DIRECTORY/dev-up-env-file-output" 2>&1; then
   fail 'dev-up rejected production URLs loaded only from the repository .env'
 fi
 rm "$DEV_ROOT/.env"
-for invalid_case in base livekit; do
-  if [ "$invalid_case" = base ]; then
-    invalid_base=http://app.dev.example
-    invalid_livekit=wss://rtc.dev.example
-  else
-    invalid_base=https://app.dev.example
-    invalid_livekit=ws://rtc.dev.example
-  fi
+for invalid_case in base livekit s3-insecure s3-localhost s3-omitted; do
+  invalid_base=https://app.dev.example
+  invalid_livekit=wss://rtc.dev.example
+  invalid_s3=https://objects.dev.example
+  case "$invalid_case" in
+    base) invalid_base=http://app.dev.example ;;
+    livekit) invalid_livekit=ws://rtc.dev.example ;;
+    s3-insecure) invalid_s3=http://objects.dev.example ;;
+    s3-localhost) invalid_s3=https://localhost:9000 ;;
+    s3-omitted) invalid_s3= ;;
+  esac
   if PATH="$TEST_DIRECTORY/bin:$PATH" \
+    APP_ENV=development \
+    PROVIDER_PROFILE=google-eu \
+    TRANSHOOTER_ROOT="$DEV_ROOT" \
     PUBLIC_BASE_URL="$invalid_base" \
     PUBLIC_LIVEKIT_URL="$invalid_livekit" \
-    "$DEV_ROOT/scripts/dev-up" > "$TEST_DIRECTORY/dev-up-invalid-$invalid_case-output" 2>&1; then
-    fail "dev-up accepted insecure production $invalid_case URL"
+    S3_PUBLIC_ENDPOINT="$invalid_s3" \
+    "$DEV_ROOT/scripts/dev-up" --provider-profile google-eu > "$TEST_DIRECTORY/dev-up-invalid-$invalid_case-output" 2>&1; then
+    fail "dev-up accepted invalid production $invalid_case URL"
   fi
 done
 

@@ -14,7 +14,8 @@ export async function runSpoolScenarios(ctx, proof) {
     runConsultation,
     assertServiceHealthy,
     resetAuthenticationThrottle,
-    consultationEvidence,
+    consultationStatus,
+    workerSupervisionEvidence,
     settlementSummary,
     settleConsultation,
     queryJson,
@@ -43,7 +44,7 @@ export async function runSpoolScenarios(ctx, proof) {
   const reservation = await waitFor(
     "worker reservation before preservation failure",
     async () => {
-      const evidence = await consultationEvidence(preservationConsultationId);
+      const evidence = await workerSupervisionEvidence(preservationConsultationId);
       const candidate = evidence.reservations[0];
       return typeof candidate?.workerId === "string" &&
         candidate.workerId.length > 0 &&
@@ -68,7 +69,7 @@ export async function runSpoolScenarios(ctx, proof) {
   if (preservation.code === 0)
     throw new Error("WAL/SQLite fault unexpectedly produced a complete archive");
   await workerRestart;
-  const beforeFence = await consultationEvidence(preservationConsultationId);
+  const beforeFence = await consultationStatus(preservationConsultationId);
   if (
     beforeFence.generation !== reservation.generation ||
     !["active", "finalizing"].includes(beforeFence.state)
@@ -90,7 +91,7 @@ export async function runSpoolScenarios(ctx, proof) {
   const fencedEvidence = await waitFor(
     "heartbeat-expiry supervisor fence",
     async () => {
-      const evidence = await consultationEvidence(preservationConsultationId);
+      const evidence = await workerSupervisionEvidence(preservationConsultationId);
       const epoch = evidence.worker_epochs.find(
         (candidate) => candidate.epoch === reservation.epoch,
       );

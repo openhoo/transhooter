@@ -9,11 +9,7 @@ if [ -n "${TRANSHOOTER_ROOT:-}" ] &&
 else
   ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 fi
-REPOSITORY_ROOT=$ROOT
-. "$REPOSITORY_ROOT/deploy/scripts/compose-lib.sh"
-ROOT=$REPOSITORY_ROOT
-STATE_FILE="$ROOT/.secrets/compose-state"
-BASE_FILE="$ROOT/deploy/compose/compose.yml"
+. "$ROOT/deploy/scripts/compose-lib.sh"
 
 BUILD_ONLY=false
 NO_BUILD=false

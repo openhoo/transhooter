@@ -7,6 +7,10 @@ import { runProviderScenarios } from "./harness/scenarios/provider.mjs";
 import { runSpoolScenarios } from "./harness/scenarios/spool.mjs";
 import { runStorageScenarios } from "./harness/scenarios/storage.mjs";
 import { installSettlement } from "./harness/settlement.mjs";
+import {
+  resumedSelectionFullyComplete,
+  shouldEmitFailureSmokeProof,
+} from "./harness-contracts.mjs";
 
 const ctx = await createHarnessContext();
 installRuntime(ctx);
@@ -34,10 +38,12 @@ async function main() {
   try {
     announcePhase("initialization");
     await initializeCheckpoint();
-    const resumedSelectionAlreadyComplete =
-      resumeRequested &&
-      [...selectedScenarios].every((scenario) => completedScenarios.has(scenario));
-    await refreshFixtureCapabilities();
+    const resumedSelectionAlreadyComplete = resumedSelectionFullyComplete({
+      resumeRequested,
+      selectedScenarios,
+      completedScenarios,
+    });
+    if (!resumedSelectionAlreadyComplete) await refreshFixtureCapabilities();
     await reapExpiredOwners();
     await persistOwnerLease();
     await setFaults();
@@ -48,11 +54,18 @@ async function main() {
     await runSpoolScenarios(ctx, proof);
     await runStorageScenarios(ctx, proof);
 
-    if (proof.scenarios.length === 0 && !resumedSelectionAlreadyComplete) {
-      throw new Error("failure-smoke produced no scenario evidence");
+    if (
+      shouldEmitFailureSmokeProof({
+        resumedSelectionAlreadyComplete,
+        scenarioCount: proof.scenarios.length,
+      })
+    ) {
+      await emitProof(ctx, proof, startedAt);
+    } else {
+      console.error(
+        "[failure-smoke] resumed selection already complete; retaining the existing proof artifact",
+      );
     }
-
-    await emitProof(ctx, proof, startedAt);
   } catch (error) {
     primaryError = new Error(
       `[failure-smoke] phase ${ctx.activePhase} failed: ${error?.message ?? String(error)}`,

@@ -20,7 +20,6 @@ COPY --chown=transhooter:transhooter tests/e2e/consultation-harness.mjs tests/e2
 COPY --chown=transhooter:transhooter tests/e2e/consultation-scenario.mjs tests/e2e/consultation-scenario.mjs
 COPY --chown=transhooter:transhooter tests/e2e/consultation-archive-proof.mjs tests/e2e/consultation-archive-proof.mjs
 COPY --chown=transhooter:transhooter tests/e2e/harness-contracts.mjs tests/e2e/harness-contracts.mjs
-COPY --chown=transhooter:transhooter tests/e2e/harness-contracts.test.mjs tests/e2e/harness-contracts.test.mjs
 COPY --chown=transhooter:transhooter tests/fixtures tests/fixtures
 WORKDIR /workspace/tests/e2e
 USER transhooter

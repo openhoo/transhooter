@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
+from transhooter_worker.application import session_audio
 from transhooter_worker.application.pipeline import (
     CaptionRevision,
     OrderedStageQueue,
@@ -16,9 +17,6 @@ from transhooter_worker.application.pipeline import (
     upsert_final_span,
 )
 from transhooter_worker.application.retry import FrozenRetryPolicy
-from transhooter_worker.application.session_audio import (
-    _audio_after_watermark as _audio_after_watermark,
-)
 from transhooter_worker.domain.models import (
     AudioChunk,
     AudioEvent,
@@ -91,15 +89,19 @@ class DirectionSession:
         self._tts: TtsSession | None = None
         self._events_task: asyncio.Task[None] | None = None
         self._terminal_sink = terminal_sink
-        self._assembler = UtteranceAssembler(
-            translation_provider,
-            spec.source_language,
-            spec.target_language,
-            stage_gate,
-            normalized_sink,
-            terminal_sink,
+        self._assembler = (
+            None
+            if spec.same_language
+            else UtteranceAssembler(
+                translation_provider,
+                spec.source_language,
+                spec.target_language,
+                stage_gate,
+                normalized_sink,
+                terminal_sink,
+            )
         )
-        self._stage_queue = OrderedStageQueue(16)
+        self._stage_queue = None if spec.same_language else OrderedStageQueue(16)
         self._stage_task: asyncio.Task[None] | None = None
         self._boundary_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
@@ -170,8 +172,9 @@ class DirectionSession:
             )
         self._events_task = asyncio.create_task(self._consume_stt())
         self._events_task.add_done_callback(self._observe_task)
-        self._stage_task = asyncio.create_task(self._stage_queue.run())
-        self._stage_task.add_done_callback(self._observe_task)
+        if self._stage_queue is not None:
+            self._stage_task = asyncio.create_task(self._stage_queue.run())
+            self._stage_task.add_done_callback(self._observe_task)
         self._boundary_task = asyncio.create_task(self._periodic_boundaries())
         self._boundary_task.add_done_callback(self._observe_task)
 
@@ -274,15 +277,17 @@ class DirectionSession:
                 await self._report_terminal("stt", stt_terminal, self._stt_attempt)
                 shutdown_error = self._retain_failed_terminal(stt_terminal, shutdown_error)
 
-            try:
-                await self._stage_queue.join()
-            except BaseException as error:
-                if not (
-                    isinstance(error, asyncio.CancelledError) and self._cancel_requested.is_set()
-                ):
-                    shutdown_error = shutdown_error or error
-                    self._record_failure(error)
-            await self._cancel_and_await_task(self._stage_task)
+            if self._stage_queue is not None:
+                try:
+                    await self._stage_queue.join()
+                except BaseException as error:
+                    if not (
+                        isinstance(error, asyncio.CancelledError)
+                        and self._cancel_requested.is_set()
+                    ):
+                        shutdown_error = shutdown_error or error
+                        self._record_failure(error)
+                await self._cancel_and_await_task(self._stage_task)
 
             # Graceful shutdown terminalizes TTS only after all queued final
             # synthesis has completed.
@@ -355,12 +360,13 @@ class DirectionSession:
                 await self._emit_normalized(OperationTerminalEvent(result))
                 await self._report_terminal("tts", result, 1)
                 shutdown_error = self._retain_failed_terminal(result, shutdown_error)
-        try:
-            await self._stage_queue.join()
-        except BaseException as error:
-            if not isinstance(error, asyncio.CancelledError):
-                shutdown_error = shutdown_error or error
-                self._record_failure(error)
+        if self._stage_queue is not None:
+            try:
+                await self._stage_queue.join()
+            except BaseException as error:
+                if not isinstance(error, asyncio.CancelledError):
+                    shutdown_error = shutdown_error or error
+                    self._record_failure(error)
 
         async with self._finish_lock:
             if self._state is Lifecycle.TERMINAL:
@@ -472,7 +478,8 @@ class DirectionSession:
             elif isinstance(event, BoundaryEvent):
                 await self._handle_boundary_event(event)
             elif isinstance(event, SessionTerminalEvent):
-                await self._stage_queue.join()
+                if self._stage_queue is not None:
+                    await self._stage_queue.join()
                 if event.terminal.outcome is not Outcome.FAILED:
                     await self._report_terminal("stt", event.terminal, self._stt_attempt)
                     return False
@@ -549,17 +556,21 @@ class DirectionSession:
                 upsert_final_span(self._same_language_spans, event)
             return
 
+        assembler = self._assembler
+        stage_queue = self._stage_queue
+        assert assembler is not None and stage_queue is not None
+
         async def translate_provisional(
             transcript_event: TranscriptEvent = event,
         ) -> None:
-            provisional = await self._assembler.transcript(
+            provisional = await assembler.transcript(
                 transcript_event,
                 time.monotonic_ns() // 1_000_000,
             )
             if provisional is not None:
                 await self._caption_sink(provisional)
 
-        await self._stage_queue.submit(
+        await stage_queue.submit(
             event.finality is Finality.SPAN_FINAL,
             translate_provisional,
         )
@@ -570,13 +581,17 @@ class DirectionSession:
             await self._emit_same_language_boundary(event.committed_through)
             return
 
+        assembler = self._assembler
+        stage_queue = self._stage_queue
+        assert assembler is not None and stage_queue is not None
+
         async def translate_boundary(boundary_event: BoundaryEvent = event) -> None:
-            revisions = await self._assembler.boundary(boundary_event)
+            revisions = await assembler.boundary(boundary_event)
             for revision in revisions:
                 await self._caption_sink(revision)
                 await self._synthesize(revision)
 
-        await self._stage_queue.submit(True, translate_boundary)
+        await stage_queue.submit(True, translate_boundary)
 
     def _commit_input_through(self, committed_through: int) -> None:
         self._committed_input = max(self._committed_input, committed_through)
@@ -670,7 +685,8 @@ class DirectionSession:
         replay_audio = tuple(
             clipped
             for chunk in self._recent_audio
-            if (clipped := _audio_after_watermark(chunk, self._committed_input)) is not None
+            if (clipped := session_audio._audio_after_watermark(chunk, self._committed_input))
+            is not None
         )
         resume_at_sample = replay_audio[0].samples.start if replay_audio else self._committed_input
         session_id = uuid4()
@@ -695,7 +711,11 @@ class DirectionSession:
                         replay_audio = tuple(
                             clipped
                             for chunk in self._recent_audio
-                            if (clipped := _audio_after_watermark(chunk, self._committed_input))
+                            if (
+                                clipped := session_audio._audio_after_watermark(
+                                    chunk, self._committed_input
+                                )
+                            )
                             is not None
                         )
                         for chunk in replay_audio:

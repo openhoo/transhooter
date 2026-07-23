@@ -9,7 +9,6 @@ if [ -n "${TRANSHOOTER_ROOT:-}" ] &&
 else
   ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 fi
-REPOSITORY_ROOT=$ROOT
 
 CONTRACT_SCRIPT_DIRECTORY=${CONTRACT_SCRIPT_DIRECTORY:-"$ROOT/tests/e2e"}
 
@@ -65,10 +64,7 @@ fi
 
 run_lightweight_contract_suites
 
-. "$REPOSITORY_ROOT/deploy/scripts/compose-lib.sh"
-ROOT=$REPOSITORY_ROOT
-STATE_FILE="$ROOT/.secrets/compose-state"
-BASE_FILE="$ROOT/deploy/compose/compose.yml"
+. "$ROOT/deploy/scripts/compose-lib.sh"
 
 LOCK_FILE=${COMPOSE_HARNESS_LOCK_FILE:-"${TMPDIR:-/tmp}/transhooter-compose-harness.lock"}
 LOCK_WAIT_SECONDS=${COMPOSE_HARNESS_LOCK_WAIT_SECONDS:-300}

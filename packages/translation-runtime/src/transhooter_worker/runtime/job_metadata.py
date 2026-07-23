@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from functools import cache
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -143,10 +144,8 @@ class CaptionPacket(BaseModel):
     occurredAtMs: int = Field(ge=0)
 
 
-def _validated_job_metadata(payload: str) -> JobMetadata:
-    path = Path(
-        os.environ.get("CONTRACTS_SCHEMA_FILE", "/workspace/contracts/contracts.schema.json")
-    )
+@cache
+def _worker_job_metadata_validator(path: Path) -> Draft202012Validator:
     try:
         schema = json.loads(path.read_text("utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -156,8 +155,13 @@ def _validated_job_metadata(payload: str) -> JobMetadata:
         definitions.get("WorkerJobMetadata"), dict
     ):
         raise RuntimeError("generated WorkerJobMetadata schema is absent")
+    return Draft202012Validator(definitions["WorkerJobMetadata"], format_checker=FormatChecker())
+
+
+def _validated_job_metadata(payload: str) -> JobMetadata:
+    path = Path(
+        os.environ.get("CONTRACTS_SCHEMA_FILE", "/workspace/contracts/contracts.schema.json")
+    ).resolve()
     candidate = json.loads(payload)
-    Draft202012Validator(definitions["WorkerJobMetadata"], format_checker=FormatChecker()).validate(
-        candidate
-    )
+    _worker_job_metadata_validator(path).validate(candidate)
     return JobMetadata.model_validate(candidate, by_alias=True, by_name=False)

@@ -5,6 +5,9 @@ import {
   acceptsCaption,
   acceptsStatus,
   audioGains,
+  CAPTION_REVISION_RECENT_LIMIT,
+  CAPTION_REVISION_TOMBSTONE_LIMIT,
+  CaptionRevisionPolicy,
   releaseLocalTrack,
 } from "./browser/room-policy.ts";
 import { durableConsultationDestination } from "./shared/consultation-routing.ts";
@@ -62,6 +65,55 @@ void test("caption route binding and revisions fail closed", () => {
     ),
     false,
   );
+});
+
+void test("caption revision tracking stays bounded and rejects late regressions", () => {
+  const policy = new CaptionRevisionPolicy();
+  const totalTracked = CAPTION_REVISION_RECENT_LIMIT + CAPTION_REVISION_TOMBSTONE_LIMIT;
+  const packet = (index: number, revision = 1, finality: "provisional" | "final" = "final") =>
+    CaptionPacketSchema.parse({
+      ...finalCaption,
+      utteranceId: `10000000-0000-4000-8001-${index.toString(16).padStart(12, "0")}`,
+      revision,
+      finality,
+      sourceSampleStart: index * 16000,
+      sourceSampleEnd: (index + 1) * 16000,
+      occurredAtMs: index + 100,
+    });
+
+  for (let index = 0; index < totalTracked + 20; index += 1) {
+    assert.equal(policy.accepts(packet(index)), true);
+  }
+
+  assert.equal(policy.trackedUtteranceCount, totalTracked);
+  assert.equal(policy.accepts(packet(0, 2)), false);
+  assert.equal(policy.accepts(packet(0, 1)), false);
+  assert.equal(policy.accepts(packet(0, 3, "provisional")), false);
+  assert.equal(policy.accepts(packet(20, 1)), false);
+  assert.equal(policy.accepts(packet(20, 2, "provisional")), false);
+});
+
+void test("caption tombstones preserve finality and revision ordering after recent eviction", () => {
+  const policy = new CaptionRevisionPolicy();
+  const original = { ...finalCaption, sourceSampleStart: 0, sourceSampleEnd: 16000 };
+  assert.equal(policy.accepts(original), true);
+
+  for (let index = 1; index <= CAPTION_REVISION_RECENT_LIMIT; index += 1) {
+    assert.equal(
+      policy.accepts({
+        ...finalCaption,
+        utteranceId: `10000000-0000-4000-8002-${index.toString(16).padStart(12, "0")}`,
+        sourceSampleStart: index * 16000,
+        sourceSampleEnd: (index + 1) * 16000,
+        occurredAtMs: index + 100,
+      }),
+      true,
+    );
+  }
+
+  assert.equal(policy.accepts({ ...original, revision: 1 }), false);
+  assert.equal(policy.accepts({ ...original, revision: 3, finality: "provisional" }), false);
+  assert.equal(policy.accepts({ ...original, revision: 3, finality: "final" }), true);
 });
 
 void test("caption trust binding requires a LiveKit agent sender", () => {

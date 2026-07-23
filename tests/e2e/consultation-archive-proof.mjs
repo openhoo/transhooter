@@ -13,13 +13,50 @@ export function createConsultationArchiveProof(context) {
     objectDownloadTimeoutMs,
   } = context;
 
-  function archiveObjectGroup(objectClass) {
-    if (objectClass.includes("composite")) return "composite";
-    if (objectClass.includes("participant") || objectClass.includes("original")) return "original";
-    if (objectClass.includes("interpret") || objectClass.includes("tts")) return "interpretation";
-    if (objectClass.includes("caption") || objectClass.includes("vtt")) return "captions";
-    if (objectClass.includes("inventory") || objectClass.includes("checkpoint")) return "inventory";
+  const archiveObjectGroups = new Set([
+    "composite",
+    "original",
+    "interpretation",
+    "captions",
+    "pipeline",
+    "inventory",
+  ]);
+
+  function archiveObjectGroup(label) {
+    if (label.includes("composite")) return "composite";
+    if (label.includes("participant") || label.includes("original") || label.includes("stt_input"))
+      return "original";
+    if (label.includes("interpret") || label.includes("tts") || label.includes("livekit_output"))
+      return "interpretation";
+    if (label.includes("caption") || label.includes("vtt")) return "captions";
+    if (label.includes("inventory") || label.includes("checkpoint")) return "inventory";
     return "pipeline";
+  }
+
+  function presentedArchiveObject(object) {
+    const label = object.label ?? object.objectClass ?? object.object_class ?? object.class;
+    if (typeof label !== "string" || label.trim().length === 0) {
+      throw new Error("archive object is missing a non-empty label/class");
+    }
+    const derivedGroup = archiveObjectGroup(label);
+    const group = object.group ?? derivedGroup;
+    if (!archiveObjectGroups.has(group)) {
+      throw new Error(`archive object ${label} has invalid group ${String(group)}`);
+    }
+    if (group !== derivedGroup) {
+      throw new Error(`archive object ${label} has inconsistent group ${group}`);
+    }
+    return {
+      id: object.id ?? object.objectId,
+      key: object.key,
+      group,
+      label,
+      contentType: object.contentType ?? object.content_type,
+      size: Number(object.size),
+      sha256: object.sha256,
+      s3Checksum: object.s3Checksum ?? object.s3_checksum ?? object.checksum,
+      versionId: object.versionId ?? object.version_id,
+    };
   }
 
   async function allArchiveObjects(page, archiveId) {
@@ -41,20 +78,9 @@ export function createConsultationArchiveProof(context) {
         throw new Error(`archive object listing exceeded ${archiveObjectCeiling} objects`);
       }
       for (const object of result.body.objects) {
-        const objectClass = object.objectClass ?? object.object_class;
-        objects.push({
-          id: object.id,
-          key: object.key,
-          group: archiveObjectGroup(objectClass),
-          label: objectClass,
-          contentType: object.contentType ?? object.content_type,
-          size: Number(object.size),
-          sha256: object.sha256,
-          s3Checksum: object.s3Checksum ?? object.s3_checksum,
-          versionId: object.versionId ?? object.version_id,
-        });
+        objects.push(presentedArchiveObject(object));
       }
-      cursor = result.body.cursor;
+      cursor = result.body.nextCursor ?? result.body.cursor;
       if (cursor !== null && cursor !== undefined) {
         if (typeof cursor !== "string" || cursor.length === 0) {
           throw new Error("archive pagination returned an invalid cursor");

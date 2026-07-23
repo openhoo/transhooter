@@ -67,7 +67,7 @@ export class EffectRunner {
       limit: this.options.batchSize,
     });
     recordWorkClaimed("effect", effects.length);
-    await Promise.all(effects.map(async (effect) => this.observeEffect(effect)));
+    await settledBarrier(effects.map(async (effect) => this.observeEffect(effect)));
     return effects.length;
   }
 
@@ -828,6 +828,16 @@ export class EffectRunner {
       );
       return "failed";
     }
+  }
+}
+
+async function settledBarrier(operations: readonly Promise<unknown>[]): Promise<void> {
+  const results = await Promise.allSettled(operations);
+  const failure = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failure) {
+    throw failure.reason;
   }
 }
 

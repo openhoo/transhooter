@@ -99,6 +99,17 @@ class AlwaysVerifiedArchive:
         return True
 
 
+class RecordingArchive(AlwaysVerifiedArchive):
+    def __init__(self) -> None:
+        self.puts: list[tuple[str, bytes, str, str]] = []
+
+    def put_create_once(
+        self, key: str, body: bytes, content_type: str, sha256: str
+    ) -> ObjectRecord:
+        self.puts.append((key, body, content_type, sha256))
+        return super().put_create_once(key, body, content_type, sha256)
+
+
 class SpoolOperation(Protocol):
     def __call__(self, *args: object, **kwargs: object) -> object: ...
 
@@ -107,8 +118,9 @@ class CommittedOperation(Protocol):
     def __call__(self) -> list[tuple[RawRef, SampleRange | None]]: ...
 
 
-def test_terminal_drain_uploads_current_meeting_non_pcm_before_reconciliation(
+def test_terminal_drain_queries_ordered_meeting_records_without_context_lookups(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spool = make_spool(tmp_path)
     meeting_id = uuid4()
@@ -121,6 +133,15 @@ def test_terminal_drain_uploads_current_meeting_non_pcm_before_reconciliation(
         media_type="application/json",
         payload=b'{"translatedText":"Guten Morgen"}',
     )
+    terminal = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="stt-terminal",
+        transport="http",
+        direction="provider",
+        media_type="application/json",
+        payload=b'{"outcome":"complete"}',
+    )
     pcm = spool.append(
         meeting_id=meeting_id,
         attempt_id=uuid4(),
@@ -131,6 +152,8 @@ def test_terminal_drain_uploads_current_meeting_non_pcm_before_reconciliation(
         payload=b"\x00\x00",
         sample_range=SampleRange(0, 1),
     )
+    checkpoint_arguments = checkpoint_delivery_arguments() | {"meeting_id": meeting_id}
+    checkpoint = spool.register_checkpoint_delivery(**checkpoint_arguments)
     other = spool.append(
         meeting_id=uuid4(),
         attempt_id=uuid4(),
@@ -140,20 +163,28 @@ def test_terminal_drain_uploads_current_meeting_non_pcm_before_reconciliation(
         media_type="application/json",
         payload=b"other meeting",
     )
-
+    archive = RecordingArchive()
     registrations: list[UUID] = []
+
+    def unexpected_context(_object_id: UUID) -> tuple[UUID, UUID, str, int, str]:
+        raise AssertionError("meeting drain must not perform per-record context lookups")
+
+    monkeypatch.setattr(spool, "context", unexpected_context)
     upload_committed_objects(
         spool,
-        AlwaysVerifiedArchive(),
+        archive,
         lambda _meeting, object_id, _object_class, _record: registrations.append(object_id),
         meeting_id,
     )
 
+    assert registrations == [caption.object_id, terminal.object_id]
+    assert [put[3] for put in archive.puts] == [caption.sha256, terminal.sha256]
     committed_ids = {ref.object_id for ref, _ in spool.committed()}
     assert caption.object_id not in committed_ids
+    assert terminal.object_id not in committed_ids
     assert pcm.object_id in committed_ids
+    assert checkpoint.raw_ref.object_id in committed_ids
     assert other.object_id in committed_ids
-    assert registrations == [caption.object_id]
 
 
 def test_retryable_oldest_registration_does_not_starve_later_committed_object(
@@ -1065,6 +1096,47 @@ def test_drain_flushes_short_pcm_batches_on_both_sides_of_gap(tmp_path: Path) ->
     ]
 
 
+def test_pcm_compactor_acknowledges_uuid_covering_checkpoint(tmp_path: Path) -> None:
+    meeting = uuid4()
+    destination = uuid4()
+    spool = make_spool(tmp_path)
+    source = spool.append(
+        meeting_id=meeting,
+        attempt_id=uuid4(),
+        stage="tts-output",
+        transport="websocket",
+        direction=str(destination),
+        media_type="audio/L16",
+        payload=b"\1\0" * 100,
+        sample_range=SampleRange(0, 100),
+    )
+    checkpoint = spool.append(
+        meeting_id=meeting,
+        attempt_id=uuid4(),
+        stage="checkpoint",
+        transport="http",
+        direction="internal",
+        media_type="application/json",
+        payload=json.dumps(
+            {
+                "sourceParticipantId": str(uuid4()),
+                "destinationParticipantId": str(destination),
+                "acceptedInput": 0,
+                "emittedOutput": 100,
+                "terminal": True,
+            }
+        ).encode(),
+    )
+    compactor = PcmCompactor(spool, AlwaysVerifiedArchive(), meeting)
+    compacted = compactor.compact("tts-output", str(destination), drain=True)[0]
+
+    compactor.acknowledge_covering_checkpoint(compacted, checkpoint.object_id)
+
+    committed_ids = {reference.object_id for reference, _ in spool.committed()}
+    assert source.object_id not in committed_ids
+    assert checkpoint.object_id in committed_ids
+
+
 def checkpoint_delivery_arguments() -> dict[str, Any]:
     checkpoint_id = uuid4()
     source_id = uuid4()
@@ -1104,6 +1176,29 @@ def test_checkpoint_delivery_create_once_authenticates_identical_wal(tmp_path: P
     assert second == first
     assert second.body == arguments["body"]
     assert spool.read(second.raw_ref.object_id) == arguments["body"]
+
+
+def test_checkpoint_delivery_reads_authenticated_wal_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spool = make_spool(tmp_path)
+    arguments = checkpoint_delivery_arguments()
+    delivery = spool.register_checkpoint_delivery(**arguments)
+    wal_path = tmp_path / "payloads" / f"{delivery.checkpoint_id}.wal"
+    original_read_bytes = Path.read_bytes
+    reads = 0
+
+    def counted_read_bytes(path: Path) -> bytes:
+        nonlocal reads
+        if path == wal_path:
+            reads += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+
+    assert spool.register_checkpoint_delivery(**arguments) == delivery
+    assert reads == 1
 
 
 def test_checkpoint_delivery_rejects_identity_or_body_mismatch(tmp_path: Path) -> None:

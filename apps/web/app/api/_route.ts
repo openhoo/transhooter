@@ -1,4 +1,5 @@
 import "server-only";
+import type { WebOperation } from "@/lib/server/web-operations";
 import { execute } from "@/lib/server-application";
 
 type RouteParams = Record<string, string>;
@@ -29,7 +30,7 @@ function safeErrorSummary(error: unknown): {
 }
 
 export async function executeRoute(
-  operation: string,
+  operation: WebOperation,
   request: Request,
   params: AwaitableRouteParams = {},
 ): Promise<Response> {
@@ -53,7 +54,7 @@ export async function executeRoute(
   }
 }
 
-export function createRoute<const Operation extends string>(operation: Operation) {
+export function createRoute(operation: WebOperation) {
   return (request: Request, context?: RouteContext): Promise<Response> =>
     executeRoute(operation, request, context?.params);
 }

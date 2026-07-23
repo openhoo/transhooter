@@ -89,18 +89,32 @@ async function executeConsultation(
       return createConsultationInvitation(config, command, context, userId);
     case "consultation.get":
       return config.consultations.get(command.consultationId, userId);
+    case "consultation.lobby": {
+      const consultation = await config.consultations.get(command.consultationId, userId);
+      return {
+        consultation,
+        options: await config.operations.consultationOptions(consultation.providerProfileId),
+        viewer: { userId, staffRole: authenticated.user.staffRole },
+      };
+    }
     case "consultation.list":
       return {
         consultations: await config.consultations.list(userId),
         viewer: { staffRole: authenticated.user.staffRole },
       };
-    case "consultation.preferences":
-      return config.consultations.setPreferences(
+    case "consultation.preferences": {
+      const consultation = await config.consultations.setPreferences(
         command.consultationId,
         userId,
         command.displayName,
         command.language,
       );
+      return {
+        consultation,
+        options: await config.operations.consultationOptions(consultation.providerProfileId),
+        viewer: { userId, staffRole: authenticated.user.staffRole },
+      };
+    }
     case "consultation.consent":
       return config.consultations.consent(command.consultationId, userId, command.snapshotHash);
     case "consultation.join":
@@ -116,6 +130,9 @@ async function executeConsultation(
       return resendConsultationInvitation(config, command, context, userId);
     case "consultation.options":
       return config.operations.consultationOptions(command.providerProfileId);
+    case "consultation.profileMetadata":
+      assertStaff(authenticated.user);
+      return config.operations.providerProfileMetadata();
     case "consultation.room":
       return config.operations.consultationRoom(command.consultationId, userId);
     default:
@@ -174,7 +191,15 @@ async function executeArchive(
     case "archive.list":
       return config.operations.archiveList(staffPrincipal(authenticated.user));
     case "archive.get":
-      return config.operations.archiveGet(staffPrincipal(authenticated.user), command.archiveId);
+      return {
+        ...(await config.operations.archivePresentation(
+          staffPrincipal(authenticated.user),
+          command.archiveId,
+          null,
+          100,
+        )),
+        viewer: { staffRole: authenticated.user.staffRole },
+      };
     case "archive.objects":
       return config.operations.archiveObjects(
         staffPrincipal(authenticated.user),

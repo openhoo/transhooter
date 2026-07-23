@@ -1,7 +1,5 @@
 import { ready } from "@/lib/server-application";
 
-export const dynamic = "force-dynamic";
-
 export async function GET(
   _request: Request,
   context: { params: Promise<{ kind: string }> },

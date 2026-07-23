@@ -12,16 +12,17 @@ import pytest
 from transhooter_worker.adapters.spool import EncryptedSpool, deterministic_roomy_capacity
 from transhooter_worker.domain.models import SampleRange
 from transhooter_worker.ports.archive import ObjectRecord
+from transhooter_worker.runtime.checkpoints import (
+    CheckpointChainState,
+    CheckpointWatermark,
+    _persist_checkpoint,
+    _replay_pending_checkpoints,
+    _restore_checkpoint_state,
+)
 from transhooter_worker.runtime.control_client import (
     ControlClient,
     PermanentControlRequestError,
     RetryableControlRequestError,
-)
-from transhooter_worker.runtime.job import (
-    CheckpointChainState,
-    _persist_checkpoint,
-    _replay_pending_checkpoints,
-    _restore_checkpoint_state,
 )
 
 
@@ -520,7 +521,7 @@ async def test_concurrent_checkpoints_for_one_source_form_one_serial_chain(
     assert deliveries[0].previous_hash is None
     assert deliveries[1].previous_hash == deliveries[0].checkpoint_hash
     assert all(delivery.acknowledged for delivery in deliveries)
-    assert state.watermarks[source_id] == (2, 8_000, 4_800, 3_840, False)
+    assert state.watermarks[source_id] == CheckpointWatermark(2, 8_000, 4_800, 3_840, False)
 
 
 @pytest.mark.asyncio
@@ -648,7 +649,9 @@ async def test_restart_replays_exact_checkpoint_before_advancing_chain(
     acknowledged = restarted_spool.list_checkpoint_deliveries(meeting_id, 3)[0]
     assert acknowledged.acknowledged
     assert restarted_state.hashes[source_id] == acknowledged.checkpoint_hash
-    assert restarted_state.watermarks[source_id] == (7, 28_000, 24_000, 19_200, False)
+    assert restarted_state.watermarks[source_id] == CheckpointWatermark(
+        7, 28_000, 24_000, 19_200, False
+    )
     await _persist_checkpoint(
         checkpoint_metadata(meeting_id),
         restarted_spool,
@@ -717,12 +720,8 @@ async def test_restart_replays_exact_checkpoint_before_advancing_chain(
     assert second_checkpoint["emittedOutput"] == 38_400
     assert second_checkpoint["destinationParticipantId"] == str(destination_id)
     restored_after_ack = _restore_checkpoint_state(restarted_spool, meeting_id, 3)
-    assert restored_after_ack.watermarks[source_id] == (
-        8,
-        32_000,
-        48_000,
-        38_400,
-        True,
+    assert restored_after_ack.watermarks[source_id] == CheckpointWatermark(
+        8, 32_000, 48_000, 38_400, True
     )
 
 

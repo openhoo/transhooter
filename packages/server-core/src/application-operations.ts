@@ -11,8 +11,41 @@ export interface StaffPrincipal {
 }
 
 export interface ArchiveObjectPage {
-  objects: readonly Record<string, unknown>[];
+  objects: readonly ArchiveObjectRow[];
   cursor: string | null;
+}
+export interface ArchiveObjectRow {
+  id: UUID;
+  objectClass: string;
+  key: string;
+  contentType: string;
+  size: string;
+  sha256: string;
+  s3Checksum: string;
+  versionId: string;
+}
+
+export interface ArchivePresentation {
+  archive: ArchiveDetail;
+  objectPage: ArchiveObjectPage;
+}
+
+export interface ConsultationOptionRow {
+  id: UUID;
+  profileId: UUID;
+  sourceLocale: string;
+  targetLocale: string;
+  mode: "translated" | "same_language";
+  snapshot: unknown;
+  profileName: string;
+  revision: number;
+  freshUntil: Date;
+}
+
+export interface ProviderProfileMetadata {
+  id: UUID;
+  name: string;
+  revision: number;
 }
 
 export interface AdminLanguageRow {
@@ -88,7 +121,8 @@ export interface ProviderAttemptInput {
 }
 
 export interface ApplicationOperations {
-  consultationOptions(profileId: string): Promise<readonly Record<string, unknown>[]>;
+  consultationOptions(profileId: string): Promise<readonly ConsultationOptionRow[]>;
+  providerProfileMetadata(): Promise<readonly ProviderProfileMetadata[]>;
   consultationRoom(consultationId: UUID, userId: UUID): Promise<Record<string, unknown>>;
   consultationInviteRecipient(consultationId: UUID, employeeUserId: UUID): Promise<string>;
   archiveList(principal: StaffPrincipal): Promise<readonly Record<string, unknown>[]>;
@@ -99,6 +133,12 @@ export interface ApplicationOperations {
     cursor: string | null,
     limit: number,
   ): Promise<ArchiveObjectPage>;
+  archivePresentation(
+    principal: StaffPrincipal,
+    archiveId: UUID,
+    cursor: string | null,
+    limit: number,
+  ): Promise<ArchivePresentation>;
   archiveDownload(principal: StaffPrincipal, archiveId: UUID, objectId: UUID): Promise<string>;
   adminFailures(principal: StaffPrincipal): Promise<readonly Record<string, unknown>[]>;
   adminLanguages(
@@ -131,8 +171,12 @@ export class PrismaApplicationOperations implements ApplicationOperations {
     this.workers = new ApplicationOperationsWorkers(database, clock);
   }
 
-  consultationOptions(profileId: string): Promise<readonly Record<string, unknown>[]> {
+  consultationOptions(profileId: string): Promise<readonly ConsultationOptionRow[]> {
     return this.queries.consultationOptions(profileId);
+  }
+
+  providerProfileMetadata(): Promise<readonly ProviderProfileMetadata[]> {
+    return this.queries.providerProfileMetadata();
   }
 
   consultationRoom(consultationId: UUID, userId: UUID): Promise<Record<string, unknown>> {
@@ -158,6 +202,14 @@ export class PrismaApplicationOperations implements ApplicationOperations {
     limit: number,
   ): Promise<ArchiveObjectPage> {
     return this.queries.archiveObjects(principal, archiveId, cursor, limit);
+  }
+  archivePresentation(
+    principal: StaffPrincipal,
+    archiveId: UUID,
+    cursor: string | null,
+    limit: number,
+  ): Promise<ArchivePresentation> {
+    return this.queries.archivePresentation(principal, archiveId, cursor, limit);
   }
 
   archiveDownload(principal: StaffPrincipal, archiveId: UUID, objectId: UUID): Promise<string> {

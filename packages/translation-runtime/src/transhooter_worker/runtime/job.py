@@ -35,36 +35,10 @@ from transhooter_worker.domain.models import (
     StageCapabilities,
 )
 from transhooter_worker.runtime.checkpoints import (
-    _PCM_OBJECT_CLASSES as _PCM_OBJECT_CLASSES,
-)
-from transhooter_worker.runtime.checkpoints import (
-    CheckpointChainState as CheckpointChainState,
-)
-from transhooter_worker.runtime.checkpoints import (
-    PendingCheckpoint as PendingCheckpoint,
-)
-from transhooter_worker.runtime.checkpoints import (
-    _deliver_checkpoint as _deliver_checkpoint,
-)
-from transhooter_worker.runtime.checkpoints import (
-    _pending_checkpoint as _pending_checkpoint,
-)
-from transhooter_worker.runtime.checkpoints import (
+    ZERO_CHECKPOINT_WATERMARK,
     _persist_checkpoint,
     _replay_pending_checkpoints,
     _restore_checkpoint_state,
-)
-from transhooter_worker.runtime.checkpoints import (
-    _record_compacted_pcm as _record_compacted_pcm,
-)
-from transhooter_worker.runtime.checkpoints import (
-    _record_terminal_pcm as _record_terminal_pcm,
-)
-from transhooter_worker.runtime.checkpoints import (
-    _register_uploaded_evidence as _register_uploaded_evidence,
-)
-from transhooter_worker.runtime.consultation import (
-    DirectionSinks as DirectionSinks,
 )
 from transhooter_worker.runtime.consultation import (
     SourceTrackTimeline,
@@ -73,12 +47,6 @@ from transhooter_worker.runtime.consultation import (
 )
 from transhooter_worker.runtime.control_client import ControlClient
 from transhooter_worker.runtime.job_metadata import (
-    CaptionPacket as CaptionPacket,
-)
-from transhooter_worker.runtime.job_metadata import (
-    CredentialReference as CredentialReference,
-)
-from transhooter_worker.runtime.job_metadata import (
     DirectionMetadata,
     FrozenStage,
     JobMetadata,
@@ -86,12 +54,6 @@ from transhooter_worker.runtime.job_metadata import (
     TranslationStage,
     TtsStage,
     _validated_job_metadata,
-)
-from transhooter_worker.runtime.job_metadata import (
-    RoomProviderSelectionMetadata as RoomProviderSelectionMetadata,
-)
-from transhooter_worker.runtime.job_metadata import (
-    WireModel as WireModel,
 )
 from transhooter_worker.runtime.provider_registry import (
     ProviderRegistry,
@@ -673,29 +635,88 @@ class InitializationContext:
     quota_lifecycle: QuotaGateLifecycle
     checkpoint_hashes: dict[UUID, str]
     provider_sets: list[Providers] = field(default_factory=list)
-    cleaned: bool = False
+    _cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _cleanup_task: asyncio.Task[None] | None = field(default=None, init=False)
+
+    @staticmethod
+    async def _settle(
+        factory: Callable[[], tuple[Awaitable[Any], ...]],
+    ) -> tuple[BaseException, ...]:
+        try:
+            awaitables = factory()
+            if not awaitables:
+                return ()
+            results = await asyncio.gather(*awaitables, return_exceptions=True)
+            return tuple(result for result in results if isinstance(result, BaseException))
+        except BaseException as error:
+            return (error,)
+
+    async def _cleanup_resources(self, error: BaseException) -> None:
+        errors = list(
+            await self._settle(
+                lambda: tuple(session.cancel() for session in self.sessions.values())
+            )
+        )
+        errors.extend(
+            await self._settle(
+                lambda: tuple(
+                    self.ctx.room.local_participant.unpublish_track(publication.sid)
+                    for _, publication in self.interpretation_tracks.values()
+                )
+            )
+        )
+        errors.extend(
+            await self._settle(
+                lambda: tuple(providers.aclose() for providers in self.provider_sets)
+            )
+        )
+        try:
+            await self.quota_lifecycle.cleanup()
+        except BaseException as cleanup_error:
+            errors.append(cleanup_error)
+        try:
+            await self.control.report_failure(
+                {
+                    "kind": type(error).__name__,
+                    "message": str(error),
+                    "lastCheckpointHashes": {
+                        str(source_id): digest
+                        for source_id, digest in self.checkpoint_hashes.items()
+                    },
+                }
+            )
+        except BaseException as report_error:
+            errors.append(report_error)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("translation initialization cleanup failed", errors)
 
     async def cleanup(self, error: BaseException) -> None:
-        if self.cleaned:
-            return
-        self.cleaned = True
-        await asyncio.gather(
-            *(session.cancel() for session in self.sessions.values()),
-            return_exceptions=True,
-        )
-        await _unpublish_interpretation_tracks(self.ctx, self.interpretation_tracks)
-        await asyncio.gather(
-            *(providers.aclose() for providers in self.provider_sets),
-            return_exceptions=True,
-        )
-        await self.quota_lifecycle.cleanup()
-        await _report_runtime_failure(self.control, error, self.checkpoint_hashes)
+        async with self._cleanup_lock:
+            if self._cleanup_task is None:
+                self._cleanup_task = asyncio.create_task(self._cleanup_resources(error))
+            cleanup_task = self._cleanup_task
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
+
+    async def _cleanup_failed_initialization(self, error: BaseException) -> None:
+        try:
+            await self.cleanup(error)
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "translation initialization failed during cleanup",
+                [error, cleanup_error],
+            ) from None
 
     async def await_effect(self, effect: Awaitable[Any]) -> Any:
         try:
             return await effect
         except BaseException as error:
-            await self.cleanup(error)
+            await self._cleanup_failed_initialization(error)
             raise
 
     async def construct(
@@ -707,7 +728,7 @@ class InitializationContext:
         try:
             return factory(*args, **kwargs)
         except BaseException as error:
-            await self.cleanup(error)
+            await self._cleanup_failed_initialization(error)
             raise
 
 
@@ -912,7 +933,7 @@ async def _reserve_direction_quota(
     redis_url = os.environ.get("REDIS_URL")
     if not redis_url:
         error = RuntimeError("REDIS_URL is required for provider quota enforcement")
-        await initialization.cleanup(error)
+        await initialization._cleanup_failed_initialization(error)
         raise error
     gates: dict[str, RedisQuotaGate] = {}
     for selected, capability in zip(
@@ -1019,8 +1040,8 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         raise
     completed_sources = {
         source_id
-        for source_id, (_, _, _, _, terminal) in checkpoint_state.watermarks.items()
-        if terminal
+        for source_id, watermark in checkpoint_state.watermarks.items()
+        if watermark.terminal
     }
     if completed_sources == {
         direction.source_participant_id for direction in metadata.selection.directions
@@ -1047,12 +1068,10 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
 
     timelines: dict[UUID, SourceTrackTimeline] = {}
     for participant_id in metadata.expected_participant_ids:
-        accepted_sequence, accepted_input, _, _, _ = checkpoint_state.watermarks.get(
-            participant_id, (0, 0, 0, 0, False)
-        )
+        watermark = checkpoint_state.watermarks.get(participant_id, ZERO_CHECKPOINT_WATERMARK)
         timelines[livekit_by_participant[participant_id]] = SourceTrackTimeline(
-            cursor=accepted_input,
-            sequence=accepted_sequence,
+            cursor=watermark.input_sample,
+            sequence=watermark.input_sequence,
         )
 
     subscribe_if_allowed = _install_room_handlers(
@@ -1128,16 +1147,10 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         )
     for direction in metadata.selection.directions:
         publisher = None
-        (
-            _resumed_sequence,
-            resumed_input,
-            resumed_provider_output,
-            resumed_output,
-            resumed_terminal,
-        ) = checkpoint_state.watermarks.get(direction.source_participant_id, (0, 0, 0, 0, False))
-        if resumed_terminal:
-            continue
-        if direction.source_participant_id in completed_sources:
+        watermark = checkpoint_state.watermarks.get(
+            direction.source_participant_id, ZERO_CHECKPOINT_WATERMARK
+        )
+        if watermark.terminal:
             continue
         if direction.mode == "translated":
             source, _ = await initialize_value(
@@ -1152,10 +1165,10 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
                 source,
                 spool,
             )
-            if resumed_output % PreservedAudioPublisher.FRAME_SAMPLES:
+            if watermark.output_sample % PreservedAudioPublisher.FRAME_SAMPLES:
                 raise RuntimeError("checkpoint output is not aligned to published frames")
-            publisher._sample = resumed_output
-            publisher._sequence = resumed_output // PreservedAudioPublisher.FRAME_SAMPLES
+            publisher._sample = watermark.output_sample
+            publisher._sequence = watermark.output_sample // PreservedAudioPublisher.FRAME_SAMPLES
             publishers[direction.destination_participant_id] = publisher
         sinks = _build_direction_sinks(
             ctx,
@@ -1165,7 +1178,7 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
             spool,
             publisher,
             checkpoint,
-            resumed_provider_output,
+            watermark.provider_output_sample,
         )
 
         stage_gate = await _reserve_direction_quota(
@@ -1206,7 +1219,7 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
             stage_gate,
             _build_provider_terminal_sink(metadata, direction, spool, control),
         )
-        session._last_input = resumed_input
+        session._last_input = watermark.input_sample
         sessions[direction.source_participant_id] = session
         try:
             await initialize(session.start())

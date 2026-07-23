@@ -739,29 +739,16 @@ export function createConsultationScenario(context) {
     requireValue(archiveId, "archive id");
     return {
       archiveId,
-      customerProfile,
       employeeProfile,
       employeePage: employee,
       customerPage: customer,
-      thirdPage: third,
     };
   }
 
   return {
     apiJson,
-    assertAudibleInterpretation,
-    assertFinalTargetedCaption,
-    assertFrozenProfile,
-    assertModes,
-    authenticate,
-    consentAndJoin,
-    createConsultation,
-    enterRoom,
     installCaptionProbe,
-    latestLink,
-    postApi,
-    savePreferences,
-    settleCreatedConsultation,
     runConsultationScenario,
+    settleCreatedConsultation,
   };
 }

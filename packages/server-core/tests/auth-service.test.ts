@@ -95,8 +95,18 @@ function createRepository(state: AuthState): AuthRepository {
     findOrCreateCustomer: async () => {
       throw new Error("unused");
     },
-    findSessionByTokenHash: async (tokenHash: string) =>
-      [...state.sessionsById.values()].find((session) => session.tokenHash === tokenHash) ?? null,
+    findAuthenticatedSessionByTokenHash: async (tokenHash: string, now: Date) => {
+      const session = [...state.sessionsById.values()].find(
+        (candidate) => candidate.tokenHash === tokenHash && candidate.expiresAt > now,
+      );
+      if (!session) {
+        return null;
+      }
+      const user = [...state.usersByEmail.values()].find(
+        (candidate) => candidate.id === session.userId,
+      );
+      return user ? { session, user } : null;
+    },
     getOrCreateActiveMagicLink: async (
       identity: MagicLinkIdentity,
       candidate: MagicLinkCandidate,
@@ -316,6 +326,32 @@ async function requestKnownSignIn(
 }
 
 describe("AuthService", () => {
+  it("returns the related user for a live session and keeps invalid sessions unauthenticated", async () => {
+    const fixture = createAuthFixture();
+    const rawToken = new Uint8Array(32).fill(4);
+    const session = makeSession({ tokenHash: hash(rawToken) });
+    fixture.state.sessionsById.set(session.id, session);
+    const encoded = Buffer.from(rawToken).toString("base64url");
+
+    await expect(fixture.service.authenticate(encoded)).resolves.toMatchObject({
+      session: { id: SESSION_ID, userId: USER_ID },
+      user: { id: USER_ID, email: "known@example.com", staffRole: "admin" },
+    });
+
+    fixture.advance(12 * 60 * 60_000);
+    await expect(fixture.service.authenticate(encoded)).rejects.toMatchObject({
+      code: "UNAUTHENTICATED",
+    });
+    fixture.state.sessionsById.set(
+      session.id,
+      makeSession({ tokenHash: hash(rawToken), expiresAt: new Date("2026-01-02T00:00:00Z") }),
+    );
+    fixture.state.usersByEmail.clear();
+    await expect(fixture.service.authenticate(encoded)).rejects.toMatchObject({
+      code: "UNAUTHENTICATED",
+    });
+  });
+
   it("keeps scanner GET non-consuming and consumes only an origin-bound CSRF-checked user POST once", async () => {
     const fixture = createAuthFixture();
     await requestKnownSignIn(fixture, {
