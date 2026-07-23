@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EgressStatus } from "livekit-server-sdk";
-import { isViableEgressAdoption } from "../src/adapters/livekit-effects";
+import { isViableEgressAdoption } from "../src/adapters/livekit-effects/egress";
 import { EffectRunner } from "../src/orchestration/effect-runner";
 import type { DurableStore, Effect } from "../src/orchestration/model";
 import type { RemoteEffects } from "../src/orchestration/remote";

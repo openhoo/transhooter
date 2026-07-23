@@ -239,7 +239,7 @@ Diese Grenzen sind vor allem in
 │   └── spool-drainer/          # Upload und Registrierung persistierter Spoolobjekte
 ├── packages/
 │   ├── contracts/              # Zod-Verträge und generiertes JSON Schema
-│   ├── server-core/            # Domäne, Use-Cases, Ports und Drizzle-Schema
+│   ├── server-core/            # Domäne, Use-Cases, Ports und Prisma-Persistenz
 │   ├── telemetry/              # Gemeinsame TypeScript-OTel-Instrumentierung
 │   └── translation-runtime/    # Gemeinsame Python-Domäne, Ports und Adapter
 ├── deploy/
@@ -259,7 +259,7 @@ Diese Grenzen sind vor allem in
 | Bereich | Implementierung |
 | --- | --- |
 | Web | Next.js 16, React 19, TypeScript, Bun |
-| Domäne/Persistenz | TypeScript, Drizzle ORM, PostgreSQL 17 |
+| Domäne/Persistenz | TypeScript, Prisma ORM, PostgreSQL 17 |
 | Realtime | LiveKit Server, LiveKit Clients und LiveKit Egress |
 | Worker | Python 3.13, asyncio, Pydantic, LiveKit Agents |
 | Provider | Google Cloud Speech/Translate/TTS oder Deepgram + DeepL |

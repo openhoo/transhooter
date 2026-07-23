@@ -20,8 +20,6 @@ import * as consultationOperations from "./postgres-store/consultations";
 import * as effectOperations from "./postgres-store/effects";
 import type { CapacityDimension } from "./postgres-store/shared";
 
-export { persistSupervisorTerminalCheckpoints } from "./postgres-store/consultations";
-
 export class PostgresStore implements DurableStore {
   private constructor(private readonly database: PrismaDatabase) {}
 

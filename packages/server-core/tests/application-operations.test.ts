@@ -1,8 +1,6 @@
 import { describe, expect, it, mock } from "bun:test";
-import {
-  checkpointPersistenceValues,
-  PrismaApplicationOperations,
-} from "../src/application-operations";
+import { PrismaApplicationOperations } from "../src/application-operations";
+import { checkpointPersistenceValues } from "../src/application-operations-workers";
 import { PrismaLanguageRepository } from "../src/persistence/application-repositories";
 import { Prisma, type PrismaClient } from "../src/persistence/database";
 import { TransactionHandle } from "../src/persistence/repositories";

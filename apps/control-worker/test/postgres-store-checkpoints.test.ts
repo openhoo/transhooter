@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { persistSupervisorTerminalCheckpoints } from "../src/adapters/postgres-store";
+import { persistSupervisorTerminalCheckpoints } from "../src/adapters/postgres-store/consultations";
 import type { WorkerReservation } from "../src/orchestration/model";
 
 const SOURCE = "00000000-0000-4000-8000-000000000011";

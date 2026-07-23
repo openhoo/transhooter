@@ -78,13 +78,7 @@
               "options": {
                 "patterns": [
                   {
-                    "group": [
-                      "next/**",
-                      "livekit-*",
-                      "@aws-sdk/**",
-                      "drizzle-orm/**",
-                      "nodemailer/**"
-                    ],
+                    "group": ["next/**", "livekit-*", "@aws-sdk/**", "nodemailer/**"],
                     "message": "Domain code cannot import framework, provider, or persistence adapters."
                   }
                 ]

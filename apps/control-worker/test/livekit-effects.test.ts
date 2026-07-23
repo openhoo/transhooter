@@ -2,11 +2,8 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { TrackSource } from "@livekit/protocol";
 import { EgressStatus } from "livekit-server-sdk";
-import {
-  egressStatusName,
-  isViableEgressAdoption,
-  LiveKitEffects,
-} from "../src/adapters/livekit-effects";
+import { LiveKitEffects } from "../src/adapters/livekit-effects";
+import { egressStatusName, isViableEgressAdoption } from "../src/adapters/livekit-effects/egress";
 import type { Effect } from "../src/orchestration/model";
 
 const consultationId = "50000000-0000-4000-8000-000000000001";

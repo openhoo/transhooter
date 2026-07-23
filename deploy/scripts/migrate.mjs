@@ -3,7 +3,6 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { baselineMigration, planMigration } from "./migration-plan.mjs";
 
 const require = createRequire(new URL("../../packages/server-core/package.json", import.meta.url));
 const pg = require("pg");
@@ -13,13 +12,7 @@ const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const prismaConfig = resolve(workspaceRoot, "packages/server-core/prisma.config.ts");
 const migrationLockNamespace = 0x5452414e;
 const migrationLockId = 0x53484f4f;
-const drizzleBaselineHash = "5aa4112ae489b2f93205314f84b58dc45aba4844a2ee1d7d5606736ba6bf9d8e";
-const drizzleBaselineCreatedAt = "1784549760398";
-const expectedDrizzleRelations = [
-  "S:__drizzle_migrations_id_seq",
-  "i:__drizzle_migrations_pkey",
-  "r:__drizzle_migrations",
-];
+const baselineMigration = "0000_baseline";
 
 async function readConnectionString() {
   const databaseUrlFile = process.env.DATABASE_URL_FILE;
@@ -119,7 +112,7 @@ async function assertNoUntrackedSchemas(client) {
   const result = await client.query(`
     SELECT schema.nspname AS name
     FROM pg_namespace AS schema
-    WHERE schema.nspname NOT IN ('public', 'drizzle', 'information_schema')
+    WHERE schema.nspname NOT IN ('public', 'information_schema')
       AND schema.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
       AND (
         EXISTS (SELECT 1 FROM pg_class AS object WHERE object.relnamespace = schema.oid)
@@ -141,102 +134,6 @@ async function assertNoUntrackedSchemas(client) {
         .join(", ")}`,
     );
   }
-}
-
-async function inspectDrizzleBaseline(client) {
-  const schemaResult = await client.query(`
-    SELECT pg_get_userbyid(schema.nspowner) = current_user AS owned
-    FROM pg_namespace AS schema
-    WHERE schema.nspname = 'drizzle'
-  `);
-  if (schemaResult.rows.length === 0) {
-    return { exists: false, proven: false };
-  }
-  if (schemaResult.rows[0]?.owned !== true) {
-    return { exists: true, proven: false };
-  }
-
-  const relations = await client.query(`
-    SELECT object.relkind || ':' || object.relname AS identity,
-           pg_get_userbyid(object.relowner) = current_user AS owned
-    FROM pg_class AS object
-    JOIN pg_namespace AS schema ON schema.oid = object.relnamespace
-    WHERE schema.nspname = 'drizzle'
-    ORDER BY identity
-  `);
-  const relationIdentities = relations.rows.map((row) => row.identity);
-  const relationsMatch =
-    relationIdentities.length === expectedDrizzleRelations.length &&
-    relationIdentities.every((identity, index) => identity === expectedDrizzleRelations[index]) &&
-    relations.rows.every((row) => row.owned === true);
-  if (!relationsMatch) {
-    return { exists: true, proven: false };
-  }
-
-  const columns = await client.query(`
-    SELECT column_name, data_type, is_nullable, column_default
-    FROM information_schema.columns
-    WHERE table_schema = 'drizzle'
-      AND table_name = '__drizzle_migrations'
-    ORDER BY ordinal_position
-  `);
-  const expectedColumns = [
-    {
-      column_name: "id",
-      data_type: "integer",
-      is_nullable: "NO",
-      column_default: "nextval('drizzle.__drizzle_migrations_id_seq'::regclass)",
-    },
-    { column_name: "hash", data_type: "text", is_nullable: "NO", column_default: null },
-    { column_name: "created_at", data_type: "bigint", is_nullable: "YES", column_default: null },
-  ];
-  const columnsMatch =
-    columns.rows.length === expectedColumns.length &&
-    columns.rows.every(
-      (column, index) => JSON.stringify(column) === JSON.stringify(expectedColumns[index]),
-    );
-  if (!columnsMatch) {
-    return { exists: true, proven: false };
-  }
-  const constraints = await client.query(`
-    SELECT constraint_object.conname AS name,
-           constraint_object.contype AS type,
-           pg_get_constraintdef(constraint_object.oid) AS definition
-    FROM pg_constraint AS constraint_object
-    JOIN pg_class AS table_object ON table_object.oid = constraint_object.conrelid
-    JOIN pg_namespace AS schema ON schema.oid = table_object.relnamespace
-    WHERE schema.nspname = 'drizzle'
-      AND table_object.relname = '__drizzle_migrations'
-    ORDER BY constraint_object.conname
-  `);
-  if (
-    constraints.rows.length !== 1 ||
-    constraints.rows[0]?.name !== "__drizzle_migrations_pkey" ||
-    constraints.rows[0]?.type !== "p" ||
-    constraints.rows[0]?.definition !== "PRIMARY KEY (id)"
-  ) {
-    return { exists: true, proven: false };
-  }
-
-  const proof = await client.query(
-    `
-      SELECT
-        count(*) = 1 AS has_one_entry,
-        bool_and(id = 1 AND hash = $1 AND created_at = $2::bigint) AS is_exact_baseline,
-        pg_get_serial_sequence('drizzle.__drizzle_migrations', 'id') =
-          'drizzle.__drizzle_migrations_id_seq' AS has_expected_sequence
-      FROM drizzle.__drizzle_migrations
-    `,
-    [drizzleBaselineHash, drizzleBaselineCreatedAt],
-  );
-  const row = proof.rows[0];
-  return {
-    exists: true,
-    proven:
-      row?.has_one_entry === true &&
-      row.is_exact_baseline === true &&
-      row.has_expected_sequence === true,
-  };
 }
 
 async function prismaHistoryExists(client) {
@@ -271,17 +168,6 @@ async function inspectPrismaHistory(client) {
   }
 }
 
-async function removeDrizzleHistory(client) {
-  await client.query("BEGIN");
-  try {
-    await client.query('DROP SCHEMA "drizzle" CASCADE');
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  }
-}
-
 async function runMigrations() {
   const connectionString = await readConnectionString();
   const client = new pg.Client({
@@ -302,23 +188,16 @@ async function runMigrations() {
     await assertMigratorPreflight(client);
     await assertNoUntrackedSchemas(client);
 
-    const hasPrismaHistory = await prismaHistoryExists(client);
-    const [hasPublicObjects, drizzleBaseline] = await Promise.all([
+    const [hasPrismaHistory, hasPublicObjects] = await Promise.all([
+      prismaHistoryExists(client),
       publicSchemaIsNonempty(client),
-      inspectDrizzleBaseline(client),
     ]);
-    const actions = planMigration({ hasPrismaHistory, hasPublicObjects, drizzleBaseline });
-    for (const action of actions) {
-      if (action === "inspect-prisma-history") {
-        await inspectPrismaHistory(client);
-      } else if (action === "resolve-baseline") {
-        await runPrisma(["migrate", "resolve", "--applied", baselineMigration], connectionString);
-      } else if (action === "remove-drizzle-history") {
-        await removeDrizzleHistory(client);
-      } else {
-        await runPrisma(["migrate", "deploy"], connectionString);
-      }
+    if (hasPrismaHistory) {
+      await inspectPrismaHistory(client);
+    } else if (hasPublicObjects) {
+      throw new Error("refusing to migrate an untracked nonempty public schema");
     }
+    await runPrisma(["migrate", "deploy"], connectionString);
     console.log("database migrations applied");
   } catch (error) {
     operationError = error;

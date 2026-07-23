@@ -12,7 +12,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { Uuid } from "../orchestration/model";
-import type { ArchiveVersionDeleter } from "./livekit-effects";
+import type { ArchiveVersionDeleter } from "./livekit-effects/shared";
 
 interface S3ArchiveConfig {
   readonly endpoint: string;

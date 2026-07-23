@@ -75,7 +75,7 @@
   --ring: var(--primary);
   --radius: 0.5rem;
 
-  /* Compatibility tokens used by established route components. */
+  /* Shared product design tokens used across route components. */
   --ink: #243148;
   --cloud: #f8f7f3;
   --cobalt: #294b73;

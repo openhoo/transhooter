@@ -14,9 +14,6 @@ import {
   sendPersistedStatus,
 } from "./livekit-effects/shared";
 
-export { egressStatusName, isViableEgressAdoption } from "./livekit-effects/egress";
-export type { ArchiveVersionDeleter, LiveKitConfig } from "./livekit-effects/shared";
-
 export class LiveKitEffects implements RemoteEffects {
   private readonly rooms: RoomServiceClient;
   private readonly dispatch: AgentDispatchClient;

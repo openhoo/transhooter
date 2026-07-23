@@ -17,7 +17,6 @@ COPY tsconfig.base.json biome.json ./
 COPY apps ./apps
 COPY packages ./packages
 COPY deploy/scripts/migrate.mjs ./deploy/scripts/migrate.mjs
-COPY deploy/scripts/migration-plan.mjs ./deploy/scripts/migration-plan.mjs
 RUN DATABASE_URL=postgresql://transhooter:transhooter@postgres/transhooter \
     bun run --filter @transhooter/server-core prisma:generate \
     && bun run build
@@ -55,6 +54,5 @@ COPY --from=build --chown=10001:10001 /workspace/packages/server-core/dist /work
 COPY --from=build --chown=10001:10001 /workspace/packages/server-core/prisma /workspace/packages/server-core/prisma
 COPY --from=build --chown=10001:10001 /workspace/packages/server-core/prisma.config.ts /workspace/packages/server-core/prisma.config.ts
 COPY --from=build --chown=10001:10001 /workspace/deploy/scripts/migrate.mjs /workspace/deploy/scripts/migrate.mjs
-COPY --from=build --chown=10001:10001 /workspace/deploy/scripts/migration-plan.mjs /workspace/deploy/scripts/migration-plan.mjs
 USER 10001:10001
 EXPOSE 3000 8080

@@ -118,8 +118,6 @@ export interface ApplicationOperations {
   workerFailure(input: WorkerFailureInput): Promise<boolean>;
 }
 
-export { checkpointPersistenceValues } from "./application-operations-workers";
-
 export class PrismaApplicationOperations implements ApplicationOperations {
   private readonly queries: ApplicationOperationsQueries;
   private readonly workers: ApplicationOperationsWorkers;
