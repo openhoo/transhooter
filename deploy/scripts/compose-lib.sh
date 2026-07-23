@@ -219,6 +219,29 @@ failure_smoke_project_is_owned() {
   esac
 }
 
+failure_smoke_project_owner_pid() {
+  candidate=$1
+  case "$candidate" in
+    transhooter-failure-*-*) ;;
+    *) return 1 ;;
+  esac
+  identity=${candidate#transhooter-failure-}
+  process_id=${identity%%-*}
+  started_at=${identity#*-}
+  case "$process_id:$started_at" in
+    :* | *: | *[!0-9:]* | *:*:*) return 1 ;;
+  esac
+  printf '%s\n' "$process_id"
+}
+
+failure_smoke_project_is_stale() {
+  candidate=$1
+  current_project=$2
+  [ "$candidate" != "$current_project" ] || return 1
+  process_id=$(failure_smoke_project_owner_pid "$candidate") || return 1
+  ! kill -0 "$process_id" 2>/dev/null
+}
+
 failure_smoke_resource_is_owned() {
   project=$1
   owner=$2

@@ -25,6 +25,24 @@ failure_smoke_resource_is_owned "$owned" "$owned" "$owned" || fail 'matching res
 if failure_smoke_resource_is_owned "$owned" "$owned" external-project; then
   fail 'external resource label was classified as owned'
 fi
+current_pid_project="transhooter-failure-$$-456"
+if failure_smoke_project_is_stale "$current_pid_project" transhooter-failure-999-456; then
+  fail 'live harness owner was classified as stale'
+fi
+stale_pid=99999999
+while kill -0 "$stale_pid" 2>/dev/null; do
+  stale_pid=$((stale_pid + 1))
+done
+stale_project="transhooter-failure-$stale_pid-456"
+failure_smoke_project_is_stale "$stale_project" transhooter-failure-999-456 ||
+  fail 'dead harness owner was not classified as stale'
+if failure_smoke_project_is_stale transhooter transhooter-failure-999-456; then
+  fail 'generic project was classified as stale failure-smoke state'
+fi
+if failure_smoke_project_is_stale "$stale_project" "$stale_project"; then
+  fail 'current harness project was classified as stale'
+fi
+
 
 TEST_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/failure-wrapper-contract.XXXXXXXX")
 trap 'rm -rf -- "$TEST_DIRECTORY"' 0 HUP INT TERM
@@ -95,11 +113,17 @@ case " $* " in
     exit 0
     ;;
 esac
+case " $* " in
+  *" ps --all --filter label=com.docker.compose.project --format "* | \
+    *" network ls --filter label=com.docker.compose.project --format "* | \
+    *" volume ls --filter label=com.docker.compose.project --format "*)
+    [ "${MOCK_MODE:-}" = stale ] && printf '%s\n' "$STALE_PROJECT"
+    exit 0
+    ;;
+esac
 case "${1:-}:${2:-}" in
   ps:*)
-    if [ "${MOCK_MODE:-}" = ambiguous ]; then
-      printf 'container|foreign-container|external-project\n'
-    fi
+    [ "${MOCK_MODE:-}" = ambiguous ] && printf 'container|foreign-container|external-project\n'
     exit 0
     ;;
   network:ls | volume:ls) exit 0 ;;
@@ -166,6 +190,9 @@ run_wrapper() {
     timeout 15 "$ROOT/scripts/failure-smoke" "$@" > "$output" 2>&1
 }
 
+STALE_PROJECT="transhooter-failure-$stale_pid-456"
+export STALE_PROJECT
+
 : > "$CALLS"
 if run_wrapper timeout "$TEST_DIRECTORY/timeout-output"; then
   fail 'timed-out setup phase succeeded'
@@ -177,6 +204,15 @@ grep -F 'Phase "Initializing failure-smoke runtime secrets" exceeded its absolut
   "$TEST_DIRECTORY/timeout-output" >/dev/null || fail 'timeout diagnostic was not emitted'
 grep -F ' down --volumes --remove-orphans' "$CALLS" >/dev/null ||
   fail 'bounded cleanup did not run after timeout'
+
+: > "$CALLS"
+if ! run_wrapper stale "$TEST_DIRECTORY/stale-output" --no-build; then
+  fail 'stale-stack cleanup wrapper run failed'
+fi
+grep -F " -p $STALE_PROJECT " "$CALLS" >/dev/null ||
+  fail 'stale failure-smoke project was not targeted'
+grep -F ' down --volumes --remove-orphans' "$CALLS" >/dev/null ||
+  fail 'stale failure-smoke project was not removed before the new run'
 
 : > "$CALLS"
 if run_wrapper ambiguous "$TEST_DIRECTORY/ambiguous-output"; then

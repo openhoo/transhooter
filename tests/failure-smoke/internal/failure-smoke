@@ -201,6 +201,35 @@ compose_bounded() {
   run_bounded "$phase" "$phase_timeout" docker compose "$@"
 }
 
+stale_failure_smoke_projects() {
+  {
+    docker ps --all --filter "label=com.docker.compose.project" \
+      --format '{{.Label "com.docker.compose.project"}}'
+    docker network ls --filter "label=com.docker.compose.project" \
+      --format '{{.Label "com.docker.compose.project"}}'
+    docker volume ls --filter "label=com.docker.compose.project" \
+      --format '{{.Label "com.docker.compose.project"}}'
+  } |
+    sort -u |
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      failure_smoke_project_is_stale "$candidate" "$PROJECT_NAME" || continue
+      printf '%s\n' "$candidate"
+    done
+}
+
+cleanup_stale_failure_smoke_projects() {
+  stale_projects=$(stale_failure_smoke_projects) || return $?
+  [ -n "$stale_projects" ] || return 0
+  printf '%s\n' "$stale_projects" | while IFS= read -r stale_project; do
+    [ -n "$stale_project" ] || continue
+    run_bounded "Cleaning stale failure-smoke stack $stale_project" \
+      "$COMPOSE_CLEANUP_TIMEOUT_SECONDS" \
+      docker compose -p "$stale_project" -f "$BASE_FILE" -f "$OVERLAY_FILE" \
+        down --volumes --remove-orphans
+  done
+}
+
 verify_failure_smoke_stack_ownership() {
   if ! failure_smoke_project_is_owned "$PROJECT_NAME" "$FAILURE_SMOKE_OWNED_PROJECT_NAME"; then
     printf 'Refusing cleanup: project %s is not the harness-owned failure-smoke stack.\n' \
@@ -281,6 +310,8 @@ else
   exit 1
 fi
 trap - 0
+
+cleanup_stale_failure_smoke_projects
 
 capture_database_diagnostic() {
   phase=$1
