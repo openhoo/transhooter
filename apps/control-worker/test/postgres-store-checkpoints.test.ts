@@ -775,7 +775,7 @@ describe("PostgresStore batched persistence contracts", () => {
     expect(rolledBack).toBe(true);
   });
 
-  it("orders active effect claims by CASE priority and lease keys", async () => {
+  it("orders active effect claims by recovery first, then STATUS_PACKET priority", async () => {
     const fake = fakeTransaction([[]]);
 
     await claimEffects(fake.transaction as never, {
@@ -787,10 +787,13 @@ describe("PostgresStore batched persistence contracts", () => {
 
     expect(fake.calls).toHaveLength(1);
     expect(fake.calls[0]?.text).toContain(
-      "ORDER BY CASE candidate.effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END,",
+      "ORDER BY CASE candidate.state WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END,",
     );
     expect(fake.calls[0]?.text).toContain(
-      "candidate.lease_expires_at NULLS FIRST,candidate.created_at,candidate.id",
+      "CASE candidate.effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END,",
+    );
+    expect(fake.calls[0]?.text).toContain(
+      "candidate.lease_expires_at NULLS LAST,candidate.created_at,candidate.id",
     );
     expect(fake.calls[0]?.text).not.toContain("candidate.claim_priority");
     expect(fake.calls[0]?.text).toContain(
@@ -808,7 +811,7 @@ describe("PostgresStore batched persistence contracts", () => {
       ),
     ]);
     expect(schema).toContain(
-      "external_effects_active_claim_priority_lease_created_id_idx covers CASE priority and lease claim ordering",
+      "external_effects_active_claim_priority_lease_created_id_idx exactly covers recovery-first state ordering, STATUS_PACKET priority within each class, expired lease ordering, and deterministic ties",
     );
     expect(schema).not.toContain("claimPriority");
     expect(schema).not.toContain('map("claim_priority")');
@@ -818,7 +821,7 @@ describe("PostgresStore batched persistence contracts", () => {
     expect(migration).not.toContain('ADD COLUMN "claim_priority"');
     expect(migration).not.toContain("GENERATED ALWAYS AS");
     expect(migration).toContain(
-      `ON "external_effects" ((CASE "effect_kind" WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END), "lease_expires_at" ASC NULLS FIRST, "created_at", "id")`,
+      `ON "external_effects" ((CASE "state" WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END), (CASE "effect_kind" WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END), "lease_expires_at" ASC NULLS LAST, "created_at", "id")`,
     );
     expect(migration).toContain("'planned'::external_effect_state");
     expect(migration).toContain("'compensating'::external_effect_state");

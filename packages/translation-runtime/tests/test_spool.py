@@ -21,6 +21,7 @@ from transhooter_worker.adapters.archive_delivery import (
     upload_committed_objects,
     upload_committed_objects_async,
 )
+from transhooter_worker.adapters.s3_archive import S3Archive
 from transhooter_worker.adapters.spool import (
     CapacityProbe,
     EncryptedSpool,
@@ -643,6 +644,57 @@ async def test_inline_terminal_drain_uses_one_worker_thread_and_keeps_loop_respo
     assert worker_threads[0] != loop_thread
     assert registration_threads == [loop_thread]
     assert original_committed() == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_executor_reaches_multipart_journal_from_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from test_s3_archive import RecordingS3Client
+
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    spool = make_spool(tmp_path)
+    meeting_id = uuid4()
+    body = b"multipart terminal evidence"
+    evidence = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="terminal",
+        transport="http",
+        direction="in",
+        media_type="application/json",
+        payload=body,
+    )
+    archive = S3Archive(
+        RecordingS3Client(),
+        "bucket",
+        None,
+        False,
+        tmp_path / "multipart.sqlite3",
+    )
+    registered: list[UUID] = []
+
+    async def register(
+        _meeting: UUID,
+        object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        registered.append(object_id)
+
+    async with ArchiveDeliveryExecutor() as executor:
+        await upload_committed_objects_async(
+            spool,
+            archive,
+            register,
+            meeting_id,
+            executor,
+        )
+
+    assert registered == [evidence.object_id]
+    assert spool.committed() == []
 
 
 @pytest.mark.asyncio

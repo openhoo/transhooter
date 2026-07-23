@@ -167,6 +167,16 @@ case " $* " in
       mkdir -p "$proof_directory"
       printf '{"scenarios":[],"shard":"mock","totalDurationMs":1,"scenarioDurationsMs":{}}\n' > "$proof_directory/proof.json"
     fi
+    if [ "${MOCK_MODE:-}" = scenario-failure ]; then
+      printf 'full-log-first-line\n'
+      line_number=1
+      while [ "$line_number" -le 205 ]; do
+        printf 'full-log-filler-%s\n' "$line_number"
+        line_number=$((line_number + 1))
+      done
+      printf 'full-log-last-line\n'
+      exit 42
+    fi
     ;;
 esac
 exit 0
@@ -317,6 +327,37 @@ grep -F ':/proof' "$CALLS" >/dev/null || fail 'no-build did not mount the privat
 [ -s "$no_build_proof" ] || fail 'no-build did not copy the harness proof'
 grep -F '"name":"Running failure injection scenarios"' "$no_build_metrics" >/dev/null ||
   fail 'no-build metrics omitted scenario execution'
+
+: > "$CALLS"
+failed_scenario_log="$TEST_DIRECTORY/failed-scenario.log"
+if run_wrapper scenario-failure "$TEST_DIRECTORY/scenario-failure-output" \
+  --no-build --scenario-log-file "$failed_scenario_log"; then
+  fail 'failed scenario wrapper run succeeded'
+else
+  failed_scenario_status=$?
+fi
+[ "$failed_scenario_status" -eq 42 ] ||
+  fail "failed scenario returned $failed_scenario_status instead of 42"
+[ "$(wc -l < "$failed_scenario_log")" -ge 207 ] ||
+  fail 'failed scenario artifact did not preserve the complete log'
+grep -Fx 'full-log-first-line' "$failed_scenario_log" >/dev/null ||
+  fail 'failed scenario artifact omitted the initial log context'
+grep -Fx 'full-log-last-line' "$failed_scenario_log" >/dev/null ||
+  fail 'failed scenario artifact omitted the terminal log context'
+grep -F "Complete failure-smoke scenario log: $failed_scenario_log" \
+  "$TEST_DIRECTORY/scenario-failure-output" >/dev/null ||
+  fail 'failed scenario did not report the caller-visible artifact'
+if grep -F 'full-log-first-line' "$TEST_DIRECTORY/scenario-failure-output" >/dev/null; then
+  fail 'failed scenario terminal output was not limited to the concise tail'
+fi
+grep -F 'full-log-last-line' "$TEST_DIRECTORY/scenario-failure-output" >/dev/null ||
+  fail 'failed scenario terminal tail omitted the final log context'
+grep -F ' down --volumes --remove-orphans' "$CALLS" >/dev/null ||
+  fail 'failed scenario did not clean the owned Compose stack'
+for remaining_run_directory in "$TEST_DIRECTORY"/transhooter-failure-smoke.*; do
+  [ ! -e "$remaining_run_directory" ] ||
+    fail 'failed scenario retained its private run directory after artifact copy'
+done
 
 parallel_output="$TEST_DIRECTORY/parallel-artifacts"
 : > "$CALLS"

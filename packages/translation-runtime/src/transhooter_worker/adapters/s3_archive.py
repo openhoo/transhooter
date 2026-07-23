@@ -7,6 +7,7 @@ import time
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -63,6 +64,7 @@ class S3Archive:
     multipart_database: Path | None = None
     _db: sqlite3.Connection | None = field(init=False, default=None, repr=False)
     _multipart_owner_id: str | None = field(init=False, default=None, repr=False)
+    _multipart_lock: RLock = field(init=False, default_factory=RLock, repr=False)
 
     MULTIPART_THRESHOLD = 100 * 1024 * 1024
     PART_SIZE = 16 * 1024 * 1024
@@ -73,7 +75,11 @@ class S3Archive:
         self._db = None
         self._multipart_owner_id = None
         if self.multipart_database:
-            self._db = sqlite3.connect(self.multipart_database, isolation_level=None)
+            self._db = sqlite3.connect(
+                self.multipart_database,
+                isolation_level=None,
+                check_same_thread=False,
+            )
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute("PRAGMA synchronous=FULL")
             self._db.executescript(_MULTIPART_SCHEMA)
@@ -87,7 +93,8 @@ class S3Archive:
         if hashlib.sha256(body).hexdigest() != sha256:
             raise ValueError("provided SHA-256 does not match body")
         if len(body) >= self.MULTIPART_THRESHOLD:
-            return self._put_multipart(key, body, content_type, sha256)
+            with self._multipart_lock:
+                return self._put_multipart(key, body, content_type, sha256)
 
         args = self._object_arguments(
             key=key,
@@ -660,29 +667,30 @@ class S3Archive:
         return int(time.time() * 1000)
 
     def abort_abandoned(self, older_than_ms: int) -> int:
-        if self._db is None:
-            return 0
-        rows = self._db.execute(
-            """
-            SELECT key, upload_id
-            FROM multipart_uploads
-            WHERE state = 'uploading' AND updated_ms < ? AND owner_id = ?
-            """,
-            (older_than_ms, self._multipart_owner()),
-        ).fetchall()
-        aborted = 0
-        for key, upload_id in rows:
-            try:
-                self._reconcile_remote_parts(key, upload_id)
-            except ClientError as exc:
-                if not self._is_missing_upload(exc):
-                    raise
-                self._forget_upload(self._db, key, upload_id)
+        with self._multipart_lock:
+            if self._db is None:
+                return 0
+            rows = self._db.execute(
+                """
+                SELECT key, upload_id
+                FROM multipart_uploads
+                WHERE state = 'uploading' AND updated_ms < ? AND owner_id = ?
+                """,
+                (older_than_ms, self._multipart_owner()),
+            ).fetchall()
+            aborted = 0
+            for key, upload_id in rows:
+                try:
+                    self._reconcile_remote_parts(key, upload_id)
+                except ClientError as exc:
+                    if not self._is_missing_upload(exc):
+                        raise
+                    self._forget_upload(self._db, key, upload_id)
+                    aborted += 1
+                    continue
+                self._abort_and_forget(self._db, key, upload_id)
                 aborted += 1
-                continue
-            self._abort_and_forget(self._db, key, upload_id)
-            aborted += 1
-        return aborted
+            return aborted
 
     def _reconcile_remote_parts(self, key: str, upload_id: str) -> None:
         self._list_remote_parts(key, upload_id)

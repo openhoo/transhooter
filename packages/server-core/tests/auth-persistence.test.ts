@@ -511,11 +511,16 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
         );
         expect(claimIndex.rows).toHaveLength(1);
         expect(claimIndex.rows[0]).toMatchObject({ ready: true, valid: true });
-        expect(claimIndex.rows[0]?.expression.replaceAll(/\s+/g, " ").trim()).toContain(
-          "CASE effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END",
+        const claimExpression = claimIndex.rows[0]?.expression.replaceAll(/\s+/g, " ").trim();
+        const recoveryPriority =
+          "CASE state WHEN 'planned'::external_effect_state THEN 1 ELSE 0 END";
+        const statusPriority = "CASE effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END";
+        expect(claimExpression).toContain(recoveryPriority);
+        expect(claimExpression).toContain(statusPriority);
+        expect(claimExpression?.indexOf(recoveryPriority)).toBeLessThan(
+          claimExpression?.indexOf(statusPriority) ?? -1,
         );
-        expect(claimIndex.rows[0]?.definition).toContain("lease_expires_at NULLS FIRST");
-        expect(claimIndex.rows[0]?.definition).toContain("created_at, id");
+        expect(claimIndex.rows[0]?.definition).toContain("lease_expires_at, created_at, id");
         expect(claimIndex.rows[0]?.predicate).toContain("'planned'::external_effect_state");
         expect(claimIndex.rows[0]?.predicate).toContain("'compensating'::external_effect_state");
 

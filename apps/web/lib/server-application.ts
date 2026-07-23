@@ -810,7 +810,7 @@ export function presentConsultationEnd(result: unknown): {
   };
 }
 
-async function present(
+export async function present(
   operation: string,
   result: unknown,
   context: RequestContext,
@@ -869,6 +869,9 @@ async function present(
       role: room.role,
       state: room.state,
     };
+  }
+  if (operation === "archives.objects.list") {
+    return presentArchiveObjects(result);
   }
   if (operation === "archives.get") {
     return presentArchive(result, context);

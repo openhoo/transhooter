@@ -28,6 +28,7 @@ const {
   archiveDeleteCommand,
   consultationCreateCommand,
   normalizeAuthFlowError,
+  present,
   presentArchiveObjects,
   presentConsultationEnd,
   presentConsultationList,
@@ -321,6 +322,57 @@ test("archive object presentation exposes only the public payload with response 
         sha256: "a".repeat(64),
         s3Checksum: "checksum-1",
         versionId: "version-1",
+      },
+    ],
+    nextCursor: id,
+  });
+});
+
+test("archive object list uses the endpoint presentation dispatch", async () => {
+  const id = "00000000-0000-4000-8000-000000000024";
+  const request = new Request("http://localhost/api/archives/archive-id/objects");
+
+  await expect(
+    present(
+      "archives.objects.list",
+      {
+        objects: [
+          {
+            id,
+            object_class: "caption_final_vtt",
+            key: "v1/meetings/consultation/captions/final.vtt",
+            content_type: "text/vtt",
+            size: "256",
+            sha256: "b".repeat(64),
+            s3_checksum: "checksum-2",
+            version_id: "version-2",
+          },
+        ],
+        cursor: id,
+      },
+      {
+        request,
+        params: {},
+        query: {},
+        body: {},
+        rawBody: null,
+        sessionToken: null,
+        csrfToken: null,
+        exchangeNonce: null,
+      },
+    ),
+  ).resolves.toEqual({
+    objects: [
+      {
+        id,
+        group: "captions",
+        label: "caption_final_vtt",
+        key: "v1/meetings/consultation/captions/final.vtt",
+        contentType: "text/vtt",
+        size: 256,
+        sha256: "b".repeat(64),
+        s3Checksum: "checksum-2",
+        versionId: "version-2",
       },
     ],
     nextCursor: id,

@@ -19,6 +19,7 @@ BUILD_ONLY=false
 NO_BUILD=false
 HOST_PROOF_FILE=
 HOST_METRICS_FILE=
+HOST_SCENARIO_LOG_FILE=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --build-only)
@@ -29,7 +30,7 @@ while [ "$#" -gt 0 ]; do
       NO_BUILD=true
       shift
       ;;
-    --proof-file | --metrics-file)
+    --proof-file | --metrics-file | --scenario-log-file)
       option=$1
       [ "$#" -ge 2 ] || {
         printf '%s requires a path.\n' "$option" >&2
@@ -38,6 +39,7 @@ while [ "$#" -gt 0 ]; do
       case "$option" in
         --proof-file) HOST_PROOF_FILE=$2 ;;
         --metrics-file) HOST_METRICS_FILE=$2 ;;
+        --scenario-log-file) HOST_SCENARIO_LOG_FILE=$2 ;;
       esac
       shift 2
       ;;
@@ -64,6 +66,21 @@ PROJECT_NAME="transhooter-failure-$$-$(date +%s%N)"
 FAILURE_SMOKE_OWNED_PROJECT_NAME=$PROJECT_NAME
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 export APP_IMAGE_NAMESPACE="${APP_IMAGE_NAMESPACE:-transhooter-harness}"
+if [ -z "$HOST_SCENARIO_LOG_FILE" ]; then
+  if [ -n "$HOST_PROOF_FILE" ]; then
+    case "$HOST_PROOF_FILE" in
+      *.proof.json) HOST_SCENARIO_LOG_FILE="${HOST_PROOF_FILE%.proof.json}.scenario.log" ;;
+      *) HOST_SCENARIO_LOG_FILE="$HOST_PROOF_FILE.scenario.log" ;;
+    esac
+  elif [ -n "$HOST_METRICS_FILE" ]; then
+    case "$HOST_METRICS_FILE" in
+      *.metrics.jsonl) HOST_SCENARIO_LOG_FILE="${HOST_METRICS_FILE%.metrics.jsonl}.scenario.log" ;;
+      *) HOST_SCENARIO_LOG_FILE="$HOST_METRICS_FILE.scenario.log" ;;
+    esac
+  else
+    HOST_SCENARIO_LOG_FILE="${FAILURE_SMOKE_OUTPUT_DIR:-$ROOT/artifacts/failure-smoke}/$PROJECT_NAME.scenario.log"
+  fi
+fi
 OVERLAY_FILE="$ROOT/deploy/compose/compose.test.yml"
 export APP_ENV=test
 export PROVIDER_PROFILE=fixture
@@ -317,6 +334,7 @@ capture_database_diagnostics() {
   consultation_sql="SELECT state, generation, room_name IS NOT NULL AS room_name_set, room_sid IS NOT NULL AS room_sid_set, dispatch_id IS NOT NULL AS dispatch_id_set, composite_egress_id IS NOT NULL AS composite_egress_id_set FROM consultations ORDER BY created_at DESC LIMIT 3"
   external_effect_sql="SELECT generation, effect_kind, state, attempts, result ? 'error' AS has_error, max(result->>'error') AS latest_error, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, result ? 'error' ORDER BY generation, effect_kind, state, attempts, has_error"
   archive_sql="SELECT a.state, a.final_inventory_hash IS NOT NULL AS inventory_hashed, count(DISTINCT o.id) AS objects, count(DISTINCT m.id) FILTER (WHERE m.state IN ('open','completing')) AS pending_multipart FROM archives a LEFT JOIN archive_objects o ON o.archive_id=a.id LEFT JOIN multipart_uploads m ON m.archive_id=a.id GROUP BY a.id, a.state, a.final_inventory_hash ORDER BY a.created_at DESC LIMIT 3"
+
   outbox_sql="SELECT id, topic, aggregate_id, generation, payload->>'kind' AS effect_kind, payload->>'subjectId' AS subject_id, payload->>'resourceGeneration' AS resource_generation, available_at, lease_owner, lease_expires_at, attempts, payload->>'lastDispatchError' AS last_dispatch_error FROM outbox WHERE delivered_at IS NULL ORDER BY available_at, id"
   compose_bounded "Capturing database diagnostics" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
     run --rm --no-deps --workdir /workspace/tests/failure-smoke \
@@ -412,6 +430,12 @@ if compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIME
   cat "$scenario_log"
 else
   status=$?
+  if copy_artifact "$scenario_log" "$HOST_SCENARIO_LOG_FILE"; then
+    printf 'Complete failure-smoke scenario log: %s\n' "$HOST_SCENARIO_LOG_FILE" >&2
+  else
+    printf 'Failed to preserve complete failure-smoke scenario log at %s.\n' \
+      "$HOST_SCENARIO_LOG_FILE" >&2
+  fi
   tail -n 200 "$scenario_log" >&2
   exit "$status"
 fi

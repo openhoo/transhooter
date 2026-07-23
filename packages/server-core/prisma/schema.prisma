@@ -443,7 +443,7 @@ model ExternalEffect {
   expectedArtifact     ExpectedArchiveArtifact?
 
   @@unique([consultationId, generation, effectKind, subjectId, occurrenceKey], map: "external_effect_occurrence_unique")
-  // Migration-managed: external_effects_active_claim_priority_lease_created_id_idx covers CASE priority and lease claim ordering.
+  // Migration-managed: external_effects_active_claim_priority_lease_created_id_idx exactly covers recovery-first state ordering, STATUS_PACKET priority within each class, expired lease ordering, and deterministic ties.
   @@map("external_effects")
 }
 
