@@ -37,6 +37,11 @@
     "admin:create-staff": "bun run --filter @transhooter/control-worker admin:create-staff",
     "admin:set-language": "bun run --filter @transhooter/control-worker admin:set-language"
   },
+  "overrides": {
+    "@hono/node-server": "2.0.11",
+    "postcss": "8.5.22",
+    "sharp": "0.35.3"
+  },
   "devDependencies": {
     "@biomejs/biome": "2.5.4"
   }
