@@ -231,12 +231,17 @@ export async function withWebOperation<T>(
     throw error;
   } finally {
     const completedAttributes: Attributes = {
-      ...attributes,
+      operation: normalizedOperation(operation),
+      surface,
       outcome,
       status_class: finalStatusClass,
-      ...(responseStatus === undefined ? {} : { "http.response.status_code": responseStatus }),
-      ...(errorKind ? { "error.kind": errorKind } : {}),
     };
+    if (responseStatus !== undefined) {
+      completedAttributes["http.response.status_code"] = responseStatus;
+    }
+    if (errorKind !== undefined) {
+      completedAttributes["error.kind"] = errorKind;
+    }
     try {
       current.operationTotal.add(1, completedAttributes);
       current.operationDuration.record((performance.now() - started) / 1_000, completedAttributes);

@@ -62,15 +62,50 @@ function mapAdminLanguage(row: Record<string, unknown>): AdminLanguageRow {
   };
 }
 
+type ArchiveObjectRow = {
+  id: UUID;
+  object_class: string;
+  key: string;
+  content_type: string;
+  size: bigint;
+  sha256: string;
+  s3_checksum: string;
+  version_id: string;
+};
+
+interface ArchiveObjectPresentation extends Record<string, unknown> {
+  id: UUID;
+  object_class: string;
+  key: string;
+  content_type: string;
+  size: string;
+  sha256: string;
+  s3_checksum: string;
+  version_id: string;
+}
+
+function mapArchiveObject(row: ArchiveObjectRow): ArchiveObjectPresentation {
+  return {
+    id: row.id,
+    object_class: row.object_class,
+    key: row.key,
+    content_type: row.content_type,
+    size: row.size.toString(),
+    sha256: row.sha256,
+    s3_checksum: row.s3_checksum,
+    version_id: row.version_id,
+  };
+}
+
 function presentArchiveObjectPage(
-  rows: readonly Record<string, unknown>[],
+  rows: readonly ArchiveObjectPresentation[],
   limit: number,
 ): ArchiveObjectPage {
   const hasMore = rows.length > limit;
   const objects = hasMore ? rows.slice(0, limit) : rows;
   return {
     objects,
-    cursor: hasMore ? String(objects.at(-1)?.id) : null,
+    cursor: hasMore ? (objects.at(-1)?.id ?? null) : null,
   };
 }
 
@@ -137,10 +172,10 @@ export class ApplicationOperationsQueries {
     limit: number,
   ): Promise<ArchiveObjectPage> {
     const boundedLimit = Math.max(1, Math.min(limit, 100));
-    const rows = await this.database.$queryRaw<Record<string, unknown>[]>(
-      Prisma.sql`SELECT DISTINCT o.* FROM archive_objects o JOIN archives a ON a.id=o.archive_id JOIN final_inventories f ON f.archive_id=a.id LEFT JOIN consultation_participants p ON p.consultation_id=a.consultation_id AND p.user_id=${principal.userId} AND p.role='employee' WHERE (a.id=${routeId} OR a.consultation_id=${routeId}) AND a.state IN ('complete','incomplete') AND (${principal.role}='admin' OR p.id IS NOT NULL) AND (${cursor}::uuid IS NULL OR o.id>${cursor}::uuid) ORDER BY o.id LIMIT ${boundedLimit + 1}`,
+    const rows = await this.database.$queryRaw<ArchiveObjectRow[]>(
+      Prisma.sql`SELECT o.id,o.object_class,o.key,o.content_type,o.size,o.sha256,o.s3_checksum,o.version_id FROM archive_objects o JOIN archives a ON a.id=o.archive_id JOIN final_inventories f ON f.archive_id=a.id LEFT JOIN consultation_participants p ON p.consultation_id=a.consultation_id AND p.user_id=${principal.userId} AND p.role='employee' WHERE (a.id=${routeId} OR a.consultation_id=${routeId}) AND a.state IN ('complete','incomplete') AND (${principal.role}='admin' OR p.id IS NOT NULL) AND (${cursor}::uuid IS NULL OR o.id>${cursor}::uuid) ORDER BY o.id LIMIT ${boundedLimit + 1}`,
     );
-    return presentArchiveObjectPage(mapDatabaseRows(rows), boundedLimit);
+    return presentArchiveObjectPage(rows.map(mapArchiveObject), boundedLimit);
   }
 
   async archiveDownload(principal: StaffPrincipal, routeId: UUID, objectId: UUID): Promise<string> {

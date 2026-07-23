@@ -26,6 +26,13 @@ type MissingInventoryEntry = Readonly<Record<string, unknown>> & {
   readonly reason: string;
 };
 
+interface ArchiveObjectEvidenceIndex {
+  readonly firstObjectIdByClassAndPrefix: ReadonlyMap<string, string>;
+  readonly prefixes: ReadonlySet<string>;
+  readonly providerEvidence: ReadonlySet<string>;
+  readonly classAndDestination: ReadonlySet<string>;
+}
+
 interface CanonicalEffectRequest {
   readonly bytes: Uint8Array;
   readonly sha256: string;
@@ -41,6 +48,7 @@ interface LeaseRenewal {
 
 class LeaseLostError extends Error {}
 type EffectOutcome = "compensated" | "failed" | "lease_lost" | "not_owned" | "done";
+const ARCHIVE_OBJECT_IO_CONCURRENCY = 4;
 
 export class EffectRunner {
   constructor(
@@ -426,6 +434,11 @@ export class EffectRunner {
             checksum: object.checksum,
             contentType: object.contentType,
           }),
+        )
+        .sort((left, right) =>
+          `${left.key}\u0000${left.versionId}\u0000${left.id}`.localeCompare(
+            `${right.key}\u0000${right.versionId}\u0000${right.id}`,
+          ),
         );
       const persistedObjects = [
         ...snapshot.objects,
@@ -451,7 +464,11 @@ export class EffectRunner {
       const vttObjects = renderedVttObjects.filter(
         (object) => !persistedIdentities.has(archiveObjectIdentity(object)),
       );
-      const derivedObjects = [...discoveredObjects, ...vttObjects];
+      const derivedObjects = [...discoveredObjects, ...vttObjects].sort((left, right) =>
+        `${left.key}\u0000${left.versionId}\u0000${left.id}`.localeCompare(
+          `${right.key}\u0000${right.versionId}\u0000${right.id}`,
+        ),
+      );
       const inventoryObjects = [
         ...persistedObjects,
         ...vttObjects.map(derivedToArchivedObject),
@@ -493,21 +510,22 @@ export class EffectRunner {
   }
 
   private async verifyObjects(objects: ReconciliationSnapshot["objects"]): Promise<Set<string>> {
-    const invalidObjectIds = new Set<string>();
-    await Promise.all(
-      objects.map(async (object) => {
-        const valid = await this.remote.verifyArchiveObject({
+    const verificationResults = await mapBounded(
+      objects,
+      ARCHIVE_OBJECT_IO_CONCURRENCY,
+      async (object) => ({
+        id: object.id,
+        valid: await this.remote.verifyArchiveObject({
           key: object.key,
           versionId: object.versionId,
           size: object.size,
           checksum: object.s3Checksum,
-        });
-        if (!valid) {
-          invalidObjectIds.add(object.id);
-        }
+        }),
       }),
     );
-    return invalidObjectIds;
+    return new Set(
+      verificationResults.filter((result) => !result.valid).map((result) => result.id),
+    );
   }
 
   private missingInventoryEntries(
@@ -515,23 +533,16 @@ export class EffectRunner {
     invalidObjectIds: ReadonlySet<string>,
     objects: readonly ArchivedObject[],
   ): MissingInventoryEntry[] {
+    const objectIndex = indexArchiveObjectEvidence(objects);
     const resolvedExpectationIds = new Map(
       snapshot.expectations.map((expected) => {
         const discovered =
           expected.fulfilledObjectId === null &&
           (expected.objectClass === "room_composite" ||
             expected.objectClass === "participant_original")
-            ? (objects
-                .filter(
-                  (object) =>
-                    object.objectClass === expected.objectClass &&
-                    object.key.startsWith(`${expected.causalKey}/`),
-                )
-                .sort((left, right) =>
-                  `${left.key}\u0000${left.versionId}\u0000${left.id}`.localeCompare(
-                    `${right.key}\u0000${right.versionId}\u0000${right.id}`,
-                  ),
-                )[0]?.id ?? null)
+            ? (objectIndex.firstObjectIdByClassAndPrefix.get(
+                `${expected.objectClass}\u0000${expected.causalKey}`,
+              ) ?? null)
             : null;
         return [expected.id, expected.fulfilledObjectId ?? discovered] as const;
       }),
@@ -587,7 +598,7 @@ export class EffectRunner {
         `/pipeline/terminal/raw/${attempt.attemptId}/`,
         `/pipeline/${attempt.stage}/raw/${attempt.attemptId}/`,
       ]) {
-        if (!objects.some((object) => object.key.includes(evidence))) {
+        if (!objectIndex.providerEvidence.has(evidence)) {
           missing.push({
             class: "provider_attempt",
             attemptId: attempt.attemptId,
@@ -603,11 +614,10 @@ export class EffectRunner {
       if (direction.mode !== "translated" || direction.emittedOutput === 0) {
         continue;
       }
-      const directionSegment = `/${direction.destinationParticipantId}/`;
       for (const objectClass of ["tts_output_pcm", "livekit_output_pcm"] as const) {
         if (
-          !objects.some(
-            (object) => object.objectClass === objectClass && object.key.includes(directionSegment),
+          !objectIndex.classAndDestination.has(
+            `${objectClass}\u0000${direction.destinationParticipantId}`,
           )
         ) {
           missing.push({
@@ -630,10 +640,7 @@ export class EffectRunner {
         return;
       }
       const outputPrefix = asRecord(result).outputPrefix;
-      if (
-        typeof outputPrefix !== "string" ||
-        !objects.some((object) => object.key.startsWith(`${outputPrefix}/`))
-      ) {
+      if (typeof outputPrefix !== "string" || !objectIndex.prefixes.has(outputPrefix)) {
         missing.push({
           class: "egress_object",
           index,
@@ -685,71 +692,94 @@ export class EffectRunner {
   ): Promise<readonly DerivedArchiveObject[]> {
     const latestPackets = await this.loadLatestFinalCaptions(consultationId, captionObjects);
     const packetsByDestination = new Map<string, CaptionPacket[]>();
-    for (const packet of latestPackets.values()) {
+    for (const packet of latestPackets) {
       const destinationPackets = packetsByDestination.get(packet.destinationParticipantId) ?? [];
       destinationPackets.push(packet);
       packetsByDestination.set(packet.destinationParticipantId, destinationPackets);
     }
 
-    const derived: DerivedArchiveObject[] = [];
-    for (const [destination, packets] of packetsByDestination) {
-      packets.sort(
-        (left, right) =>
-          left.sourceSampleStart - right.sourceSampleStart ||
-          left.utteranceId.localeCompare(right.utteranceId),
-      );
-      const body = encodeVtt(packets);
-      const sha256 = createHash("sha256").update(body).digest("hex");
-      const key = `v1/meetings/${consultationId}/captions/${destination}/final.vtt`;
-      const uploaded = await this.remote.putArchiveObject({
-        key,
-        body,
-        contentType: "text/vtt; charset=utf-8",
-        sha256,
+    const uploads = [...packetsByDestination.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([destination, packets]) => {
+        const orderedPackets = [...packets].sort(
+          (left, right) =>
+            left.sourceSampleStart - right.sourceSampleStart ||
+            left.utteranceId.localeCompare(right.utteranceId),
+        );
+        const body = encodeVtt(orderedPackets);
+        return {
+          body,
+          key: `v1/meetings/${consultationId}/captions/${destination}/final.vtt`,
+          sha256: createHash("sha256").update(body).digest("hex"),
+        };
       });
-      derived.push({
-        id: deterministicUuid(consultationId, `archive-object:${key}:${uploaded.versionId}`),
-        objectClass: archiveObjectClass(key),
-        key,
+
+    return await mapBounded(uploads, ARCHIVE_OBJECT_IO_CONCURRENCY, async (upload) => {
+      const uploaded = await this.remote.putArchiveObject({
+        key: upload.key,
+        body: upload.body,
+        contentType: "text/vtt; charset=utf-8",
+        sha256: upload.sha256,
+      });
+      return {
+        id: deterministicUuid(consultationId, `archive-object:${upload.key}:${uploaded.versionId}`),
+        objectClass: archiveObjectClass(upload.key),
+        key: upload.key,
         versionId: uploaded.versionId,
         size: uploaded.size,
-        sha256,
+        sha256: upload.sha256,
         checksum: uploaded.checksum,
         contentType: "text/vtt; charset=utf-8",
-      });
-    }
-    return derived;
+      };
+    });
   }
 
   private async loadLatestFinalCaptions(
     consultationId: Uuid,
     captionObjects: readonly ArchivedObject[],
-  ): Promise<Map<string, CaptionPacket>> {
-    const latest = new Map<string, CaptionPacket>();
-    for (const object of captionObjects) {
-      const bytes = await this.remote.readArchiveObject({
-        key: object.key,
-        versionId: object.versionId,
-      });
-      const decoded: unknown = JSON.parse(new TextDecoder().decode(bytes));
-      const candidates = Array.isArray(decoded) ? decoded : [decoded];
-      for (const candidate of candidates) {
-        const parsed = CaptionPacketSchema.safeParse(candidate);
-        if (
-          !parsed.success ||
-          parsed.data.finality !== "final" ||
-          parsed.data.consultationId !== consultationId
-        ) {
-          continue;
+  ): Promise<readonly CaptionPacket[]> {
+    const orderedObjects = [...captionObjects].sort((left, right) =>
+      archiveObjectIdentity(left).localeCompare(archiveObjectIdentity(right)),
+    );
+    const packetsByObject = await mapBounded(
+      orderedObjects,
+      ARCHIVE_OBJECT_IO_CONCURRENCY,
+      async (object) => {
+        const bytes = await this.remote.readArchiveObject({
+          key: object.key,
+          versionId: object.versionId,
+        });
+        const decoded: unknown = JSON.parse(new TextDecoder().decode(bytes));
+        const candidates = Array.isArray(decoded) ? decoded : [decoded];
+        const packets: CaptionPacket[] = [];
+        for (const candidate of candidates) {
+          const parsed = CaptionPacketSchema.safeParse(candidate);
+          if (
+            parsed.success &&
+            parsed.data.finality === "final" &&
+            parsed.data.consultationId === consultationId
+          ) {
+            packets.push(parsed.data);
+          }
         }
-        const key = `${parsed.data.destinationParticipantId}:${parsed.data.utteranceId}`;
+        return packets;
+      },
+    );
+    const latest = new Map<string, CaptionPacket>();
+    for (const packets of packetsByObject) {
+      for (const packet of packets) {
+        const key = `${packet.destinationParticipantId}:${packet.utteranceId}`;
         const prior = latest.get(key);
-        if (prior === undefined || parsed.data.revision > prior.revision) {
-          latest.set(key, parsed.data);
+        if (prior === undefined || packet.revision > prior.revision) {
+          latest.set(key, packet);
         }
       }
     }
-    return latest;
+    return [...latest.values()].sort(
+      (left, right) =>
+        left.destinationParticipantId.localeCompare(right.destinationParticipantId) ||
+        left.utteranceId.localeCompare(right.utteranceId),
+    );
   }
 
   private async deleteArchive(effect: Effect): Promise<EffectOutcome> {
@@ -801,11 +831,95 @@ export class EffectRunner {
   }
 }
 
+async function mapBounded<TInput, TResult>(
+  items: readonly TInput[],
+  concurrency: number,
+  operation: (item: TInput, index: number) => Promise<TResult>,
+): Promise<TResult[]> {
+  if (items.length === 0) {
+    return [];
+  }
+  const results = new Array<TResult>(items.length);
+  let nextIndex = 0;
+  let rejected = false;
+  let failure: unknown;
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async (): Promise<void> => {
+      while (!rejected) {
+        const index = nextIndex;
+        if (index >= items.length) {
+          return;
+        }
+        nextIndex += 1;
+        try {
+          results[index] = await operation(items[index] as TInput, index);
+        } catch (error) {
+          if (!rejected) {
+            rejected = true;
+            failure = error;
+          }
+          return;
+        }
+      }
+    },
+  );
+  await Promise.all(workers);
+  if (rejected) {
+    throw failure;
+  }
+  return results;
+}
+
 function archiveObjectIdentity(object: {
   readonly key: string;
   readonly versionId: string;
 }): string {
   return `${object.key}\u0000${object.versionId}`;
+}
+
+function indexArchiveObjectEvidence(
+  objects: readonly ArchivedObject[],
+): ArchiveObjectEvidenceIndex {
+  const firstObjectIdByClassAndPrefix = new Map<string, string>();
+  const prefixes = new Set<string>();
+  const providerEvidence = new Set<string>();
+  const classAndDestination = new Set<string>();
+  const orderedObjects = [...objects].sort((left, right) =>
+    `${left.key}\u0000${left.versionId}\u0000${left.id}`.localeCompare(
+      `${right.key}\u0000${right.versionId}\u0000${right.id}`,
+    ),
+  );
+
+  for (const object of orderedObjects) {
+    const segments = object.key.split("/");
+    let prefix = segments[0] ?? "";
+    for (let index = 1; index < segments.length; index += 1) {
+      prefixes.add(prefix);
+      const classAndPrefix = `${object.objectClass}\u0000${prefix}`;
+      if (!firstObjectIdByClassAndPrefix.has(classAndPrefix)) {
+        firstObjectIdByClassAndPrefix.set(classAndPrefix, object.id);
+      }
+      prefix += `/${segments[index]}`;
+    }
+
+    for (let index = 1; index < segments.length - 1; index += 1) {
+      const segment = segments[index];
+      if (segment !== undefined) {
+        classAndDestination.add(`${object.objectClass}\u0000${segment}`);
+      }
+      if (segment === "pipeline" && segments[index + 2] === "raw" && index + 4 < segments.length) {
+        providerEvidence.add(`/pipeline/${segments[index + 1]}/raw/${segments[index + 3]}/`);
+      }
+    }
+  }
+
+  return {
+    firstObjectIdByClassAndPrefix,
+    prefixes,
+    providerEvidence,
+    classAndDestination,
+  };
 }
 
 function derivedToArchivedObject(object: DerivedArchiveObject): ArchivedObject {

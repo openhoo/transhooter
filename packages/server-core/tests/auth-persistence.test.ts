@@ -218,29 +218,29 @@ async function integrationDatabaseUrl(): Promise<string> {
   return value;
 }
 
-async function waitForQueuedMigrators(client: Client): Promise<void> {
+async function waitForPollingMigrators(client: Client): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = await client.query<{ waiting: string }>(
-      `SELECT count(*)::text AS waiting
-       FROM pg_locks lock
-       JOIN pg_stat_activity activity ON activity.pid = lock.pid
-       WHERE lock.locktype = 'advisory'
-         AND lock.classid = $1::oid
-         AND lock.objid = $2::oid
-         AND lock.database = (
-           SELECT oid FROM pg_database WHERE datname = current_database()
-         )
-         AND NOT lock.granted
-         AND activity.application_name = 'transhooter-migrator'`,
-      [MIGRATION_LOCK_NAMESPACE, MIGRATION_LOCK_ID],
+    const result = await client.query<{ connected: string; waiting_locks: string }>(
+      `SELECT
+         count(DISTINCT activity.pid) FILTER (
+           WHERE activity.application_name = 'transhooter-migrator'
+         )::text AS connected,
+         count(DISTINCT activity.pid) FILTER (
+           WHERE lock.locktype = 'advisory'
+             AND NOT lock.granted
+             AND activity.application_name = 'transhooter-migrator'
+         )::text AS waiting_locks
+       FROM pg_stat_activity AS activity
+       LEFT JOIN pg_locks AS lock ON lock.pid = activity.pid`,
     );
-    if (result.rows[0]?.waiting === "2") {
+    if (result.rows[0]?.connected === "2") {
+      expect(result.rows[0]?.waiting_locks).toBe("0");
       return;
     }
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
-  throw new Error("two migrators did not queue behind the advisory lock");
+  throw new Error("two migrators did not connect while polling for the advisory lock");
 }
 
 async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe">): Promise<{
@@ -335,27 +335,21 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
         });
         migrators.push(first, second);
 
-        await waitForQueuedMigrators(database);
+        await waitForPollingMigrators(database);
         const locks = await database.query<{ granted: boolean; count: string }>(
           `SELECT granted, count(*)::text AS count
            FROM pg_locks lock
-           LEFT JOIN pg_stat_activity activity ON activity.pid = lock.pid
            WHERE lock.locktype = 'advisory'
              AND lock.classid = $1::oid
              AND lock.objid = $2::oid
              AND lock.database = (
                SELECT oid FROM pg_database WHERE datname = current_database()
              )
-             AND (lock.pid = pg_backend_pid()
-               OR activity.application_name = 'transhooter-migrator')
            GROUP BY granted
            ORDER BY granted`,
           [MIGRATION_LOCK_NAMESPACE, MIGRATION_LOCK_ID],
         );
-        expect(locks.rows).toEqual([
-          { granted: false, count: "2" },
-          { granted: true, count: "1" },
-        ]);
+        expect(locks.rows).toEqual([{ granted: true, count: "1" }]);
         await database.query("SELECT pg_advisory_unlock($1, $2)", [
           MIGRATION_LOCK_NAMESPACE,
           MIGRATION_LOCK_ID,
@@ -369,10 +363,27 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           expect(result.output).toContain("database migrations applied");
         }
 
-        const migrationSql = await readFile(
-          join(import.meta.dir, "../prisma/migrations/0000_baseline/migration.sql"),
-        );
-        const baselineChecksum = createHash("sha256").update(migrationSql).digest("hex");
+        const [baselineMigrationBytes, performanceIndexesMigrationBytes] = await Promise.all([
+          readFile(join(import.meta.dir, "../prisma/migrations/0000_baseline/migration.sql")),
+          readFile(
+            join(
+              import.meta.dir,
+              "../prisma/migrations/20260723070000_performance_indexes/migration.sql",
+            ),
+          ),
+        ]);
+        const baselineMigrationSql = baselineMigrationBytes.toString("utf-8");
+        const performanceIndexesMigrationSql = performanceIndexesMigrationBytes.toString("utf-8");
+        const expectedMigrations = [
+          {
+            migration_name: "0000_baseline",
+            checksum: createHash("sha256").update(baselineMigrationSql).digest("hex"),
+          },
+          {
+            migration_name: "20260723070000_performance_indexes",
+            checksum: createHash("sha256").update(performanceIndexesMigrationSql).digest("hex"),
+          },
+        ];
         const history = await database.query<{
           migration_name: string;
           checksum: string;
@@ -387,20 +398,21 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
              rolled_back_at IS NULL AS not_rolled_back,
              applied_steps_count
            FROM public._prisma_migrations
-           ORDER BY started_at, id`,
+           ORDER BY migration_name`,
         );
-        expect(history.rows).toHaveLength(1);
-        expect(history.rows[0]).toMatchObject({
-          migration_name: "0000_baseline",
-          checksum: baselineChecksum,
-          finished: true,
-          not_rolled_back: true,
-        });
-        const appliedStepsCount = history.rows[0]?.applied_steps_count;
-        if (appliedStepsCount === undefined) {
-          throw new Error("expected applied migration history");
+        expect(history.rows).toHaveLength(expectedMigrations.length);
+        for (const [index, expectedMigration] of expectedMigrations.entries()) {
+          const appliedMigration = history.rows[index];
+          if (appliedMigration === undefined) {
+            throw new Error(`expected applied migration ${expectedMigration.migration_name}`);
+          }
+          expect(appliedMigration).toMatchObject({
+            ...expectedMigration,
+            finished: true,
+            not_rolled_back: true,
+          });
+          expect([0, 1]).toContain(appliedMigration.applied_steps_count);
         }
-        expect([0, 1]).toContain(appliedStepsCount);
         const migratedTables = await database.query<{ name: string }>(
           `SELECT table_name AS name
            FROM information_schema.tables
@@ -413,6 +425,99 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           { name: "pending_exchanges" },
           { name: "provider_attempts" },
         ]);
+
+        const claimPriorityColumns = await database.query<{ column_name: string }>(
+          `SELECT column_name
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = 'external_effects'
+             AND column_name = 'claim_priority'`,
+        );
+        expect(claimPriorityColumns.rows).toEqual([]);
+
+        const performanceStatements = performanceIndexesMigrationSql
+          .split(";")
+          .map((statement) => statement.trim())
+          .filter((statement) => statement.length > 0);
+        const concurrentClaimIndex = performanceStatements.find((statement) =>
+          statement.startsWith(
+            'CREATE INDEX CONCURRENTLY "external_effects_active_claim_priority_lease_created_id_idx"',
+          ),
+        );
+        if (!concurrentClaimIndex) {
+          throw new Error(
+            "performance migration omitted the concurrent external-effect claim index",
+          );
+        }
+
+        const populatedProfileId = "20000000-0000-4000-8000-000000000001";
+        const populatedConsultationId = "20000000-0000-4000-8000-000000000002";
+        await database.query(
+          `INSERT INTO provider_profiles(id,name,enabled,current_revision,created_at)
+           VALUES ($1,$2,true,1,$3)`,
+          [populatedProfileId, `migration-populated-${populatedProfileId}`, new Date()],
+        );
+        await database.query(
+          `INSERT INTO provider_profile_revisions(
+             profile_id,revision,capability_hash,adapter_builds,policy,credential_references,created_at
+           ) VALUES ($1,1,$2,'{}'::jsonb,'{}'::jsonb,'[]'::jsonb,$3)`,
+          [populatedProfileId, "b".repeat(64), new Date()],
+        );
+        await database.query(
+          `INSERT INTO consultations(
+             id,state,provider_profile_id,provider_profile_revision,created_at,updated_at
+           ) VALUES ($1,'invited',$2,1,$3,$3)`,
+          [populatedConsultationId, populatedProfileId, new Date()],
+        );
+        await database.query(
+          `INSERT INTO external_effects(
+             id,consultation_id,generation,effect_kind,subject_id,state,created_at,updated_at,occurrence_key
+           ) VALUES
+             ($1,$3,0,'ROOM_CREATE',$4,'planned',$6,$6,'room'),
+             ($2,$3,0,'STATUS_PACKET',$5,'planned',$6,$6,'status')`,
+          [
+            "20000000-0000-4000-8000-000000000003",
+            "20000000-0000-4000-8000-000000000004",
+            populatedConsultationId,
+            "20000000-0000-4000-8000-000000000005",
+            "20000000-0000-4000-8000-000000000006",
+            new Date(),
+          ],
+        );
+        await database.query('DROP INDEX "consultation_participants_user_id_consultation_id_idx"');
+        await database.query(
+          'DROP INDEX "external_effects_active_claim_priority_lease_created_id_idx"',
+        );
+        for (const statement of performanceStatements) {
+          await database.query(statement);
+        }
+
+        const claimIndex = await database.query<{
+          definition: string;
+          expression: string;
+          predicate: string;
+          ready: boolean;
+          valid: boolean;
+        }>(
+          `SELECT
+             pg_get_indexdef(index.indexrelid) AS definition,
+             pg_get_expr(index.indexprs,index.indrelid) AS expression,
+             pg_get_expr(index.indpred,index.indrelid) AS predicate,
+             index.indisready AS ready,
+             index.indisvalid AS valid
+           FROM pg_index AS index
+           JOIN pg_class AS relation ON relation.oid = index.indexrelid
+           WHERE relation.relname = 'external_effects_active_claim_priority_lease_created_id_idx'`,
+        );
+        expect(claimIndex.rows).toHaveLength(1);
+        expect(claimIndex.rows[0]).toMatchObject({ ready: true, valid: true });
+        expect(claimIndex.rows[0]?.expression.replaceAll(/\s+/g, " ").trim()).toContain(
+          "CASE effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END",
+        );
+        expect(claimIndex.rows[0]?.definition).toContain("lease_expires_at NULLS FIRST");
+        expect(claimIndex.rows[0]?.definition).toContain("created_at, id");
+        expect(claimIndex.rows[0]?.predicate).toContain("'planned'::external_effect_state");
+        expect(claimIndex.rows[0]?.predicate).toContain("'compensating'::external_effect_state");
 
         const linkId = "10000000-0000-4000-8000-000000000001";
         const exchangeId = "10000000-0000-4000-8000-000000000002";
@@ -511,6 +616,6 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
         }
         await rm(temporaryDirectory, { recursive: true, force: true });
       }
-    });
+    }, 30_000);
   },
 );

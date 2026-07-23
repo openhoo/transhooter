@@ -295,7 +295,9 @@ function normalize(
 
 function normalizeSpanAttributes(attributes: SpanAttributes): Record<string, SpanAttribute> {
   const normalized: Record<string, SpanAttribute> = {};
-  for (const [key, value] of Object.entries(attributes)) {
+  for (const key in attributes) {
+    if (!Object.hasOwn(attributes, key)) continue;
+    const value = attributes[key];
     const allowed = ATTRIBUTE_VALUES[key];
     if (allowed !== undefined && typeof value === "string") {
       normalized[key] = normalize(value, allowed, "other");

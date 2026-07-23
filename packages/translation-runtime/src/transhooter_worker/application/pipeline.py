@@ -142,12 +142,16 @@ async def publish_complete_pcm_frames(
 ) -> int:
     if frame_bytes <= 0:
         raise ValueError("frame_bytes must be positive")
-    published_samples = 0
-    while len(pending_pcm) >= frame_bytes:
-        await sink(bytes(pending_pcm[:frame_bytes]))
-        del pending_pcm[:frame_bytes]
-        published_samples += frame_bytes // 2
-    return published_samples
+    published_bytes = 0
+    try:
+        while len(pending_pcm) - published_bytes >= frame_bytes:
+            frame_end = published_bytes + frame_bytes
+            await sink(bytes(pending_pcm[published_bytes:frame_end]))
+            published_bytes = frame_end
+    finally:
+        if published_bytes:
+            del pending_pcm[:published_bytes]
+    return published_bytes // 2
 
 
 StageGate = Callable[[str, int], Awaitable[None]]

@@ -1,5 +1,7 @@
+import asyncio
 import json
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,6 +30,7 @@ from transhooter_worker.domain.models import (
 from transhooter_worker.ports.providers import TranslationAttempt
 from transhooter_worker.runtime.probe import execute_probe
 from transhooter_worker.runtime.provider_registry import Providers
+from transhooter_worker.runtime.redis_quota import RedisQuotaGate
 
 
 def write_wav_fixture(
@@ -41,6 +44,141 @@ def write_wav_fixture(
         target.setsampwidth(2)
         target.setframerate(sample_rate)
         target.writeframes(frames)
+
+
+class RedisResponseReader:
+    def __init__(self) -> None:
+        self.responses: asyncio.Queue[tuple[bytes, bytes]] = asyncio.Queue()
+        self.current_line: bytes | None = None
+
+    def respond(self, prefix: bytes, line: bytes) -> None:
+        self.responses.put_nowait((prefix, line))
+
+    async def readexactly(self, _: int) -> bytes:
+        prefix, self.current_line = await self.responses.get()
+        return prefix
+
+    async def readline(self) -> bytes:
+        assert self.current_line is not None
+        line = self.current_line
+        self.current_line = None
+        return line
+
+
+class RecordingRedisWriter:
+    def __init__(
+        self,
+        reader: RedisResponseReader,
+        on_command: Callable[[tuple[str, ...]], None],
+    ) -> None:
+        self.reader = reader
+        self.on_command = on_command
+        self.commands: list[tuple[str, ...]] = []
+        self.closed = False
+        self.waited_closed = False
+
+    def write(self, payload: bytes) -> None:
+        lines = payload.split(b"\r\n")
+        command = tuple(lines[index].decode() for index in range(2, len(lines) - 1, 2))
+        self.commands.append(command)
+        self.on_command(command)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        self.waited_closed = True
+
+
+def quota_gate(url: str = "redis://redis:6379") -> RedisQuotaGate:
+    return RedisQuotaGate(
+        url,
+        "provider",
+        "account",
+        "region",
+        {"translation": {"characters_minute": 100}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_redis_quota_reuses_authenticated_connection_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[RecordingRedisWriter] = []
+
+    async def open_connection(
+        *_: object,
+    ) -> tuple[RedisResponseReader, RecordingRedisWriter]:
+        reader = RedisResponseReader()
+
+        def respond(command: tuple[str, ...]) -> None:
+            reader.respond(b"+", b"OK\r\n") if command[0] == "AUTH" else reader.respond(
+                b":", b"1\r\n"
+            )
+
+        writer = RecordingRedisWriter(reader, respond)
+        connections.append(writer)
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    gate = quota_gate("redis://:secret@redis:6379")
+
+    await gate("translation", 4)
+    await gate("translation", 5)
+    await gate.aclose()
+
+    assert len(connections) == 1
+    assert [command[0] for command in connections[0].commands] == [
+        "AUTH",
+        "EVAL",
+        "EVAL",
+    ]
+    assert connections[0].closed
+    assert connections[0].waited_closed
+    with pytest.raises(RuntimeError, match="closed"):
+        await gate("translation", 1)
+
+
+@pytest.mark.asyncio
+async def test_redis_quota_serializes_concurrent_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_command = asyncio.Event()
+    release_first = asyncio.Event()
+    eval_count = 0
+    reader = RedisResponseReader()
+
+    class BlockingRedisWriter(RecordingRedisWriter):
+        async def drain(self) -> None:
+            nonlocal eval_count
+            eval_count += 1
+            if eval_count == 1:
+                first_command.set()
+                await release_first.wait()
+            self.reader.respond(b":", b"1\r\n")
+
+    writer = BlockingRedisWriter(reader, lambda _: None)
+
+    async def open_connection(
+        *_: object,
+    ) -> tuple[RedisResponseReader, BlockingRedisWriter]:
+        return reader, writer
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    gate = quota_gate()
+    first = asyncio.create_task(gate("translation", 4))
+    await first_command.wait()
+    second = asyncio.create_task(gate("translation", 5))
+    await asyncio.sleep(0)
+
+    assert eval_count == 1
+    release_first.set()
+    await asyncio.gather(first, second)
+    assert eval_count == 2
+    await gate.aclose()
 
 
 @pytest.mark.asyncio
@@ -367,7 +505,9 @@ async def test_partial_pcm_publication_checkpoints_delivered_frame_before_retry(
     monkeypatch.setenv("APP_ENV", "test")
     first_frame = b"\x01\x00" * 960
     second_frame = b"\x02\x00" * 960
-    pending = bytearray(first_frame + second_frame)
+    third_frame = b"\x03\x00" * 960
+    trailing_partial_frame = b"\x04\x00" * 100
+    pending = bytearray(first_frame + second_frame + third_frame + trailing_partial_frame)
     delivered: list[bytes] = []
     checkpoints: list[tuple[int, int, bool]] = []
     publication_attempt = 0
@@ -375,7 +515,7 @@ async def test_partial_pcm_publication_checkpoints_delivered_frame_before_retry(
     async def publish(frame: bytes) -> None:
         nonlocal publication_attempt
         publication_attempt += 1
-        if publication_attempt == 2:
+        if publication_attempt == 3:
             raise RuntimeError("injected publication failure")
         delivered.append(frame)
 
@@ -403,17 +543,17 @@ async def test_partial_pcm_publication_checkpoints_delivered_frame_before_retry(
     with pytest.raises(RuntimeError, match="injected publication failure"):
         await session._publish_complete_pcm_frames(pending)
 
-    assert delivered == [first_frame]
-    assert bytes(pending) == second_frame
-    assert checkpoints == [(4_000, 960, False)]
-    assert session._last_output == 960
+    assert delivered == [first_frame, second_frame]
+    assert bytes(pending) == third_frame + trailing_partial_frame
+    assert checkpoints == [(4_000, 1_920, False)]
+    assert session._last_output == 1_920
 
     await session._publish_complete_pcm_frames(pending)
 
-    assert delivered == [first_frame, second_frame]
-    assert not pending
-    assert checkpoints == [(4_000, 960, False)]
-    assert session._last_output == 1_920
+    assert delivered == [first_frame, second_frame, third_frame]
+    assert bytes(pending) == trailing_partial_frame
+    assert checkpoints == [(4_000, 1_920, False)]
+    assert session._last_output == 2_880
 
 
 @pytest.mark.asyncio

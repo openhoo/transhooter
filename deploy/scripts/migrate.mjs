@@ -13,6 +13,22 @@ const prismaConfig = resolve(workspaceRoot, "packages/server-core/prisma.config.
 const migrationLockNamespace = 0x5452414e;
 const migrationLockId = 0x53484f4f;
 const baselineMigration = "0000_baseline";
+const migrationLockRetryMilliseconds = 100;
+
+async function acquireMigrationLock(client) {
+  while (true) {
+    const result = await client.query("SELECT pg_try_advisory_lock($1, $2) AS acquired", [
+      migrationLockNamespace,
+      migrationLockId,
+    ]);
+    if (result.rows[0]?.acquired === true) {
+      return;
+    }
+    await new Promise((resolvePromise) =>
+      setTimeout(resolvePromise, migrationLockRetryMilliseconds),
+    );
+  }
+}
 
 async function readConnectionString() {
   const databaseUrlFile = process.env.DATABASE_URL_FILE;
@@ -179,10 +195,7 @@ async function runMigrations() {
   let cleanupError;
   try {
     await client.connect();
-    await client.query("SELECT pg_advisory_lock($1, $2)", [
-      migrationLockNamespace,
-      migrationLockId,
-    ]);
+    await acquireMigrationLock(client);
     lockAcquired = true;
 
     await assertMigratorPreflight(client);

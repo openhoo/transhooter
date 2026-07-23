@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { EgressStatus } from "livekit-server-sdk";
 import { isViableEgressAdoption } from "../src/adapters/livekit-effects/egress";
 import { EffectRunner } from "../src/orchestration/effect-runner";
-import type { DurableStore, Effect } from "../src/orchestration/model";
+import type {
+  ArchivedObject,
+  DurableStore,
+  Effect,
+  ReconciliationSnapshot,
+} from "../src/orchestration/model";
 import type { RemoteEffects } from "../src/orchestration/remote";
 import { type EffectFaultControl, FileEffectFaultControl } from "../src/runtime/fault-control";
 
@@ -644,4 +649,110 @@ test("a stale owner cannot persist a remote success after its lease is stolen", 
   await runner.tick();
 
   assert.deepEqual(calls, ["remote-success"]);
+});
+
+test("caption read failures abort reconciliation and propagate the original failure", async () => {
+  const archiveEffect: Effect = {
+    ...effect,
+    kind: "ARCHIVE_RECONCILE",
+    subjectId: effect.consultationId,
+    occurrenceKey: "ARCHIVE_RECONCILE:caption-read-failure",
+    plan: { forceIncomplete: true, resourceGeneration: effect.generation },
+  };
+  const captionObjects: ArchivedObject[] = Array.from({ length: 8 }, (_, index) => ({
+    id: `10000000-0000-4000-8001-${String(index).padStart(12, "0")}`,
+    objectClass: "caption_packet",
+    key: `v1/meetings/${effect.consultationId}/captions/${String(index)}.json`,
+    versionId: `caption-v${String(index)}`,
+    size: 1,
+    sha256: "a".repeat(64),
+    s3Checksum: `caption-crc-${String(index)}`,
+    contentType: "application/json",
+  }));
+  const snapshot: ReconciliationSnapshot = {
+    archiveId: "10000000-0000-4000-8000-000000000011",
+    state: "reconciling",
+    reconciliationDeadlineAt: new Date(0),
+    roomClose: { terminal: true },
+    workerTerminal: { terminal: true },
+    egressResults: [],
+    providerGaps: [],
+    directions: [],
+    providerAttempts: [],
+    expectations: [],
+    objects: captionObjects,
+  };
+  const readsSaturated = Promise.withResolvers<void>();
+  const releaseReads = Promise.withResolvers<void>();
+  const failingReadReleased = Promise.withResolvers<void>();
+  const errors: string[] = [];
+  let startedReads = 0;
+  let completedReads = 0;
+  let inventoryUploads = 0;
+  let completions = 0;
+  const store = {
+    claimEffects: async () => [archiveEffect],
+    currentGeneration: async () => archiveEffect.generation,
+    persistCalling: async () => ({
+      ...archiveEffect,
+      state: "calling" as const,
+      requestBytes: new Uint8Array(),
+      requestSha256: "a".repeat(64),
+    }),
+    renewEffectLease: async () => true,
+    reconciliationSnapshot: async () => snapshot,
+    completeReconciliation: async () => {
+      completions += 1;
+      return true;
+    },
+    markFailed: async (_id: string, _owner: string, message: string) => {
+      errors.push(message);
+    },
+  } as unknown as DurableStore;
+  const remote = {
+    discoverArchiveObjects: async () => [],
+    verifyArchiveObject: async () => true,
+    readArchiveObject: async (input: { key: string }) => {
+      startedReads += 1;
+      if (startedReads === 4) {
+        readsSaturated.resolve();
+      }
+      await releaseReads.promise;
+      const shouldFail = input.key.endsWith("/0.json");
+      if (!shouldFail) {
+        await failingReadReleased.promise;
+      }
+      if (shouldFail) {
+        failingReadReleased.resolve();
+        throw new Error("caption object read failed");
+      }
+      completedReads += 1;
+      return new TextEncoder().encode("{}");
+    },
+    putArchiveObject: async () => {
+      inventoryUploads += 1;
+      return { versionId: "unexpected", size: 0, checksum: "unexpected" };
+    },
+  } as unknown as RemoteEffects;
+  const runner = new EffectRunner(
+    store,
+    remote,
+    { now: () => new Date(1_000) },
+    {
+      owner: "10000000-0000-4000-8000-000000000009",
+      leaseMs: 1_000,
+      batchSize: 1,
+    },
+  );
+
+  const tick = runner.tick();
+  await readsSaturated.promise;
+  releaseReads.resolve();
+  await tick;
+
+  assert.equal(startedReads, 4);
+  assert.equal(completedReads, 3);
+  assert.deepEqual(errors, ["caption object read failed"]);
+  assert.equal(inventoryUploads, 0);
+  assert.equal(completions, 0);
 });

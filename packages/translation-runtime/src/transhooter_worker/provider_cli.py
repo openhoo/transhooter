@@ -9,6 +9,8 @@ import os
 import statistics
 import time
 import wave
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +35,7 @@ from transhooter_worker.runtime.provider_registry import (
     GoogleProfile,
     ProfileConfig,
     ProviderRegistry,
+    Providers,
     resolve_profile_config,
 )
 
@@ -588,6 +591,14 @@ def _archive_probe_evidence(
     return archived
 
 
+@asynccontextmanager
+async def _provider_lifecycle(providers: Providers) -> AsyncIterator[Providers]:
+    try:
+        yield providers
+    finally:
+        await providers.aclose()
+
+
 async def _one_probe(
     profile_name: str,
     source: str,
@@ -607,12 +618,14 @@ async def _one_probe(
         None,
     )
     before_ids = {ref.object_id for ref, _ in journal.committed()}
-    bootstrap_providers = ProviderRegistry.construct(profile, meeting_id, journal)
-    capabilities = await asyncio.gather(
-        bootstrap_providers.stt.capabilities(),
-        bootstrap_providers.translation.capabilities(),
-        bootstrap_providers.tts.capabilities(),
-    )
+    async with _provider_lifecycle(
+        ProviderRegistry.construct(profile, meeting_id, journal)
+    ) as bootstrap_providers:
+        capabilities = await asyncio.gather(
+            bootstrap_providers.stt.capabilities(),
+            bootstrap_providers.translation.capabilities(),
+            bootstrap_providers.tts.capabilities(),
+        )
     effective_voice = _effective_voice(
         profile,
         target,
@@ -628,49 +641,53 @@ async def _one_probe(
         target,
         effective_voice,
     )
-    providers = ProviderRegistry.construct(profile, meeting_id, journal)
-    probe_input = audio.read_bytes()
-    journal.append(
-        meeting_id=meeting_id,
-        attempt_id=meeting_id,
-        stage="probe-input",
-        transport="grpc",
-        direction="internal",
-        media_type="audio/wav",
-        payload=probe_input,
-    )
-    health = await asyncio.gather(
-        *(
-            provider.health(str(meeting_id))
-            for provider in (providers.stt, providers.translation, providers.tts)
+    async with _provider_lifecycle(
+        ProviderRegistry.construct(profile, meeting_id, journal)
+    ) as providers:
+        probe_input = audio.read_bytes()
+        journal.append(
+            meeting_id=meeting_id,
+            attempt_id=meeting_id,
+            stage="probe-input",
+            transport="grpc",
+            direction="internal",
+            media_type="audio/wav",
+            payload=probe_input,
         )
-    )
-    if not all(item.healthy for item in health):
-        raise RuntimeError(f"selected profile {profile_name} has an unhealthy stage")
-    started = time.monotonic_ns()
-    result = await execute_probe(providers, audio, source, target, effective_voice, meeting_id)
-    elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
-    evidence = [ref for ref, _ in journal.committed() if ref.object_id not in before_ids]
-    if not evidence:
-        raise RuntimeError("probe produced no durable raw provider evidence")
-    archived = (
-        [] if profile_name == "fixture" else _archive_probe_evidence(meeting_id, journal, evidence)
-    )
-    return {
-        "runId": str(result.run_id),
-        "profile": profile_name,
-        "source": source,
-        "target": target,
-        "transcript": result.transcript,
-        "translation": result.translation,
-        "ttsSha256": result.raw_sha256,
-        "ttsBytes": len(result.synthesized_pcm),
-        "attemptIds": [str(value) for value in result.provider_attempt_ids],
-        "rawEvidenceCount": len(evidence),
-        "archivedEvidence": archived,
-        "elapsedMs": elapsed_ms,
-        "stages": [item.provider for item in capabilities],
-    }
+        health = await asyncio.gather(
+            *(
+                provider.health(str(meeting_id))
+                for provider in (providers.stt, providers.translation, providers.tts)
+            )
+        )
+        if not all(item.healthy for item in health):
+            raise RuntimeError(f"selected profile {profile_name} has an unhealthy stage")
+        started = time.monotonic_ns()
+        result = await execute_probe(providers, audio, source, target, effective_voice, meeting_id)
+        elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
+        evidence = [ref for ref, _ in journal.committed() if ref.object_id not in before_ids]
+        if not evidence:
+            raise RuntimeError("probe produced no durable raw provider evidence")
+        archived = (
+            []
+            if profile_name == "fixture"
+            else _archive_probe_evidence(meeting_id, journal, evidence)
+        )
+        return {
+            "runId": str(result.run_id),
+            "profile": profile_name,
+            "source": source,
+            "target": target,
+            "transcript": result.transcript,
+            "translation": result.translation,
+            "ttsSha256": result.raw_sha256,
+            "ttsBytes": len(result.synthesized_pcm),
+            "attemptIds": [str(value) for value in result.provider_attempt_ids],
+            "rawEvidenceCount": len(evidence),
+            "archivedEvidence": archived,
+            "elapsedMs": elapsed_ms,
+            "stages": [item.provider for item in capabilities],
+        }
 
 
 def _capability_database_path() -> Path:
@@ -702,13 +719,17 @@ async def _run_refresh_or_preflight(args: argparse.Namespace) -> dict[str, objec
         args.target,
         None,
     )
-    bootstrap_providers = ProviderRegistry.construct(profile, run_id, journal)
-    bootstrap_stages = (
-        bootstrap_providers.stt,
-        bootstrap_providers.translation,
-        bootstrap_providers.tts,
-    )
-    discovered = await asyncio.gather(*(provider.capabilities() for provider in bootstrap_stages))
+    async with _provider_lifecycle(
+        ProviderRegistry.construct(profile, run_id, journal)
+    ) as bootstrap_providers:
+        bootstrap_stages = (
+            bootstrap_providers.stt,
+            bootstrap_providers.translation,
+            bootstrap_providers.tts,
+        )
+        discovered = await asyncio.gather(
+            *(provider.capabilities() for provider in bootstrap_stages)
+        )
     effective_voice = _effective_voice(
         profile,
         args.target,
@@ -724,46 +745,48 @@ async def _run_refresh_or_preflight(args: argparse.Namespace) -> dict[str, objec
         args.target,
         effective_voice,
     )
-    providers = ProviderRegistry.construct(profile, run_id, journal)
-    stage_providers = (providers.stt, providers.translation, providers.tts)
-    health_results = await asyncio.gather(
-        *(provider.health(str(run_id)) for provider in stage_providers)
-    )
-    if not all(result.healthy for result in health_results):
-        raise RuntimeError("provider capability refresh health probe failed")
+    async with _provider_lifecycle(
+        ProviderRegistry.construct(profile, run_id, journal)
+    ) as providers:
+        stage_providers = (providers.stt, providers.translation, providers.tts)
+        health_results = await asyncio.gather(
+            *(provider.health(str(run_id)) for provider in stage_providers)
+        )
+        if not all(result.healthy for result in health_results):
+            raise RuntimeError("provider capability refresh health probe failed")
 
-    capabilities: tuple[StageCapabilities, ...] = tuple(
-        replace(capability, evidence=capability.evidence or health.evidence)
-        for capability, health in zip(discovered, health_results, strict=True)
-    )
-    if any(capability.evidence is None for capability in capabilities):
-        raise RuntimeError("provider capability refresh lacks durable probe evidence")
+        capabilities: tuple[StageCapabilities, ...] = tuple(
+            replace(capability, evidence=capability.evidence or health.evidence)
+            for capability, health in zip(discovered, health_results, strict=True)
+        )
+        if any(capability.evidence is None for capability in capabilities):
+            raise RuntimeError("provider capability refresh lacks durable probe evidence")
 
-    result: dict[str, object] = {
-        "runId": str(run_id),
-        "profile": args.profile,
-        "capabilities": [_capability_summary(capability) for capability in capabilities],
-    }
-    if args.command == "preflight":
-        result["healthy"] = True
+        result: dict[str, object] = {
+            "runId": str(run_id),
+            "profile": args.profile,
+            "capabilities": [_capability_summary(capability) for capability in capabilities],
+        }
+        if args.command == "preflight":
+            result["healthy"] = True
+            return result
+
+        stored_revision = CapabilityStore(_capability_database_path()).replace(
+            args.profile,
+            capabilities,
+        )
+        result.update(stored_revision)
+        published_profile = _capability_refresh(
+            args.profile,
+            profile,
+            args.source,
+            args.target,
+            capabilities,
+        )
+        await _publish_capabilities(published_profile)
+        result["publishedProfileId"] = published_profile["profileId"]
+        result["publishedCapabilityHash"] = published_profile["capabilityHash"]
         return result
-
-    stored_revision = CapabilityStore(_capability_database_path()).replace(
-        args.profile,
-        capabilities,
-    )
-    result.update(stored_revision)
-    published_profile = _capability_refresh(
-        args.profile,
-        profile,
-        args.source,
-        args.target,
-        capabilities,
-    )
-    await _publish_capabilities(published_profile)
-    result["publishedProfileId"] = published_profile["profileId"]
-    result["publishedCapabilityHash"] = published_profile["capabilityHash"]
-    return result
 
 
 def _load_benchmark_fixtures(manifest_path: Path) -> list[object]:

@@ -2,6 +2,8 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from threading import Event, Lock, get_ident
+from typing import Protocol
 from uuid import UUID, uuid4
 
 import httpx
@@ -15,6 +17,7 @@ from transhooter_worker.adapters.fixture.provider import (
     FixtureTtsSession,
 )
 from transhooter_worker.adapters.fixture.scenario import FixtureScenario
+from transhooter_worker.adapters.spool import EncryptedSpool, deterministic_roomy_capacity
 from transhooter_worker.application.session import DirectionSession, DirectionSpec
 from transhooter_worker.domain.models import (
     AudioChunk,
@@ -34,13 +37,25 @@ from transhooter_worker.domain.models import (
     SynthesisUtterance,
     Transport,
 )
+from transhooter_worker.ports.archive import ObjectRecord
 from transhooter_worker.ports.providers import SttSession
+from transhooter_worker.runtime.checkpoints import CheckpointChainState, _persist_checkpoint
+from transhooter_worker.runtime.job import _drain_runtime
+from transhooter_worker.runtime.provider_registry import Providers
 
 REF = RawRef(UUID(int=1), 1, "0" * 64, 1, "application/json")
 
 
 async def ignore_sink(*_: object) -> None:
     return None
+
+
+class SpoolOperation(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+class CommittedOperation(Protocol):
+    def __call__(self) -> list[tuple[RawRef, SampleRange | None]]: ...
 
 
 def failed_terminal(session_id: UUID) -> SessionTerminal:
@@ -459,6 +474,44 @@ def fixture_direction(
 
 
 @pytest.mark.asyncio
+async def test_runtime_drain_closes_providers_after_sessions_and_publishers_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "test")
+    events: list[str] = []
+
+    class Session:
+        async def finish(self) -> None:
+            events.append("session")
+
+    class Publisher:
+        async def drain(self) -> None:
+            assert events == ["session"]
+            events.append("publisher")
+
+    async def close_providers() -> None:
+        assert events == ["session", "publisher"]
+        events.append("providers")
+
+    providers = Providers(
+        FixtureSttProvider(),
+        FixtureTranslationProvider(),
+        FixtureTtsProvider(),
+        _close=close_providers,
+    )
+
+    await _drain_runtime(
+        set(),
+        {uuid4(): Session()},  # type: ignore[dict-item]
+        {uuid4(): Publisher()},  # type: ignore[dict-item]
+        [providers],
+    )
+    await providers.aclose()
+
+    assert events == ["session", "publisher", "providers"]
+
+
+@pytest.mark.asyncio
 async def test_fixture_stt_fails_after_exact_configured_chunk_boundary(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -541,3 +594,143 @@ async def test_concurrent_finish_and_shutdown_cancel_emit_one_terminal_checkpoin
     await asyncio.gather(session.finish(), session.cancel())
 
     assert terminal_flags == [True]
+
+
+class CheckpointMetadata:
+    def __init__(self, consultation_id: UUID) -> None:
+        self.consultation_id = consultation_id
+        self.worker_epoch = 3
+        self.write_epoch = 4
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_archive_drain_keeps_event_loop_responsive(
+    tmp_path: Path,
+) -> None:
+    meeting_id = uuid4()
+    source_id = uuid4()
+    destination_id = uuid4()
+    spool = EncryptedSpool(
+        tmp_path / "payloads",
+        tmp_path / "journal.sqlite3",
+        {"v1": b"k" * 32},
+        "v1",
+        capacity_probe=deterministic_roomy_capacity,
+    )
+    evidence = spool.append(
+        meeting_id=meeting_id,
+        attempt_id=uuid4(),
+        stage="terminal",
+        transport="http",
+        direction="internal",
+        media_type="application/json",
+        payload=b'{"outcome":"succeeded"}',
+    )
+    archive_entered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_archive = Event()
+    archive_threads: list[int] = []
+    loop_thread = get_ident()
+    operations: list[str] = []
+    spool_threads: list[int] = []
+    observations_lock = Lock()
+
+    original_acknowledge: SpoolOperation = spool.mark_checkpoint_delivery_acknowledged
+
+    def acknowledge_observed(*args: object, **kwargs: object) -> object:
+        with observations_lock:
+            spool_threads.append(get_ident())
+        operations.append("ack")
+        return original_acknowledge(*args, **kwargs)
+
+    spool.mark_checkpoint_delivery_acknowledged = acknowledge_observed
+
+    original_committed: CommittedOperation = spool.committed
+    for method_name in (
+        "register_checkpoint_delivery",
+        "committed",
+        "context",
+        "committed_scoped",
+        "read",
+        "mark_uploaded",
+        "compact_uploaded_envelopes",
+        "pcm_scopes",
+        "covering_checkpoint",
+        "checkpoint_covers",
+    ):
+        original: SpoolOperation = getattr(spool, method_name)
+
+        def observed(
+            *args: object,
+            _operation: SpoolOperation = original,
+            **kwargs: object,
+        ) -> object:
+            with observations_lock:
+                spool_threads.append(get_ident())
+            return _operation(*args, **kwargs)
+
+        setattr(spool, method_name, observed)
+
+    class Archive:
+        def put_create_once(
+            self, key: str, body: bytes, content_type: str, sha256: str
+        ) -> ObjectRecord:
+            with observations_lock:
+                archive_threads.append(get_ident())
+            if "/pipeline/terminal/" in key:
+                loop.call_soon_threadsafe(archive_entered.set)
+                release_archive.wait()
+            return ObjectRecord(str(uuid4()), key, "v1", len(body), sha256, "crc", content_type)
+
+        def verify(self, _record: ObjectRecord) -> bool:
+            with observations_lock:
+                archive_threads.append(get_ident())
+            return True
+
+    class Control:
+        async def record_object(
+            self, payload: dict[str, object], *, event_id: UUID | None = None
+        ) -> None:
+            assert event_id is not None
+            object_payload = payload["object"]
+            assert isinstance(object_payload, dict)
+            operations.append(f"record:{object_payload['objectId']}")
+
+        async def checkpoint(
+            self, _payload: dict[str, object], *, event_id: UUID | None = None
+        ) -> None:
+            assert event_id is not None
+            operations.append("checkpoint")
+
+    metadata = CheckpointMetadata(meeting_id)
+    task = asyncio.create_task(
+        _persist_checkpoint(
+            metadata,
+            spool,
+            Archive(),
+            Control(),
+            CheckpointChainState.empty(),
+            source_id,
+            destination_id,
+            4_000,
+            960,
+            True,
+        )
+    )
+    try:
+        await archive_entered.wait()
+        await asyncio.wait_for(asyncio.sleep(0), 0.1)
+    finally:
+        release_archive.set()
+    await task
+
+    assert archive_threads
+    assert spool_threads
+    assert len(set(spool_threads)) == 1
+    assert len(set(archive_threads)) == 1
+    assert spool_threads[0] == archive_threads[0]
+    assert spool_threads[0] != loop_thread
+    assert operations.index(f"record:{evidence.object_id}") < operations.index("checkpoint")
+    assert operations[-2:] == ["checkpoint", "ack"]
+    committed = original_committed()
+    assert evidence.object_id not in {reference.object_id for reference, _ in committed}

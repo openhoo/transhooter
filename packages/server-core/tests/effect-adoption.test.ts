@@ -1,4 +1,7 @@
 import { describe, expect, it, mock } from "bun:test";
+import { Prisma, type PrismaClient } from "../src/persistence/database";
+import { PrismaEffectRepository } from "../src/persistence/effect-repository";
+import { TransactionHandle } from "../src/persistence/transaction";
 import type { EffectRepository, ExternalEffect, Transaction } from "../src/ports/index";
 import { DurableEffectExecutor } from "../src/rooms/effects";
 
@@ -55,6 +58,15 @@ function executeEffect(
     resultGeneration: (value) => value.generation,
   });
 }
+
+function inspectSql(statement: unknown): string {
+  expect(statement).toBeInstanceOf(Prisma.Sql);
+  return (statement as Prisma.Sql).strings.join("?").replace(/\s+/g, " ").trim();
+}
+
+const EFFECT_PROJECTION =
+  "id, consultation_id, generation, effect_kind, subject_id, state, request_bytes, " +
+  "request_hash, lease_owner, lease_expires_at, result, attempts";
 
 describe("DurableEffectExecutor", () => {
   it("persists request identity and adopts a matching remote effect before calling", async () => {
@@ -178,5 +190,71 @@ describe("DurableEffectExecutor", () => {
     ).resolves.toEqual({ generation: 3, sid: "successor" });
 
     expect(compensate).not.toHaveBeenCalled();
+  });
+});
+
+describe("PrismaEffectRepository projection", () => {
+  it("uses the EffectRow projection for inserted and locked effects", async () => {
+    const queryRaw = mock(async (_statement: Prisma.Sql) => [
+      {
+        id: EFFECT.id,
+        consultation_id: EFFECT.consultationId,
+        generation: EFFECT.generation,
+        effect_kind: EFFECT.kind,
+        subject_id: EFFECT.subjectId,
+        state: EFFECT.state,
+        request_bytes: EFFECT.requestBytes,
+        request_hash: EFFECT.requestHash,
+        lease_owner: EFFECT.leaseOwner,
+        lease_expires_at: EFFECT.leaseExpiresAt,
+        result: EFFECT.result,
+        attempts: EFFECT.attempts,
+      },
+    ]);
+    const transaction = new TransactionHandle({
+      $queryRaw: queryRaw,
+    } as unknown as Prisma.TransactionClient);
+    const repository = new PrismaEffectRepository({} as unknown as PrismaClient);
+
+    await expect(repository.plan(EFFECT, transaction)).resolves.toEqual(EFFECT);
+    await expect(repository.lock(EFFECT.id, transaction)).resolves.toEqual(EFFECT);
+
+    const statements = queryRaw.mock.calls.map(([statement]) => inspectSql(statement));
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toMatch(new RegExp(`RETURNING ${EFFECT_PROJECTION}$`));
+    expect(statements[1]).toContain(`SELECT ${EFFECT_PROJECTION} FROM external_effects`);
+    for (const statement of statements) {
+      expect(statement).not.toMatch(/(?:SELECT|RETURNING) \*/);
+    }
+  });
+
+  it("uses the same projection when an identity already exists", async () => {
+    const row = {
+      id: EFFECT.id,
+      consultation_id: EFFECT.consultationId,
+      generation: EFFECT.generation,
+      effect_kind: EFFECT.kind,
+      subject_id: EFFECT.subjectId,
+      state: EFFECT.state,
+      request_bytes: EFFECT.requestBytes,
+      request_hash: EFFECT.requestHash,
+      lease_owner: EFFECT.leaseOwner,
+      lease_expires_at: EFFECT.leaseExpiresAt,
+      result: EFFECT.result,
+      attempts: EFFECT.attempts,
+    };
+    let query = 0;
+    const queryRaw = mock(async (_statement: Prisma.Sql) => (query++ === 0 ? [] : [row]));
+    const transaction = new TransactionHandle({
+      $queryRaw: queryRaw,
+    } as unknown as Prisma.TransactionClient);
+    const repository = new PrismaEffectRepository({} as unknown as PrismaClient);
+
+    await expect(repository.plan(EFFECT, transaction)).resolves.toEqual(EFFECT);
+
+    const statements = queryRaw.mock.calls.map(([statement]) => inspectSql(statement));
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toMatch(new RegExp(`RETURNING ${EFFECT_PROJECTION}$`));
+    expect(statements[1]).toContain(`SELECT ${EFFECT_PROJECTION} FROM external_effects`);
   });
 });

@@ -495,10 +495,16 @@ function csrfAccepted(request: Request, cookieToken: string | undefined): boolea
   return cookieBytes.length === headerBytes.length && timingSafeEqual(cookieBytes, headerBytes);
 }
 
-function presentConsultationList(result: unknown) {
-  const consultations = z.array(ConsultationSchema).parse(result);
+export function presentConsultationList(result: unknown) {
+  const page = z
+    .object({
+      consultations: z.array(ConsultationSchema),
+      viewer: z.object({ staffRole: StaffRoleSchema.nullable() }),
+    })
+    .parse(result);
   return {
-    consultations: consultations.map((consultation) => {
+    viewer: page.viewer,
+    consultations: page.consultations.map((consultation) => {
       const customer = consultation.participants.find((slot) => slot.role === "customer");
       const href =
         durableConsultationDestination(consultation) ?? `/consultations/${consultation.id}/lobby`;
@@ -642,44 +648,62 @@ function archiveObjectGroup(objectClass: string): string {
   return "pipeline";
 }
 
+export function presentArchiveObjects(result: unknown) {
+  const page = z
+    .object({
+      objects: z.array(
+        z.object({
+          id: UuidSchema,
+          object_class: z.string(),
+          key: z.string().min(1),
+          content_type: z.string(),
+          size: z.coerce.number().nonnegative(),
+          sha256: z.string(),
+          s3_checksum: z.string().min(1),
+          version_id: z.string(),
+        }),
+      ),
+      cursor: z.string().nullable(),
+    })
+    .parse(result);
+  return {
+    objects: page.objects.map((object) => ({
+      id: object.id,
+      group: archiveObjectGroup(object.object_class),
+      label: object.object_class,
+      key: object.key,
+      contentType: object.content_type,
+      size: object.size,
+      sha256: object.sha256,
+      s3Checksum: object.s3_checksum,
+      versionId: object.version_id,
+    })),
+    nextCursor: page.cursor,
+  };
+}
+
 async function presentArchive(result: unknown, context: RequestContext): Promise<unknown> {
   const archive = ObjectSchema.parse(result);
   const auth = await authenticate(context.sessionToken);
   const archiveId = requiredUuid(z.string().parse(archive.id), "archiveId");
-  const page = z
-    .object({
-      objects: z.array(ObjectSchema),
-      cursor: z.string().nullable(),
-    })
-    .parse(
-      await configuredApplication().execute(
-        {
-          kind: "archive.objects",
-          archiveId,
-          cursor: context.query.cursor ?? null,
-          limit: 100,
-        },
-        context.sessionToken ? { sessionToken: context.sessionToken } : {},
-      ),
-    );
+  const page = presentArchiveObjects(
+    await configuredApplication().execute(
+      {
+        kind: "archive.objects",
+        archiveId,
+        cursor: context.query.cursor ?? null,
+        limit: 100,
+      },
+      context.sessionToken ? { sessionToken: context.sessionToken } : {},
+    ),
+  );
   const inventory =
     archive.inventory && typeof archive.inventory === "object"
       ? ObjectSchema.parse(archive.inventory)
       : {};
   const missing = Array.isArray(inventory.missing) ? inventory.missing : [];
   const errors = Array.isArray(inventory.errors) ? inventory.errors : [];
-  const objects = page.objects.map((object) => {
-    const objectClass = displayString(object.object_class ?? object.objectClass);
-    return {
-      id: z.string().parse(object.id),
-      group: archiveObjectGroup(objectClass),
-      label: objectClass,
-      contentType: displayString(object.content_type ?? object.contentType),
-      size: z.coerce.number().nonnegative().parse(object.size),
-      sha256: z.string().parse(object.sha256),
-      versionId: z.string().parse(object.version_id ?? object.versionId),
-    };
-  });
+  const objects = page.objects;
   const activeHolds = z
     .array(
       z.object({
@@ -717,7 +741,7 @@ async function presentArchive(result: unknown, context: RequestContext): Promise
         detail: displayString(detail, JSON.stringify(detail)),
       })),
     ],
-    nextCursor: page.cursor,
+    nextCursor: page.nextCursor,
     canAdminister: auth.user.staffRole === "admin",
     activeHolds,
     inventoryVersion: z.string().nullable().catch(null).parse(archive.inventoryVersionId),

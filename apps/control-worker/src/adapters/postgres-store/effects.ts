@@ -81,7 +81,8 @@ export async function claimEffects(
             AND epoch.terminal_at IS NOT NULL
         )
       )
-    ORDER BY CASE candidate.effect_kind WHEN 'STATUS_PACKET' THEN 0 ELSE 1 END,candidate.created_at
+    ORDER BY CASE candidate.effect_kind WHEN 'STATUS_PACKET'::text THEN 0 ELSE 1 END,
+      candidate.lease_expires_at NULLS FIRST,candidate.created_at,candidate.id
     FOR UPDATE SKIP LOCKED LIMIT ${options.limit}
   ) UPDATE external_effects e SET lease_owner=${options.owner}, lease_expires_at=${new Date(options.now.getTime() + options.leaseMs).toISOString()}
     FROM picked WHERE e.id=picked.id RETURNING e.*`);
@@ -183,48 +184,115 @@ export async function scheduleEffect(
   });
 }
 
+const PLANNED_EFFECT_BATCH_SIZE = 500;
+
 export async function insertPlannedEffects(
   transaction: Prisma.TransactionClient,
   effects: readonly PlannedEffect[],
 ): Promise<void> {
-  for (const effect of effects) {
-    const authoritative = await transaction.$queryRaw<
-      IdRow[]
-    >(Prisma.sql`INSERT INTO external_effects(id,consultation_id,generation,effect_kind,subject_id,occurrence_key,state,result,attempts,created_at,updated_at)
-      VALUES (${effect.id},${effect.consultationId},${effect.generation},${effect.kind},${effect.subjectId},${effect.occurrenceKey},'planned',
-        ${JSON.stringify({ plan: effect.plan })}::jsonb,0,now(),now())
+  for (let offset = 0; offset < effects.length; offset += PLANNED_EFFECT_BATCH_SIZE) {
+    await insertPlannedEffectBatch(
+      transaction,
+      effects.slice(offset, offset + PLANNED_EFFECT_BATCH_SIZE),
+    );
+  }
+}
+
+async function insertPlannedEffectBatch(
+  transaction: Prisma.TransactionClient,
+  effects: readonly PlannedEffect[],
+): Promise<void> {
+  if (effects.length === 0) {
+    return;
+  }
+
+  const plannedRows = effects.map(
+    (effect, ordinal) => Prisma.sql`(
+      ${ordinal}::integer,${effect.id}::uuid,${effect.consultationId}::uuid,
+      ${effect.generation}::integer,${effect.kind}::text,${effect.subjectId}::uuid,
+      ${effect.occurrenceKey}::text,${JSON.stringify({ plan: effect.plan })}::jsonb
+    )`,
+  );
+  const authoritative = await transaction.$queryRaw<
+    (IdRow & {
+      readonly effect_kind: string;
+      readonly output_prefix: string | null;
+    })[]
+  >(Prisma.sql`WITH requested(
+      ordinal,id,consultation_id,generation,effect_kind,subject_id,occurrence_key,result
+    ) AS (
+      VALUES ${Prisma.join(plannedRows)}
+    ), unique_requested AS (
+      SELECT DISTINCT ON (consultation_id,generation,effect_kind,subject_id,occurrence_key)
+        id,consultation_id,generation,effect_kind,subject_id,occurrence_key,result
+      FROM requested
+      ORDER BY consultation_id,generation,effect_kind,subject_id,occurrence_key,ordinal
+    ), inserted AS (
+      INSERT INTO external_effects(
+        id,consultation_id,generation,effect_kind,subject_id,occurrence_key,
+        state,result,attempts,created_at,updated_at
+      )
+      SELECT id,consultation_id,generation,effect_kind,subject_id,occurrence_key,
+        'planned',result,0,now(),now()
+      FROM unique_requested
       ON CONFLICT (consultation_id,generation,effect_kind,subject_id,occurrence_key)
       DO UPDATE SET updated_at=external_effects.updated_at
-      RETURNING id`);
-    const effectId = authoritative[0]?.id;
-    if (effectId === undefined) {
-      throw new Error("authoritative effect was not persisted");
+      RETURNING id,consultation_id,generation,effect_kind,subject_id,occurrence_key
+    )
+    SELECT inserted.id,requested.effect_kind,
+      requested.result->'plan'->>'outputPrefix' AS output_prefix
+    FROM requested
+    JOIN inserted USING (consultation_id,generation,effect_kind,subject_id,occurrence_key)
+    ORDER BY requested.ordinal`);
+  if (authoritative.length !== effects.length) {
+    throw new Error("authoritative effects were not persisted");
+  }
+
+  const egressRowsByKey = new Map<string, Prisma.Sql>();
+  for (const effect of authoritative) {
+    if (
+      effect.effect_kind !== "ROOM_COMPOSITE_EGRESS" &&
+      effect.effect_kind !== "PARTICIPANT_EGRESS"
+    ) {
+      continue;
     }
-    if (effect.kind === "ROOM_COMPOSITE_EGRESS" || effect.kind === "PARTICIPANT_EGRESS") {
-      const outputPrefix = effect.plan.outputPrefix;
-      if (typeof outputPrefix !== "string" || outputPrefix.length === 0) {
-        throw new Error("Egress effect omitted its immutable output prefix");
-      }
-      const objectClass =
-        effect.kind === "ROOM_COMPOSITE_EGRESS" ? "room_composite" : "participant_original";
-      await transaction.$executeRaw(Prisma.sql`INSERT INTO expected_archive_artifacts(
-          id,archive_id,effect_id,profile_id,profile_revision,object_class,causal_key,
-          sample_start,sample_end,owner_epoch,disposition,created_at
-        )
-        SELECT ${effectId},archive.id,${effectId},consultation.provider_profile_id,
-          consultation.provider_profile_revision,${objectClass},${outputPrefix},
-          NULL,NULL,archive.write_epoch,'expected',now()
-        FROM consultations consultation
-        JOIN archives archive ON archive.consultation_id=consultation.id
-        WHERE consultation.id=${effect.consultationId}
-          AND consultation.generation=${effect.generation}
-          AND archive.state NOT IN ('deleting','deleted')
-        ON CONFLICT (archive_id,object_class,causal_key) DO UPDATE
-        SET effect_id=COALESCE(expected_archive_artifacts.effect_id,EXCLUDED.effect_id)
-        WHERE expected_archive_artifacts.effect_id IS NULL
-          OR expected_archive_artifacts.effect_id=EXCLUDED.effect_id`);
+    if (effect.output_prefix === null || effect.output_prefix.length === 0) {
+      throw new Error("Egress effect omitted its immutable output prefix");
+    }
+    const objectClass =
+      effect.effect_kind === "ROOM_COMPOSITE_EGRESS" ? "room_composite" : "participant_original";
+    const key = JSON.stringify([effect.id, objectClass, effect.output_prefix]);
+    if (!egressRowsByKey.has(key)) {
+      egressRowsByKey.set(
+        key,
+        Prisma.sql`(${effect.id}::uuid,${objectClass}::text,${effect.output_prefix}::text)`,
+      );
     }
   }
+  if (egressRowsByKey.size === 0) {
+    return;
+  }
+  const egressRows = [...egressRowsByKey.values()];
+  await transaction.$executeRaw(Prisma.sql`WITH requested(effect_id,object_class,causal_key) AS (
+      VALUES ${Prisma.join(egressRows)}
+    )
+    INSERT INTO expected_archive_artifacts(
+      id,archive_id,effect_id,profile_id,profile_revision,object_class,causal_key,
+      sample_start,sample_end,owner_epoch,disposition,created_at
+    )
+    SELECT requested.effect_id,archive.id,requested.effect_id,consultation.provider_profile_id,
+      consultation.provider_profile_revision,requested.object_class,requested.causal_key,
+      NULL,NULL,archive.write_epoch,'expected',now()
+    FROM requested
+    JOIN external_effects effect ON effect.id=requested.effect_id
+    JOIN consultations consultation ON consultation.id=effect.consultation_id
+      AND consultation.generation=effect.generation
+    JOIN archives archive ON archive.consultation_id=consultation.id
+      AND archive.state NOT IN ('deleting','deleted')
+    ON CONFLICT (archive_id,object_class,causal_key) DO UPDATE
+    SET effect_id=COALESCE(expected_archive_artifacts.effect_id,EXCLUDED.effect_id)
+    WHERE expected_archive_artifacts.effect_id IS NULL
+      OR expected_archive_artifacts.effect_id=EXCLUDED.effect_id`);
 }
 
 function markAppliedStatement(

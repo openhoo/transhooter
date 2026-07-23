@@ -147,10 +147,10 @@ async def test_google_translation_caller_cancellation_does_not_restart_provider_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("owned", "expected_closes"), [(True, 1), (False, 0)])
-async def test_google_translation_closes_only_owned_channel(
+@pytest.mark.parametrize(("injected", "expected_closes"), [(False, 1), (True, 0)])
+async def test_google_translation_channel_closes_at_provider_lifetime_end(
     monkeypatch: pytest.MonkeyPatch,
-    owned: bool,
+    injected: bool,
     expected_closes: int,
 ) -> None:
     channel = BlockingTranslationChannel()
@@ -167,7 +167,7 @@ async def test_google_translation_closes_only_owned_channel(
     provider = GoogleTranslationProvider(
         google_config(),
         MemoryJournal(),
-        None if owned else channel,
+        channel if injected else None,
     )
     attempt = await provider.start(request)
     result_waiter = asyncio.create_task(attempt.result())
@@ -180,6 +180,11 @@ async def test_google_translation_closes_only_owned_channel(
     outcome = await result_waiter
 
     assert outcome.terminal.outcome is Outcome.SUCCEEDED
+    assert channel.closes == 0
+
+    await provider.aclose()
+    await provider.aclose()
+
     assert channel.closes == expected_closes
 
 

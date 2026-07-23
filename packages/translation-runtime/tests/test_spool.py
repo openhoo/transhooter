@@ -7,13 +7,14 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event, Lock, get_ident
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
 from transhooter_worker.adapters.archive_delivery import (
+    ArchiveDeliveryExecutor,
     ArchiveObjectRegistrationClient,
     PermanentRegistrationError,
     RetryableRegistrationError,
@@ -28,7 +29,7 @@ from transhooter_worker.adapters.spool import (
     deterministic_roomy_capacity,
 )
 from transhooter_worker.application.compactor import PcmCompactor
-from transhooter_worker.domain.models import SampleRange
+from transhooter_worker.domain.models import RawRef, SampleRange
 from transhooter_worker.ports.archive import ObjectRecord
 from transhooter_worker.runtime import spool_drainer
 from transhooter_worker.runtime.control_client import PermanentControlRequestError
@@ -95,6 +96,14 @@ class AlwaysVerifiedArchive:
 
     def verify(self, record: ObjectRecord) -> bool:
         return True
+
+
+class SpoolOperation(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+class CommittedOperation(Protocol):
+    def __call__(self) -> list[tuple[RawRef, SampleRange | None]]: ...
 
 
 def test_terminal_drain_uploads_current_meeting_non_pcm_before_reconciliation(
@@ -549,12 +558,12 @@ async def test_inline_terminal_drain_keeps_retryable_rejection_committed(
 
 
 @pytest.mark.asyncio
-async def test_inline_terminal_drain_archives_on_connection_owner_thread(
+async def test_inline_terminal_drain_uses_one_worker_thread_and_keeps_loop_responsive(
     tmp_path: Path,
 ) -> None:
     spool = make_spool(tmp_path)
     meeting_id = uuid4()
-    spool.append(
+    evidence = spool.append(
         meeting_id=meeting_id,
         attempt_id=uuid4(),
         stage="terminal",
@@ -563,23 +572,109 @@ async def test_inline_terminal_drain_archives_on_connection_owner_thread(
         media_type="application/json",
         payload=b'{"outcome":"succeeded"}',
     )
-    owner_thread = get_ident()
+    loop_thread = get_ident()
+    archive_entered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_archive = Event()
+    observations_lock = Lock()
+    worker_threads: list[int] = []
+    registration_threads: list[int] = []
 
-    class ThreadBoundArchive(AlwaysVerifiedArchive):
+    def observe_worker_thread() -> None:
+        with observations_lock:
+            worker_threads.append(get_ident())
+
+    original_committed: CommittedOperation = spool.committed
+    for method_name in (
+        "committed",
+        "context",
+        "read",
+        "mark_uploaded",
+        "compact_uploaded_envelopes",
+    ):
+        original: SpoolOperation = getattr(spool, method_name)
+
+        def observed(
+            *args: object,
+            _operation: SpoolOperation = original,
+            **kwargs: object,
+        ) -> object:
+            observe_worker_thread()
+            return _operation(*args, **kwargs)
+
+        setattr(spool, method_name, observed)
+
+    class BlockingThreadBoundArchive(AlwaysVerifiedArchive):
         def put_create_once(
             self, key: str, body: bytes, content_type: str, sha256: str
         ) -> ObjectRecord:
-            assert get_ident() == owner_thread
+            observe_worker_thread()
+            loop.call_soon_threadsafe(archive_entered.set)
+            release_archive.wait()
             return super().put_create_once(key, body, content_type, sha256)
 
-    await upload_committed_objects_async(
-        spool,
-        ThreadBoundArchive(),
-        lambda *_arguments: asyncio.sleep(0),
-        meeting_id,
-    )
+    async def register(
+        _meeting: UUID,
+        object_id: UUID,
+        _object_class: str,
+        _record: ObjectRecord,
+    ) -> None:
+        with observations_lock:
+            registration_threads.append(get_ident())
+        assert object_id == evidence.object_id
 
-    assert spool.committed() == []
+    task = asyncio.create_task(
+        upload_committed_objects_async(
+            spool,
+            BlockingThreadBoundArchive(),
+            register,
+            meeting_id,
+        )
+    )
+    try:
+        await archive_entered.wait()
+        await asyncio.wait_for(asyncio.sleep(0), 0.1)
+    finally:
+        release_archive.set()
+    await task
+
+    assert worker_threads
+    assert len(set(worker_threads)) == 1
+    assert worker_threads[0] != loop_thread
+    assert registration_threads == [loop_thread]
+    assert original_committed() == []
+
+
+@pytest.mark.asyncio
+async def test_archive_delivery_executor_reuses_thread_across_sequence() -> None:
+    threads: list[int] = []
+
+    async with ArchiveDeliveryExecutor() as executor:
+        for _ in range(3):
+            threads.append(await executor.run(get_ident))
+
+    assert len(set(threads)) == 1
+    assert threads[0] != get_ident()
+
+
+@pytest.mark.asyncio
+async def test_archive_delivery_cancellation_waits_for_owned_operation() -> None:
+    entered = asyncio.Event()
+    release = Event()
+    loop = asyncio.get_running_loop()
+
+    def block() -> None:
+        loop.call_soon_threadsafe(entered.set)
+        release.wait()
+
+    async with ArchiveDeliveryExecutor() as executor:
+        task = asyncio.create_task(executor.run(block))
+        await entered.wait()
+        task.cancel()
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 def test_uploaded_envelope_compaction_is_bounded_and_preserves_replay_evidence(

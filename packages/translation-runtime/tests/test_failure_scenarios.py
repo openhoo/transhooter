@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -24,6 +25,7 @@ from transhooter_worker.domain.models import (
     TranslationRequest,
 )
 from transhooter_worker.ports.providers import TranslationAttempt
+from transhooter_worker.runtime.redis_quota import RedisQuotaGate
 
 
 def wildcard_scenario_file(
@@ -222,3 +224,65 @@ async def test_fixture_scenario_makes_encrypted_spool_unwritable(
             media_type="audio/L16",
             payload=b"x",
         )
+
+
+@pytest.mark.asyncio
+async def test_redis_quota_reconnects_after_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = 0
+
+    class SuccessfulReader:
+        async def readexactly(self, _: int) -> bytes:
+            return b":"
+
+        async def readline(self) -> bytes:
+            return b"1\r\n"
+
+    class RedisWriter:
+        def __init__(self, fails: bool) -> None:
+            self.fails = fails
+            self.close_calls = 0
+
+        def write(self, _: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            if self.fails:
+                raise ConnectionResetError("connection lost")
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            return None
+
+    writers: list[RedisWriter] = []
+
+    async def open_connection(*_: object) -> tuple[SuccessfulReader, RedisWriter]:
+        nonlocal opened
+        opened += 1
+        writer = RedisWriter(fails=opened == 1)
+        writers.append(writer)
+        return SuccessfulReader(), writer
+
+    monkeypatch.setattr(asyncio, "open_connection", open_connection)
+    gate = RedisQuotaGate(
+        "redis://redis:6379",
+        "provider",
+        "account",
+        "region",
+        {"translation": {"characters_minute": 100}},
+    )
+
+    with pytest.raises(ConnectionResetError, match="connection lost"):
+        await gate("translation", 4)
+    await gate("translation", 5)
+
+    assert opened == 2
+    assert all(writer.closed for writer in writers[:1])
+    await gate.aclose()
+    await gate.aclose()
+    assert all(writer.closed for writer in writers)
+    assert [writer.close_calls for writer in writers] == [1, 1]

@@ -2,6 +2,7 @@ import { describe, expect, it, mock } from "bun:test";
 import { PrismaApplicationOperations } from "../src/application-operations";
 import { checkpointPersistenceValues } from "../src/application-operations-workers";
 import { PrismaLanguageRepository } from "../src/persistence/application-repositories";
+import { PrismaConsultationRepository } from "../src/persistence/consultation-repository";
 import { Prisma, type PrismaClient } from "../src/persistence/database";
 import { TransactionHandle } from "../src/persistence/repositories";
 
@@ -193,6 +194,91 @@ const ARCHIVE_DETAIL_ROW = {
   ],
 };
 
+const LIST_USER_ID = "00000000-0000-4000-8000-000000000030";
+
+function consultationListRow(
+  id: string,
+  archive: { state: "pending" | "complete" } | null = { state: "pending" },
+  participants: unknown[] = [
+    {
+      id: `${id.slice(0, -1)}1`,
+      consultationId: id,
+      userId: LIST_USER_ID,
+      role: "employee",
+      livekitIdentity: "00000000-0000-4000-8000-000000000032",
+      displayName: "Employee",
+      language: "en-US",
+      capabilityRowId: null,
+      consentVersion: null,
+      consentCopyHash: null,
+      consentSnapshotHash: null,
+      consentedAt: null,
+      present: false,
+      presenceEventId: null,
+      presenceEventTime: null,
+      absenceOrder: 0n,
+      readyOrder: 0n,
+      finalizeOrder: 0n,
+      publicationGranted: false,
+      participantEgressId: null,
+      joinedAt: null,
+      disconnectedAt: null,
+    },
+    {
+      id: `${id.slice(0, -1)}2`,
+      consultationId: id,
+      userId: "00000000-0000-4000-8000-000000000031",
+      role: "customer",
+      livekitIdentity: "00000000-0000-4000-8000-000000000033",
+      displayName: "Customer",
+      language: "de-DE",
+      capabilityRowId: null,
+      consentVersion: null,
+      consentCopyHash: null,
+      consentSnapshotHash: null,
+      consentedAt: null,
+      present: false,
+      presenceEventId: null,
+      presenceEventTime: null,
+      absenceOrder: 0n,
+      readyOrder: 0n,
+      finalizeOrder: 0n,
+      publicationGranted: false,
+      participantEgressId: null,
+      joinedAt: null,
+      disconnectedAt: null,
+    },
+  ],
+) {
+  return {
+    id,
+    state: "invited",
+    providerProfileId: "00000000-0000-4000-8000-000000000034",
+    providerProfileRevision: 1,
+    providerSelection: null,
+    snapshotHash: null,
+    generation: 0,
+    roomName: null,
+    roomSid: null,
+    workerIdentity: null,
+    dispatchId: null,
+    compositeEgressId: null,
+    readyDeadlineAt: null,
+    finalizeDeadlineAt: null,
+    bothAbsentSince: null,
+    admissionFencedAt: null,
+    effectGeneration: 0,
+    employeeUserId: LIST_USER_ID,
+    creationIdempotencyKey: null,
+    presenceEpoch: 0n,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+    deletedAt: null,
+    archive,
+    participants,
+  };
+}
+
 function prismaRawQueryError(originalCode: string): Prisma.PrismaClientKnownRequestError {
   return new Prisma.PrismaClientKnownRequestError(`Raw query failed. Code: \`${originalCode}\`.`, {
     code: "P2010",
@@ -247,6 +333,64 @@ function createSequentialOperations(results: Array<Record<string, unknown>[]>) {
   );
   return { queryRaw, executeRaw, operations };
 }
+
+describe("PrismaConsultationRepository listing", () => {
+  it("loads multiple consultations in one ordered relational query", async () => {
+    const rows = [
+      consultationListRow("00000000-0000-4000-8000-000000000040"),
+      consultationListRow("00000000-0000-4000-8000-000000000041", { state: "complete" }),
+    ];
+    const findMany = mock(async () => rows);
+    const repository = new PrismaConsultationRepository({
+      consultation: { findMany },
+    } as unknown as PrismaClient);
+
+    const consultations = await repository.listForUser(LIST_USER_ID);
+
+    expect(findMany).toHaveBeenCalledTimes(1);
+    expect(findMany).toHaveBeenCalledWith({
+      where: { participants: { some: { userId: LIST_USER_ID } } },
+      include: {
+        archive: { select: { state: true } },
+        participants: { orderBy: { role: "asc" } },
+      },
+      orderBy: { id: "asc" },
+    });
+    expect(consultations.map(({ id }) => id)).toEqual(rows.map(({ id }) => id));
+    expect(consultations[0]?.participants.map(({ role }) => role)).toEqual([
+      "employee",
+      "customer",
+    ]);
+    expect(consultations[1]?.archiveState).toBe("complete");
+  });
+
+  it("omits consultations whose required archive relation is missing", async () => {
+    const findMany = mock(async () => [
+      consultationListRow("00000000-0000-4000-8000-000000000040", null),
+      consultationListRow("00000000-0000-4000-8000-000000000041"),
+    ]);
+    const repository = new PrismaConsultationRepository({
+      consultation: { findMany },
+    } as unknown as PrismaClient);
+
+    const consultations = await repository.listForUser(LIST_USER_ID);
+
+    expect(consultations.map(({ id }) => id)).toEqual(["00000000-0000-4000-8000-000000000041"]);
+  });
+
+  it("fails closed when a listed consultation does not have exactly two participants", async () => {
+    const malformed = consultationListRow("00000000-0000-4000-8000-000000000040");
+    malformed.participants = malformed.participants.slice(0, 1);
+    const findMany = mock(async () => [malformed]);
+    const repository = new PrismaConsultationRepository({
+      consultation: { findMany },
+    } as unknown as PrismaClient);
+
+    await expect(repository.listForUser(LIST_USER_ID)).rejects.toMatchObject({
+      code: "INVALID_PARTICIPANTS",
+    });
+  });
+});
 
 describe("ApplicationOperations typed views", () => {
   it("returns enabled and disabled current profile directions", async () => {
@@ -304,14 +448,48 @@ describe("ApplicationOperations typed views", () => {
     expect(detail.providerAttemptGroups[0]?.attemptIds).toEqual(detail.providerAttemptIds);
   });
 
-  it("lists archive objects only for finalized archives", async () => {
-    const { queryRaw, operations } = createOperations([] as unknown[]);
+  it("lists finalized archive objects with download identity and integrity evidence", async () => {
+    const objectId = "00000000-0000-4000-8000-000000000023";
+    const { queryRaw, operations } = createOperations([
+      {
+        id: objectId,
+        object_class: "final_inventory",
+        key: "v1/meetings/consultation/inventory/final.json",
+        content_type: "application/json",
+        size: 128n,
+        sha256: "a".repeat(64),
+        s3_checksum: "checksum-1",
+        version_id: "version-1",
+      },
+    ]);
 
-    await operations.archiveObjects(ADMIN, "00000000-0000-4000-8000-000000000004", null, 50);
+    const page = await operations.archiveObjects(
+      ADMIN,
+      "00000000-0000-4000-8000-000000000004",
+      null,
+      50,
+    );
 
     const query = inspectSql(queryRaw.mock.calls[0]?.[0]).text;
+    expect(query).toContain("o.key");
+    expect(query).toContain("o.s3_checksum");
     expect(query).toContain("a.state IN ('complete','incomplete')");
     expect(query).toContain("JOIN final_inventories f ON f.archive_id=a.id");
+    expect(page).toEqual({
+      objects: [
+        {
+          id: objectId,
+          object_class: "final_inventory",
+          key: "v1/meetings/consultation/inventory/final.json",
+          content_type: "application/json",
+          size: "128",
+          sha256: "a".repeat(64),
+          s3_checksum: "checksum-1",
+          version_id: "version-1",
+        },
+      ],
+      cursor: null,
+    });
   });
 
   it("persists a fenced immutable provider terminal and accepts only an exact replay", async () => {

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
+from types import TracebackType
+from typing import ParamSpec, TypeVar
 from uuid import UUID
 
 import boto3  # type: ignore[import-untyped]
@@ -34,6 +39,57 @@ _OBJECTS = _METER.create_counter(
 _OBJECT_CLASSES = frozenset(
     {"provider_terminal", "checkpoint", "caption_ledger", "pipeline_exchange"}
 )
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+class ArchiveDeliveryExecutor:
+    """Single thread owner for a terminal spool/archive delivery sequence."""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="transhooter-archive-delivery",
+        )
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._cancel_requested = False
+
+    async def __aenter__(self) -> ArchiveDeliveryExecutor:
+        self._cancel_requested = False
+        self._loop = asyncio.get_running_loop()
+        return self
+
+    async def __aexit__(
+        self,
+        _error_type: type[BaseException] | None,
+        _error: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._loop = None
+
+    async def run(
+        self,
+        operation: Callable[_P, _T],
+        *args: _P.args,
+        **kwargs: _P.kwargs,
+    ) -> _T:
+        loop = asyncio.get_running_loop()
+        if self._loop is None or loop is not self._loop:
+            raise RuntimeError("archive delivery executor used outside its owning event loop")
+        if self._cancel_requested:
+            raise asyncio.CancelledError
+        future: asyncio.Future[_T] = loop.run_in_executor(
+            self._executor,
+            partial(operation, *args, **kwargs),
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            self._cancel_requested = True
+            await future
+            raise
 
 
 def _normalized_object_class(object_class: str) -> str:
@@ -234,39 +290,6 @@ def _is_transient_auth_rejection(error: PermanentControlRequestError) -> bool:
     return message.endswith("HTTP 401") or message.endswith("HTTP 403")
 
 
-async def _register_object_async(
-    register: Callable[[UUID, UUID, str, ObjectRecord], Awaitable[None]],
-    meeting: UUID,
-    object_id: UUID,
-    object_class: str,
-    record: ObjectRecord,
-) -> None:
-    normalized_class = _normalized_object_class(object_class)
-    with _TRACER.start_as_current_span(
-        "transhooter.worker.spool.register",
-        attributes={"object.class": normalized_class},
-        record_exception=False,
-        set_status_on_exception=False,
-    ) as span:
-        try:
-            await register(meeting, object_id, object_class, record)
-        except PermanentControlRequestError as error:
-            if _is_transient_auth_rejection(error):
-                retryable = RetryableRegistrationError(str(error), (error,))
-                _record_registration("retryable", normalized_class, retryable)
-                _finish_span(span, "retryable", retryable)
-                raise retryable from error
-            _record_registration("permanent", normalized_class, error)
-            _finish_span(span, "permanent", error)
-            raise
-        except BaseException as error:
-            _record_registration("retryable", normalized_class, error)
-            _finish_span(span, "retryable", error)
-            raise
-        _record_registration("ok", normalized_class)
-        _finish_span(span, "ok")
-
-
 def _raise_registration_failures(failures: list[Exception]) -> None:
     if not failures:
         return
@@ -328,53 +351,75 @@ def upload_committed_objects(
     _raise_registration_failures(retryable_failures)
 
 
+async def _registration_coroutine(
+    register: Callable[[UUID, UUID, str, ObjectRecord], Awaitable[None]],
+    meeting: UUID,
+    object_id: UUID,
+    object_class: str,
+    record: ObjectRecord,
+) -> None:
+    await register(meeting, object_id, object_class, record)
+
+
+def _run_registration_on_loop(
+    loop: asyncio.AbstractEventLoop,
+    register: Callable[[UUID, UUID, str, ObjectRecord], Awaitable[None]],
+    meeting: UUID,
+    object_id: UUID,
+    object_class: str,
+    record: ObjectRecord,
+) -> None:
+    registration = _registration_coroutine(register, meeting, object_id, object_class, record)
+    future: Future[None] = asyncio.run_coroutine_threadsafe(registration, loop)
+    try:
+        future.result()
+    except PermanentControlRequestError as error:
+        if _is_transient_auth_rejection(error):
+            raise RetryableRegistrationError(str(error), (error,)) from error
+        raise PermanentRegistrationError(str(error)) from error
+
+
+def _upload_committed_objects_with_async_registration(
+    spool: EncryptedSpool,
+    archive: ArchiveStore,
+    register: Callable[[UUID, UUID, str, ObjectRecord], Awaitable[None]],
+    meeting_id: UUID,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    upload_committed_objects(
+        spool,
+        archive,
+        lambda meeting, object_id, object_class, record: _run_registration_on_loop(
+            loop,
+            register,
+            meeting,
+            object_id,
+            object_class,
+            record,
+        ),
+        meeting_id,
+    )
+
+
 async def upload_committed_objects_async(
     spool: EncryptedSpool,
     archive: ArchiveStore,
     register: Callable[[UUID, UUID, str, ObjectRecord], Awaitable[None]],
     meeting_id: UUID,
+    executor: ArchiveDeliveryExecutor | None = None,
 ) -> None:
-    pcm_stages = {"stt-input", "tts-output", "livekit-output"}
-    retryable_failures: list[Exception] = []
-    for spool_ref, _ in spool.committed():
-        meeting, attempt, stage, ordinal, media_type = spool.context(spool_ref.object_id)
-        if meeting != meeting_id or stage in pcm_stages or stage == "checkpoint":
-            continue
-        suffix = "json" if "json" in media_type else "bin"
-        key = f"v1/meetings/{meeting}/pipeline/{stage}/raw/{attempt}/{ordinal:020d}.{suffix}"
-        body = spool.read(spool_ref.object_id)
-        archive_record = archive.put_create_once(
-            key,
-            body,
-            media_type,
-            hashlib.sha256(body).hexdigest(),
+    async def upload(owner: ArchiveDeliveryExecutor) -> None:
+        await owner.run(
+            _upload_committed_objects_with_async_registration,
+            spool,
+            archive,
+            register,
+            meeting_id,
+            asyncio.get_running_loop(),
         )
-        object_class = _object_class(stage)
-        try:
-            await _register_object_async(
-                register,
-                meeting,
-                spool_ref.object_id,
-                object_class,
-                archive_record,
-            )
-        except PermanentControlRequestError as error:
-            spool.quarantine(spool_ref.object_id)
-            _record_object("quarantined", object_class)
-            logger.error(
-                "spool object result=quarantined object.class=%s error.kind=%s",
-                _normalized_object_class(object_class),
-                bounded_error_kind(error),
-            )
-            continue
-        except Exception as error:
-            retryable_failures.append(error)
-            continue
-        spool.mark_uploaded(
-            spool_ref.object_id,
-            archive_record.version_id,
-            archive_record.s3_checksum,
-        )
-        _record_object("uploaded", object_class)
-    spool.compact_uploaded_envelopes()
-    _raise_registration_failures(retryable_failures)
+
+    if executor is not None:
+        await upload(executor)
+        return
+    async with ArchiveDeliveryExecutor() as owner:
+        await upload(owner)

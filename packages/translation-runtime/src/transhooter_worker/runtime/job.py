@@ -7,7 +7,7 @@ import os
 import signal
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -95,6 +95,7 @@ from transhooter_worker.runtime.job_metadata import (
 )
 from transhooter_worker.runtime.provider_registry import (
     ProviderRegistry,
+    Providers,
     credential_fingerprint,
 )
 from transhooter_worker.runtime.publisher import (
@@ -466,10 +467,30 @@ async def _drain_runtime(
     stream_tasks: set[asyncio.Task[None]],
     sessions: dict[UUID, DirectionSession],
     publishers: dict[UUID, PreservedAudioPublisher],
+    provider_sets: list[Providers],
 ) -> None:
     await _cancel_stream_tasks(stream_tasks)
-    await asyncio.gather(*(session.finish() for session in sessions.values()))
-    await asyncio.gather(*(publisher.drain() for publisher in publishers.values()))
+    session_results = await asyncio.gather(
+        *(session.finish() for session in sessions.values()),
+        return_exceptions=True,
+    )
+    publisher_results = await asyncio.gather(
+        *(publisher.drain() for publisher in publishers.values()),
+        return_exceptions=True,
+    )
+    provider_results = await asyncio.gather(
+        *(providers.aclose() for providers in provider_sets),
+        return_exceptions=True,
+    )
+    errors = [
+        result
+        for result in (*session_results, *publisher_results, *provider_results)
+        if isinstance(result, BaseException)
+    ]
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("translation runtime drain failed", errors)
 
 
 async def _unpublish_interpretation_tracks(
@@ -520,6 +541,60 @@ def _completed_runtime_error(
     )
 
 
+@dataclass(slots=True)
+class QuotaGateLifecycle:
+    gates: list[RedisQuotaGate] = field(default_factory=list)
+    leases: list[tuple[RedisQuotaGate, str, str]] = field(default_factory=list)
+    _cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _cleanup_task: asyncio.Task[None] | None = field(default=None, init=False)
+
+    def add_gate(self, gate: RedisQuotaGate) -> None:
+        if all(registered is not gate for registered in self.gates):
+            self.gates.append(gate)
+
+    def add_lease(self, gate: RedisQuotaGate, stage: str, reservation: str) -> None:
+        self.leases.append((gate, stage, reservation))
+
+    @staticmethod
+    async def _settle(awaitables: tuple[Awaitable[Any], ...]) -> tuple[BaseException, ...]:
+        if not awaitables:
+            return ()
+        results = await asyncio.gather(*awaitables, return_exceptions=True)
+        return tuple(result for result in results if isinstance(result, BaseException))
+
+    @staticmethod
+    def _raise_cleanup_errors(errors: tuple[BaseException, ...]) -> None:
+        if not errors:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup("Redis quota cleanup failed", list(errors))
+
+    async def cleanup(self) -> None:
+        async with self._cleanup_lock:
+            if self._cleanup_task is None:
+                leases = tuple(self.leases)
+                gates = tuple(self.gates)
+
+                async def cleanup_resources() -> None:
+                    release_errors = await self._settle(
+                        tuple(
+                            gate.release_active(stage, reservation)
+                            for gate, stage, reservation in leases
+                        )
+                    )
+                    close_errors = await self._settle(tuple(gate.aclose() for gate in gates))
+                    self._raise_cleanup_errors((*release_errors, *close_errors))
+
+                self._cleanup_task = asyncio.create_task(cleanup_resources())
+            cleanup_task = self._cleanup_task
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
+
+
 async def _supervise_runtime(
     ctx: agents.JobContext,
     metadata: JobMetadata,
@@ -528,7 +603,7 @@ async def _supervise_runtime(
     provider_health: tuple[ProviderHealth, ...],
     sessions: dict[UUID, DirectionSession],
     publishers: dict[UUID, PreservedAudioPublisher],
-    quota_leases: list[tuple[RedisQuotaGate, str, str]],
+    quota_lifecycle: QuotaGateLifecycle,
     stream_tasks: set[asyncio.Task[None]],
     drain_runtime: Callable[[], Awaitable[None]],
     stream_failure: asyncio.Future[BaseException],
@@ -538,7 +613,14 @@ async def _supervise_runtime(
     interpretation_tracks: dict[str, tuple[rtc.AudioSource, rtc.LocalTrackPublication]],
 ) -> None:
     heartbeat_task = asyncio.create_task(
-        _heartbeat_loop(metadata, spool, control, provider_health, quota_leases, drain_requested)
+        _heartbeat_loop(
+            metadata,
+            spool,
+            control,
+            provider_health,
+            quota_lifecycle.leases,
+            drain_requested,
+        )
     )
     disconnect_task = asyncio.create_task(disconnected.wait())
     drain_task = asyncio.create_task(drain_requested.wait())
@@ -579,10 +661,7 @@ async def _supervise_runtime(
             drain_task,
             return_exceptions=True,
         )
-        await asyncio.gather(
-            *(gate.release_active(stage, reservation) for gate, stage, reservation in quota_leases),
-            return_exceptions=True,
-        )
+        await quota_lifecycle.cleanup()
 
 
 @dataclass(slots=True)
@@ -591,8 +670,9 @@ class InitializationContext:
     control: ControlClient
     sessions: dict[UUID, DirectionSession]
     interpretation_tracks: dict[str, tuple[rtc.AudioSource, rtc.LocalTrackPublication]]
-    quota_leases: list[tuple[RedisQuotaGate, str, str]]
+    quota_lifecycle: QuotaGateLifecycle
     checkpoint_hashes: dict[UUID, str]
+    provider_sets: list[Providers] = field(default_factory=list)
     cleaned: bool = False
 
     async def cleanup(self, error: BaseException) -> None:
@@ -605,12 +685,10 @@ class InitializationContext:
         )
         await _unpublish_interpretation_tracks(self.ctx, self.interpretation_tracks)
         await asyncio.gather(
-            *(
-                gate.release_active(stage, reservation)
-                for gate, stage, reservation in self.quota_leases
-            ),
+            *(providers.aclose() for providers in self.provider_sets),
             return_exceptions=True,
         )
+        await self.quota_lifecycle.cleanup()
         await _report_runtime_failure(self.control, error, self.checkpoint_hashes)
 
     async def await_effect(self, effect: Awaitable[Any]) -> Any:
@@ -852,12 +930,13 @@ async def _reserve_direction_quota(
             selected.region,
             {capability.stage: selected.limits},
         )
+        initialization.quota_lifecycle.add_gate(gate)
         gates[capability.stage] = gate
         reservation = (
             f"{metadata.consultation_id}:{direction.source_participant_id}:{capability.stage}"
         )
         await initialization.await_effect(gate.reserve_active(capability.stage, reservation))
-        initialization.quota_leases.append((gate, capability.stage, reservation))
+        initialization.quota_lifecycle.add_lease(gate, capability.stage, reservation)
 
     async def enforce_stage_quota(stage: str, amount: int) -> None:
         await gates[stage.removesuffix("_start")](stage, amount)
@@ -880,6 +959,7 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         _selected_locales(metadata),
     )
     if spool.usage_ratio() >= 0.70:
+        await providers.aclose()
         raise RuntimeError("encrypted spool admission requires capacity below 70%")
     control = ControlClient(
         os.environ["CONTROL_INTERNAL_URL"],
@@ -893,22 +973,32 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
     sessions: dict[UUID, DirectionSession] = {}
     sessions_by_identity: dict[UUID, DirectionSession] = {}
     publishers: dict[UUID, PreservedAudioPublisher] = {}
-    quota_leases: list[tuple[RedisQuotaGate, str, str]] = []
     stream_tasks: set[asyncio.Task[None]] = set()
+    quota_lifecycle = QuotaGateLifecycle()
+    provider_sets: list[Providers] = [providers]
 
     drain_task: asyncio.Task[None] | None = None
 
     async def drain_runtime_once() -> None:
         nonlocal drain_task
         if drain_task is None:
-            drain_task = asyncio.create_task(_drain_runtime(stream_tasks, sessions, publishers))
-        await asyncio.shield(drain_task)
+            drain_task = asyncio.create_task(
+                _drain_runtime(stream_tasks, sessions, publishers, provider_sets)
+            )
+        try:
+            await asyncio.shield(drain_task)
+        except asyncio.CancelledError:
+            await drain_task
+            raise
 
     async def shutdown_runtime() -> None:
         try:
             await drain_runtime_once()
         finally:
-            await control.aclose()
+            try:
+                await quota_lifecycle.cleanup()
+            finally:
+                await control.aclose()
 
     ctx.add_shutdown_callback(shutdown_runtime)
 
@@ -921,7 +1011,12 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
             for direction in metadata.selection.directions
         },
     )
-    await _replay_pending_checkpoints(metadata, spool, archive, control, checkpoint_state)
+    try:
+        await _replay_pending_checkpoints(metadata, spool, archive, control, checkpoint_state)
+    except BaseException:
+        await providers.aclose()
+        await control.aclose()
+        raise
     completed_sources = {
         source_id
         for source_id, (_, _, _, _, terminal) in checkpoint_state.watermarks.items()
@@ -930,14 +1025,21 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
     if completed_sources == {
         direction.source_participant_id for direction in metadata.selection.directions
     }:
+        await providers.aclose()
         await control.aclose()
         return
 
-    stt_caps, translation_caps, tts_caps, provider_health = await _reported_preflight(
-        lambda: _provider_preflight(metadata, providers),
-        control.report_failure,
-        metadata.snapshot_hash,
-    )
+    try:
+        stt_caps, translation_caps, tts_caps, provider_health = await _reported_preflight(
+            lambda: _provider_preflight(metadata, providers),
+            control.report_failure,
+            metadata.snapshot_hash,
+        )
+    except BaseException:
+        await providers.aclose()
+        await control.aclose()
+        raise
+    await providers.aclose()
     sessions_ready = asyncio.Event()
     disconnected = asyncio.Event()
     drain_requested = asyncio.Event()
@@ -972,8 +1074,9 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
         control,
         sessions,
         interpretation_tracks,
-        quota_leases,
+        quota_lifecycle,
         checkpoint_state.hashes,
+        provider_sets,
     )
     initialize = initialization.await_effect
     initialize_value = initialization.construct
@@ -1081,6 +1184,7 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
             ScopedExchangeJournal(spool, _direction_scope(metadata, direction)),
             tuple(dict.fromkeys(direction_locales)),
         )
+        provider_sets.append(direction_providers)
         spec = DirectionSpec(
             direction.source_participant_id,
             direction.destination_participant_id,
@@ -1103,30 +1207,43 @@ async def _run_consultation(ctx: agents.JobContext) -> None:
             _build_provider_terminal_sink(metadata, direction, spool, control),
         )
         session._last_input = resumed_input
-        session._committed_input = resumed_input
-        session._last_output = resumed_output
         sessions[direction.source_participant_id] = session
-        await initialize(session.start())
+        try:
+            await initialize(session.start())
+        except BaseException:
+            provider_sets.remove(direction_providers)
+            raise
         sessions_by_identity[livekit_by_participant[direction.source_participant_id]] = session
     sessions_ready.set()
 
-    await _supervise_runtime(
-        ctx,
-        metadata,
-        spool,
-        control,
-        provider_health,
-        sessions,
-        publishers,
-        quota_leases,
-        stream_tasks,
-        drain_runtime_once,
-        failure,
-        disconnected,
-        drain_requested,
-        checkpoint_state.hashes,
-        interpretation_tracks,
-    )
+    try:
+        await _supervise_runtime(
+            ctx,
+            metadata,
+            spool,
+            control,
+            provider_health,
+            sessions,
+            publishers,
+            quota_lifecycle,
+            stream_tasks,
+            drain_runtime_once,
+            failure,
+            disconnected,
+            drain_requested,
+            checkpoint_state.hashes,
+            interpretation_tracks,
+        )
+    finally:
+        await drain_runtime_once()
+
+
+def _contains_spool_unavailable(error: BaseException) -> bool:
+    if isinstance(error, SpoolUnavailable):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(_contains_spool_unavailable(nested) for nested in error.exceptions)
+    return False
 
 
 async def consultation_entrypoint(ctx: agents.JobContext) -> None:
@@ -1147,10 +1264,11 @@ async def consultation_entrypoint(ctx: agents.JobContext) -> None:
             raise
         else:
             _set_ok_status(span)
-    except SpoolUnavailable:
-        supervisor_pid = os.environ.get("TRANSHOOTER_WORKER_SUPERVISOR_PID")
-        if supervisor_pid is not None:
-            os.kill(int(supervisor_pid), signal.SIGTERM)
+    except BaseException as error:
+        if _contains_spool_unavailable(error):
+            supervisor_pid = os.environ.get("TRANSHOOTER_WORKER_SUPERVISOR_PID")
+            if supervisor_pid is not None:
+                os.kill(int(supervisor_pid), signal.SIGTERM)
         raise
     finally:
         attributes = {"result": result}

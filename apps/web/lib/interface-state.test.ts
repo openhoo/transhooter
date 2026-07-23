@@ -7,6 +7,7 @@ import {
   persistDevicePreference,
   readDevicePreference,
 } from "../components/interface-state.ts";
+import { createProviderStageFormatter } from "../components/language-admin.tsx";
 
 void test("system-default devices clear consultation session preferences", () => {
   const values = new Map<string, string>([
@@ -106,4 +107,35 @@ void test("language mutations remain single-flight until the active request sett
   assert.equal(gate.tryEnter(), false);
   gate.leave();
   assert.equal(gate.tryEnter(), true);
+});
+
+void test("provider stage labels parse each unchanged snapshot once and refresh for updates", () => {
+  let parseCount = 0;
+  const format = createProviderStageFormatter((value) => {
+    parseCount += 1;
+    return JSON.parse(value) as unknown;
+  });
+  const original = JSON.stringify({
+    stt: { provider: "google", model: "chirp_3" },
+    translation: { provider: "google", model: "translation-llm" },
+    tts: { bypass: true },
+  });
+
+  assert.equal(
+    format(original),
+    "STT: google · chirp_3\nTRANSLATION: google · translation-llm\nTTS: bypass",
+  );
+  assert.equal(format(original), format(original));
+  assert.equal(parseCount, 1);
+
+  const updated = JSON.stringify({
+    stt: { provider: "google", model: "chirp_3" },
+    translation: { provider: "google", model: "translation-llm-v2" },
+    tts: { provider: "google", model: "neural2" },
+  });
+  assert.equal(
+    format(updated),
+    "STT: google · chirp_3\nTRANSLATION: google · translation-llm-v2\nTTS: google · neural2",
+  );
+  assert.equal(parseCount, 2);
 });

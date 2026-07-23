@@ -7,7 +7,10 @@ import time
 from dataclasses import dataclass
 from uuid import UUID, uuid4, uuid5
 
-from transhooter_worker.adapters.archive_delivery import upload_committed_objects_async
+from transhooter_worker.adapters.archive_delivery import (
+    ArchiveDeliveryExecutor,
+    upload_committed_objects_async,
+)
 from transhooter_worker.adapters.s3_archive import S3Archive
 from transhooter_worker.adapters.spool import EncryptedSpool, SpoolCheckpointDelivery
 from transhooter_worker.application.compactor import CompactedPcm, PcmCompactor
@@ -51,6 +54,28 @@ class CheckpointChainState:
         return lock
 
 
+def _register_checkpoint_delivery(
+    metadata: JobMetadata,
+    spool: EncryptedSpool,
+    source_id: UUID,
+    checkpoint_id: UUID,
+    checkpoint_hash: str,
+    previous_hash: str | None,
+    control_event_id: UUID,
+    body: bytes,
+) -> SpoolCheckpointDelivery:
+    return spool.register_checkpoint_delivery(
+        checkpoint_id=checkpoint_id,
+        meeting_id=metadata.consultation_id,
+        source_id=source_id,
+        worker_epoch=metadata.worker_epoch,
+        checkpoint_hash=checkpoint_hash,
+        previous_hash=previous_hash,
+        control_event_id=control_event_id,
+        body=body,
+    )
+
+
 async def _persist_checkpoint(
     metadata: JobMetadata,
     spool: EncryptedSpool,
@@ -74,9 +99,15 @@ async def _persist_checkpoint(
     provider_output_sample = (
         output_sample if provider_output_sample is None else provider_output_sample
     )
+    requested = (
+        input_sequence,
+        input_sample,
+        provider_output_sample,
+        output_sample,
+        terminal,
+    )
     async with state.lock_for(source_id):
         pending = state.pending.get(source_id)
-        requested = (input_sequence, input_sample, provider_output_sample, output_sample, terminal)
         if pending is not None:
             await _deliver_checkpoint(metadata, spool, archive, control, pending)
             state.hashes[source_id] = pending.digest
@@ -134,20 +165,46 @@ async def _persist_checkpoint(
         digest = hashlib.sha256((previous_hash or "").encode() + encoded).hexdigest()
         checkpoint["highWatermarkSha256"] = digest
         body = json.dumps(checkpoint, separators=(",", ":"), sort_keys=True).encode()
-        delivery = spool.register_checkpoint_delivery(
-            checkpoint_id=checkpoint_id,
-            meeting_id=metadata.consultation_id,
-            source_id=source_id,
-            worker_epoch=metadata.worker_epoch,
-            checkpoint_hash=digest,
-            previous_hash=previous_hash,
-            control_event_id=uuid4(),
-            body=body,
-        )
-        pending = _pending_checkpoint(delivery)
-        state.pending[source_id] = pending
-        await _deliver_checkpoint(metadata, spool, archive, control, pending)
-        state.hashes[source_id] = digest
+        control_event_id = uuid4()
+
+        pending_holder: list[PendingCheckpoint] = []
+
+        async def persist(executor: ArchiveDeliveryExecutor | None) -> None:
+            if executor is None:
+                delivery = _register_checkpoint_delivery(
+                    metadata,
+                    spool,
+                    source_id,
+                    checkpoint_id,
+                    digest,
+                    previous_hash,
+                    control_event_id,
+                    body,
+                )
+            else:
+                delivery = await executor.run(
+                    _register_checkpoint_delivery,
+                    metadata,
+                    spool,
+                    source_id,
+                    checkpoint_id,
+                    digest,
+                    previous_hash,
+                    control_event_id,
+                    body,
+                )
+            pending = _pending_checkpoint(delivery)
+            state.pending[source_id] = pending
+            pending_holder.append(pending)
+            await _deliver_checkpoint(metadata, spool, archive, control, pending, executor=executor)
+
+        if terminal:
+            async with ArchiveDeliveryExecutor() as executor:
+                await persist(executor)
+        else:
+            await persist(None)
+        pending = pending_holder[0]
+        state.hashes[source_id] = pending.digest
         state.watermarks[source_id] = requested
         del state.pending[source_id]
 
@@ -307,10 +364,10 @@ _PCM_OBJECT_CLASSES = {
 }
 
 
-async def _record_compacted_pcm(
-    metadata: JobMetadata, control: ControlClient, compacted: CompactedPcm
-) -> None:
-    sample_range = {"start": compacted.samples.start, "end": compacted.samples.end}
+def _compacted_pcm_records(
+    metadata: JobMetadata, compacted: CompactedPcm
+) -> tuple[tuple[UUID, str, ObjectRecord], ...]:
+    records: list[tuple[UUID, str, ObjectRecord]] = []
     for record, object_class in (
         (compacted.pcm, _PCM_OBJECT_CLASSES[compacted.stage]),
         (compacted.sidecar, "pcm_sidecar"),
@@ -318,6 +375,15 @@ async def _record_compacted_pcm(
         object_id = uuid5(
             metadata.consultation_id, f"archive-object:{record.key}:{record.version_id}"
         )
+        records.append((object_id, object_class, record))
+    return tuple(records)
+
+
+async def _record_compacted_pcm(
+    metadata: JobMetadata, control: ControlClient, compacted: CompactedPcm
+) -> None:
+    sample_range = {"start": compacted.samples.start, "end": compacted.samples.end}
+    for object_id, object_class, record in _compacted_pcm_records(metadata, compacted):
         await control.record_object(
             {
                 "writerEpoch": metadata.write_epoch,
@@ -340,9 +406,12 @@ async def _record_compacted_pcm(
         )
 
 
-async def _record_terminal_pcm(
-    metadata: JobMetadata, spool: EncryptedSpool, archive: S3Archive, control: ControlClient
-) -> None:
+def _compact_terminal_pcm(
+    metadata: JobMetadata,
+    spool: EncryptedSpool,
+    archive: S3Archive,
+) -> tuple[tuple[CompactedPcm, UUID], ...]:
+    compacted: list[tuple[CompactedPcm, UUID]] = []
     for meeting_id, stage, direction in spool.pcm_scopes(include_uploaded=True):
         if meeting_id != metadata.consultation_id:
             continue
@@ -354,14 +423,59 @@ async def _record_terminal_pcm(
         compactor = PcmCompactor(
             spool, archive, meeting_id, 16_000 if stage == "stt-input" else 48_000
         )
-        closed_objects = compactor.compact(stage, direction, drain=True, include_uploaded=True)
-        for closed_object in closed_objects:
+        for closed_object in compactor.compact(stage, direction, drain=True, include_uploaded=True):
             if not spool.checkpoint_covers(
                 terminal_checkpoint, stage, direction, closed_object.samples.end
             ):
                 raise RuntimeError("terminal checkpoint does not cover compacted PCM")
+            compacted.append((closed_object, terminal_checkpoint))
+    return tuple(compacted)
+
+
+def _acknowledge_compacted_pcm(
+    spool: EncryptedSpool,
+    compacted: CompactedPcm,
+    terminal_checkpoint: UUID,
+) -> None:
+    if not spool.checkpoint_covers(
+        terminal_checkpoint,
+        compacted.stage,
+        compacted.direction,
+        compacted.samples.end,
+    ):
+        raise ValueError("checkpoint is absent or does not durably cover compacted samples")
+    for ref in compacted.source_refs:
+        spool.mark_uploaded(
+            ref.object_id,
+            compacted.pcm.version_id,
+            compacted.pcm.s3_checksum,
+        )
+
+
+async def _record_terminal_pcm(
+    metadata: JobMetadata,
+    spool: EncryptedSpool,
+    archive: S3Archive,
+    control: ControlClient,
+    executor: ArchiveDeliveryExecutor | None = None,
+) -> None:
+    async def record(owner: ArchiveDeliveryExecutor) -> None:
+        for closed_object, terminal_checkpoint in await owner.run(
+            _compact_terminal_pcm, metadata, spool, archive
+        ):
             await _record_compacted_pcm(metadata, control, closed_object)
-            compactor.acknowledge_covering_checkpoint(closed_object, str(terminal_checkpoint))
+            await owner.run(
+                _acknowledge_compacted_pcm,
+                spool,
+                closed_object,
+                terminal_checkpoint,
+            )
+
+    if executor is not None:
+        await record(executor)
+        return
+    async with ArchiveDeliveryExecutor() as owner:
+        await record(owner)
 
 
 async def _register_uploaded_evidence(
@@ -394,69 +508,91 @@ async def _register_uploaded_evidence(
     )
 
 
+def _archive_checkpoint(
+    archive: S3Archive,
+    pending: PendingCheckpoint,
+    object_key: str,
+    object_sha256: str,
+) -> ObjectRecord:
+    return archive.put_create_once(object_key, pending.body, "application/json", object_sha256)
+
+
 async def _deliver_checkpoint(
     metadata: JobMetadata,
     spool: EncryptedSpool,
     archive: S3Archive,
     control: ControlClient,
     pending: PendingCheckpoint,
+    *,
+    executor: ArchiveDeliveryExecutor | None = None,
 ) -> None:
-    checkpoint_id = pending.checkpoint_id
-    object_key = (
-        f"v1/meetings/{metadata.consultation_id}/inventory/checkpoints/{checkpoint_id}.json"
-    )
-    object_sha256 = hashlib.sha256(pending.body).hexdigest()
-    spool.register_checkpoint_delivery(
-        checkpoint_id=pending.checkpoint_id,
-        meeting_id=metadata.consultation_id,
-        source_id=UUID(str(pending.checkpoint["sourceParticipantId"])),
-        worker_epoch=metadata.worker_epoch,
-        checkpoint_hash=pending.digest,
-        previous_hash=(
-            str(pending.checkpoint["previousCheckpointSha256"])
-            if pending.checkpoint["previousCheckpointSha256"] is not None
-            else None
-        ),
-        control_event_id=pending.control_event_id,
-        body=pending.body,
-    )
-    archived = archive.put_create_once(object_key, pending.body, "application/json", object_sha256)
-    await control.record_object(
-        {
-            "writerEpoch": metadata.write_epoch,
-            "causalKey": str(checkpoint_id),
-            "object": {
-                "objectId": str(checkpoint_id),
-                "class": "checkpoint",
-                "key": archived.key,
-                "versionId": archived.version_id,
-                "size": archived.size,
-                "sha256": archived.sha256,
-                "s3Checksum": archived.s3_checksum,
-                "contentType": archived.content_type,
-                "sampleRange": None,
-                "attempt": None,
-                "sequence": None,
-            },
-        },
-        event_id=pending.checkpoint_id,
-    )
-    if pending.terminal:
-        await upload_committed_objects_async(
-            spool,
-            archive,
-            lambda meeting_id, object_id, object_class, record: _register_uploaded_evidence(
-                metadata, control, meeting_id, object_id, object_class, record
-            ),
-            metadata.consultation_id,
+    async def deliver(owner: ArchiveDeliveryExecutor | None) -> None:
+        checkpoint_id = pending.checkpoint_id
+        object_key = (
+            f"v1/meetings/{metadata.consultation_id}/inventory/checkpoints/{checkpoint_id}.json"
         )
-        await _record_terminal_pcm(metadata, spool, archive, control)
-    await control.checkpoint(
-        {
-            "writeEpoch": metadata.write_epoch,
-            "objectKey": object_key,
-            "checkpoint": pending.checkpoint,
-        },
-        event_id=pending.control_event_id,
-    )
-    spool.mark_checkpoint_delivery_acknowledged(pending.control_event_id)
+        object_sha256 = hashlib.sha256(pending.body).hexdigest()
+        if owner is None:
+            archived = _archive_checkpoint(archive, pending, object_key, object_sha256)
+        else:
+            archived = await owner.run(
+                _archive_checkpoint,
+                archive,
+                pending,
+                object_key,
+                object_sha256,
+            )
+        await control.record_object(
+            {
+                "writerEpoch": metadata.write_epoch,
+                "causalKey": str(checkpoint_id),
+                "object": {
+                    "objectId": str(checkpoint_id),
+                    "class": "checkpoint",
+                    "key": archived.key,
+                    "versionId": archived.version_id,
+                    "size": archived.size,
+                    "sha256": archived.sha256,
+                    "s3Checksum": archived.s3_checksum,
+                    "contentType": archived.content_type,
+                    "sampleRange": None,
+                    "attempt": None,
+                    "sequence": None,
+                },
+            },
+            event_id=pending.checkpoint_id,
+        )
+        if pending.terminal:
+            if owner is None:
+                raise RuntimeError("terminal checkpoint delivery requires an executor")
+            await upload_committed_objects_async(
+                spool,
+                archive,
+                lambda meeting_id, object_id, object_class, record: _register_uploaded_evidence(
+                    metadata, control, meeting_id, object_id, object_class, record
+                ),
+                metadata.consultation_id,
+                owner,
+            )
+            await _record_terminal_pcm(metadata, spool, archive, control, owner)
+        await control.checkpoint(
+            {
+                "writeEpoch": metadata.write_epoch,
+                "objectKey": object_key,
+                "checkpoint": pending.checkpoint,
+            },
+            event_id=pending.control_event_id,
+        )
+        if owner is None:
+            spool.mark_checkpoint_delivery_acknowledged(pending.control_event_id)
+        else:
+            await owner.run(spool.mark_checkpoint_delivery_acknowledged, pending.control_event_id)
+
+    if executor is not None:
+        await deliver(executor)
+        return
+    if pending.terminal:
+        async with ArchiveDeliveryExecutor() as owner:
+            await deliver(owner)
+        return
+    await deliver(None)

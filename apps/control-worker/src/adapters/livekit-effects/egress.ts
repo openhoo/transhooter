@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import type { EgressInfo } from "@livekit/protocol";
 import { StopEgressRequest } from "@livekit/protocol";
 import {
@@ -32,6 +33,9 @@ type EgressTerminalResult = {
   readonly fileResults: EgressInfo["fileResults"];
   readonly segmentResults: EgressInfo["segmentResults"];
 };
+
+const EGRESS_STOP_POLL_INTERVAL_MS = 250;
+const EGRESS_STOP_POLL_ATTEMPTS = 120;
 
 export function isTerminalEgress(status: EgressStatus): boolean {
   return (
@@ -77,6 +81,19 @@ export function terminalEgressResult(info: EgressInfo): EgressTerminalResult {
     fileResults: info.fileResults,
     segmentResults: info.segmentResults,
   };
+}
+
+async function waitForTerminalEgress(
+  egress: EgressClient,
+  initial: EgressInfo,
+): Promise<EgressInfo> {
+  if (isTerminalEgress(initial.status)) return initial;
+  for (let attempt = 0; attempt < EGRESS_STOP_POLL_ATTEMPTS; attempt += 1) {
+    await delay(EGRESS_STOP_POLL_INTERVAL_MS);
+    const current = (await egress.listEgress({ egressId: initial.egressId }))[0];
+    if (current !== undefined && isTerminalEgress(current.status)) return current;
+  }
+  throw new Error("Egress stop has not reached terminal state");
 }
 
 function egressMatches(
@@ -160,11 +177,10 @@ export class EgressEffects {
     roomName: string,
   ): Promise<RemoteResult> {
     if (effect.kind === "EGRESS_STOP") {
-      const info = await this.getEgress().stopEgress(requiredString(request, "egressId"));
-      if (!isTerminalEgress(info.status)) {
-        throw new Error("Egress stop has not reached terminal state");
-      }
-      return { remoteId: info.egressId, result: terminalEgressResult(info) };
+      const egress = this.getEgress();
+      const stopped = await egress.stopEgress(requiredString(request, "egressId"));
+      const terminal = await waitForTerminalEgress(egress, stopped);
+      return { remoteId: terminal.egressId, result: terminalEgressResult(terminal) };
     }
     const output = this.segmentedOutput(`${requiredString(request, "outputPrefix")}/${effect.id}`);
     const started =

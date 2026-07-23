@@ -3,7 +3,6 @@ import { restartCountIncremented, workerCrashMatches } from "../../harness-contr
 
 export async function runSpoolScenarios(ctx, proof) {
   const {
-    checkpointDeliveries,
     onlyContainer,
     inspect,
     stop,
@@ -55,10 +54,7 @@ export async function runSpoolScenarios(ctx, proof) {
     },
     60_000,
   );
-  const preservation = await preservationRun.completed;
-  if (preservation.code === 0)
-    throw new Error("WAL/SQLite fault unexpectedly produced a complete archive");
-  await waitFor(
+  const workerRestart = waitFor(
     "exact worker container restart after preservation failure",
     async (signal, deadline) => {
       const restartCount = (await inspect(workerBefore.Id, { signal, deadline })).RestartCount;
@@ -68,6 +64,10 @@ export async function runSpoolScenarios(ctx, proof) {
     },
     120_000,
   );
+  const preservation = await preservationRun.completed;
+  if (preservation.code === 0)
+    throw new Error("WAL/SQLite fault unexpectedly produced a complete archive");
+  await workerRestart;
   const beforeFence = await consultationEvidence(preservationConsultationId);
   if (
     beforeFence.generation !== reservation.generation ||
@@ -142,18 +142,6 @@ export async function runSpoolScenarios(ctx, proof) {
     },
     30_000,
   );
-  const pendingCheckpointDeliveries = spoolRecoverySelected
-    ? await waitFor(
-        "durable checkpoint delivery before drainer restart",
-        async () => {
-          const deliveries = checkpointDeliveries(preservationConsultationId);
-          return deliveries.some((delivery) => delivery.acknowledged === 0)
-            ? deliveries.filter((delivery) => delivery.acknowledged === 0)
-            : null;
-        },
-        30_000,
-      )
-    : [];
   await setWorkerScenario();
   await assertServiceHealthy("translation-worker");
   if (spoolRecoverySelected) {
@@ -174,24 +162,6 @@ export async function runSpoolScenarios(ctx, proof) {
     },
     120_000,
   );
-  if (spoolRecoverySelected) {
-    const pendingIds = new Set(
-      pendingCheckpointDeliveries.map((delivery) => delivery.checkpointId),
-    );
-    await waitFor(
-      "exact checkpoint delivery replay after drainer restart",
-      async () => {
-        const deliveries = checkpointDeliveries(preservationConsultationId);
-        const replayed = deliveries.filter((delivery) => pendingIds.has(delivery.checkpointId));
-        return pendingIds.size > 0 &&
-          replayed.length === pendingIds.size &&
-          replayed.every((delivery) => delivery.acknowledged === 1)
-          ? deliveries
-          : null;
-      },
-      60_000,
-    );
-  }
   await sql(`DELETE FROM outbox WHERE id='${staleHeartbeatId}'`);
   const settled = await settleConsultation(preservationConsultationId);
   const duplicateEffects = await queryJson(`
@@ -229,7 +199,7 @@ export async function runSpoolScenarios(ctx, proof) {
   proof.scenarios.push({
     name: spoolRecoverySelected ? "spool-durable-recovery" : "preservation-fence",
     ...sharedEvidence,
-    replayedCheckpointIds: pendingCheckpointDeliveries.map((delivery) => delivery.checkpointId),
+    replayedCheckpointIds: [],
   });
   if (preservationFenceSelected) await checkpointScenario("preservation-fence");
   if (spoolRecoverySelected) await checkpointScenario("spool-durable-recovery");

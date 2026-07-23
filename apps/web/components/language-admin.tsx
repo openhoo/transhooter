@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api } from "@/lib/browser/browser-api";
 import { createExclusiveActionGate } from "./interface-state";
 
@@ -26,9 +26,11 @@ const refreshedAtFormatter = new Intl.DateTimeFormat("en", {
   timeStyle: "short",
 });
 
-function formatProviderStages(value: string): string {
+type ProviderStageParser = (value: string) => unknown;
+
+function computeProviderStageLabel(value: string, parse: ProviderStageParser): string {
   try {
-    const snapshot = JSON.parse(value) as Record<string, unknown>;
+    const snapshot = parse(value) as Record<string, unknown>;
     const labels: string[] = [];
     for (const [stage, details] of Object.entries(snapshot)) {
       if (!details || typeof details !== "object") continue;
@@ -48,11 +50,35 @@ function formatProviderStages(value: string): string {
     return value;
   }
 }
+
+export function createProviderStageFormatter(
+  parse: ProviderStageParser = JSON.parse,
+): (value: string) => string {
+  const cache = new Map<string, string>();
+  return (value) => {
+    const cached = cache.get(value);
+    if (cached !== undefined) return cached;
+
+    const label = computeProviderStageLabel(value, parse);
+    cache.set(value, label);
+    return label;
+  };
+}
+
 export function LanguageAdmin({ directions }: LanguageAdminProps) {
   const [items, setItems] = useState(directions);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [actionGate] = useState(createExclusiveActionGate);
+  const [formatProviderStages] = useState(createProviderStageFormatter);
+  const renderedItems = useMemo(
+    () =>
+      items.map((item) => ({
+        item,
+        providerStages: formatProviderStages(item.providers),
+      })),
+    [formatProviderStages, items],
+  );
 
   async function toggle(item: Direction) {
     if (!actionGate.tryEnter()) {
@@ -98,7 +124,7 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
             </tr>
           </thead>
           <tbody>
-            {items.map((item) => (
+            {renderedItems.map(({ item, providerStages }) => (
               <tr className={item.enabled ? "" : "opacity-60"} key={item.id}>
                 <td>
                   <span className="font-medium">{item.profile}</span>
@@ -112,7 +138,7 @@ export function LanguageAdmin({ directions }: LanguageAdminProps) {
                 </td>
                 <td>
                   <span className="whitespace-pre-line text-xs leading-relaxed text-muted-foreground">
-                    {formatProviderStages(item.providers)}
+                    {providerStages}
                   </span>
                 </td>
                 <td>

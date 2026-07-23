@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import google.auth
@@ -51,7 +51,7 @@ from transhooter_worker.domain.models import (
     WordTiming,
 )
 from transhooter_worker.ports.exchange_journal import ExchangeJournal
-from transhooter_worker.ports.providers import SttEvent, TtsEvent
+from transhooter_worker.ports.providers import SttEvent, SynthesisAttempt, TtsEvent
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _TTS_MESSAGE_BYTE_LIMIT = 5_000
@@ -127,7 +127,8 @@ async def _capability_rpc(
             metadata=(("x-goog-user-project", config.quota_project),),
             timeout=20,
         )
-        response = cast(bytes, await call)
+        response = await _await_rpc(call)
+        assert isinstance(response, bytes)
         response_ref = _append_capability_evidence(
             config=config,
             journal=journal,
@@ -384,22 +385,93 @@ def authenticated_channel(endpoint: str, quota_project: str) -> grpc.aio.Channel
     return grpc.aio.secure_channel(endpoint, composite, options=(("grpc.enable_retries", 0),))
 
 
+async def _await_rpc[RpcResult](call: Awaitable[RpcResult]) -> RpcResult:
+    return await call
+
+
+class GoogleChannelPool:
+    def __init__(self, quota_project: str) -> None:
+        self._quota_project = quota_project
+        self._channels: dict[str, grpc.aio.Channel] = {}
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    def channel(self, endpoint: str) -> grpc.aio.Channel:
+        if self._close_task is not None:
+            raise RuntimeError("Google channel pool is closed")
+        channel = self._channels.get(endpoint)
+        if channel is None:
+            channel = authenticated_channel(endpoint, self._quota_project)
+            self._channels[endpoint] = channel
+        return channel
+
+    async def aclose(self) -> None:
+        async with self._close_lock:
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(self._close_channels())
+            close_task = self._close_task
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await close_task
+            raise
+
+    async def _close_channels(self) -> None:
+        results = await asyncio.gather(
+            *(channel.close() for channel in self._channels.values()),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise BaseExceptionGroup("Google channel close failed", errors)
+
+
+class _GoogleProviderChannels:
+    def __init__(
+        self,
+        endpoint: str,
+        quota_project: str,
+        channel: grpc.aio.Channel | None,
+        channel_pool: GoogleChannelPool | None,
+    ) -> None:
+        if channel is not None and channel_pool is not None:
+            raise ValueError("Google provider accepts either a channel or a channel pool")
+        self._endpoint = endpoint
+        self._external_channel = channel
+        self._shared_pool = channel_pool
+        self._owned_pool = (
+            GoogleChannelPool(quota_project) if channel is None and channel_pool is None else None
+        )
+
+    def channel(self) -> grpc.aio.Channel:
+        if self._external_channel is not None:
+            return self._external_channel
+        pool = self._shared_pool or self._owned_pool
+        assert pool is not None
+        return pool.channel(self._endpoint)
+
+    async def aclose(self) -> None:
+        if self._owned_pool is not None:
+            await self._owned_pool.aclose()
+
+
 class GoogleSttProvider:
     def __init__(
         self,
         c: GoogleConfig,
         j: ExchangeJournal,
         channel: grpc.aio.Channel | None = None,
+        *,
+        channel_pool: GoogleChannelPool | None = None,
     ) -> None:
         self._config = c
         self._journal = j
-        self._channel = channel
+        self._channels = _GoogleProviderChannels(
+            c.speech_endpoint, c.quota_project, channel, channel_pool
+        )
 
     async def capabilities(self) -> StageCapabilities:
-        owned_channel = self._channel is None
-        channel = self._channel or authenticated_channel(
-            self._config.speech_endpoint, self._config.quota_project
-        )
+        channel = self._channels.channel()
         rpc: _CapabilityRpcResult | None = None
         try:
             request = locations_pb2.GetLocationRequest(
@@ -463,9 +535,6 @@ class GoogleSttProvider:
                 raw_refs=rpc.raw_refs,
             )
             return capability
-        finally:
-            if owned_channel:
-                await channel.close()
 
     async def health(self, snapshot: str) -> ProviderHealth:
         try:
@@ -482,10 +551,7 @@ class GoogleSttProvider:
         resume_at_sample: int = 0,
         commit_watermark: int = 0,
     ) -> GoogleSttSession:
-        owned_channel = self._channel is None
-        channel = self._channel or authenticated_channel(
-            self._config.speech_endpoint, self._config.quota_project
-        )
+        channel = self._channels.channel()
         return GoogleSttSession(
             self._config,
             self._journal,
@@ -494,8 +560,10 @@ class GoogleSttProvider:
             language,
             resume_at_sample,
             commit_watermark,
-            owned_channel=owned_channel,
         )
+
+    async def aclose(self) -> None:
+        await self._channels.aclose()
 
 
 class GoogleSttSession:
@@ -512,13 +580,10 @@ class GoogleSttSession:
         language: str,
         resume_at_sample: int = 0,
         commit_watermark: int = 0,
-        *,
-        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
-        self._owned_channel = owned_channel
         self._id = sid
         self._language = language
         self._input: asyncio.Queue[AudioChunk | object | None] = asyncio.Queue(
@@ -750,9 +815,6 @@ class GoogleSttSession:
                 str(exc),
             )
             await self._terminalize(Outcome.FAILED, error)
-        finally:
-            if self._owned_channel:
-                await self._channel.close()
 
     async def _emit_transcript_results(
         self,
@@ -927,16 +989,17 @@ class GoogleTranslationProvider:
         c: GoogleConfig,
         j: ExchangeJournal,
         channel: grpc.aio.Channel | None = None,
+        *,
+        channel_pool: GoogleChannelPool | None = None,
     ) -> None:
         self._config = c
         self._journal = j
-        self._channel = channel
+        self._channels = _GoogleProviderChannels(
+            c.translation_endpoint, c.quota_project, channel, channel_pool
+        )
 
     async def capabilities(self) -> StageCapabilities:
-        owned_channel = self._channel is None
-        channel = self._channel or authenticated_channel(
-            self._config.translation_endpoint, self._config.quota_project
-        )
+        channel = self._channels.channel()
         rpc: _CapabilityRpcResult | None = None
         try:
             request = translation_service.GetSupportedLanguagesRequest(
@@ -987,9 +1050,6 @@ class GoogleTranslationProvider:
                 raw_refs=rpc.raw_refs,
             )
             return capability
-        finally:
-            if owned_channel:
-                await channel.close()
 
     async def health(self, snapshot: str) -> ProviderHealth:
         try:
@@ -999,17 +1059,16 @@ class GoogleTranslationProvider:
             return ProviderHealth(False, int(time.time() * 1000), type(exc).__name__, None)
 
     async def start(self, request: TranslationRequest) -> GoogleTranslationAttempt:
-        owned_channel = self._channel is None
-        channel = self._channel or authenticated_channel(
-            self._config.translation_endpoint, self._config.quota_project
-        )
+        channel = self._channels.channel()
         return GoogleTranslationAttempt(
             self._config,
             self._journal,
             channel,
             request,
-            owned_channel=owned_channel,
         )
+
+    async def aclose(self) -> None:
+        await self._channels.aclose()
 
 
 class GoogleTranslationAttempt:
@@ -1019,13 +1078,10 @@ class GoogleTranslationAttempt:
         j: ExchangeJournal,
         channel: grpc.aio.Channel,
         r: TranslationRequest,
-        *,
-        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
-        self._owned_channel = owned_channel
         self._request = r
         self._task: asyncio.Task[TranslationOutcome] | None = None
         self._terminal: OperationTerminal | None = None
@@ -1088,8 +1144,6 @@ class GoogleTranslationAttempt:
     ) -> OperationTerminal:
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
-        elif self._owned_channel:
-            await self._channel.close()
         async with self._lock:
             if self._terminal is not None:
                 terminal = self._terminal
@@ -1100,14 +1154,10 @@ class GoogleTranslationAttempt:
         return terminal
 
     async def _run(self) -> TranslationOutcome:
-        try:
-            return await self._run_rpc()
-        finally:
-            if self._owned_channel:
-                await self._channel.close()
+        return await self._run_rpc()
 
     async def _run_rpc(self) -> TranslationOutcome:
-        call: object | None = None
+        call: Any = None
         try:
             request = self._build_request()
             callable_ = self._channel.unary_unary(
@@ -1120,7 +1170,8 @@ class GoogleTranslationAttempt:
                 metadata=(("x-goog-user-project", self._config.quota_project),),
                 timeout=20,
             )
-            response = await cast(Awaitable[translation_service.TranslateTextResponse], call)
+            rpc_task = asyncio.create_task(_await_rpc(call))
+            response = await rpc_task
             self._refs.append(await self._record_status(call, error=None))
             if len(response.translations) != 1:
                 raise RuntimeError("Google translation response cardinality must be one")
@@ -1321,16 +1372,17 @@ class GoogleTtsProvider:
         c: GoogleConfig,
         j: ExchangeJournal,
         channel: grpc.aio.Channel | None = None,
+        *,
+        channel_pool: GoogleChannelPool | None = None,
     ) -> None:
         self._config = c
         self._journal = j
-        self._channel = channel
+        self._channels = _GoogleProviderChannels(
+            c.tts_endpoint, c.quota_project, channel, channel_pool
+        )
 
     async def capabilities(self) -> StageCapabilities:
-        owned_channel = self._channel is None
-        channel = self._channel or authenticated_channel(
-            self._config.tts_endpoint, self._config.quota_project
-        )
+        channel = self._channels.channel()
         rpc: _CapabilityRpcResult | None = None
         try:
             request = cloud_tts.ListVoicesRequest()
@@ -1394,20 +1446,12 @@ class GoogleTtsProvider:
                 raw_refs=rpc.raw_refs,
             )
             return capability
-        finally:
-            if owned_channel:
-                await channel.close()
 
     async def health(self, snapshot: str) -> ProviderHealth:
         attempt_id = uuid4()
-        attempt: GoogleTtsAttempt | None = None
-        owned_channel = False
-        channel: grpc.aio.Channel | None = None
+        attempt: SynthesisAttempt | None = None
         try:
-            owned_channel = self._channel is None
-            channel = self._channel or authenticated_channel(
-                self._config.tts_endpoint, self._config.quota_project
-            )
+            channel = self._channels.channel()
             utterance = SynthesisUtterance(
                 uuid4(),
                 attempt_id,
@@ -1416,25 +1460,14 @@ class GoogleTtsProvider:
                 self._config.probe_voice,
                 SampleRange(0, 1),
             )
-            if owned_channel:
-                attempt = GoogleTtsAttempt(
-                    self._config,
-                    self._journal,
-                    channel,
-                    utterance,
-                    self._config.probe_voice_locale,
-                    self._config.probe_voice,
-                    owned_channel=True,
-                )
-            else:
-                attempt = GoogleTtsAttempt(
-                    self._config,
-                    self._journal,
-                    channel,
-                    utterance,
-                    self._config.probe_voice_locale,
-                    self._config.probe_voice,
-                )
+            attempt = GoogleTtsAttempt(
+                self._config,
+                self._journal,
+                channel,
+                utterance,
+                self._config.probe_voice_locale,
+                self._config.probe_voice,
+            )
             audio = False
             terminal = None
             async for event in attempt.events():
@@ -1457,13 +1490,8 @@ class GoogleTtsProvider:
         except Exception as exc:
             return ProviderHealth(False, int(time.time() * 1000), type(exc).__name__, None)
         finally:
-            if owned_channel and channel is not None:
-                if attempt is None:
-                    await channel.close()
-                elif attempt._terminal is None:
-                    await asyncio.shield(attempt.cancel())
-                else:
-                    await asyncio.shield(attempt.finish())
+            if attempt is not None:
+                await asyncio.gather(attempt.cancel(), return_exceptions=True)
 
     async def open(self, session_id: UUID, language: str, voice: str) -> GoogleTtsSession:
         ref = self._journal.append(
@@ -1477,10 +1505,7 @@ class GoogleTtsProvider:
                 {"language": language, "voice": voice}, separators=(",", ":")
             ).encode(),
         )
-        owned_channel = self._channel is None
-        channel = self._channel or authenticated_channel(
-            self._config.tts_endpoint, self._config.quota_project
-        )
+        channel = self._channels.channel()
         return GoogleTtsSession(
             self._config,
             self._journal,
@@ -1489,8 +1514,10 @@ class GoogleTtsProvider:
             language,
             voice,
             ref,
-            owned_channel=owned_channel,
         )
+
+    async def aclose(self) -> None:
+        await self._channels.aclose()
 
 
 class GoogleTtsSession:
@@ -1503,13 +1530,10 @@ class GoogleTtsSession:
         language: str,
         voice: str,
         open_ref: RawRef,
-        *,
-        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
-        self._owned_channel = owned_channel
         self._id = sid
         self._language = language
         self._voice = voice
@@ -1550,20 +1574,16 @@ class GoogleTtsSession:
         async with self._end_lock:
             if self._terminal:
                 return self._terminal
-            try:
-                if outcome is Outcome.CANCELLED:
-                    await asyncio.gather(
-                        *(attempt.cancel() for attempt in self._attempts),
-                        return_exceptions=True,
-                    )
-                else:
-                    await asyncio.gather(
-                        *(attempt.finish() for attempt in self._attempts),
-                        return_exceptions=True,
-                    )
-            finally:
-                if self._owned_channel:
-                    await self._channel.close()
+            if outcome is Outcome.CANCELLED:
+                await asyncio.gather(
+                    *(attempt.cancel() for attempt in self._attempts),
+                    return_exceptions=True,
+                )
+            else:
+                await asyncio.gather(
+                    *(attempt.finish() for attempt in self._attempts),
+                    return_exceptions=True,
+                )
             self._terminal = SessionTerminal(
                 terminal_id=uuid4(),
                 session_id=self._id,
@@ -1591,13 +1611,10 @@ class GoogleTtsAttempt:
         u: SynthesisUtterance,
         language: str,
         voice: str,
-        *,
-        owned_channel: bool = False,
     ) -> None:
         self._config = c
         self._journal = j
         self._channel = channel
-        self._owned_channel = owned_channel
         self._utterance = u
         self._language = language
         self._voice = voice
@@ -1673,11 +1690,7 @@ class GoogleTtsAttempt:
             return await self._end(Outcome.CANCELLED, refs, self._emitted, error)
 
     async def _run(self) -> None:
-        try:
-            await self._run_rpc()
-        finally:
-            if self._owned_channel:
-                await self._channel.close()
+        await self._run_rpc()
 
     async def _run_rpc(self) -> None:
         call: object | None = None

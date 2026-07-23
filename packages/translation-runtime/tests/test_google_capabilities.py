@@ -156,7 +156,7 @@ async def test_speech_capabilities_decode_nested_language_model_maps(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("owned", "expected_closes"), [(True, 1), (False, 0)])
-async def test_speech_capability_transport_closes_only_owned_channel(
+async def test_speech_provider_reuses_channel_and_closes_only_owned_channel(
     monkeypatch: pytest.MonkeyPatch,
     owned: bool,
     expected_closes: int,
@@ -183,24 +183,89 @@ async def test_speech_capability_transport_closes_only_owned_channel(
             self.closes += 1
 
     channel = Channel()
+    creations = 0
+    seen_channels: list[object] = []
 
-    async def rpc(*_: object, **__: object) -> google_provider._CapabilityRpcResult:
+    def create_channel(*_: object) -> Channel:
+        nonlocal creations
+        creations += 1
+        return channel
+
+    async def rpc(
+        _: object,
+        __: object,
+        rpc_channel: object,
+        *___: object,
+    ) -> google_provider._CapabilityRpcResult:
+        seen_channels.append(rpc_channel)
         return google_provider._CapabilityRpcResult(
             location.SerializeToString(), UUID(int=11), (evidence,)
         )
 
     monkeypatch.setattr(google_provider, "_capability_rpc", rpc)
-    monkeypatch.setattr(google_provider, "authenticated_channel", lambda *_: channel)
+    monkeypatch.setattr(google_provider, "authenticated_channel", create_channel)
     provider = google_provider.GoogleSttProvider(
         google_provider.GoogleConfig("project", "quota", UUID(int=2), "credential"),
         Journal(),
         None if owned else channel,  # type: ignore[arg-type]
     )
 
-    capabilities = await provider.capabilities()
+    first = await provider.capabilities()
+    second = await provider.capabilities()
+    await provider.aclose()
+    await provider.aclose()
 
-    assert capabilities.languages == ("en-US",)
+    assert first.languages == second.languages == ("en-US",)
+    assert creations == (1 if owned else 0)
+    assert seen_channels == [channel, channel]
     assert channel.closes == expected_closes
+
+
+@pytest.mark.asyncio
+async def test_translation_provider_reuses_one_channel_across_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Channel:
+        def __init__(self) -> None:
+            self.closes = 0
+
+        async def close(self) -> None:
+            self.closes += 1
+
+    channel = Channel()
+    creations = 0
+
+    def create_channel(*_: object) -> Channel:
+        nonlocal creations
+        creations += 1
+        return channel
+
+    monkeypatch.setattr(google_provider, "authenticated_channel", create_channel)
+    provider = google_provider.GoogleTranslationProvider(
+        google_provider.GoogleConfig("project", "quota", UUID(int=2), "credential"),
+        Journal(),
+    )
+    request = TranslationRequest(
+        UUID(int=20),
+        UUID(int=21),
+        "final",
+        "en-US",
+        "de-DE",
+        "hello",
+        SampleRange(0, 1),
+    )
+
+    first = await provider.start(request)
+    second = await provider.start(request)
+
+    assert first._channel is second._channel is channel
+    assert creations == 1
+    assert channel.closes == 0
+
+    await provider.aclose()
+    await provider.aclose()
+
+    assert channel.closes == 1
 
 
 @pytest.mark.asyncio
@@ -333,6 +398,9 @@ async def test_tts_health_runs_streaming_synthesis_and_validates_returned_format
     )
 
     class Attempt:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+
         def events(self):
             async def stream():
                 yield AudioEvent(
@@ -348,13 +416,19 @@ async def test_tts_health_runs_streaming_synthesis_and_validates_returned_format
 
             return stream()
 
+        async def cancel(self) -> OperationTerminal:
+            self.cancel_calls += 1
+            return terminal
+
     captured: dict[str, object] = {}
 
     def attempt_factory(*args: object) -> Attempt:
         captured["utterance"] = args[3]
         captured["language"] = args[4]
         captured["voice"] = args[5]
-        return Attempt()
+        attempt = Attempt()
+        captured["attempt"] = attempt
+        return attempt
 
     monkeypatch.setattr(google_provider, "GoogleTtsAttempt", attempt_factory)
     config = google_provider.GoogleConfig(
@@ -382,6 +456,9 @@ async def test_tts_health_runs_streaming_synthesis_and_validates_returned_format
     assert utterance.language == "de-DE"
     assert captured["language"] == "de-DE"
     assert captured["voice"] == "de-DE-Chirp3-HD-Algenib"
+    attempt = captured["attempt"]
+    assert isinstance(attempt, Attempt)
+    assert attempt.cancel_calls == 1
 
 
 @pytest.mark.asyncio

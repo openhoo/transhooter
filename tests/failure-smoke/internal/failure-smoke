@@ -313,25 +313,47 @@ trap - 0
 
 cleanup_stale_failure_smoke_projects
 
-capture_database_diagnostic() {
-  phase=$1
-  statement=$2
-  compose_bounded "$phase" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
+capture_database_diagnostics() {
+  consultation_sql="SELECT state, generation, room_name IS NOT NULL AS room_name_set, room_sid IS NOT NULL AS room_sid_set, dispatch_id IS NOT NULL AS dispatch_id_set, composite_egress_id IS NOT NULL AS composite_egress_id_set FROM consultations ORDER BY created_at DESC LIMIT 3"
+  external_effect_sql="SELECT generation, effect_kind, state, attempts, result ? 'error' AS has_error, max(result->>'error') AS latest_error, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, result ? 'error' ORDER BY generation, effect_kind, state, attempts, has_error"
+  archive_sql="SELECT a.state, a.final_inventory_hash IS NOT NULL AS inventory_hashed, count(DISTINCT o.id) AS objects, count(DISTINCT m.id) FILTER (WHERE m.state IN ('open','completing')) AS pending_multipart FROM archives a LEFT JOIN archive_objects o ON o.archive_id=a.id LEFT JOIN multipart_uploads m ON m.archive_id=a.id GROUP BY a.id, a.state, a.final_inventory_hash ORDER BY a.created_at DESC LIMIT 3"
+  outbox_sql="SELECT id, topic, aggregate_id, generation, payload->>'kind' AS effect_kind, payload->>'subjectId' AS subject_id, payload->>'resourceGeneration' AS resource_generation, available_at, lease_owner, lease_expires_at, attempts, payload->>'lastDispatchError' AS last_dispatch_error FROM outbox WHERE delivered_at IS NULL ORDER BY available_at, id"
+  compose_bounded "Capturing database diagnostics" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
     run --rm --no-deps --workdir /workspace/tests/failure-smoke \
-      -e "FAILURE_DIAGNOSTIC_SQL=$statement" failure-smoke bun --eval '
+      -e "FAILURE_DIAGNOSTIC_CONSULTATION_SQL=$consultation_sql" \
+      -e "FAILURE_DIAGNOSTIC_EXTERNAL_EFFECT_SQL=$external_effect_sql" \
+      -e "FAILURE_DIAGNOSTIC_ARCHIVE_SQL=$archive_sql" \
+      -e "FAILURE_DIAGNOSTIC_OUTBOX_SQL=$outbox_sql" \
+      failure-smoke bun --eval '
       import postgres from "postgres";
+      const diagnostics = [
+        ["Capturing consultation diagnostics", process.env.FAILURE_DIAGNOSTIC_CONSULTATION_SQL],
+        ["Capturing external-effect diagnostics", process.env.FAILURE_DIAGNOSTIC_EXTERNAL_EFFECT_SQL],
+        ["Capturing archive recovery diagnostics", process.env.FAILURE_DIAGNOSTIC_ARCHIVE_SQL],
+        ["Capturing outbox diagnostics", process.env.FAILURE_DIAGNOSTIC_OUTBOX_SQL],
+      ];
       const connectionString = (await Bun.file(process.env.DATABASE_URL_FILE).text()).trim();
       const database = postgres(connectionString, {
         max: 1,
         prepare: false,
         connect_timeout: 10,
       });
+      let failed = false;
       try {
-        const rows = await database.unsafe(process.env.FAILURE_DIAGNOSTIC_SQL);
-        for (const row of rows) console.log(JSON.stringify(row));
+        for (const [label, statement] of diagnostics) {
+          console.log(`=== ${label} ===`);
+          try {
+            const rows = await database.unsafe(statement);
+            for (const row of rows) console.log(JSON.stringify(row));
+          } catch (error) {
+            failed = true;
+            console.error(`${label} failed:`, error);
+          }
+        }
       } finally {
         await database.end({ timeout: 1 });
       }
+      if (failed) process.exitCode = 1;
     '
 }
 
@@ -342,14 +364,7 @@ cleanup() {
     compose_bounded "Capturing failure-smoke service status" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" ps || true
     compose_bounded "Capturing failure-smoke logs" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS" \
       logs --no-color --tail=80 web translation-worker spool-drainer control-worker-1 control-worker-2 capability-publisher language-refresh postgres-role-bootstrap postgres-capability-bootstrap migrate livekit egress minio || true
-    capture_database_diagnostic "Capturing consultation diagnostics" \
-      "SELECT state, generation, room_name IS NOT NULL AS room_name_set, room_sid IS NOT NULL AS room_sid_set, dispatch_id IS NOT NULL AS dispatch_id_set, composite_egress_id IS NOT NULL AS composite_egress_id_set FROM consultations ORDER BY created_at DESC LIMIT 3" || true
-    capture_database_diagnostic "Capturing external-effect diagnostics" \
-      "SELECT generation, effect_kind, state, attempts, result ? 'error' AS has_error, max(result->>'error') AS latest_error, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, result ? 'error' ORDER BY generation, effect_kind, state, attempts, has_error" || true
-    capture_database_diagnostic "Capturing archive recovery diagnostics" \
-      "SELECT a.state, a.final_inventory_hash IS NOT NULL AS inventory_hashed, count(DISTINCT o.id) AS objects, count(DISTINCT m.id) FILTER (WHERE m.state IN ('open','completing')) AS pending_multipart FROM archives a LEFT JOIN archive_objects o ON o.archive_id=a.id LEFT JOIN multipart_uploads m ON m.archive_id=a.id GROUP BY a.id, a.state, a.final_inventory_hash ORDER BY a.created_at DESC LIMIT 3" || true
-    capture_database_diagnostic "Capturing outbox diagnostics" \
-      "SELECT topic, generation, delivered_at IS NOT NULL AS delivered, attempts, payload ? 'lastDispatchError' AS has_last_dispatch_error, count(*) FROM outbox GROUP BY topic, generation, delivered_at IS NOT NULL, attempts, payload ? 'lastDispatchError' ORDER BY topic, generation, delivered, attempts, has_last_dispatch_error" || true
+    capture_database_diagnostics || true
   fi
   if verify_failure_smoke_stack_ownership; then
     if ! compose_bounded "Cleaning owned failure-smoke stack $PROJECT_NAME" \
@@ -390,6 +405,13 @@ if ! $NO_BUILD; then
   compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
     build minio egress-ready translation-worker web failure-smoke
 fi
-compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIMEOUT_SECONDS" \
+scenario_log="$RUN_DIRECTORY/scenario.log"
+if compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIMEOUT_SECONDS" \
   run --rm -v "$PROOF_DIRECTORY:/proof" -e FAILURE_SMOKE_PROOF_FILE=/proof/proof.json \
-    failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@"
+    failure-smoke bun ../failure-smoke/failure-smoke.mjs "$@" >"$scenario_log" 2>&1; then
+  cat "$scenario_log"
+else
+  status=$?
+  tail -n 200 "$scenario_log" >&2
+  exit "$status"
+fi

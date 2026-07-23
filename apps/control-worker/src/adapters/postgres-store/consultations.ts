@@ -583,7 +583,8 @@ export async function completeRoomDrain(
     await transaction.$executeRaw(Prisma.sql`UPDATE archives SET state='reconciling',reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,now()+interval '30 minutes'),updated_at=now()
       WHERE consultation_id=${consultationId} AND state IN ('pending','recording')`);
     await transaction.$executeRaw(Prisma.sql`INSERT INTO orchestration_deadlines(consultation_id,generation,kind,due_at)
-      SELECT ${consultationId},${generation},'archive-reconcile',reconciliation_deadline_at FROM archives WHERE consultation_id=${consultationId}
+      SELECT ${consultationId},${generation},'archive-reconcile',reconciliation_deadline_at FROM archives
+      WHERE consultation_id=${consultationId} AND state='reconciling' AND reconciliation_deadline_at IS NOT NULL
       ON CONFLICT (consultation_id,generation,kind) DO UPDATE SET due_at=EXCLUDED.due_at`);
   });
 }
@@ -592,11 +593,20 @@ export async function capacityDimensions(
   client: PrismaConnection,
   consultationId: Uuid,
 ): Promise<readonly CapacityDimension[]> {
-  const rows = await client.$queryRaw<{ readonly provider_selection: unknown }[]>(
-    Prisma.sql`SELECT provider_selection FROM consultations WHERE id=${consultationId} LIMIT 1`,
+  const rows = await client.$queryRaw<
+    { readonly state: string; readonly provider_selection: unknown }[]
+  >(
+    Prisma.sql`SELECT state,provider_selection FROM consultations WHERE id=${consultationId} LIMIT 1`,
   );
-  const selection = rows[0]?.provider_selection;
+  const consultation = rows[0];
+  if (consultation === undefined) {
+    throw new Error("consultation provider selection is missing");
+  }
+  const selection = consultation.provider_selection;
   if (selection === undefined || selection === null) {
+    if (consultation.state === "deleted") {
+      return [];
+    }
     throw new Error("consultation provider selection is missing");
   }
   return capacityDimensionsForSelection(RoomProviderSelectionSchema.parse(selection));

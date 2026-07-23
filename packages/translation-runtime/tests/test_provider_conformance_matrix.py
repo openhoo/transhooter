@@ -744,6 +744,9 @@ async def test_google_capability_channel_ownership(
     with pytest.raises(RuntimeError, match="capability unavailable"):
         await asyncio.wait_for(provider.capabilities(), 1)
 
+    assert channel.closes == 0
+    await provider.aclose()
+    await provider.aclose()
     assert channel.closes == (0 if supplied else 1)
 
 

@@ -275,7 +275,11 @@ def test_google_missing_discovered_target_voice_fails_closed() -> None:
         )
 
 
-def test_effective_voice_is_identical_in_journal_and_provider_config() -> None:
+def test_effective_voice_is_identical_in_journal_and_provider_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transhooter_worker.adapters.google import provider as google_provider
+
     profile = GoogleProfile(
         kind="google-eu",
         project="project",
@@ -297,6 +301,10 @@ def test_effective_voice_is_identical_in_journal_and_provider_config() -> None:
         def set_context(self, context: dict[str, object]) -> None:
             self.context = context
 
+    def reject_channel_creation(*_: object) -> object:
+        raise AssertionError("configuration construction must not load ADC or create channels")
+
+    monkeypatch.setattr(google_provider, "authenticated_channel", reject_channel_creation)
     journal = Journal()
     _configure_journal_context(
         journal,  # type: ignore[arg-type]

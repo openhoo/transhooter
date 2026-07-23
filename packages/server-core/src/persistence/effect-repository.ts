@@ -3,6 +3,21 @@ import type { EffectRepository, ExternalEffect, OutboxMessage, Transaction } fro
 import { Prisma, type PrismaClient } from "./database";
 import { TransactionHandle, unwrap } from "./transaction";
 
+const EFFECT_PROJECTION = Prisma.sql`
+  id,
+  consultation_id,
+  generation,
+  effect_kind,
+  subject_id,
+  state,
+  request_bytes,
+  request_hash,
+  lease_owner,
+  lease_expires_at,
+  result,
+  attempts
+`;
+
 export class PrismaEffectRepository implements EffectRepository {
   constructor(private readonly database: PrismaClient) {}
 
@@ -49,14 +64,14 @@ export class PrismaEffectRepository implements EffectRepository {
       )
       ON CONFLICT(consultation_id, generation, effect_kind, subject_id, occurrence_key)
       DO NOTHING
-      RETURNING *
+      RETURNING ${EFFECT_PROJECTION}
     `);
     if (inserted[0]) {
       return mapEffect(inserted[0]);
     }
 
     const existing = await database.$queryRaw<EffectRow[]>(Prisma.sql`
-      SELECT *
+      SELECT ${EFFECT_PROJECTION}
       FROM external_effects
       WHERE consultation_id = ${effect.consultationId}
         AND generation = ${effect.generation}
@@ -73,7 +88,7 @@ export class PrismaEffectRepository implements EffectRepository {
 
   async lock(effectId: UUID, tx: Transaction): Promise<ExternalEffect | null> {
     const rows = await unwrap(tx).$queryRaw<EffectRow[]>(Prisma.sql`
-      SELECT *
+      SELECT ${EFFECT_PROJECTION}
       FROM external_effects
       WHERE id = ${effectId}
       LIMIT 1

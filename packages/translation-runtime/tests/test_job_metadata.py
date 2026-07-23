@@ -3,6 +3,7 @@ import hashlib
 import json
 import signal
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,10 +12,13 @@ from jsonschema.exceptions import ValidationError
 from transhooter_worker.adapters.spool import SpoolUnavailable
 from transhooter_worker.domain.models import StageCapabilities
 from transhooter_worker.runtime.job import (
+    InitializationContext,
+    QuotaGateLifecycle,
     SourceTrackTimeline,
     SttStage,
     _heartbeat_loop,
     _reported_preflight,
+    _supervise_runtime,
     _validate_frozen_stage,
     _validated_job_metadata,
     consultation_entrypoint,
@@ -131,6 +135,221 @@ async def test_rejected_heartbeat_requests_graceful_drain(
     assert control.calls == 1
 
 
+@pytest.mark.asyncio
+async def test_quota_gate_cleanup_releases_before_closing_each_unique_gate_once() -> None:
+    events: list[str] = []
+
+    class Gate:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def release_active(self, stage: str, reservation: str) -> None:
+            events.append(f"release:{self.name}:{stage}:{reservation}")
+
+        async def aclose(self) -> None:
+            assert "release:active:stt:reservation" in events
+            events.append(f"close:{self.name}")
+
+    active_gate = Gate("active")
+    window_only_gate = Gate("window-only")
+    lifecycle = QuotaGateLifecycle()
+    lifecycle.add_gate(active_gate)  # type: ignore[arg-type]
+    lifecycle.add_gate(active_gate)  # type: ignore[arg-type]
+    lifecycle.add_gate(window_only_gate)  # type: ignore[arg-type]
+    lifecycle.add_lease(active_gate, "stt", "reservation")  # type: ignore[arg-type]
+
+    await asyncio.gather(lifecycle.cleanup(), lifecycle.cleanup())
+
+    assert events == [
+        "release:active:stt:reservation",
+        "close:active",
+        "close:window-only",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_quota_gate_cleanup_finishes_before_propagating_cancellation() -> None:
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    events: list[str] = []
+
+    class Gate:
+        async def release_active(self, _stage: str, _reservation: str) -> None:
+            release_started.set()
+            await allow_release.wait()
+            events.append("gate:release")
+
+        async def aclose(self) -> None:
+            events.append("gate:close")
+
+    gate = Gate()
+    lifecycle = QuotaGateLifecycle()
+    lifecycle.add_gate(gate)  # type: ignore[arg-type]
+    lifecycle.add_lease(gate, "stt", "reservation")  # type: ignore[arg-type]
+    cleanup_task = asyncio.create_task(lifecycle.cleanup())
+    await release_started.wait()
+    cleanup_task.cancel()
+    allow_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup_task
+
+    assert events == ["gate:release", "gate:close"]
+
+
+@pytest.mark.asyncio
+async def test_quota_gate_cleanup_closes_all_gates_and_aggregates_errors() -> None:
+    events: list[str] = []
+
+    class FailingGate:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def release_active(self, _stage: str, _reservation: str) -> None:
+            events.append(f"release:{self.name}")
+            raise RuntimeError(f"release {self.name}")
+
+        async def aclose(self) -> None:
+            events.append(f"close:{self.name}")
+            raise RuntimeError(f"close {self.name}")
+
+    first = FailingGate("first")
+    second = FailingGate("second")
+    lifecycle = QuotaGateLifecycle()
+    for gate in (first, second):
+        lifecycle.add_gate(gate)  # type: ignore[arg-type]
+        lifecycle.add_lease(gate, "stt", gate.name)  # type: ignore[arg-type]
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await lifecycle.cleanup()
+
+    assert events == [
+        "release:first",
+        "release:second",
+        "close:first",
+        "close:second",
+    ]
+    assert [str(error) for error in raised.value.exceptions] == [
+        "release first",
+        "release second",
+        "close first",
+        "close second",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_supervision_stops_gate_users_before_quota_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_contract_schema(monkeypatch)
+    metadata = _validated_job_metadata(json.dumps(job_metadata_payload()))
+    events: list[str] = []
+
+    class Spool:
+        @staticmethod
+        def usage_ratio() -> float:
+            return 0.1
+
+    class Control:
+        async def heartbeat(self, _health: dict[str, object]) -> bool:
+            return True
+
+        async def report_failure(self, _report: dict[str, object]) -> None:
+            raise AssertionError("graceful shutdown must not report a failure")
+
+    stream_task = asyncio.create_task(asyncio.Event().wait())
+    stream_tasks = {stream_task}
+
+    async def drain_runtime() -> None:
+        stream_task.cancel()
+        await asyncio.gather(stream_task, return_exceptions=True)
+        events.append("tasks:stopped")
+
+    class Gate:
+        async def reserve_active(self, _stage: str, _reservation: str) -> None:
+            return None
+
+        async def release_active(self, _stage: str, _reservation: str) -> None:
+            assert stream_task.done()
+            events.append("gate:release")
+
+        async def aclose(self) -> None:
+            assert events == ["tasks:stopped", "gate:release"]
+            events.append("gate:close")
+
+    gate = Gate()
+    lifecycle = QuotaGateLifecycle()
+    lifecycle.add_gate(gate)  # type: ignore[arg-type]
+    lifecycle.add_lease(gate, "stt", "reservation")  # type: ignore[arg-type]
+    disconnected = asyncio.Event()
+    disconnected.set()
+
+    await _supervise_runtime(
+        SimpleNamespace(room=SimpleNamespace()),  # type: ignore[arg-type]
+        metadata,
+        Spool(),  # type: ignore[arg-type]
+        Control(),  # type: ignore[arg-type]
+        (),
+        {},
+        {},
+        lifecycle,
+        stream_tasks,  # type: ignore[arg-type]
+        drain_runtime,
+        asyncio.get_running_loop().create_future(),
+        disconnected,
+        asyncio.Event(),
+        {},
+        {},
+    )
+
+    assert events == ["tasks:stopped", "gate:release", "gate:close"]
+
+
+@pytest.mark.asyncio
+async def test_initialization_cleanup_stops_sessions_before_releasing_and_closing_gates() -> None:
+    events: list[str] = []
+
+    class Session:
+        async def cancel(self) -> None:
+            events.append("session:cancel")
+
+    class Gate:
+        async def release_active(self, _stage: str, _reservation: str) -> None:
+            assert events == ["session:cancel"]
+            events.append("gate:release")
+
+        async def aclose(self) -> None:
+            assert events == ["session:cancel", "gate:release"]
+            events.append("gate:close")
+
+    class Control:
+        async def report_failure(self, _report: dict[str, object]) -> None:
+            events.append("control:report")
+
+    gate = Gate()
+    lifecycle = QuotaGateLifecycle()
+    lifecycle.add_gate(gate)  # type: ignore[arg-type]
+    lifecycle.add_lease(gate, "translation", "reservation")  # type: ignore[arg-type]
+    initialization = InitializationContext(
+        SimpleNamespace(room=SimpleNamespace()),  # type: ignore[arg-type]
+        Control(),  # type: ignore[arg-type]
+        {uuid4(): Session()},  # type: ignore[dict-item]
+        {},
+        lifecycle,
+        {},
+    )
+
+    await initialization.cleanup(RuntimeError("initialization failed"))
+    await initialization.cleanup(RuntimeError("duplicate cleanup"))
+
+    assert events == [
+        "session:cancel",
+        "gate:release",
+        "gate:close",
+        "control:report",
+    ]
+
+
 def test_metadata_is_validated_against_generated_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,6 +432,28 @@ async def test_spool_failure_requests_graceful_supervisor_shutdown(
     monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
 
     with pytest.raises(SpoolUnavailable, match="spool unavailable"):
+        await consultation_entrypoint(object())  # type: ignore[arg-type]
+
+    assert killed == [(1234, signal.SIGTERM)]
+
+
+@pytest.mark.asyncio
+async def test_nested_spool_failure_requests_graceful_supervisor_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[tuple[int, int]] = []
+
+    async def fail_consultation(_ctx: object) -> None:
+        raise BaseExceptionGroup(
+            "translation runtime drain failed",
+            [RuntimeError("provider cleanup failed"), SpoolUnavailable("spool unavailable")],
+        )
+
+    monkeypatch.setenv("TRANSHOOTER_WORKER_SUPERVISOR_PID", "1234")
+    monkeypatch.setattr("transhooter_worker.runtime.job._run_consultation", fail_consultation)
+    monkeypatch.setattr("os.kill", lambda pid, sig: killed.append((pid, sig)))
+
+    with pytest.raises(BaseExceptionGroup, match="translation runtime drain failed"):
         await consultation_entrypoint(object())  # type: ignore[arg-type]
 
     assert killed == [(1234, signal.SIGTERM)]

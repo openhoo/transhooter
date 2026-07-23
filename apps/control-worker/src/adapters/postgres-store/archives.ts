@@ -11,7 +11,6 @@ import type {
 } from "../../orchestration/model";
 import {
   type ArchiveObjectRow,
-  type ArchiveStateRow,
   type CheckpointRow,
   type DrainResultRow,
   type EgressResultRow,
@@ -30,6 +29,15 @@ import {
   withTransaction,
 } from "./shared";
 
+const RECONCILIATION_OBJECT_BATCH_SIZE = 1_000;
+
+interface ReconciliationObjectIdentityRow {
+  readonly key: string;
+  readonly version_id: string;
+}
+
+class ReconciliationCompletionFenceError extends Error {}
+
 export async function preparePendingArchiveDeletes(client: PrismaConnection): Promise<void> {
   await client.$executeRaw(claimPendingArchiveDeletesStatement());
 }
@@ -43,15 +51,34 @@ export async function reconciliationSnapshot(
   return withTransaction(
     client,
     async (transaction) => {
-      const [archiveStateRow] = await transaction.$queryRaw<
-        ArchiveStateRow[]
-      >(Prisma.sql`SELECT id,state
+      const [archiveRow] = await transaction.$queryRaw<
+        ReconciliationArchiveRow[]
+      >(Prisma.sql`SELECT id,state,reconciliation_deadline_at
       FROM archives
-      WHERE consultation_id=${consultationId}`);
-      if (archiveStateRow === undefined) {
-        throw new Error("consultation archive is unavailable");
+      WHERE consultation_id=${consultationId}
+      FOR UPDATE SKIP LOCKED`);
+      if (archiveRow === undefined) {
+        const [unlockedStateRow] = await transaction.$queryRaw<{ readonly state: unknown }[]>(
+          Prisma.sql`SELECT state FROM archives WHERE consultation_id=${consultationId}`,
+        );
+        if (unlockedStateRow === undefined) {
+          throw new Error("consultation archive is unavailable");
+        }
+        const unlockedState = ArchiveStateSchema.parse(unlockedStateRow.state);
+        if (
+          unlockedState === "complete" ||
+          unlockedState === "incomplete" ||
+          unlockedState === "deleting" ||
+          unlockedState === "deleted"
+        ) {
+          return null;
+        }
+        if (unlockedState !== "reconciling") {
+          throw new Error(`archive is not reconciling: ${unlockedState}`);
+        }
+        throw new Error("reconciling archive is unavailable");
       }
-      const archiveState = ArchiveStateSchema.parse(archiveStateRow.state);
+      const archiveState = ArchiveStateSchema.parse(archiveRow.state);
       if (
         archiveState === "complete" ||
         archiveState === "incomplete" ||
@@ -63,23 +90,10 @@ export async function reconciliationSnapshot(
       if (archiveState !== "reconciling") {
         throw new Error(`archive is not reconciling: ${archiveState}`);
       }
-      const [archiveRow] = await transaction.$queryRaw<
-        ReconciliationArchiveRow[]
-      >(Prisma.sql`SELECT id,state,reconciliation_deadline_at
-      FROM archives
-      WHERE consultation_id=${consultationId} AND state='reconciling'
-      FOR UPDATE SKIP LOCKED`);
-      const archive =
-        archiveRow === undefined
-          ? undefined
-          : {
-              id: archiveRow.id,
-              state: ArchiveStateSchema.parse(archiveRow.state),
-              reconciliationDeadlineAt: nullableDate(archiveRow.reconciliation_deadline_at),
-            };
-      if (archive === undefined) {
-        throw new Error("reconciling archive is unavailable");
-      }
+      const archive = {
+        id: archiveRow.id,
+        reconciliationDeadlineAt: nullableDate(archiveRow.reconciliation_deadline_at),
+      };
       if (archive.reconciliationDeadlineAt === null) {
         throw new Error("reconciling archive has no deadline");
       }
@@ -175,74 +189,95 @@ export async function completeReconciliation(
   finalObject: FinalInventoryObject,
   derivedObjects: readonly DerivedArchiveObject[],
 ): Promise<boolean> {
-  return withTransaction(
-    client,
-    async (transaction) => {
-      const locked = await transaction.$queryRaw<IdRow[]>(Prisma.sql`SELECT id FROM external_effects
-        WHERE id=${effect.id} AND consultation_id=${effect.consultationId} AND generation=${effect.generation}
-          AND effect_kind='ARCHIVE_RECONCILE' AND lease_owner=${owner} AND lease_expires_at>${now}
-          AND state='calling'
-        FOR UPDATE`);
-      if (locked.length !== 1) {
-        return false;
-      }
-      const [consultation] = await transaction.$queryRaw<{ generation: number }[]>(
-        Prisma.sql`SELECT generation FROM consultations WHERE id=${effect.consultationId} FOR UPDATE`,
-      );
-      if (consultation?.generation !== effect.generation) {
-        return false;
-      }
-      const archive = await transaction.$queryRaw<IdRow[]>(Prisma.sql`SELECT id FROM archives
-        WHERE id=${snapshot.archiveId} AND consultation_id=${effect.consultationId} AND state='reconciling'
-        FOR UPDATE`);
-      if (archive.length !== 1) {
-        return false;
-      }
-      await insertReconciliationObjects(
-        transaction,
-        effect.consultationId,
-        snapshot.archiveId,
-        sha256,
-        finalObject,
-        derivedObjects,
-      );
-      const persistedInventory = JSON.stringify(inventory);
-      await transaction.$executeRaw(Prisma.sql`INSERT INTO final_inventories(
-          archive_id,status,inventory,sha256,object_id,room_close,worker_terminal,
-          egress_results,missing,errors,created_at
-        ) VALUES (
-          ${snapshot.archiveId},${inventory.status},${persistedInventory}::jsonb,${sha256},
-          ${finalObject.id},${JSON.stringify(inventory.roomClose)}::jsonb,
-          ${JSON.stringify(inventory.workerTerminal)}::jsonb,
-          ${JSON.stringify(inventory.egressResults)}::jsonb,${JSON.stringify(inventory.missing)}::jsonb,
-          ${JSON.stringify(inventory.errors)}::jsonb,${now}
-        ) ON CONFLICT (archive_id) DO UPDATE SET status=EXCLUDED.status,inventory=EXCLUDED.inventory,
-          sha256=EXCLUDED.sha256,object_id=EXCLUDED.object_id,room_close=EXCLUDED.room_close,
-          worker_terminal=EXCLUDED.worker_terminal,egress_results=EXCLUDED.egress_results,
-          missing=EXCLUDED.missing,errors=EXCLUDED.errors,created_at=EXCLUDED.created_at`);
-      const completed = await transaction.$queryRaw<IdRow[]>(Prisma.sql`WITH archive_done AS (
-          UPDATE archives archive SET state=${inventory.status},
-            final_inventory_hash=${sha256},reconciliation_deadline_at=NULL,updated_at=${now}
-          FROM consultations consultation
-          WHERE archive.id=${snapshot.archiveId} AND archive.consultation_id=${effect.consultationId}
-            AND archive.state='reconciling' AND consultation.id=archive.consultation_id
-            AND consultation.generation=${effect.generation}
-          RETURNING archive.id
-        ) UPDATE external_effects effect SET state='done',lease_owner=NULL,lease_expires_at=NULL,updated_at=${now}
-        WHERE effect.id=${effect.id} AND effect.lease_owner=${owner} AND effect.state='calling'
-          AND EXISTS (SELECT 1 FROM archive_done)
-        RETURNING effect.id`);
-      if (completed.length !== 1) {
-        return false;
-      }
-      await transaction.$executeRaw(Prisma.sql`UPDATE orchestration_deadlines
-        SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL
-        WHERE consultation_id=${effect.consultationId} AND generation=${effect.generation}
-          AND kind='archive-reconcile'`);
-      return true;
-    },
-    { maxWait: 5_000, timeout: 300_000 },
-  );
+  const ownsTransaction = "$transaction" in client;
+  try {
+    return await withTransaction(
+      client,
+      async (transaction) => {
+        const locked = await transaction.$queryRaw<
+          IdRow[]
+        >(Prisma.sql`SELECT id FROM external_effects
+          WHERE id=${effect.id} AND consultation_id=${effect.consultationId} AND generation=${effect.generation}
+            AND effect_kind='ARCHIVE_RECONCILE' AND lease_owner=${owner} AND lease_expires_at>${now}
+            AND state='calling'
+          FOR UPDATE`);
+        if (locked.length !== 1) {
+          return false;
+        }
+        const [consultation] = await transaction.$queryRaw<{ generation: number }[]>(
+          Prisma.sql`SELECT generation FROM consultations WHERE id=${effect.consultationId} FOR UPDATE`,
+        );
+        if (consultation?.generation !== effect.generation) {
+          return false;
+        }
+        const archive = await transaction.$queryRaw<IdRow[]>(Prisma.sql`SELECT id FROM archives
+          WHERE id=${snapshot.archiveId} AND consultation_id=${effect.consultationId} AND state='reconciling'
+          FOR UPDATE`);
+        if (archive.length !== 1) {
+          return false;
+        }
+        await insertReconciliationObjects(
+          transaction,
+          effect.consultationId,
+          snapshot.archiveId,
+          sha256,
+          finalObject,
+          derivedObjects,
+        );
+        const persistedInventory = JSON.stringify(inventory);
+        await transaction.$executeRaw(Prisma.sql`INSERT INTO final_inventories(
+            archive_id,status,inventory,sha256,object_id,room_close,worker_terminal,
+            egress_results,missing,errors,created_at
+          ) VALUES (
+            ${snapshot.archiveId},${inventory.status},${persistedInventory}::jsonb,${sha256},
+            ${finalObject.id},${JSON.stringify(inventory.roomClose)}::jsonb,
+            ${JSON.stringify(inventory.workerTerminal)}::jsonb,
+            ${JSON.stringify(inventory.egressResults)}::jsonb,${JSON.stringify(inventory.missing)}::jsonb,
+            ${JSON.stringify(inventory.errors)}::jsonb,${now}
+          ) ON CONFLICT (archive_id) DO UPDATE SET status=EXCLUDED.status,inventory=EXCLUDED.inventory,
+            sha256=EXCLUDED.sha256,object_id=EXCLUDED.object_id,room_close=EXCLUDED.room_close,
+            worker_terminal=EXCLUDED.worker_terminal,egress_results=EXCLUDED.egress_results,
+            missing=EXCLUDED.missing,errors=EXCLUDED.errors,created_at=EXCLUDED.created_at`);
+        const completed = await transaction.$queryRaw<IdRow[]>(Prisma.sql`WITH eligible_effect AS (
+            SELECT effect.id
+            FROM external_effects effect
+            WHERE effect.id=${effect.id} AND effect.consultation_id=${effect.consultationId}
+              AND effect.generation=${effect.generation} AND effect.effect_kind='ARCHIVE_RECONCILE'
+              AND effect.lease_owner=${owner} AND effect.lease_expires_at>${now}
+              AND effect.state='calling'
+          ), archive_done AS (
+            UPDATE archives archive SET state=${inventory.status},
+              final_inventory_hash=${sha256},reconciliation_deadline_at=NULL,updated_at=${now}
+            FROM consultations consultation
+            WHERE archive.id=${snapshot.archiveId} AND archive.consultation_id=${effect.consultationId}
+              AND archive.state='reconciling' AND consultation.id=archive.consultation_id
+              AND consultation.generation=${effect.generation}
+              AND EXISTS (SELECT 1 FROM eligible_effect)
+            RETURNING archive.id
+          ) UPDATE external_effects effect
+          SET state='done',lease_owner=NULL,lease_expires_at=NULL,updated_at=${now}
+          WHERE effect.id=${effect.id} AND effect.consultation_id=${effect.consultationId}
+            AND effect.generation=${effect.generation} AND effect.effect_kind='ARCHIVE_RECONCILE'
+            AND effect.lease_owner=${owner} AND effect.lease_expires_at>${now}
+            AND effect.state='calling' AND EXISTS (SELECT 1 FROM archive_done)
+          RETURNING effect.id`);
+        if (completed.length !== 1) {
+          throw new ReconciliationCompletionFenceError("reconciliation completion fence rejected");
+        }
+        await transaction.$executeRaw(Prisma.sql`UPDATE orchestration_deadlines
+          SET completed_at=COALESCE(completed_at,now()),lease_owner=NULL,lease_expires_at=NULL
+          WHERE consultation_id=${effect.consultationId} AND generation=${effect.generation}
+            AND kind='archive-reconcile'`);
+        return true;
+      },
+      { maxWait: 5_000, timeout: 300_000 },
+    );
+  } catch (error) {
+    if (error instanceof ReconciliationCompletionFenceError && ownsTransaction) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 export async function finishArchiveDeletionIfEmpty(
@@ -269,13 +304,69 @@ async function insertReconciliationObjects(
   derivedObjects: readonly DerivedArchiveObject[],
 ): Promise<void> {
   const finalKey = `v1/meetings/${consultationId}/inventory/final.json`;
-  await transaction.$executeRaw(Prisma.sql`INSERT INTO archive_objects(id,archive_id,object_class,causal_key,key,version_id,size,sha256,s3_checksum,content_type,writer_epoch,created_at)
-        SELECT ${finalObject.id}::uuid,id,'inventory','inventory:final',${finalKey}::text,${finalObject.versionId}::text,${finalObject.size}::bigint,${sha256}::text,${finalObject.checksum}::text,'application/json',write_epoch,now()
-        FROM archives WHERE id=${archiveId} ON CONFLICT (key,version_id) DO NOTHING`);
-  for (const object of derivedObjects) {
-    await transaction.$executeRaw(Prisma.sql`INSERT INTO archive_objects(id,archive_id,object_class,causal_key,key,version_id,size,sha256,s3_checksum,content_type,writer_epoch,created_at)
-          SELECT ${object.id}::uuid,id,${object.objectClass}::text,${object.key}::text,${object.key}::text,${object.versionId}::text,${object.size}::bigint,${object.sha256}::text,${object.checksum}::text,${object.contentType}::text,write_epoch,now()
-          FROM archives WHERE id=${archiveId} ON CONFLICT (key,version_id) DO NOTHING`);
+  const objects = [
+    {
+      id: finalObject.id,
+      objectClass: "inventory",
+      causalKey: "inventory:final",
+      key: finalKey,
+      versionId: finalObject.versionId,
+      size: finalObject.size,
+      objectSha256: sha256,
+      checksum: finalObject.checksum,
+      contentType: "application/json",
+    },
+    ...derivedObjects.map((object) => ({
+      id: object.id,
+      objectClass: object.objectClass,
+      causalKey: object.key,
+      key: object.key,
+      versionId: object.versionId,
+      size: object.size,
+      objectSha256: object.sha256,
+      checksum: object.checksum,
+      contentType: object.contentType,
+    })),
+  ];
+  const uniqueObjectsByIdentity = new Map<string, (typeof objects)[number]>();
+  for (const object of objects) {
+    const identity = `${object.key}\u0000${object.versionId}`;
+    if (!uniqueObjectsByIdentity.has(identity)) {
+      uniqueObjectsByIdentity.set(identity, object);
+    }
+  }
+  const uniqueObjects = [...uniqueObjectsByIdentity.values()];
+  for (let offset = 0; offset < uniqueObjects.length; offset += RECONCILIATION_OBJECT_BATCH_SIZE) {
+    const batch = uniqueObjects.slice(offset, offset + RECONCILIATION_OBJECT_BATCH_SIZE);
+    const values = batch.map(
+      (object) => Prisma.sql`(
+        ${object.id}::uuid,${object.objectClass}::text,${object.causalKey}::text,${object.key}::text,
+        ${object.versionId}::text,${object.size}::bigint,${object.objectSha256}::text,
+        ${object.checksum}::text,${object.contentType}::text
+      )`,
+    );
+    const persisted = await transaction.$queryRaw<ReconciliationObjectIdentityRow[]>(
+      Prisma.sql`WITH requested(
+          id,object_class,causal_key,key,version_id,size,sha256,s3_checksum,content_type
+        ) AS (
+          VALUES ${Prisma.join(values)}
+        )
+        INSERT INTO archive_objects(
+          id,archive_id,object_class,causal_key,key,version_id,size,sha256,s3_checksum,
+          content_type,writer_epoch,created_at
+        )
+        SELECT requested.id,archive.id,requested.object_class,requested.causal_key,requested.key,
+          requested.version_id,requested.size,requested.sha256,requested.s3_checksum,
+          requested.content_type,archive.write_epoch,now()
+        FROM requested
+        JOIN archives archive ON archive.id=${archiveId}
+        ON CONFLICT (key,version_id) DO UPDATE SET archive_id=archive_objects.archive_id
+        WHERE archive_objects.archive_id=EXCLUDED.archive_id
+        RETURNING archive_objects.key,archive_objects.version_id`,
+    );
+    if (persisted.length !== batch.length) {
+      throw new Error(`archive object identity conflicts with another archive: ${archiveId}`);
+    }
   }
   await transaction.$executeRaw(Prisma.sql`WITH matches AS (
       SELECT expected.id AS expectation_id,(

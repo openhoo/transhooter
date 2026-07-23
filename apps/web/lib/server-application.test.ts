@@ -9,6 +9,17 @@ mock.module("next/headers", () => ({
   }),
   headers: async () => new Headers(),
 }));
+mock.module("livekit-client", () => ({
+  ConnectionState: {},
+  DataPacket_Kind: { RELIABLE: 0 },
+  Room: class {},
+  RoomEvent: {},
+  Track: {},
+  TrackEvent: {},
+  createLocalAudioTrack: async () => undefined,
+  createLocalVideoTrack: async () => undefined,
+}));
+mock.module("../components/room.module.css", () => ({ default: {} }));
 
 // Import after replacing Next's request guards so the server boundary can run in Bun.
 const {
@@ -17,12 +28,17 @@ const {
   archiveDeleteCommand,
   consultationCreateCommand,
   normalizeAuthFlowError,
+  presentArchiveObjects,
   presentConsultationEnd,
+  presentConsultationList,
   presentLanguages,
   providerAttemptCommand,
   statusFor,
   workerFailureCommand,
 } = await import("./server-application");
+const { startFinalizationPolling, startShutdownCountdown } = await import(
+  "../components/consultation-room"
+);
 const { DomainError } = await import("@transhooter/server-core");
 const { trustedClientIp } = await import("./server/composition");
 const { POST: heartbeatPOST } = await import("../app/api/internal/heartbeat/route");
@@ -221,6 +237,271 @@ test("consultation end presents the service wrapper without inventing a deadline
       shutdownAtMs: 1_700_000_005_000,
     }),
   ).toEqual({ generation: 4, shutdownAtMs: 1_700_000_005_000 });
+});
+
+test("consultation list carries the authenticated viewer role into presentation", () => {
+  const customerId = "00000000-0000-4000-8000-000000000021";
+  const employeeId = "00000000-0000-4000-8000-000000000024";
+  const consultationId = "00000000-0000-4000-8000-000000000022";
+  expect(
+    presentConsultationList({
+      viewer: { staffRole: "employee" },
+      consultations: [
+        {
+          id: consultationId,
+          state: "invited",
+          archiveState: "pending",
+          providerProfileId: "google-eu",
+          providerProfileRevision: 1,
+          participants: [
+            {
+              id: employeeId,
+              role: "employee",
+              userId: employeeId,
+              livekitIdentity: employeeId,
+              displayName: "Employee",
+              language: null,
+              consent: null,
+            },
+            {
+              id: customerId,
+              role: "customer",
+              userId: customerId,
+              livekitIdentity: customerId,
+              displayName: "Customer",
+              language: null,
+              consent: null,
+            },
+          ],
+          providerSelection: null,
+          snapshotHash: null,
+          generation: 0,
+          roomName: null,
+          roomSid: null,
+          dispatchId: null,
+          compositeEgressId: null,
+          createdAt: new Date("2026-01-01T00:00:00Z"),
+          updatedAt: new Date("2026-01-01T00:00:00Z"),
+        },
+      ],
+    }),
+  ).toMatchObject({
+    viewer: { staffRole: "employee" },
+    consultations: [{ id: consultationId, customerName: "Customer", canResend: true }],
+  });
+});
+
+test("archive object presentation exposes only the public payload with response aliases", () => {
+  const id = "00000000-0000-4000-8000-000000000023";
+  expect(
+    presentArchiveObjects({
+      objects: [
+        {
+          id,
+          object_class: "participant_original",
+          key: "v1/meetings/consultation/audio/original.ogg",
+          content_type: "audio/ogg",
+          size: "128",
+          sha256: "a".repeat(64),
+          s3_checksum: "checksum-1",
+          version_id: "version-1",
+        },
+      ],
+      cursor: id,
+    }),
+  ).toEqual({
+    objects: [
+      {
+        id,
+        group: "original",
+        label: "participant_original",
+        key: "v1/meetings/consultation/audio/original.ogg",
+        contentType: "audio/ogg",
+        size: 128,
+        sha256: "a".repeat(64),
+        s3Checksum: "checksum-1",
+        versionId: "version-1",
+      },
+    ],
+    nextCursor: id,
+  });
+});
+
+test("shutdown countdown updates immediately on deadline-aligned boundaries through exact zero", () => {
+  let now = 7_250;
+  let scheduled: (() => void) | undefined;
+  let scheduledDelay: number | undefined;
+  const updates: number[] = [];
+  const scheduler = {
+    now: () => now,
+    setTimeout(callback: () => void, delayMs: number) {
+      scheduled = callback;
+      scheduledDelay = delayMs;
+      return 1;
+    },
+    clearTimeout() {
+      scheduled = undefined;
+      scheduledDelay = undefined;
+    },
+  };
+
+  const stop = startShutdownCountdown(10_000, (seconds) => updates.push(seconds), scheduler);
+  expect(updates).toEqual([3]);
+  expect(scheduledDelay).toBe(750);
+
+  for (const expectedSeconds of [2, 1, 0]) {
+    const callback = scheduled;
+    const delay = scheduledDelay;
+    expect(callback).toBeDefined();
+    expect(delay).toBeDefined();
+    scheduled = undefined;
+    scheduledDelay = undefined;
+    now += delay ?? 0;
+    callback?.();
+    expect(updates.at(-1)).toBe(expectedSeconds);
+    if (expectedSeconds > 0) expect(Number(scheduledDelay)).toBe(1_000);
+  }
+
+  expect(updates).toEqual([3, 2, 1, 0]);
+  expect(scheduled).toBeUndefined();
+  stop();
+});
+
+function createFinalizationPollingScheduler() {
+  let nextId = 1;
+  const timers = new Map<number, { callback: () => void; delayMs: number }>();
+  const scheduler = {
+    setTimeout(callback: () => void, delayMs: number) {
+      const id = nextId++;
+      timers.set(id, { callback, delayMs });
+      return id;
+    },
+    clearTimeout(id: number) {
+      timers.delete(id);
+    },
+  };
+  return {
+    scheduler,
+    pendingDelays: () => [...timers.values()].map(({ delayMs }) => delayMs).sort((a, b) => a - b),
+    run(delayMs: number) {
+      const timer = [...timers].find(([, pending]) => pending.delayMs === delayMs);
+      expect(timer).toBeDefined();
+      if (!timer) return;
+      timers.delete(timer[0]);
+      timer[1].callback();
+    },
+  };
+}
+test("finalization polling times out a stalled single-flight attempt before polling again", async () => {
+  const timers = createFinalizationPollingScheduler();
+  const firstAttempt = Promise.withResolvers<{ redirectTo?: string }>();
+  const secondAttempt = Promise.withResolvers<{ redirectTo?: string }>();
+  let firstSignal: AbortSignal | undefined;
+  let secondSignal: AbortSignal | undefined;
+  let requestNumber = 0;
+  const request = mock((_consultationId: string, signal: AbortSignal) => {
+    requestNumber += 1;
+    if (requestNumber === 1) {
+      firstSignal = signal;
+      return firstAttempt.promise;
+    }
+    secondSignal = signal;
+    return secondAttempt.promise;
+  });
+
+  const stop = startFinalizationPolling("00000000-0000-4000-8000-000000000025", () => undefined, {
+    scheduler: timers.scheduler,
+    request,
+    pollIntervalMs: 25,
+    attemptTimeoutMs: 100,
+  });
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(timers.pendingDelays()).toEqual([100]);
+
+  timers.run(100);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(firstSignal?.aborted).toBe(true);
+  expect(timers.pendingDelays()).toEqual([25]);
+
+  timers.run(25);
+  expect(request).toHaveBeenCalledTimes(2);
+  expect(secondSignal?.aborted).toBe(false);
+  expect(timers.pendingDelays()).toEqual([100]);
+
+  firstAttempt.resolve({ redirectTo: "/archives/stale" });
+  await Promise.resolve();
+  expect(request).toHaveBeenCalledTimes(2);
+
+  stop();
+  expect(secondSignal?.aborted).toBe(true);
+  expect(timers.pendingDelays()).toEqual([]);
+});
+
+test("finalization polling cleanup aborts the active attempt and clears every timer", async () => {
+  const timers = createFinalizationPollingScheduler();
+  let attemptSignal: AbortSignal | undefined;
+  const request = mock((_consultationId: string, signal: AbortSignal) => {
+    attemptSignal = signal;
+    const { promise, reject } = Promise.withResolvers<{ redirectTo?: string }>();
+    signal.addEventListener("abort", () => reject(new Error("cleanup aborted")), { once: true });
+    return promise;
+  });
+
+  const stop = startFinalizationPolling("00000000-0000-4000-8000-000000000026", () => undefined, {
+    scheduler: timers.scheduler,
+    request,
+    pollIntervalMs: 25,
+    attemptTimeoutMs: 100,
+  });
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(timers.pendingDelays()).toEqual([100]);
+
+  stop();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(attemptSignal?.aborted).toBe(true);
+  expect(timers.pendingDelays()).toEqual([]);
+  expect(request).toHaveBeenCalledTimes(1);
+});
+
+test("finalization polling cleanup clears a scheduled retry", async () => {
+  const timers = createFinalizationPollingScheduler();
+  const request = mock(async () => ({}));
+  const stop = startFinalizationPolling("00000000-0000-4000-8000-000000000027", () => undefined, {
+    scheduler: timers.scheduler,
+    request,
+    pollIntervalMs: 25,
+    attemptTimeoutMs: 100,
+  });
+
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(timers.pendingDelays()).toEqual([25]);
+  stop();
+  expect(timers.pendingDelays()).toEqual([]);
+});
+
+test("finalization polling redirects once and stops permanently", async () => {
+  const timers = createFinalizationPollingScheduler();
+  const { promise: redirected, resolve: resolveRedirect } = Promise.withResolvers<string>();
+  const onRedirect = mock((redirectTo: string) => resolveRedirect(redirectTo));
+  const request = mock(async () => ({ redirectTo: "/archives/final" }));
+
+  const stop = startFinalizationPolling("00000000-0000-4000-8000-000000000028", onRedirect, {
+    scheduler: timers.scheduler,
+    request,
+    pollIntervalMs: 25,
+    attemptTimeoutMs: 100,
+  });
+  expect(await redirected).toBe("/archives/final");
+  expect(onRedirect).toHaveBeenCalledTimes(1);
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(timers.pendingDelays()).toEqual([]);
+
+  stop();
+  expect(timers.pendingDelays()).toEqual([]);
 });
 
 test("request payload parsing rejects declared and streamed bodies above the cap", async () => {

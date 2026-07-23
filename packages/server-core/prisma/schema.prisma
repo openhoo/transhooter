@@ -242,6 +242,7 @@ model ConsultationParticipant {
   @@unique([consultationId, id], map: "consultation_participants_consultation_id_id_key")
   @@unique([consultationId, role], map: "consultation_participants_consultation_id_role_key")
   @@unique([consultationId, userId], map: "consultation_participants_consultation_id_user_id_key")
+  @@index([userId, consultationId], map: "consultation_participants_user_id_consultation_id_idx")
   @@map("consultation_participants")
 }
 
@@ -442,6 +443,7 @@ model ExternalEffect {
   expectedArtifact     ExpectedArchiveArtifact?
 
   @@unique([consultationId, generation, effectKind, subjectId, occurrenceKey], map: "external_effect_occurrence_unique")
+  // Migration-managed: external_effects_active_claim_priority_lease_created_id_idx covers CASE priority and lease claim ordering.
   @@map("external_effects")
 }
 

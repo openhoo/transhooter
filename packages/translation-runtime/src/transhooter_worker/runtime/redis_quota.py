@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from contextlib import suppress
 from urllib.parse import unquote, urlparse
 
 _AUDIO_SAMPLES_PER_SECOND = 16_000
@@ -137,6 +138,10 @@ return 1
         self._region = region
         self._limits = limits
         self._active_owner_tokens: dict[tuple[str, str], str] = {}
+        self._connection_lock = asyncio.Lock()
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._closed = False
 
     async def __call__(self, stage: str, amount: int) -> None:
         is_start_reservation = stage.endswith("_start")
@@ -242,13 +247,50 @@ return 1
         )
 
     async def _execute_redis_command(self, *parts: str) -> int | str:
+        async with self._connection_lock:
+            if self._closed:
+                raise RuntimeError("Redis quota gate is closed")
+            try:
+                reader, writer = await self._connection()
+                return await self._send_command(reader, writer, *parts)
+            except asyncio.CancelledError:
+                await self._disconnect()
+                raise
+            except (ConnectionError, OSError, asyncio.IncompleteReadError):
+                await self._disconnect()
+                raise
+
+    async def _connection(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self._reader is not None and self._writer is not None:
+            return self._reader, self._writer
+
         reader, writer = await asyncio.open_connection(self._host, self._port)
         try:
             if self._password:
                 await self._send_command(reader, writer, "AUTH", self._password)
-            return await self._send_command(reader, writer, *parts)
-        finally:
-            writer.close()
+        except BaseException:
+            await self._close_writer(writer)
+            raise
+        self._reader = reader
+        self._writer = writer
+        return reader, writer
+
+    async def aclose(self) -> None:
+        async with self._connection_lock:
+            self._closed = True
+            await self._disconnect()
+
+    async def _disconnect(self) -> None:
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        if writer is not None:
+            await self._close_writer(writer)
+
+    @staticmethod
+    async def _close_writer(writer: asyncio.StreamWriter) -> None:
+        writer.close()
+        with suppress(Exception):
             await writer.wait_closed()
 
     async def _reserve(self, keys: list[str], arguments: list[str]) -> bool:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
@@ -22,6 +24,7 @@ from transhooter_worker.adapters.fixture.provider import (
 )
 from transhooter_worker.adapters.fixture.scenario import FixtureScenario
 from transhooter_worker.adapters.google.provider import (
+    GoogleChannelPool,
     GoogleConfig,
     GoogleSttProvider,
     GoogleTranslationProvider,
@@ -93,11 +96,34 @@ ProfileConfig = Annotated[
 ]
 
 
+async def _run_close(close: Callable[[], Awaitable[None]]) -> None:
+    await close()
+
+
 @dataclass(frozen=True, slots=True)
 class Providers:
     stt: StreamingSttProvider
     translation: TextTranslationProvider
     tts: StreamingTtsProvider
+    _close: Callable[[], Awaitable[None]] | None = None
+    _close_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _close_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+
+    async def aclose(self) -> None:
+        if self._close is None:
+            return
+        async with self._close_lock:
+            close = self._close
+            assert close is not None
+            if self._close_task is None:
+                object.__setattr__(self, "_close_task", asyncio.create_task(_run_close(close)))
+            close_task = self._close_task
+        assert close_task is not None
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            await close_task
+            raise
 
 
 def _required_env(name: str) -> str:
@@ -204,10 +230,12 @@ class ProviderRegistry:
             probe_voice=config.probe_voice,
             probe_voice_locale=config.probe_voice_locale,
         )
+        channels = GoogleChannelPool(config.quota_project)
         return Providers(
-            stt=GoogleSttProvider(google_config, journal),
-            translation=GoogleTranslationProvider(google_config, journal),
-            tts=GoogleTtsProvider(google_config, journal),
+            stt=GoogleSttProvider(google_config, journal, channel_pool=channels),
+            translation=GoogleTranslationProvider(google_config, journal, channel_pool=channels),
+            tts=GoogleTtsProvider(google_config, journal, channel_pool=channels),
+            _close=channels.aclose,
         )
 
     @staticmethod

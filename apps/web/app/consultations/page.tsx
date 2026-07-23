@@ -13,7 +13,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { requirePageData, requirePageViewer } from "@/lib/server-application";
+import { requirePageData } from "@/lib/server-application";
 
 export const metadata: Metadata = { title: "Consultations" };
 export const dynamic = "force-dynamic";
@@ -27,7 +27,10 @@ type Consultation = {
   canCancel: boolean;
   canResend: boolean;
 };
-type ConsultationsPageData = { consultations: Consultation[] };
+type ConsultationsPageData = {
+  consultations: Consultation[];
+  viewer: { staffRole: "employee" | "admin" | null };
+};
 const consultationDateFormatter = new Intl.DateTimeFormat("en", {
   dateStyle: "medium",
   timeStyle: "short",
@@ -143,8 +146,8 @@ function ConsultationList({
 }
 
 export default async function ConsultationsPage() {
-  const { consultations } = await requirePageData<ConsultationsPageData>("consultations.list");
-  const viewer = await requirePageViewer();
+  const { consultations, viewer } =
+    await requirePageData<ConsultationsPageData>("consultations.list");
   const canManage = viewer.staffRole !== null;
 
   return (

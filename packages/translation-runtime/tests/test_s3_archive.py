@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from threading import Condition, get_ident
 from typing import Any
 from uuid import uuid4
 
@@ -22,6 +23,8 @@ class RecordingS3Client:
         self.next_upload = 1
         self.completion_calls = 0
         self.upload_calls: list[tuple[str, int]] = []
+        self.upload_finish_order: list[int] = []
+        self.completion_part_numbers: list[int] = []
 
     def put_object(self, **kwargs: Any) -> dict[str, str]:
         self.objects[(kwargs["Key"], "v1")] = (
@@ -79,6 +82,7 @@ class RecordingS3Client:
         part_number = kwargs["PartNumber"]
         self.upload_calls.append((str(kwargs["Key"]), int(part_number)))
         etag = f"etag-{part_number}"
+        self.upload_finish_order.append(int(part_number))
         checksum = str(kwargs["ChecksumCRC64NVME"])
         self.parts[kwargs["Key"]][part_number] = (
             bytes(kwargs["Body"]),
@@ -89,6 +93,9 @@ class RecordingS3Client:
 
     def complete_multipart_upload(self, **kwargs: Any) -> dict[str, str]:
         self.completion_calls += 1
+        self.completion_part_numbers = [
+            int(part["PartNumber"]) for part in kwargs["MultipartUpload"]["Parts"]
+        ]
         key = kwargs["Key"]
         uploaded_parts = self.parts[key]
         body = b"".join(uploaded_parts[number][0] for number in sorted(uploaded_parts))
@@ -114,6 +121,107 @@ class RecordingS3Client:
         upload_id = str(kwargs["UploadId"])
         self.aborted.append(upload_id)
         self.active_uploads.pop(upload_id, None)
+
+
+class BoundedConcurrencyS3Client(RecordingS3Client):
+    def __init__(self, initial_wave_size: int) -> None:
+        super().__init__()
+        self._condition = Condition()
+        self._initial_wave_size = initial_wave_size
+        self._initial_wave_started = 0
+        self.active_uploads_count = 0
+        self.peak_uploads = 0
+
+    def upload_part(self, **kwargs: Any) -> dict[str, str]:
+        with self._condition:
+            self.active_uploads_count += 1
+            self.peak_uploads = max(self.peak_uploads, self.active_uploads_count)
+            if self._initial_wave_started < self._initial_wave_size:
+                self._initial_wave_started += 1
+                if self._initial_wave_started == self._initial_wave_size:
+                    self._condition.notify_all()
+                elif not self._condition.wait_for(
+                    lambda: self._initial_wave_started == self._initial_wave_size,
+                    timeout=1,
+                ):
+                    raise AssertionError("multipart uploads did not execute concurrently")
+        try:
+            return super().upload_part(**kwargs)
+        finally:
+            with self._condition:
+                self.active_uploads_count -= 1
+                self._condition.notify_all()
+
+
+class ReverseCompletionS3Client(RecordingS3Client):
+    def __init__(self, part_count: int) -> None:
+        super().__init__()
+        self._condition = Condition()
+        self._part_count = part_count
+        self._started = 0
+        self._next_to_finish = part_count
+
+    def upload_part(self, **kwargs: Any) -> dict[str, str]:
+        part_number = int(kwargs["PartNumber"])
+        with self._condition:
+            self._started += 1
+            if self._started == self._part_count:
+                self._condition.notify_all()
+            elif not self._condition.wait_for(
+                lambda: self._started == self._part_count,
+                timeout=1,
+            ):
+                raise AssertionError("multipart uploads did not start concurrently")
+            if not self._condition.wait_for(
+                lambda: part_number == self._next_to_finish,
+                timeout=1,
+            ):
+                raise AssertionError("multipart upload did not finish in forced order")
+        response = super().upload_part(**kwargs)
+        with self._condition:
+            self._next_to_finish -= 1
+            self._condition.notify_all()
+        return response
+
+
+class FailOnePartOnceS3Client(RecordingS3Client):
+    def __init__(self, part_count: int, failing_part: int) -> None:
+        super().__init__()
+        self._condition = Condition()
+        self._part_count = part_count
+        self._failing_part = failing_part
+        self._initial_started = 0
+        self._initial_wave_released = False
+        self._failed = False
+
+    def upload_part(self, **kwargs: Any) -> dict[str, str]:
+        part_number = int(kwargs["PartNumber"])
+        with self._condition:
+            if not self._initial_wave_released:
+                self._initial_started += 1
+                if self._initial_started == self._part_count:
+                    self._initial_wave_released = True
+                    self._condition.notify_all()
+                elif not self._condition.wait_for(
+                    lambda: self._initial_wave_released,
+                    timeout=1,
+                ):
+                    raise AssertionError("initial multipart wave did not start concurrently")
+            if part_number == self._failing_part and not self._failed:
+                self._failed = True
+                self.upload_calls.append((str(kwargs["Key"]), part_number))
+                raise RuntimeError("injected multipart upload failure")
+        return super().upload_part(**kwargs)
+
+
+class OwnerThreadRecordingArchive(S3Archive):
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.persisted_threads: list[int] = []
+
+    def _persist_multipart_part(self, **kwargs: Any) -> dict[str, Any]:
+        self.persisted_threads.append(get_ident())
+        return super()._persist_multipart_part(**kwargs)
 
 
 def archive_client(
@@ -223,6 +331,82 @@ def test_archive_multipart_persists_parts_and_verifies(
     ]
 
 
+def test_archive_bounds_parallel_multipart_uploads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    monkeypatch.setattr(S3Archive, "MULTIPART_UPLOAD_CONCURRENCY", 3)
+    client = BoundedConcurrencyS3Client(initial_wave_size=3)
+    archive = S3Archive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
+    body = b"a" * 47
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/concurrent.pcm"
+
+    archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert client.peak_uploads == 3
+    assert client.active_uploads_count == 0
+    assert len(client.upload_calls) == 8
+
+
+def test_archive_completes_parallel_parts_in_part_number_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    client = ReverseCompletionS3Client(part_count=4)
+    archive = S3Archive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
+    body = b"b" * 23
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/ordered.pcm"
+
+    archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert client.upload_finish_order == [4, 3, 2, 1]
+    assert client.completion_part_numbers == [1, 2, 3, 4]
+
+
+def test_archive_parallel_failure_persists_successes_and_retries_missing_part(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
+    client = FailOnePartOnceS3Client(part_count=3, failing_part=2)
+    archive = OwnerThreadRecordingArchive(
+        client, "bucket", None, False, tmp_path / "multipart.sqlite3"
+    )
+    owner_thread = get_ident()
+    assert archive._db is not None
+    database = archive._db
+    body = b"c" * 17
+    key = f"v1/meetings/{uuid4()}/audio/stt-input/source/retry.pcm"
+
+    with pytest.raises(RuntimeError, match="injected multipart upload failure"):
+        archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert database is not None
+    assert database.execute(
+        """
+        SELECT part_number, etag
+        FROM multipart_parts
+        WHERE key = ?
+        ORDER BY part_number
+        """,
+        (key,),
+    ).fetchall() == [(1, "etag-1"), (2, ""), (3, "etag-3")]
+    assert archive.persisted_threads == [owner_thread, owner_thread]
+    assert client.active_uploads == {"upload-1": key}
+    assert client.aborted == []
+
+    record = archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert record.version_id == "v2"
+    assert client.next_upload == 2
+    assert client.upload_calls.count((key, 1)) == 1
+    assert client.upload_calls.count((key, 2)) == 2
+    assert client.upload_calls.count((key, 3)) == 1
+    assert client.completion_part_numbers == [1, 2, 3]
+
+
 def test_crc64nvme_matches_standard_check_vector() -> None:
     assert S3Archive._crc64nvme(b"123456789") == "rosUhgp5mIg="
 
@@ -258,8 +442,9 @@ def test_archive_reuses_only_checksum_and_size_matched_remote_part(
     record = archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
 
     assert record.version_id == "v2"
-    assert client.upload_calls == [(key, 2), (key, 3)]
+    assert sorted(client.upload_calls) == [(key, 2), (key, 3)]
     assert client.parts[key][1][1] == "durable-etag"
+    assert client.completion_part_numbers == [1, 2, 3]
 
 
 def test_archive_same_sha_multipart_replay_returns_durable_identity(
@@ -453,13 +638,16 @@ def test_archive_restarts_upload_with_unexpected_remote_part_superset(
     assert sorted(client.parts[key]) == [1, 2, 3]
 
 
-def test_archive_startup_reconciles_remote_part_superset_and_aborts_stale_upload(
-    tmp_path: Path,
+def test_archive_startup_aborts_stale_upload_and_reuses_same_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
     archive, client = archive_client(tmp_path)
     assert archive._db is not None
+    body = b"a" * 17
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/002.pcm"
-    journal_upload(archive, key, "a" * 64, "stale-upload", 0)
+    journal_upload(archive, key, sha256_hex(body), "stale-upload", 0)
     archive._db.execute(
         """
         INSERT INTO multipart_parts(key, part_number, etag, checksum, size)
@@ -478,20 +666,36 @@ def test_archive_startup_reconciles_remote_part_superset_and_aborts_stale_upload
     assert client.aborted == ["stale-upload"]
     assert reopened._db is not None
     assert reopened._db.execute(
-        "SELECT state FROM multipart_uploads WHERE key = ?", (key,)
-    ).fetchone() == ("aborted",)
+        "SELECT COUNT(*) FROM multipart_uploads WHERE key = ?", (key,)
+    ).fetchone() == (0,)
     assert reopened._db.execute(
         "SELECT COUNT(*) FROM multipart_parts WHERE key = ?", (key,)
-    ).fetchone() == (1,)
+    ).fetchone() == (0,)
+
+    record = reopened.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert record.version_id == "v2"
+    assert client.next_upload == 2
+    assert client.completion_part_numbers == [1, 2, 3]
+    assert reopened._db is not None
+    reopened._db.close()
+    replay_archive = S3Archive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
+    replayed = replay_archive.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert replayed == record
+    assert client.completion_calls == 1
 
 
-def test_archive_startup_forgets_stale_upload_missing_during_reconcile(
+def test_archive_startup_forgets_missing_upload_and_reuses_same_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(S3Archive, "MULTIPART_THRESHOLD", 10)
+    monkeypatch.setattr(S3Archive, "PART_SIZE", 6)
     archive, client = archive_client(tmp_path)
     assert archive._db is not None
+    body = b"b" * 17
     key = f"v1/meetings/{uuid4()}/audio/stt-input/source/003.pcm"
-    journal_upload(archive, key, "b" * 64, "missing-upload", 0)
+    journal_upload(archive, key, sha256_hex(body), "missing-upload", 0)
     archive._db.execute(
         """
         INSERT INTO multipart_parts(key, part_number, etag, checksum, size)
@@ -500,9 +704,12 @@ def test_archive_startup_forgets_stale_upload_missing_during_reconcile(
         (key,),
     )
     archive._db.close()
+    list_parts = client.list_parts
 
-    def missing_parts(**_: Any) -> dict[str, list[dict[str, Any]]]:
-        raise no_such_upload("ListParts")
+    def missing_parts(**kwargs: Any) -> dict[str, list[dict[str, Any]]]:
+        if kwargs["UploadId"] == "missing-upload":
+            raise no_such_upload("ListParts")
+        return list_parts(**kwargs)
 
     monkeypatch.setattr(client, "list_parts", missing_parts)
     reopened = S3Archive(client, "bucket", None, False, tmp_path / "multipart.sqlite3")
@@ -514,6 +721,12 @@ def test_archive_startup_forgets_stale_upload_missing_during_reconcile(
     assert reopened._db.execute(
         "SELECT COUNT(*) FROM multipart_parts WHERE key = ?", (key,)
     ).fetchone() == (0,)
+
+    record = reopened.put_create_once(key, body, "audio/L16", sha256_hex(body))
+
+    assert record.version_id == "v2"
+    assert client.next_upload == 2
+    assert client.completion_part_numbers == [1, 2, 3]
 
 
 def test_archive_startup_accepts_missing_upload_after_ambiguous_abort(

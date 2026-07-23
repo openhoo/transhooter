@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,7 @@ from uuid import UUID
 
 import pytest
 
-from transhooter_worker.domain.models import RawRef
+from transhooter_worker.domain.models import RawRef, SampleRange, TranslationRequest
 from transhooter_worker.runtime.provider_registry import (
     AlternateProfile,
     ProviderRegistry,
@@ -179,3 +180,105 @@ def test_alternate_credentials_are_read_once_and_bound_to_fingerprints(
     assert providers.translation._config.api_key == "dl-original"
     assert profile.deepgram_credential_fingerprint == hashlib.sha256(b"dg-original").hexdigest()
     assert profile.deepl_credential_fingerprint == hashlib.sha256(b"dl-original").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_google_registry_constructs_lazily_reuses_endpoint_channels_and_closes_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transhooter_worker.adapters.google import provider as google_provider
+    from transhooter_worker.runtime.provider_registry import GoogleProfile
+
+    class Channel:
+        def __init__(self, endpoint: str) -> None:
+            self.endpoint = endpoint
+            self.closes = 0
+
+        async def close(self) -> None:
+            self.closes += 1
+
+    created: list[Channel] = []
+
+    def create_channel(endpoint: str, _: str) -> Channel:
+        channel = Channel(endpoint)
+        created.append(channel)
+        return channel
+
+    monkeypatch.setattr(google_provider, "authenticated_channel", create_channel)
+    providers = ProviderRegistry.construct(
+        GoogleProfile(
+            kind="google-eu",
+            project="project",
+            quota_project="quota",
+            credential_fingerprint="credential",
+            probe_voice="voice",
+        ),
+        UUID(int=5),
+        DeterministicJournal(),
+    )
+
+    assert created == []
+
+    stt_channel = providers.stt._channels.channel()
+    assert providers.stt._channels.channel() is stt_channel
+    assert [channel.endpoint for channel in created] == ["eu-speech.googleapis.com:443"]
+
+    request = TranslationRequest(
+        UUID(int=21),
+        UUID(int=22),
+        "final",
+        "en-US",
+        "de-DE",
+        "hello",
+        SampleRange(0, 1),
+    )
+    first_attempt = await providers.translation.start(request)
+    second_attempt = await providers.translation.start(request)
+    assert first_attempt._channel is second_attempt._channel
+
+    first_tts_session = await providers.tts.open(UUID(int=23), "de-DE", "voice")
+    second_tts_session = await providers.tts.open(UUID(int=24), "de-DE", "voice")
+    assert first_tts_session._channel is second_tts_session._channel
+    await asyncio.gather(first_tts_session.cancel(), second_tts_session.cancel())
+
+    assert [channel.endpoint for channel in created] == [
+        "eu-speech.googleapis.com:443",
+        "translate-eu.googleapis.com:443",
+        "eu-texttospeech.googleapis.com:443",
+    ]
+
+    await asyncio.gather(providers.aclose(), providers.aclose())
+
+    assert [channel.closes for channel in created] == [1, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_google_registry_close_before_first_use_does_not_create_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transhooter_worker.adapters.google import provider as google_provider
+    from transhooter_worker.runtime.provider_registry import GoogleProfile
+
+    creations = 0
+
+    def create_channel(*_: object) -> object:
+        nonlocal creations
+        creations += 1
+        return object()
+
+    monkeypatch.setattr(google_provider, "authenticated_channel", create_channel)
+    providers = ProviderRegistry.construct(
+        GoogleProfile(
+            kind="google-eu",
+            project="project",
+            quota_project="quota",
+            credential_fingerprint="credential",
+            probe_voice="voice",
+        ),
+        UUID(int=6),
+        DeterministicJournal(),
+    )
+
+    await providers.aclose()
+
+    assert creations == 0

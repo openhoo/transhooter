@@ -90,7 +90,10 @@ async function executeConsultation(
     case "consultation.get":
       return config.consultations.get(command.consultationId, userId);
     case "consultation.list":
-      return config.consultations.list(userId);
+      return {
+        consultations: await config.consultations.list(userId),
+        viewer: { staffRole: authenticated.user.staffRole },
+      };
     case "consultation.preferences":
       return config.consultations.setPreferences(
         command.consultationId,

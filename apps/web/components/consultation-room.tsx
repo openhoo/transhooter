@@ -204,27 +204,149 @@ function useAudioGainRouting(
   }, [interpretationAudio, interpretationReady, mode, originalAudio, sameLanguage]);
 }
 
+type ShutdownCountdownScheduler = {
+  now(): number;
+  setTimeout(callback: () => void, delayMs: number): number;
+  clearTimeout(timer: number): void;
+};
+
+export function startShutdownCountdown(
+  deadline: number,
+  onSeconds: (seconds: number) => void,
+  scheduler: ShutdownCountdownScheduler = {
+    now: Date.now,
+    setTimeout: window.setTimeout.bind(window),
+    clearTimeout: window.clearTimeout.bind(window),
+  },
+): () => void {
+  let stopped = false;
+  let timer: number | undefined;
+
+  function tick() {
+    timer = undefined;
+    if (stopped) return;
+
+    const remainingMs = Math.max(0, deadline - scheduler.now());
+    const seconds = Math.ceil(remainingMs / 1_000);
+    onSeconds(seconds);
+    if (seconds === 0) return;
+
+    const nextBoundaryMs = remainingMs - (seconds - 1) * 1_000;
+    timer = scheduler.setTimeout(tick, Math.max(1, nextBoundaryMs));
+  }
+
+  tick();
+  return () => {
+    stopped = true;
+    if (timer !== undefined) scheduler.clearTimeout(timer);
+  };
+}
+
 function useShutdownCountdown(shutdownAt: number | null) {
   const [seconds, setSeconds] = useState<number | null>(null);
 
   useEffect(() => {
-    if (shutdownAt === null) {
-      return;
-    }
-    const deadline = shutdownAt;
-
-    function tick() {
-      setSeconds(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)));
-    }
-
-    tick();
-    const timer = window.setInterval(tick, 200);
-    return () => {
-      window.clearInterval(timer);
-    };
+    if (shutdownAt === null) return;
+    return startShutdownCountdown(shutdownAt, setSeconds);
   }, [shutdownAt]);
 
   return seconds;
+}
+
+type FinalizationPollingScheduler = {
+  setTimeout(callback: () => void, delayMs: number): number;
+  clearTimeout(timer: number): void;
+};
+
+type FinalizationPollingOptions = {
+  scheduler?: FinalizationPollingScheduler;
+  request?: (consultationId: string, signal: AbortSignal) => Promise<{ redirectTo?: string }>;
+  pollIntervalMs?: number;
+  attemptTimeoutMs?: number;
+};
+
+export const FINALIZATION_POLL_INTERVAL_MS = 1_000;
+export const FINALIZATION_POLL_ATTEMPT_TIMEOUT_MS = 10_000;
+
+export function startFinalizationPolling(
+  consultationId: string,
+  onRedirect: (redirectTo: string) => void,
+  options: FinalizationPollingOptions = {},
+): () => void {
+  const scheduler = options.scheduler ?? {
+    setTimeout: window.setTimeout.bind(window),
+    clearTimeout: window.clearTimeout.bind(window),
+  };
+  const request =
+    options.request ??
+    ((id: string, signal: AbortSignal) =>
+      api<{ redirectTo?: string }>(`/api/consultations/${id}`, { signal }));
+  const pollIntervalMs = options.pollIntervalMs ?? FINALIZATION_POLL_INTERVAL_MS;
+  const attemptTimeoutMs = options.attemptTimeoutMs ?? FINALIZATION_POLL_ATTEMPT_TIMEOUT_MS;
+  const cleanupController = new AbortController();
+  let activeAttempt: AbortController | undefined;
+  let attemptTimer: number | undefined;
+  let stopped = false;
+  let timer: number | undefined;
+
+  async function poll() {
+    timer = undefined;
+    if (stopped) return;
+
+    const attempt = new AbortController();
+    activeAttempt = attempt;
+    const { promise: aborted, reject: rejectAborted } = Promise.withResolvers<never>();
+    const abortAttempt = () => {
+      if (attempt.signal.aborted) return;
+      attempt.abort();
+      rejectAborted(Object.assign(new Error("Finalization poll aborted"), { name: "AbortError" }));
+    };
+    cleanupController.signal.addEventListener("abort", abortAttempt, { once: true });
+    attemptTimer = scheduler.setTimeout(() => {
+      attemptTimer = undefined;
+      abortAttempt();
+    }, attemptTimeoutMs);
+
+    let result: { redirectTo?: string } | undefined;
+    try {
+      result = await Promise.race([request(consultationId, attempt.signal), aborted]);
+    } catch {
+      // A transient poll failure must not interrupt the server-owned shutdown.
+    } finally {
+      cleanupController.signal.removeEventListener("abort", abortAttempt);
+      if (attemptTimer !== undefined) {
+        scheduler.clearTimeout(attemptTimer);
+        attemptTimer = undefined;
+      }
+      if (activeAttempt === attempt) activeAttempt = undefined;
+    }
+
+    if (stopped) return;
+    if (result?.redirectTo) {
+      stopped = true;
+      cleanupController.abort();
+      onRedirect(result.redirectTo);
+      return;
+    }
+
+    timer = scheduler.setTimeout(() => {
+      void poll();
+    }, pollIntervalMs);
+  }
+
+  void poll();
+  return () => {
+    stopped = true;
+    cleanupController.abort();
+    if (attemptTimer !== undefined) {
+      scheduler.clearTimeout(attemptTimer);
+      attemptTimer = undefined;
+    }
+    if (timer !== undefined) {
+      scheduler.clearTimeout(timer);
+      timer = undefined;
+    }
+  };
 }
 
 function useFinalizationRedirect(
@@ -236,25 +358,9 @@ function useFinalizationRedirect(
     if (callState !== "finalizing" || seconds !== 0) {
       return;
     }
-
-    async function poll() {
-      try {
-        const result = await api<{ redirectTo?: string }>(`/api/consultations/${consultationId}`);
-        if (result.redirectTo) {
-          window.location.replace(result.redirectTo);
-        }
-      } catch {
-        // A transient poll failure must not interrupt the server-owned shutdown.
-      }
-    }
-
-    void poll();
-    const timer = window.setInterval(() => {
-      void poll();
-    }, 1000);
-    return () => {
-      window.clearInterval(timer);
-    };
+    return startFinalizationPolling(consultationId, (redirectTo) => {
+      window.location.replace(redirectTo);
+    });
   }, [callState, consultationId, seconds]);
 }
 

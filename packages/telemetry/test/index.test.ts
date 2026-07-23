@@ -1,6 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 
 const OTLP_ENVIRONMENT_KEYS = [
@@ -116,9 +117,45 @@ test("OTLP common and signal-specific endpoint matrix", async () => {
   for (const matrixCase of cases) {
     const paths = await exportedPaths(matrixCase.environment);
     const routedEndpoints = [...new Set(paths)].sort();
-    +assert.deepEqual(routedEndpoints, [...matrixCase.expected], matrixCase.name);
+    assert.deepEqual(routedEndpoints, [...matrixCase.expected], matrixCase.name);
     for (const expectedPath of matrixCase.expected) {
       assert.ok(paths.includes(expectedPath), `${matrixCase.name}: missing ${expectedPath}`);
     }
   }
+});
+
+test("application telemetry avoids hot-path attribute temporaries", async () => {
+  const [webTelemetry, controlTelemetry] = await Promise.all([
+    readFile(new URL("../../../apps/web/lib/server/telemetry.ts", import.meta.url), "utf8"),
+    readFile(
+      new URL("../../../apps/control-worker/src/runtime/telemetry.ts", import.meta.url),
+      "utf8",
+    ),
+  ]);
+
+  const completionObjects = webTelemetry.match(/const completedAttributes: Attributes =/gu) ?? [];
+  assert.equal(completionObjects.length, 1);
+  assert.match(
+    webTelemetry,
+    /const completedAttributes: Attributes = \{\s*operation: normalizedOperation\(operation\),\s*surface,\s*outcome,\s*status_class: finalStatusClass,\s*\};/u,
+  );
+  assert.match(
+    webTelemetry,
+    /if \(responseStatus !== undefined\) \{\s*completedAttributes\["http\.response\.status_code"\] = responseStatus;\s*\}/u,
+  );
+  assert.match(
+    webTelemetry,
+    /if \(errorKind !== undefined\) \{\s*completedAttributes\["error\.kind"\] = errorKind;\s*\}/u,
+  );
+  assert.doesNotMatch(
+    webTelemetry,
+    /const completedAttributes: Attributes = \{[\s\S]*?\.\.\.[\s\S]*?\};/u,
+  );
+
+  const normalizer = controlTelemetry.match(/function normalizeSpanAttributes[\s\S]*?\n\}/u)?.[0];
+  assert.ok(normalizer, "control span attribute normalizer must remain defined");
+  assert.match(normalizer, /for \(const key in attributes\)/u);
+  assert.match(normalizer, /Object\.hasOwn\(attributes, key\)/u);
+  assert.match(normalizer, /const allowed = ATTRIBUTE_VALUES\[key\]/u);
+  assert.doesNotMatch(normalizer, /Object\.entries/u);
 });

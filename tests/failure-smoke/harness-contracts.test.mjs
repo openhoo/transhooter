@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { readFile } from "node:fs/promises";
 import {
   archiveLockHierarchyBlocked,
   archiveRaceWinner,
@@ -247,5 +248,51 @@ describe("failure-smoke proof contracts", () => {
     ]) {
       expect(archiveRaceWinner(falsePositive)).toBeNull();
     }
+  });
+  it("captures ordered database diagnostics in one bounded disposable container", async () => {
+    const wrapper = await readFile(new URL("./internal/failure-smoke", import.meta.url), "utf8");
+    const functionStart = wrapper.indexOf("capture_database_diagnostics() {");
+    const cleanupStart = wrapper.indexOf("\ncleanup() {", functionStart);
+    const diagnosticFunction = wrapper.slice(functionStart, cleanupStart);
+
+    expect(functionStart).toBeGreaterThan(-1);
+    expect(cleanupStart).toBeGreaterThan(functionStart);
+    expect(diagnosticFunction.match(/failure-smoke bun --eval/g)).toHaveLength(1);
+    expect(diagnosticFunction).toContain(
+      'compose_bounded "Capturing database diagnostics" "$COMPOSE_DIAGNOSTIC_TIMEOUT_SECONDS"',
+    );
+    expect(diagnosticFunction).toContain("run --rm --no-deps");
+    expect(diagnosticFunction).toContain("for (const [label, statement] of diagnostics)");
+    expect(diagnosticFunction).toContain("catch (error)");
+    expect(diagnosticFunction).toContain("failed = true");
+    expect(diagnosticFunction).toContain("if (failed) process.exitCode = 1");
+
+    const labels = [
+      "Capturing consultation diagnostics",
+      "Capturing external-effect diagnostics",
+      "Capturing archive recovery diagnostics",
+      "Capturing outbox diagnostics",
+    ];
+    let previousLabel = -1;
+    for (const label of labels) {
+      const labelIndex = diagnosticFunction.indexOf(label);
+      expect(labelIndex).toBeGreaterThan(previousLabel);
+      previousLabel = labelIndex;
+    }
+    for (const queryFragment of [
+      "FROM consultations ORDER BY created_at DESC LIMIT 3",
+      "FROM external_effects GROUP BY generation, effect_kind, state, attempts",
+      "FROM archives a LEFT JOIN archive_objects o ON o.archive_id=a.id",
+      "FROM outbox WHERE delivered_at IS NULL ORDER BY available_at, id",
+    ]) {
+      expect(diagnosticFunction).toContain(queryFragment);
+    }
+
+    const statusIndex = wrapper.indexOf('"Capturing failure-smoke service status"');
+    const logsIndex = wrapper.indexOf('"Capturing failure-smoke logs"', statusIndex);
+    const databaseIndex = wrapper.indexOf("capture_database_diagnostics || true", logsIndex);
+    expect(statusIndex).toBeGreaterThan(-1);
+    expect(logsIndex).toBeGreaterThan(statusIndex);
+    expect(databaseIndex).toBeGreaterThan(logsIndex);
   });
 });

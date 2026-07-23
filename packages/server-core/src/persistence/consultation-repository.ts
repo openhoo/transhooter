@@ -46,16 +46,18 @@ export class PrismaConsultationRepository
   }
 
   async listForUser(userId: UUID): Promise<readonly Consultation[]> {
-    const rows = await this.database.consultationParticipant.findMany({
-      where: { userId },
-      select: { consultationId: true },
-      orderBy: { consultationId: "asc" },
+    const rows = await this.database.consultation.findMany({
+      where: {
+        participants: { some: { userId } },
+      },
+      include: {
+        archive: { select: { state: true } },
+        participants: { orderBy: { role: "asc" } },
+      },
+      orderBy: { id: "asc" },
     });
-    const consultationsForUser = await Promise.all(
-      rows.map(({ consultationId }) => this.load(consultationId, this.database)),
-    );
 
-    return consultationsForUser.filter((value): value is Consultation => value !== null);
+    return rows.map(mapConsultation).filter((value): value is Consultation => value !== null);
   }
 
   async create(
@@ -482,48 +484,59 @@ export class PrismaConsultationRepository
         participants: { orderBy: { role: "asc" } },
       },
     });
-    if (!row?.archive) {
-      return null;
-    }
-
-    const [firstParticipant, secondParticipant] = row.participants;
-    if (
-      firstParticipant === undefined ||
-      secondParticipant === undefined ||
-      row.participants.length !== 2
-    ) {
-      throw new DomainError("INVALID_PARTICIPANTS");
-    }
-    const participants: [ParticipantSlot, ParticipantSlot] = [
-      mapParticipant(firstParticipant),
-      mapParticipant(secondParticipant),
-    ];
-
-    return {
-      id: row.id,
-      state: row.state,
-      archiveState: row.archive.state,
-      providerProfileId: row.providerProfileId,
-      providerProfileRevision: row.providerProfileRevision,
-      participants,
-      providerSelection: row.providerSelection
-        ? RoomProviderSelectionSchema.parse(row.providerSelection)
-        : null,
-      snapshotHash: row.snapshotHash,
-      generation: row.generation,
-      roomName: row.roomName,
-      roomSid: row.roomSid,
-      dispatchId: row.dispatchId,
-      compositeEgressId: row.compositeEgressId,
-      workerIdentity: row.workerIdentity,
-      readyDeadlineAt: row.readyDeadlineAt,
-      finalizeDeadlineAt: row.finalizeDeadlineAt,
-      bothAbsentSince: row.bothAbsentSince,
-      admissionFencedAt: row.admissionFencedAt,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-    };
+    return row ? mapConsultation(row) : null;
   }
+}
+
+type ConsultationRow = Prisma.ConsultationGetPayload<{
+  include: {
+    archive: { select: { state: true } };
+    participants: true;
+  };
+}>;
+
+function mapConsultation(row: ConsultationRow): Consultation | null {
+  if (!row.archive) {
+    return null;
+  }
+
+  const [firstParticipant, secondParticipant] = row.participants;
+  if (
+    firstParticipant === undefined ||
+    secondParticipant === undefined ||
+    row.participants.length !== 2
+  ) {
+    throw new DomainError("INVALID_PARTICIPANTS");
+  }
+  const participants: [ParticipantSlot, ParticipantSlot] = [
+    mapParticipant(firstParticipant),
+    mapParticipant(secondParticipant),
+  ];
+
+  return {
+    id: row.id,
+    state: row.state,
+    archiveState: row.archive.state,
+    providerProfileId: row.providerProfileId,
+    providerProfileRevision: row.providerProfileRevision,
+    participants,
+    providerSelection: row.providerSelection
+      ? RoomProviderSelectionSchema.parse(row.providerSelection)
+      : null,
+    snapshotHash: row.snapshotHash,
+    generation: row.generation,
+    roomName: row.roomName,
+    roomSid: row.roomSid,
+    dispatchId: row.dispatchId,
+    compositeEgressId: row.compositeEgressId,
+    workerIdentity: row.workerIdentity,
+    readyDeadlineAt: row.readyDeadlineAt,
+    finalizeDeadlineAt: row.finalizeDeadlineAt,
+    bothAbsentSince: row.bothAbsentSince,
+    admissionFencedAt: row.admissionFencedAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
 }
 
 interface IdRow {

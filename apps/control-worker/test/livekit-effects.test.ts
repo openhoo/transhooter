@@ -461,6 +461,47 @@ test("participant removal targets the persisted resource room", async () => {
   assert.deepEqual(rooms, [resourceRoomName, resourceRoomName]);
 });
 
+test("Egress stop waits for terminal evidence before succeeding", async () => {
+  const adapter = createAdapter();
+  let listCalls = 0;
+  Object.assign(adapter, {
+    egress: {
+      stopEgress: async () => ({
+        egressId: "EG_stopping",
+        status: EgressStatus.EGRESS_ENDING,
+      }),
+      listEgress: async () => {
+        listCalls += 1;
+        return [
+          {
+            egressId: "EG_stopping",
+            status: listCalls === 1 ? EgressStatus.EGRESS_ENDING : EgressStatus.EGRESS_COMPLETE,
+          },
+        ];
+      },
+    },
+  });
+
+  const result = await adapter.execute(
+    { ...effect, kind: "EGRESS_STOP" },
+    { egressId: "EG_stopping" },
+  );
+
+  assert.equal(listCalls, 2);
+  assert.deepEqual(result, {
+    remoteId: "EG_stopping",
+    result: {
+      egressId: "EG_stopping",
+      status: "EGRESS_COMPLETE",
+      error: undefined,
+      errorCode: undefined,
+      details: undefined,
+      fileResults: undefined,
+      segmentResults: undefined,
+    },
+  });
+});
+
 test("compensation discovers an ambiguous deterministic room create", async () => {
   const adapter = createAdapter();
   const deleted: string[] = [];
