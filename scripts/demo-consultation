@@ -149,8 +149,20 @@ probe_input() {
   duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input" 2>/dev/null) || fail "$participant input duration cannot be decoded: $input"
   awk -v duration="$duration" 'BEGIN { exit !(duration + 0 >= 1) }' || fail "$participant input is shorter than one second: $input"
 }
-probe_input employee "$EMPLOYEE_INPUT"
-probe_input customer "$CUSTOMER_INPUT"
+(
+  trap - 0 HUP INT TERM
+  probe_input employee "$EMPLOYEE_INPUT"
+) &
+employee_probe_pid=$!
+(
+  trap - 0 HUP INT TERM
+  probe_input customer "$CUSTOMER_INPUT"
+) &
+customer_probe_pid=$!
+probe_status=0
+wait "$employee_probe_pid" || probe_status=1
+wait "$customer_probe_pid" || probe_status=1
+[ "$probe_status" -eq 0 ] || fail 'one or more input videos failed validation'
 
 convert_input() {
   participant=$1
@@ -168,10 +180,22 @@ case "$DEADLINE_SECONDS" in '' | *[!0-9]*) fail 'CONSULTATION_DEMO_DEADLINE_SECO
 [ "$DEADLINE_SECONDS" -gt 0 ] || fail 'CONSULTATION_DEMO_DEADLINE_SECONDS must be a positive integer'
 SCENARIO_DEADLINE_EPOCH_MS=$((($(date +%s) + DEADLINE_SECONDS) * 1000))
 export SCENARIO_DEADLINE_EPOCH_MS
-convert_input employee "$EMPLOYEE_INPUT"
-convert_input customer "$CUSTOMER_INPUT"
+(
+  trap - 0 HUP INT TERM
+  convert_input employee "$EMPLOYEE_INPUT"
+) &
+employee_conversion_pid=$!
+(
+  trap - 0 HUP INT TERM
+  convert_input customer "$CUSTOMER_INPUT"
+) &
+customer_conversion_pid=$!
+conversion_status=0
+wait "$employee_conversion_pid" || conversion_status=1
+wait "$customer_conversion_pid" || conversion_status=1
+[ "$conversion_status" -eq 0 ] || fail 'one or more input video conversions failed'
 
-for port in 3000 7880 7881 8025 9000 9001; do
+for port in 3000 7880 7881 9000 9001; do
   if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
     fail "required TCP port is already occupied: $port"
   fi
@@ -203,6 +227,7 @@ for compose_file in "$BASE_FILE" "$TEST_FILE" $PROFILE_FILES "$COMMON_DEMO_FILE"
 done
 
 export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
+export APP_IMAGE_NAMESPACE=${APP_IMAGE_NAMESPACE:-transhooter-demo}
 export APP_ENV=$([ "$PROVIDER_PROFILE" = fixture ] && printf test || printf development)
 export PROVIDER_PROFILE
 export PROVIDER_NETWORK_DISABLED=$([ "$PROVIDER_PROFILE" = fixture ] && printf true || printf false)

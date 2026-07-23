@@ -610,13 +610,18 @@ export function createConsultationScenario(context) {
     const invite = await poll("customer invitation", ({ signal }) =>
       latestLink(customerEmail, { signal }),
     );
-    const customer = await authenticate(customerContext, customerEmail, invite);
     const thirdEmail = `admission-${runId}@example.test`;
-    state.admissionFixtureConsultationId = await createConsultation(
+    const customerAuthentication = authenticate(customerContext, customerEmail, invite);
+    const admissionFixtureCreation = createConsultation(
       employee,
       `Admission probe ${runId.slice(0, 8)}`,
       thirdEmail,
     );
+    const [customer, admissionFixtureConsultationId] = await Promise.all([
+      customerAuthentication,
+      admissionFixtureCreation,
+    ]);
+    state.admissionFixtureConsultationId = admissionFixtureConsultationId;
     const thirdInvite = await poll("third-user invitation", ({ signal }) =>
       latestLink(thirdEmail, { signal }),
     );
@@ -632,11 +637,11 @@ export function createConsultationScenario(context) {
         customer.goto(`${baseUrl}/consultations/${consultationId}/lobby`),
       ]),
     );
-    await boundedPage(employee, "save employee preferences", () =>
-      savePreferences(employee, `Employee ${runId.slice(0, 8)}`, "en-US"),
-    );
-    await boundedPage(customer, "save customer preferences", () =>
-      savePreferences(customer, `Customer ${runId.slice(0, 8)}`, "de-DE"),
+    await boundedPages([employee, customer], "save participant preferences", () =>
+      Promise.all([
+        savePreferences(employee, `Employee ${runId.slice(0, 8)}`, "en-US"),
+        savePreferences(customer, `Customer ${runId.slice(0, 8)}`, "de-DE"),
+      ]),
     );
     const [employeeProfile, customerProfile] = await boundedPages(
       [employee, customer],

@@ -177,7 +177,7 @@ export async function runConsultationBrowserWorkflow({
       chromium.launch({
         executablePath: chromium.executablePath(),
         headless: !visible,
-        slowMo: visible ? 150 : 0,
+        slowMo: 0,
         timeout: timeoutMs,
         env: visible ? display.env : undefined,
         args: [
@@ -192,30 +192,52 @@ export async function runConsultationBrowserWorkflow({
       }),
     );
 
-  const employeeBrowser = await launchBrowser("employee", employeeMedia);
-  let customerBrowser;
-  let thirdBrowser;
-  try {
-    customerBrowser = await launchBrowser("customer", customerMedia);
-    if (headed) thirdBrowser = await launchBrowser("admission probe", null, false);
-  } catch (error) {
-    await Promise.allSettled([employeeBrowser.close(), customerBrowser?.close()]);
-    throw error;
+  const browserResults = await Promise.allSettled([
+    launchBrowser("employee", employeeMedia),
+    launchBrowser("customer", customerMedia),
+    headed ? launchBrowser("admission probe", null, false) : Promise.resolve(undefined),
+  ]);
+  const browserFailure = browserResults.find((entry) => entry.status === "rejected");
+  if (browserFailure) {
+    await Promise.allSettled(
+      browserResults
+        .filter((entry) => entry.status === "fulfilled" && entry.value)
+        .map((entry) => entry.value.close()),
+    );
+    throw browserFailure.reason;
   }
+  const [employeeBrowser, customerBrowser, thirdBrowser] = browserResults.map(
+    (entry) => entry.value,
+  );
   const contextOptions = {
     permissions: ["camera", "microphone"],
     viewport: headed ? null : undefined,
   };
-  const employeeContext = await boundedBrowser(employeeBrowser, "create employee context", () =>
-    employeeBrowser.newContext(contextOptions),
-  );
-  const customerContext = await boundedBrowser(customerBrowser, "create customer context", () =>
-    customerBrowser.newContext(contextOptions),
-  );
-  const thirdContext = await boundedBrowser(
-    thirdBrowser ?? employeeBrowser,
-    "create third-user context",
-    () => (thirdBrowser ?? employeeBrowser).newContext(),
+  const contextResults = await Promise.allSettled([
+    boundedBrowser(employeeBrowser, "create employee context", () =>
+      employeeBrowser.newContext(contextOptions),
+    ),
+    boundedBrowser(customerBrowser, "create customer context", () =>
+      customerBrowser.newContext(contextOptions),
+    ),
+    boundedBrowser(thirdBrowser ?? employeeBrowser, "create third-user context", () =>
+      (thirdBrowser ?? employeeBrowser).newContext(),
+    ),
+  ]);
+  const contextFailure = contextResults.find((entry) => entry.status === "rejected");
+  if (contextFailure) {
+    await Promise.allSettled([
+      ...contextResults
+        .filter((entry) => entry.status === "fulfilled")
+        .map((entry) => entry.value.close()),
+      ...[employeeBrowser, customerBrowser, thirdBrowser]
+        .filter(Boolean)
+        .map((browser) => browser.close()),
+    ]);
+    throw contextFailure.reason;
+  }
+  const [employeeContext, customerContext, thirdContext] = contextResults.map(
+    (entry) => entry.value,
   );
   let browserDeadlineCancellation = setTimeout(() => {
     void Promise.allSettled(

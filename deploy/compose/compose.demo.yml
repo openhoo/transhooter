@@ -5,8 +5,7 @@ services:
       - "127.0.0.1:9001:9001"
 
   mailpit:
-    ports: !override
-      - "127.0.0.1:8025:8025"
+    ports: !override []
 
   livekit:
     networks:
