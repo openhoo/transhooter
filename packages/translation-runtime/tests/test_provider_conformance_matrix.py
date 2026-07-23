@@ -642,7 +642,7 @@ async def test_google_rollover_suppresses_duplicate_final_and_records_each_grpc_
     events = [event async for event in session.events()]
     assert [
         (event.text, event.samples) for event in events if isinstance(event, TranscriptEvent)
-    ] == [("fresh", SampleRange(4_300_000, 4_328_000))]
+    ] == [("fresh", SampleRange(4_312_000, 4_360_000))]
     status_rows = [row for row in journal.rows.values() if row.get("direction") == "status-in"]
     assert status_rows
     status = json.loads(status_rows[-1]["payload"])

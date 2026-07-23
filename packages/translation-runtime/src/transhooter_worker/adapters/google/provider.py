@@ -56,6 +56,9 @@ from transhooter_worker.ports.providers import SttEvent, SynthesisAttempt, TtsEv
 
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 _TTS_MESSAGE_BYTE_LIMIT = 5_000
+_STT_SAMPLE_RATE = 16_000
+_STT_STREAM_SECONDS = 270
+_STT_STREAM_SAMPLES = _STT_STREAM_SECONDS * _STT_SAMPLE_RATE
 
 
 def _tts_text_messages(text: str) -> tuple[str, ...]:
@@ -537,7 +540,7 @@ class GoogleSttProvider:
                 (self._config.speech_model,),
                 (
                     ("chunk_bytes", 8000),
-                    ("session_seconds", 270),
+                    ("session_seconds", _STT_STREAM_SECONDS),
                     ("messages_minute", 500),
                     ("streams", 2),
                 ),
@@ -630,10 +633,12 @@ class GoogleSttSession:
         self._boundaries: list[UUID] = []
         self._last_result_end = commit_watermark
         self._commit_watermark = commit_watermark
+        self._last_final_end = commit_watermark
         self._active_utterance_start = max(resume_at_sample, commit_watermark)
         self._recent: list[AudioChunk] = []
         self._stream_bases: list[int] = [resume_at_sample]
-        self._next_rotation = resume_at_sample + 270 * 16000
+        self._stream_replay_floors: list[int] = [commit_watermark]
+        self._next_rotation = resume_at_sample + _STT_STREAM_SAMPLES
         self._finishing = False
         self._task = asyncio.create_task(self._run())
 
@@ -678,19 +683,21 @@ class GoogleSttSession:
             await asyncio.gather(put, closed, return_exceptions=True)
 
     async def _enqueue_rollover(self, chunk: AudioChunk) -> None:
-        overlap_start = chunk.samples.start - 32000
-        overlap = [item for item in self._recent if item.samples.end > overlap_start]
+        replay_floor = max(self._commit_watermark, self._last_final_end)
+        overlap = [item for item in self._recent if item.samples.end > replay_floor]
         stream_base = overlap[0].samples.start if overlap else chunk.samples.start
         self._stream_bases.append(stream_base)
+        self._stream_replay_floors.append(replay_floor)
         await self._put_input(self._ROTATE)
         for item in overlap:
             await self._put_input(item)
-        self._next_rotation += 270 * 16000
+        self._recent = []
+        self._next_rotation += _STT_STREAM_SAMPLES
 
     def _remember_recent_chunk(self, chunk: AudioChunk) -> None:
         self._recent.append(chunk)
-        cutoff = chunk.samples.end - 32000
-        self._recent = [item for item in self._recent if item.samples.end > cutoff]
+        replay_floor = max(self._commit_watermark, self._last_final_end)
+        self._recent = [item for item in self._recent if item.samples.end > replay_floor]
 
     def events(self) -> AsyncIterator[SttEvent]:
         async def stream() -> AsyncIterator[SttEvent]:
@@ -797,6 +804,11 @@ class GoogleSttSession:
             stream_index = 0
             while True:
                 base = self._stream_bases[stream_index]
+                replay_floor = max(
+                    self._stream_replay_floors[stream_index],
+                    self._commit_watermark,
+                    self._last_final_end,
+                )
                 stream_index += 1
                 call = self._channel.stream_stream(
                     "/google.cloud.speech.v2.Speech/StreamingRecognize",
@@ -804,7 +816,7 @@ class GoogleSttSession:
                     response_deserializer=self._deserialize,
                 )(self._requests(), metadata=(("x-goog-user-project", self._config.quota_project),))
                 async for response in call:
-                    await self._emit_transcript_results(response, base)
+                    await self._emit_transcript_results(response, base, replay_floor)
                 self._refs.append(
                     await self._record_stream_status(
                         call=call,
@@ -854,6 +866,7 @@ class GoogleSttSession:
         self,
         response: cloud_speech.StreamingRecognizeResponse,
         base_sample: int,
+        replay_floor: int = 0,
     ) -> None:
         self._received += 1
         raw_ref = self._refs[-1]
@@ -876,12 +889,23 @@ class GoogleSttSession:
                 for word in alternative.words
             )
             reported_end = base_sample + _duration_samples(result.result_end_offset, 16000)
-            if result.is_final and reported_end <= self._commit_watermark:
+            effective_floor = max(self._commit_watermark, replay_floor)
+            if reported_end <= effective_floor:
                 continue
             transcript = alternative.transcript
-            if result.is_final and words and words[0].samples.start < self._commit_watermark:
-                words = tuple(word for word in words if word.samples.end > self._commit_watermark)
+            if words and words[0].samples.start < effective_floor:
+                words = tuple(word for word in words if word.samples.end > effective_floor)
                 if words:
+                    first = words[0]
+                    if first.samples.start < effective_floor:
+                        words = (
+                            WordTiming(
+                                first.text,
+                                SampleRange(effective_floor, first.samples.end),
+                                first.confidence,
+                            ),
+                            *words[1:],
+                        )
                     trimmed_transcript = " ".join(word.text for word in words).strip()
                     if trimmed_transcript:
                         transcript = trimmed_transcript
@@ -889,12 +913,13 @@ class GoogleSttSession:
                 start = words[0].samples.start
                 self._active_utterance_start = start
             else:
-                start = max(base_sample, self._active_utterance_start, self._commit_watermark)
+                start = max(base_sample, self._active_utterance_start, effective_floor)
             if result.is_final:
-                start = max(start, self._commit_watermark)
+                start = max(start, effective_floor)
             end = max(start + 1, reported_end, words[-1].samples.end if words else reported_end)
             self._last_result_end = max(self._last_result_end, end)
             if result.is_final:
+                self._last_final_end = max(self._last_final_end, end)
                 self._active_utterance_start = end
             await self._emit_event(
                 TranscriptEvent(

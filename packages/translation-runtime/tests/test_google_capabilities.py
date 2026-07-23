@@ -15,6 +15,7 @@ from google.protobuf.any_pb2 import Any as ProtobufAny
 
 from transhooter_worker.adapters.google import provider as google_provider
 from transhooter_worker.domain.models import (
+    AudioChunk,
     AudioEvent,
     BoundaryEvent,
     Finality,
@@ -280,6 +281,7 @@ async def test_replayed_final_trims_words_committed_before_watermark() -> None:
     session._refs = [raw_ref]
     session._commit_watermark = 16_000
     session._last_result_end = 16_000
+    session._last_final_end = 16_000
     session._boundaries = [boundary_id]
     session._events = asyncio.Queue()
     session._event_slots = asyncio.Semaphore(64)
@@ -337,6 +339,7 @@ async def test_chirp_revisions_keep_one_utterance_sample_range_without_word_offs
     session._refs = [raw_ref]
     session._commit_watermark = 0
     session._last_result_end = 0
+    session._last_final_end = 0
     session._active_utterance_start = 0
     session._boundaries = []
     session._events = asyncio.Queue()
@@ -379,6 +382,7 @@ async def test_next_chirp_utterance_starts_after_the_previous_final() -> None:
     session._refs = [raw_ref]
     session._commit_watermark = 0
     session._last_result_end = 16_000
+    session._last_final_end = 16_000
     session._active_utterance_start = 16_000
     session._boundaries = []
     session._events = asyncio.Queue()
@@ -400,6 +404,178 @@ async def test_next_chirp_utterance_starts_after_the_previous_final() -> None:
     event = session._events.get_nowait()
     assert isinstance(event, TranscriptEvent)
     assert event.samples == SampleRange(16_000, 32_000)
+
+
+@pytest.mark.asyncio
+async def test_google_rollover_replays_only_audio_after_the_last_final() -> None:
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._commit_watermark = 8_000
+    session._last_final_end = 12_000
+    session._recent = [
+        AudioChunk(UUID(int=1), 1, SampleRange(4_000, 8_000), b"\0" * 8_000),
+        AudioChunk(UUID(int=2), 2, SampleRange(8_000, 16_000), b"\0" * 16_000),
+        AudioChunk(UUID(int=3), 3, SampleRange(16_000, 20_000), b"\0" * 8_000),
+    ]
+    session._stream_bases = [0]
+    session._stream_replay_floors = [0]
+    session._next_rotation = google_provider._STT_STREAM_SAMPLES
+    session._input = asyncio.Queue()
+    session._input_closed = asyncio.Event()
+    current = AudioChunk(
+        UUID(int=4),
+        4,
+        SampleRange(
+            google_provider._STT_STREAM_SAMPLES,
+            google_provider._STT_STREAM_SAMPLES + 4_000,
+        ),
+        b"\0" * 8_000,
+    )
+
+    expected_overlap = session._recent[1:]
+    await session._enqueue_rollover(current)
+
+    queued = [session._input.get_nowait() for _ in range(3)]
+    assert queued == [session._ROTATE, *expected_overlap]
+    assert session._recent == []
+    assert session._stream_bases == [0, 8_000]
+    assert session._stream_replay_floors == [0, 12_000]
+    assert session._next_rotation == google_provider._STT_STREAM_SAMPLES * 2
+
+
+@pytest.mark.asyncio
+async def test_google_rollover_history_contains_only_the_current_stream() -> None:
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._commit_watermark = 0
+    session._last_final_end = 0
+    previous = AudioChunk(UUID(int=1), 1, SampleRange(0, 4_000), b"\0" * 8_000)
+    session._recent = [previous]
+    session._stream_bases = [0]
+    session._stream_replay_floors = [0]
+    session._next_rotation = google_provider._STT_STREAM_SAMPLES
+    session._input = asyncio.Queue()
+    session._input_closed = asyncio.Event()
+    first_current = AudioChunk(
+        UUID(int=2),
+        2,
+        SampleRange(
+            google_provider._STT_STREAM_SAMPLES,
+            google_provider._STT_STREAM_SAMPLES + 4_000,
+        ),
+        b"\0" * 8_000,
+    )
+
+    await session._enqueue_rollover(first_current)
+    assert session._recent == []
+    session._remember_recent_chunk(first_current)
+    second_current = AudioChunk(
+        UUID(int=3),
+        3,
+        SampleRange(
+            google_provider._STT_STREAM_SAMPLES * 2,
+            google_provider._STT_STREAM_SAMPLES * 2 + 4_000,
+        ),
+        b"\0" * 8_000,
+    )
+    await session._enqueue_rollover(second_current)
+    queued = [session._input.get_nowait() for _ in range(4)]
+    assert queued == [
+        session._ROTATE,
+        previous,
+        session._ROTATE,
+        first_current,
+    ]
+    assert session._recent == []
+
+
+@pytest.mark.asyncio
+async def test_google_rollover_suppresses_replayed_provisional_results() -> None:
+    raw_ref = RawRef(UUID(int=8), 8, "8" * 64, 1, "application/protobuf")
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._received = 0
+    session._refs = [raw_ref]
+    session._commit_watermark = 8_000
+    session._last_result_end = 12_000
+    session._last_final_end = 12_000
+    session._active_utterance_start = 12_000
+    session._boundaries = []
+    session._events = asyncio.Queue()
+    session._event_slots = asyncio.Semaphore(64)
+    response = google_provider.cloud_speech.StreamingRecognizeResponse(
+        results=[
+            google_provider.cloud_speech.StreamingRecognitionResult(
+                alternatives=[
+                    google_provider.cloud_speech.SpeechRecognitionAlternative(
+                        transcript="replayed interim"
+                    )
+                ],
+                is_final=False,
+                result_end_offset=timedelta(seconds=0.25),
+            ),
+            google_provider.cloud_speech.StreamingRecognitionResult(
+                alternatives=[
+                    google_provider.cloud_speech.SpeechRecognitionAlternative(transcript="fresh")
+                ],
+                is_final=True,
+                result_end_offset=timedelta(seconds=1),
+            ),
+        ]
+    )
+
+    await session._emit_transcript_results(response, base_sample=8_000, replay_floor=12_000)
+
+    event = session._events.get_nowait()
+    assert isinstance(event, TranscriptEvent)
+    assert event.text == "fresh"
+    assert event.samples == SampleRange(12_000, 24_000)
+    assert session._events.empty()
+
+
+@pytest.mark.asyncio
+async def test_google_rollover_clips_provisional_word_crossing_replay_floor() -> None:
+    raw_ref = RawRef(UUID(int=8), 8, "8" * 64, 1, "application/protobuf")
+    session = object.__new__(google_provider.GoogleSttSession)
+    session._received = 0
+    session._refs = [raw_ref]
+    session._commit_watermark = 0
+    session._last_result_end = 12_000
+    session._last_final_end = 12_000
+    session._active_utterance_start = 12_000
+    session._boundaries = []
+    session._events = asyncio.Queue()
+    session._event_slots = asyncio.Semaphore(64)
+    response = google_provider.cloud_speech.StreamingRecognizeResponse(
+        results=[
+            google_provider.cloud_speech.StreamingRecognitionResult(
+                alternatives=[
+                    google_provider.cloud_speech.SpeechRecognitionAlternative(
+                        transcript="crossing fresh",
+                        words=[
+                            google_provider.cloud_speech.WordInfo(
+                                word="crossing",
+                                start_offset=timedelta(seconds=0.125),
+                                end_offset=timedelta(seconds=0.5),
+                            ),
+                            google_provider.cloud_speech.WordInfo(
+                                word="fresh",
+                                start_offset=timedelta(seconds=0.5),
+                                end_offset=timedelta(seconds=1),
+                            ),
+                        ],
+                    )
+                ],
+                is_final=False,
+                result_end_offset=timedelta(seconds=1),
+            )
+        ]
+    )
+
+    await session._emit_transcript_results(response, base_sample=8_000, replay_floor=12_000)
+
+    event = session._events.get_nowait()
+    assert isinstance(event, TranscriptEvent)
+    assert event.samples == SampleRange(12_000, 24_000)
+    assert event.words[0].samples == SampleRange(12_000, 16_000)
+    assert event.words[1].samples == SampleRange(16_000, 24_000)
 
 
 @pytest.mark.asyncio
