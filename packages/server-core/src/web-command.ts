@@ -191,27 +191,52 @@ export type InternalCommand =
       report: ProviderAttemptReport;
     }
   | {
-      kind: "internal.failure";
+      kind: "internal.archiveObject";
+      consultationId: UUID;
+      generation: number;
+      workerId: UUID;
+      workerEpoch: number;
+      writerEpoch: number;
+      causalKey: string;
+      object: ArchiveObjectRecord;
+    }
+  | {
+      kind: "internal.expiredWorkerEpochs";
+    }
+  | {
+      kind: "internal.completeWorkerEpoch";
       consultationId: UUID;
       generation: number;
       workerId: UUID;
       epoch: number;
-      eventId: UUID;
-      kindName: string;
-      message: string;
-      phase?: string;
-      snapshotHash?: string;
-      lastCheckpointHashes: Readonly<Record<UUID, string>>;
+      writeEpoch: number;
+      completionEventId: UUID;
+      outcome: "clean" | "failed";
+      terminalCheckpoints: readonly [
+        { checkpointId: UUID; checkpointHash: string },
+        { checkpointId: UUID; checkpointHash: string },
+      ];
+      failure: {
+        kind: string;
+        message: string;
+        phase?: string | undefined;
+        snapshotHash?: string | undefined;
+        lastCheckpointHashes: Readonly<Record<UUID, string>>;
+      } | null;
     }
   | {
-      kind: "internal.archiveObject";
+      kind: "internal.abandonWorkerEpoch";
       consultationId: UUID;
-      generation?: number;
-      workerId?: UUID;
-      workerEpoch?: number;
-      writerEpoch?: number;
-      causalKey: string;
-      object: ArchiveObjectRecord;
+      generation: number;
+      workerId: UUID;
+      epoch: number;
+      writeEpoch: number;
+      abandonmentEventId: UUID;
+      sealId?: UUID | undefined;
+      completionEventId?: UUID | undefined;
+      reason: string;
+      handoffDigest: string;
+      permanentOutcomeDigest: string;
     }
   | {
       kind: "internal.finalize";

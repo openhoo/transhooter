@@ -102,6 +102,21 @@ describe("consultation harness public contracts", () => {
     expect(source).toContain("proof,");
     expect(source).toContain("close,");
   });
+
+  it("keeps exactly two headed participant Chromium processes", async () => {
+    const source = await readFile(
+      new URL("./consultation-browser-workflow.mjs", import.meta.url),
+      "utf8",
+    );
+    expect(source).toContain('launchBrowser("employee", employeeMedia)');
+    expect(source).toContain('launchBrowser("customer", customerMedia)');
+    expect(source).toContain(
+      'headed ? launchBrowser("admission probe", null, false) : Promise.resolve(undefined)',
+    );
+    expect(source).toContain("headless: !visible");
+    expect(source).toContain("thirdBrowser ?? employeeBrowser");
+    expect(source).not.toContain('launchBrowser("admission probe", null, true)');
+  });
 });
 
 describe("consultation smoke proof contracts", () => {

@@ -99,7 +99,9 @@ export async function claimStaleReservations(
 ): Promise<readonly WorkerReservation[]> {
   const rows = await client.$queryRaw<ReservationRow[]>(Prisma.sql`WITH picked AS (
     SELECT reservation.consultation_id,reservation.generation FROM worker_reservations reservation
+    JOIN consultations consultation ON consultation.id=reservation.consultation_id
     WHERE reservation.fenced_at IS NULL AND reservation.released_at IS NULL
+      AND reservation.worker_id IS DISTINCT FROM consultation.worker_identity
       AND reservation.lease_expires_at < ${options.now.toISOString()}
       AND (reservation.supervisor_owner IS NULL OR reservation.supervisor_owner=${options.owner}
         OR reservation.supervisor_lease_expires_at < ${options.now.toISOString()})
@@ -109,7 +111,7 @@ export async function claimStaleReservations(
           AND epoch.worker_id=reservation.worker_id AND epoch.epoch=reservation.epoch
           AND epoch.terminal_at IS NOT NULL
       )
-    ORDER BY reservation.lease_expires_at FOR UPDATE SKIP LOCKED LIMIT ${options.limit}
+    ORDER BY reservation.lease_expires_at FOR UPDATE OF reservation SKIP LOCKED LIMIT ${options.limit}
   ) UPDATE worker_reservations r SET supervisor_owner=${options.owner},supervisor_lease_expires_at=${new Date(options.now.getTime() + options.leaseMs).toISOString()}
     FROM picked WHERE r.consultation_id=picked.consultation_id AND r.generation=picked.generation RETURNING r.*`);
   return rows.map(mapReservation);

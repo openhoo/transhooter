@@ -37,8 +37,7 @@ services:
 
   spool-drainer:
     environment:
-      <<: *demo-fixture-env
-      FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+      APP_ENV: test
 
   control-worker-1:
     environment:

@@ -10,6 +10,16 @@ read_secret() {
 owner_password=$(read_secret /run/secrets/postgres-owner-password)
 export PGPASSWORD="$owner_password"
 
+attempt=0
+until pg_isready --host=postgres --username=transhooter_owner --dbname=transhooter >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 60 ]; then
+    echo "postgres did not accept network connections within 60 seconds" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
 if [ "${POSTGRES_BOOTSTRAP_PHASE:-roles}" = capability-grants ]; then
   psql --host=postgres --username=transhooter_owner --dbname=transhooter \
     --set=ON_ERROR_STOP=1 <<'SQL'

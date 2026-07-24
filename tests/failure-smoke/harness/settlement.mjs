@@ -168,9 +168,10 @@ export function installSettlement(ctx) {
         (SELECT row_to_json(f) FROM final_inventories f WHERE f.archive_id=a.id) AS inventory,
         COALESCE((SELECT json_agg(json_build_object(
           'id',e.id,'kind',e.effect_kind,'generation',e.generation,'subjectId',e.subject_id,
-          'state',e.state,'attempts',e.attempts,'requestHash',e.request_hash,
-          'leaseOwner',e.lease_owner,'leaseExpiresAt',e.lease_expires_at,
-          'result',e.result,'compensationResult',e.compensation_result
+          'state',e.state,'attempts',e.attempts,'occurrenceKey',e.occurrence_key,
+          'requestHash',e.request_hash,'leaseOwner',e.lease_owner,
+          'leaseExpiresAt',e.lease_expires_at,'result',e.result,
+          'compensationResult',e.compensation_result
         ) ORDER BY e.created_at) FROM external_effects e WHERE e.consultation_id=c.id),'[]'::json) AS effects,
         COALESCE((SELECT json_agg(json_build_object(
           'kind',j.kind,'state',j.state,'egressId',j.egress_id,'terminalAt',j.terminal_at,
@@ -217,8 +218,7 @@ export function installSettlement(ctx) {
           AS pending_cancellation_outbox,
         COALESCE((SELECT count(*) FROM external_effects e
           WHERE e.consultation_id=c.id
-            AND e.state IN ('planned','calling','applied','compensating')),0)::int
-          AS active_effects,
+            AND e.state IN ('planned','calling','applied','compensating')),0)::int AS active_effects,
         COALESCE((SELECT count(*) FROM expected_archive_artifacts x
           WHERE x.archive_id=a.id AND x.disposition='expected'
             AND x.fulfilled_object_id IS NULL),0)::int AS unresolved_expectations,
@@ -299,6 +299,20 @@ export function installSettlement(ctx) {
       unfencedReservations: evidence.unfenced_reservations,
       unterminatedWorkerEpochs: evidence.unterminated_worker_epochs,
       roomCleanupConfirmed: evidence.room_cleanup_confirmed,
+      openEffects: evidence.effects
+        .filter((effect) =>
+          ["planned", "calling", "applied", "compensating"].includes(effect.state),
+        )
+        .map((effect) => ({
+          id: effect.id,
+          kind: effect.kind,
+          generation: effect.generation,
+          subjectId: effect.subjectId,
+          state: effect.state,
+          attempts: effect.attempts,
+          occurrenceKey: effect.occurrenceKey,
+          result: effect.result,
+        })),
       effects: evidence.effects.slice(0, 10).map((effect) => ({
         kind: effect.kind,
         generation: effect.generation,

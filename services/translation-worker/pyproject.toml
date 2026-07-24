@@ -1,0 +1,104 @@
+[project]
+name = "transhooter-translation-worker"
+version = "0.1.0"
+description = "LiveKit translation worker and provider diagnostics for Transhooter"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "transhooter-spool-store",
+  "boto3==1.40.4",
+  "google-auth==2.40.3",
+  "google-cloud-speech==2.33.0",
+  "google-cloud-texttospeech==2.27.0",
+  "google-cloud-translate==3.21.1",
+  "grpcio==1.74.0",
+  "protobuf==6.33.6",
+  "httpx==0.28.1",
+  "jsonschema==4.25.1",
+  "livekit==1.0.17",
+  "livekit-agents==1.2.6",
+  "opentelemetry-api==1.44.0",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+  "opentelemetry-sdk==1.44.0",
+  "pydantic==2.11.7",
+  "websockets==16.1",
+]
+
+[dependency-groups]
+dev = [
+  "import-linter==2.3",
+  "mypy==1.17.1",
+  "pytest==9.0.3",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.12.8",
+]
+
+[project.scripts]
+transhooter-translation-worker = "transhooter_worker.runtime.worker:main"
+transhooter-provider = "transhooter_worker.provider_cli:main"
+transhooter-worker-healthcheck = "transhooter_worker.runtime.healthcheck:main"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/transhooter_worker"]
+
+[tool.uv.sources]
+transhooter-spool-store = { path = "../../packages/spool-store" }
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["transhooter_worker"]
+
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["E501", "RUF001"]
+
+[tool.importlinter]
+root_package = "transhooter_worker"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Domain has no outward dependencies"
+type = "forbidden"
+source_modules = ["transhooter_worker.domain"]
+forbidden_modules = ["transhooter_worker.application", "transhooter_worker.ports", "transhooter_worker.adapters", "transhooter_worker.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "Application cannot import adapters or runtime"
+type = "forbidden"
+source_modules = ["transhooter_worker.application"]
+forbidden_modules = ["transhooter_worker.adapters", "transhooter_worker.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "Ports cannot import adapters or runtime"
+type = "forbidden"
+source_modules = ["transhooter_worker.ports"]
+forbidden_modules = ["transhooter_worker.adapters", "transhooter_worker.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "Worker cannot import spool drainer"
+type = "forbidden"
+source_modules = ["transhooter_worker"]
+forbidden_modules = ["transhooter_spool_drainer"]

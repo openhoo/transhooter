@@ -205,6 +205,11 @@ select_compose_command_bounded() {
   fi
 }
 
+case "$(docker --version 2>/dev/null)" in
+  podman*) CONTAINER_ENGINE_KIND=podman ;;
+  *) CONTAINER_ENGINE_KIND=docker ;;
+esac
+
 compose_bounded() {
   phase=$1
   phase_timeout=$2
@@ -217,14 +222,34 @@ compose_bounded() {
 }
 
 stale_failure_smoke_projects() {
-  {
-    docker ps --all --filter "label=com.docker.compose.project" \
-      --format '{{.Label "com.docker.compose.project"}}'
-    docker network ls --filter "label=com.docker.compose.project" \
-      --format '{{.Label "com.docker.compose.project"}}'
-    docker volume ls --filter "label=com.docker.compose.project" \
-      --format '{{.Label "com.docker.compose.project"}}'
-  } |
+  if [ "$CONTAINER_ENGINE_KIND" = podman ]; then
+    {
+      docker ps --all --filter "label=com.docker.compose.project" --format '{{.ID}}' |
+        while IFS= read -r id; do
+          [ -n "$id" ] &&
+            docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$id"
+        done
+      docker network ls --filter "label=com.docker.compose.project" --format '{{.ID}}' |
+        while IFS= read -r id; do
+          [ -n "$id" ] &&
+            docker network inspect --format '{{ index .Labels "com.docker.compose.project" }}' "$id"
+        done
+      docker volume ls --filter "label=com.docker.compose.project" --format '{{.Name}}' |
+        while IFS= read -r name; do
+          [ -n "$name" ] &&
+            docker volume inspect --format '{{ index .Labels "com.docker.compose.project" }}' "$name"
+        done
+    }
+  else
+    {
+      docker ps --all --filter "label=com.docker.compose.project" \
+        --format '{{.Label "com.docker.compose.project"}}'
+      docker network ls --filter "label=com.docker.compose.project" \
+        --format '{{.Label "com.docker.compose.project"}}'
+      docker volume ls --filter "label=com.docker.compose.project" \
+        --format '{{.Label "com.docker.compose.project"}}'
+    }
+  fi |
     sort -u |
     while IFS= read -r candidate; do
       [ -n "$candidate" ] || continue
@@ -255,15 +280,15 @@ verify_failure_smoke_stack_ownership() {
   : > "$RESOURCE_PROOF_FILE"
   run_bounded "Classifying owned failure-smoke containers" "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS" \
     docker ps --all --filter "label=com.docker.compose.project=$PROJECT_NAME" \
-      --format 'container|{{.ID}}|{{.Label "com.docker.compose.project"}}' >> "$RESOURCE_PROOF_FILE" ||
+      --format "container|{{.ID}}|$PROJECT_NAME" >> "$RESOURCE_PROOF_FILE" ||
     return $?
   run_bounded "Classifying owned failure-smoke networks" "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS" \
     docker network ls --filter "label=com.docker.compose.project=$PROJECT_NAME" \
-      --format 'network|{{.ID}}|{{.Label "com.docker.compose.project"}}' >> "$RESOURCE_PROOF_FILE" ||
+      --format "network|{{.ID}}|$PROJECT_NAME" >> "$RESOURCE_PROOF_FILE" ||
     return $?
   run_bounded "Classifying owned failure-smoke volumes" "$COMPOSE_OWNERSHIP_TIMEOUT_SECONDS" \
     docker volume ls --filter "label=com.docker.compose.project=$PROJECT_NAME" \
-      --format 'volume|{{.Name}}|{{.Label "com.docker.compose.project"}}' >> "$RESOURCE_PROOF_FILE" ||
+      --format "volume|{{.Name}}|$PROJECT_NAME" >> "$RESOURCE_PROOF_FILE" ||
     return $?
 
   while IFS='|' read -r resource_kind resource_id resource_project_label; do
@@ -339,7 +364,7 @@ cleanup_stale_failure_smoke_projects
 
 capture_database_diagnostics() {
   consultation_sql="SELECT state, generation, room_name IS NOT NULL AS room_name_set, room_sid IS NOT NULL AS room_sid_set, dispatch_id IS NOT NULL AS dispatch_id_set, composite_egress_id IS NOT NULL AS composite_egress_id_set FROM consultations ORDER BY created_at DESC LIMIT 3"
-  external_effect_sql="SELECT generation, effect_kind, state, attempts, result ? 'error' AS has_error, max(result->>'error') AS latest_error, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, result ? 'error' ORDER BY generation, effect_kind, state, attempts, has_error"
+  external_effect_sql="SELECT generation, effect_kind, state, attempts, result ? 'error' AS has_error, max(result->>'error') AS latest_error, bool_or(lease_owner IS NOT NULL) AS leased, max(lease_expires_at) AS latest_lease_expiry, count(*) FROM external_effects GROUP BY generation, effect_kind, state, attempts, result ? 'error' ORDER BY generation, effect_kind, state, attempts, has_error"
   archive_sql="SELECT a.state, a.final_inventory_hash IS NOT NULL AS inventory_hashed, count(DISTINCT o.id) AS objects, count(DISTINCT m.id) FILTER (WHERE m.state IN ('open','completing')) AS pending_multipart FROM archives a LEFT JOIN archive_objects o ON o.archive_id=a.id LEFT JOIN multipart_uploads m ON m.archive_id=a.id GROUP BY a.id, a.state, a.final_inventory_hash ORDER BY a.created_at DESC LIMIT 3"
 
   outbox_sql="SELECT id, topic, aggregate_id, generation, payload->>'kind' AS effect_kind, payload->>'subjectId' AS subject_id, payload->>'resourceGeneration' AS resource_generation, available_at, lease_owner, lease_expires_at, attempts, payload->>'lastDispatchError' AS last_dispatch_error FROM outbox WHERE delivered_at IS NULL ORDER BY available_at, id"
@@ -431,7 +456,7 @@ trap 'terminate_active 143' TERM
 
 if $BUILD_ONLY; then
   compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
-    build minio egress-ready translation-worker web failure-smoke
+    build minio egress-ready translation-worker spool-drainer web failure-smoke
   exit 0
 fi
 
@@ -439,7 +464,7 @@ compose_bounded "Initializing failure-smoke runtime secrets" "$COMPOSE_SETUP_TIM
   run --rm --no-deps secrets-init
 if ! $NO_BUILD; then
   compose_bounded "Building failure-smoke application and harness images" "$COMPOSE_BUILD_TIMEOUT_SECONDS" \
-    build minio egress-ready translation-worker web failure-smoke
+    build minio egress-ready translation-worker spool-drainer web failure-smoke
 fi
 SCENARIO_STARTED=true
 if compose_bounded "Running failure injection scenarios" "$COMPOSE_SCENARIO_TIMEOUT_SECONDS" \

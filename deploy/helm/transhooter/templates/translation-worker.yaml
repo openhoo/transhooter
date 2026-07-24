@@ -1,84 +1,90 @@
-{{- $root := . -}}
-{{- range $component, $replicas := dict "translation-worker" .Values.replicas.translationWorker "spool-drainer" .Values.replicas.spoolDrainer }}
+{{- if ne (int .Values.replicas.spoolDrainer) 1 -}}
+{{- fail "spool-drainer requires exactly one replica" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "transhooter.fullname" $root }}-{{ $component }}
+  name: {{ include "transhooter.fullname" . }}-translation-worker
   labels:
-    {{- include "transhooter.labels" $root | nindent 4 }}
+    {{- include "transhooter.labels" . | nindent 4 }}
 spec:
-  replicas: {{ $replicas }}
+  replicas: {{ .Values.replicas.translationWorker }}
   selector:
     matchLabels:
-      {{- include "transhooter.selectorLabels" $root | nindent 6 }}
-      app.kubernetes.io/component: {{ $component }}
+      {{- include "transhooter.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: translation-worker
   template:
     metadata:
       annotations:
-        checksum/config: {{ include (print $root.Template.BasePath "/configmap.yaml") $root | sha256sum }}
-        transhooter.io/runtime-secret-revision: {{ $root.Values.rollout.runtimeSecretRevision | quote }}
-        {{- if eq $component "translation-worker" }}
-        transhooter.io/provider-secret-revision: {{ $root.Values.rollout.providerSecretRevision | quote }}
-        {{- end }}
-        {{- with $root.Values.podAnnotations }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        transhooter.io/runtime-secret-revision: {{ .Values.rollout.runtimeSecretRevision | quote }}
+        transhooter.io/provider-secret-revision: {{ .Values.rollout.providerSecretRevision | quote }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
-        {{- include "transhooter.selectorLabels" $root | nindent 8 }}
-        app.kubernetes.io/component: {{ $component }}
+        {{- include "transhooter.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: translation-worker
     spec:
       automountServiceAccountToken: false
-      serviceAccountName: {{ include "transhooter.fullname" $root }}-{{ $component }}
+      serviceAccountName: {{ include "transhooter.fullname" . }}-translation-worker
       imagePullSecrets:
-        {{- toYaml $root.Values.imagePullSecrets | nindent 8 }}
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
       securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
       containers:
-        - name: {{ $component }}
-          image: {{ include "transhooter.image" (ternary $root.Values.images.spoolDrainer $root.Values.images.translationWorker (eq $component "spool-drainer")) | quote }}
-          imagePullPolicy: {{ (ternary $root.Values.images.spoolDrainer $root.Values.images.translationWorker (eq $component "spool-drainer")).pullPolicy }}
-          {{- if eq $component "spool-drainer" }}
-          command: [python, apps/spool-drainer/main.py]
-          {{- else }}
-          command: [python, apps/translation-worker/main.py, start]
-          {{- end }}
-          {{- if eq $component "spool-drainer" }}
+        - name: translation-worker
+          image: {{ include "transhooter.image" .Values.images.translationWorker | quote }}
+          imagePullPolicy: {{ .Values.images.translationWorker.pullPolicy }}
+          command: [transhooter-translation-worker, start]
           env:
-            - {name: APP_ENV, value: {{ $root.Values.config.appEnv | quote }}}
-            - {name: S3_ENDPOINT, value: {{ $root.Values.config.s3Endpoint | quote }}}
-            - {name: S3_REGION, value: {{ $root.Values.config.s3Region | quote }}}
-            - {name: S3_BUCKET, value: {{ $root.Values.config.s3Bucket | quote }}}
-            - {name: S3_KMS_KEY_ID, value: {{ $root.Values.config.s3KmsKeyId | quote }}}
-            - {name: ARCHIVE_REQUIRE_KMS, value: {{ $root.Values.config.archiveRequireKms | quote }}}
-            - {name: S3_CREDENTIALS_FILE, value: /run/secrets/s3-credentials}
+            - {name: APP_ENV, value: {{ .Values.config.appEnv | quote }}}
+            - {name: PROVIDER_PROFILE, value: {{ .Values.config.providerProfile | quote }}}
+            {{- if eq .Values.config.providerProfile "google-eu" }}
+            - {name: GOOGLE_APPLICATION_CREDENTIALS, value: /run/secrets/google-adc.json}
+            - {name: GOOGLE_CLOUD_PROJECT, value: {{ .Values.config.providers.googleEu.cloudProject | quote }}}
+            - {name: GOOGLE_QUOTA_PROJECT, value: {{ .Values.config.providers.googleEu.quotaProject | quote }}}
+            - {name: GOOGLE_TTS_VOICE, value: {{ .Values.config.providers.googleEu.ttsVoice | quote }}}
+            {{- else if eq .Values.config.providerProfile "google-speech-eu" }}
+            - {name: GOOGLE_APPLICATION_CREDENTIALS, value: /run/secrets/google-adc.json}
+            - {name: GOOGLE_CLOUD_PROJECT, value: {{ .Values.config.providers.googleSpeechEu.cloudProject | quote }}}
+            - {name: GOOGLE_QUOTA_PROJECT, value: {{ .Values.config.providers.googleSpeechEu.quotaProject | quote }}}
+            - {name: GOOGLE_SPEECH_LOCATION, value: {{ .Values.config.providers.googleSpeechEu.speechLocation | quote }}}
+            - {name: GOOGLE_SPEECH_MODEL, value: {{ .Values.config.providers.googleSpeechEu.speechModel | quote }}}
+            - {name: GOOGLE_TRANSLATION_LOCATION, value: {{ .Values.config.providers.googleSpeechEu.translationLocation | quote }}}
+            - {name: GOOGLE_TRANSLATION_MODEL, value: {{ .Values.config.providers.googleSpeechEu.translationModel | quote }}}
+            - {name: GOOGLE_TTS_LOCATION, value: {{ .Values.config.providers.googleSpeechEu.ttsLocation | quote }}}
+            - {name: GOOGLE_TTS_VOICE, value: {{ .Values.config.providers.googleSpeechEu.ttsVoice | quote }}}
+            - {name: GOOGLE_TTS_VOICE_LOCALE, value: {{ .Values.config.providers.googleSpeechEu.ttsVoiceLocale | quote }}}
+            {{- else if eq .Values.config.providerProfile "deepgram-deepl-eu" }}
+            - {name: DEEPGRAM_API_KEY_FILE, value: /run/secrets/deepgram-api-key}
+            - {name: DEEPL_API_KEY_FILE, value: /run/secrets/deepl-api-key}
+            - {name: DEEPGRAM_VOICE, value: {{ .Values.config.providers.deepgramDeeplEu.deepgramVoice | quote }}}
+            - {name: DEEPGRAM_APPROVED_VOICES, value: {{ join "," .Values.config.providers.deepgramDeeplEu.deepgramApprovedVoices | quote }}}
+            - {name: DEEPGRAM_STREAMS, value: {{ .Values.config.providers.deepgramDeeplEu.deepgramStreams | quote }}}
+            - {name: DEEPGRAM_AUDIO_SECONDS_MINUTE, value: {{ .Values.config.providers.deepgramDeeplEu.deepgramAudioSecondsMinute | quote }}}
+            - {name: DEEPL_REQUESTS_MINUTE, value: {{ .Values.config.providers.deepgramDeeplEu.deeplRequestsMinute | quote }}}
+            - {name: DEEPL_CHARACTERS_MINUTE, value: {{ .Values.config.providers.deepgramDeeplEu.deeplCharactersMinute | quote }}}
+            {{- end }}
+            - {name: LIVEKIT_URL, value: {{ .Values.config.livekitUrl | quote }}}
+            - {name: LIVEKIT_CREDENTIALS_FILE, value: /run/secrets/livekit-credentials}
             - {name: SPOOL_KEYRING_FILE, value: /run/secrets/spool-keyring}
-            - {name: CONTROL_INTERNAL_URL, value: {{ printf "http://%s-web:%v" (include "transhooter.fullname" $root) $root.Values.service.port | quote }}}
-            - {name: SPOOL_PATH, value: /var/lib/transhooter/spool}
-            - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
-          {{- else }}
-          envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" $root }}}}]
-          env:
+            - {name: CONTROL_INTERNAL_URL, value: {{ printf "http://%s-web:%v" (include "transhooter.fullname" .) .Values.service.port | quote }}}
             - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
             - {name: SPOOL_PATH, value: /var/lib/transhooter/spool}
-          {{- end }}
-            {{- if $root.Values.telemetry.enabled }}
-            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ default (printf "http://%s-otel-collector:%v" (include "transhooter.fullname" $root) $root.Values.telemetry.collector.ports.otlpHttp) $root.Values.telemetry.endpoint | quote }}}
+            {{- if .Values.telemetry.enabled }}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ default (printf "http://%s-otel-collector:%v" (include "transhooter.fullname" .) .Values.telemetry.collector.ports.otlpHttp) .Values.telemetry.endpoint | quote }}}
             - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
             - {name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio}
-            - {name: OTEL_TRACES_SAMPLER_ARG, value: {{ $root.Values.telemetry.traceSampleRatio | quote }}}
-            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: {{ $root.Values.telemetry.metricExportIntervalMillis | quote }}}
-            - {name: OTEL_RESOURCE_ATTRIBUTES, value: {{ printf "service.namespace=transhooter,deployment.environment.name=%s" $root.Values.config.appEnv | quote }}}
-            - {name: OTEL_SERVICE_NAME, value: {{ printf "transhooter-%s" $component | quote }}}
+            - {name: OTEL_TRACES_SAMPLER_ARG, value: {{ .Values.telemetry.traceSampleRatio | quote }}}
+            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: {{ .Values.telemetry.metricExportIntervalMillis | quote }}}
+            - {name: OTEL_RESOURCE_ATTRIBUTES, value: {{ printf "service.namespace=transhooter,deployment.environment.name=%s" .Values.config.appEnv | quote }}}
+            - {name: OTEL_SERVICE_NAME, value: transhooter-translation-worker}
             {{- end }}
-          {{- if eq $component "spool-drainer" }}
-          readinessProbe: {exec: {command: [transhooter-spool-drainer-healthcheck]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
-          livenessProbe: {exec: {command: [transhooter-spool-drainer-healthcheck]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
-          {{- else }}
           readinessProbe: {exec: {command: [transhooter-worker-healthcheck]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
           livenessProbe: {exec: {command: [transhooter-worker-healthcheck]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
-          {{- end }}
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
           resources:
-            {{- toYaml (ternary $root.Values.resources.spoolDrainer $root.Values.resources.translationWorker (eq $component "spool-drainer")) | nindent 12 }}
+            {{- toYaml .Values.resources.translationWorker | nindent 12 }}
           volumeMounts:
             - {name: runtime-secrets, mountPath: /run/secrets, readOnly: true}
             - {name: internal-token, mountPath: /var/run/secrets/transhooter, readOnly: true}
@@ -89,32 +95,101 @@ spec:
           projected:
             sources:
               - secret:
-                  name: {{ $root.Values.existingSecret }}
+                  name: {{ .Values.existingSecret }}
                   items:
-                    {{- if eq $component "spool-drainer" }}
-                    - {key: s3-credentials, path: s3-credentials}
-                    - {key: spool-keyring, path: spool-keyring}
-                    {{- else }}
-                    - {key: database-url, path: database-url}
-                    - {key: redis-url, path: redis-url}
                     - {key: livekit-credentials, path: livekit-credentials}
-                    - {key: s3-credentials, path: s3-credentials}
                     - {key: spool-keyring, path: spool-keyring}
-                    {{- end }}
-              {{- if eq $component "translation-worker" }}
               - secret:
-                  name: {{ $root.Values.providerSecretName }}
+                  name: {{ .Values.providerSecretName }}
                   items:
-                    {{- range $root.Values.providerSecretKeys }}
+                    {{- range .Values.providerSecretKeys }}
                     - {key: {{ . | quote }}, path: {{ . | quote }}}
                     {{- end }}
-              {{- end }}
         - name: internal-token
           projected:
             sources:
-              - serviceAccountToken: {path: token, audience: {{ $root.Values.config.internalAudience | quote }}, expirationSeconds: 600}
+              - serviceAccountToken: {path: token, audience: {{ .Values.config.internalAudience | quote }}, expirationSeconds: 600}
         - name: spool
-          persistentVolumeClaim: {claimName: {{ $root.Values.spool.existingClaim }}}
+          persistentVolumeClaim: {claimName: {{ .Values.spool.existingClaim }}}
         - {name: tmp, emptyDir: {}}
 ---
-{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "transhooter.fullname" . }}-spool-drainer
+  labels:
+    {{- include "transhooter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas.spoolDrainer }}
+  selector:
+    matchLabels:
+      {{- include "transhooter.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: spool-drainer
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        transhooter.io/runtime-secret-revision: {{ .Values.rollout.runtimeSecretRevision | quote }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "transhooter.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: spool-drainer
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: {{ include "transhooter.fullname" . }}-spool-drainer
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: spool-drainer
+          image: {{ include "transhooter.image" .Values.images.spoolDrainer | quote }}
+          imagePullPolicy: {{ .Values.images.spoolDrainer.pullPolicy }}
+          command: [transhooter-spool-drainer]
+          env:
+            - {name: APP_ENV, value: {{ .Values.config.appEnv | quote }}}
+            - {name: S3_ENDPOINT, value: {{ .Values.config.s3Endpoint | quote }}}
+            - {name: S3_REGION, value: {{ .Values.config.s3Region | quote }}}
+            - {name: S3_BUCKET, value: {{ .Values.config.s3Bucket | quote }}}
+            - {name: S3_KMS_KEY_ID, value: {{ .Values.config.s3KmsKeyId | quote }}}
+            - {name: ARCHIVE_REQUIRE_KMS, value: {{ .Values.config.archiveRequireKms | quote }}}
+            - {name: S3_CREDENTIALS_FILE, value: /run/secrets/s3-credentials}
+            - {name: SPOOL_KEYRING_FILE, value: /run/secrets/spool-keyring}
+            - {name: CONTROL_INTERNAL_URL, value: {{ printf "http://%s-web:%v" (include "transhooter.fullname" .) .Values.service.port | quote }}}
+            - {name: SPOOL_PATH, value: /var/lib/transhooter/spool}
+            - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
+            {{- if .Values.telemetry.enabled }}
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ default (printf "http://%s-otel-collector:%v" (include "transhooter.fullname" .) .Values.telemetry.collector.ports.otlpHttp) .Values.telemetry.endpoint | quote }}}
+            - {name: OTEL_EXPORTER_OTLP_PROTOCOL, value: "http/protobuf"}
+            - {name: OTEL_TRACES_SAMPLER, value: parentbased_traceidratio}
+            - {name: OTEL_TRACES_SAMPLER_ARG, value: {{ .Values.telemetry.traceSampleRatio | quote }}}
+            - {name: OTEL_METRIC_EXPORT_INTERVAL, value: {{ .Values.telemetry.metricExportIntervalMillis | quote }}}
+            - {name: OTEL_RESOURCE_ATTRIBUTES, value: {{ printf "service.namespace=transhooter,deployment.environment.name=%s" .Values.config.appEnv | quote }}}
+            - {name: OTEL_SERVICE_NAME, value: transhooter-spool-drainer}
+            {{- end }}
+          readinessProbe: {exec: {command: [transhooter-spool-drainer-healthcheck]}, periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 12}
+          livenessProbe: {exec: {command: [transhooter-spool-drainer-healthcheck]}, periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 6}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources:
+            {{- toYaml .Values.resources.spoolDrainer | nindent 12 }}
+          volumeMounts:
+            - {name: runtime-secrets, mountPath: /run/secrets, readOnly: true}
+            - {name: internal-token, mountPath: /var/run/secrets/transhooter, readOnly: true}
+            - {name: spool, mountPath: /var/lib/transhooter/spool}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: runtime-secrets
+          secret:
+            secretName: {{ .Values.existingSecret }}
+            items:
+              - {key: s3-credentials, path: s3-credentials}
+              - {key: spool-keyring, path: spool-keyring}
+        - name: internal-token
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, audience: {{ .Values.config.internalAudience | quote }}, expirationSeconds: 600}
+        - name: spool
+          persistentVolumeClaim: {claimName: {{ .Values.spool.existingClaim }}}
+        - {name: tmp, emptyDir: {}}
+---

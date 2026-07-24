@@ -78,7 +78,12 @@ type InternalVerifierPrimitives = {
   };
 };
 
-const servicePermissions = Object.freeze({
+export const INTERNAL_SERVICE_DEFINITIONS = Object.freeze({
+  web: Object.freeze({
+    service: "web" as const,
+    token: null,
+    permissions: Object.freeze([]),
+  }),
   controlWorker: Object.freeze({
     service: "control-worker" as const,
     token: "controlWorker" as const,
@@ -92,32 +97,35 @@ const servicePermissions = Object.freeze({
   translationWorker: Object.freeze({
     service: "translation-worker" as const,
     token: "translationWorker" as const,
-    permissions: Object.freeze([
-      "capability:write",
-      "heartbeat:write",
-      "checkpoint:write",
-      "archive:finalize",
-      "failure:write",
-    ]),
+    permissions: Object.freeze(["capability:write", "heartbeat:write", "provider-attempt:write"]),
   }),
   spoolDrainer: Object.freeze({
     service: "spool-drainer" as const,
     token: "spoolDrainer" as const,
-    permissions: Object.freeze(["checkpoint:write", "archive:finalize"]),
+    permissions: Object.freeze([
+      "checkpoint:write",
+      "worker-recovery:read",
+      "worker-recovery:write",
+    ]),
   }),
   languageRefresh: Object.freeze({
     service: "language-refresh" as const,
     token: null,
     permissions: Object.freeze(["capability:write"]),
   }),
+  capabilityPublisher: Object.freeze({
+    service: "capability-publisher" as const,
+    token: null,
+    permissions: Object.freeze(["capability:write"]),
+  }),
 });
 
-function composeBearerRegistrations(
+export function composeBearerRegistrations(
   config: WebConfig,
   primitives: InternalVerifierPrimitives,
 ): BearerRegistration[] {
   const registrations: BearerRegistration[] = [];
-  for (const definition of Object.values(servicePermissions)) {
+  for (const definition of Object.values(INTERNAL_SERVICE_DEFINITIONS)) {
     if (definition.token === null) {
       continue;
     }
@@ -151,17 +159,39 @@ export function trustedClientIp(request: Request, boundary: ClientIpBoundary): s
   return address.toLowerCase();
 }
 
+export function kubernetesServiceAccountSubjects(
+  config: Pick<WebConfig, "podNamespace" | "internalServiceAccountPrefix">,
+) {
+  if (!config.podNamespace || !config.internalServiceAccountPrefix) {
+    throw new Error("Internal Kubernetes service account identity is not configured");
+  }
+  const prefix = `system:serviceaccount:${config.podNamespace}:${config.internalServiceAccountPrefix}-`;
+  return Object.fromEntries(
+    Object.values(INTERNAL_SERVICE_DEFINITIONS).map((definition) => [
+      `${prefix}${definition.service}`,
+      {
+        service: definition.service,
+        permissions: definition.permissions,
+      },
+    ]),
+  );
+}
+
 function kubernetesPrincipalVerifier(
   config: WebConfig,
   primitives: InternalVerifierPrimitives,
 ): InternalPrincipalVerifier {
-  if (!config.internalJwtIssuer || !config.internalJwtAudience || !config.podNamespace) {
+  if (
+    !config.internalJwtIssuer ||
+    !config.internalJwtAudience ||
+    !config.podNamespace ||
+    !config.internalServiceAccountPrefix
+  ) {
     throw new Error("Internal JWT verification is not configured");
   }
   const issuer = config.internalJwtIssuer;
   const audience = config.internalJwtAudience;
   const jwks = createRemoteJWKSet(new URL(`${issuer.replace(/\/$/, "")}/openid/v1/jwks`));
-  const prefix = `system:serviceaccount:${config.podNamespace}:`;
   const jwt: ServiceJwtVerifier = {
     async verify(token) {
       const verified = await jwtVerify(token, jwks, { issuer, audience });
@@ -181,16 +211,13 @@ function kubernetesPrincipalVerifier(
       };
     },
   };
-  const subjects = Object.fromEntries(
-    Object.values(servicePermissions).map((definition) => [
-      `${prefix}${definition.service}`,
-      {
-        service: definition.service,
-        permissions: definition.permissions,
-      },
-    ]),
+  return new KubernetesServiceAccountVerifier(
+    jwt,
+    issuer,
+    audience,
+    kubernetesServiceAccountSubjects(config),
+    primitives.clock,
   );
-  return new KubernetesServiceAccountVerifier(jwt, issuer, audience, subjects, primitives.clock);
 }
 
 function internalPrincipalVerifier(

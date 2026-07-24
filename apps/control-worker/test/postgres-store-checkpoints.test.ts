@@ -6,6 +6,7 @@ import {
 } from "../src/adapters/postgres-store/archives";
 import {
   capacityDimensions,
+  claimStaleReservations,
   completeRoomDrain,
   persistSupervisorTerminalCheckpoints,
 } from "../src/adapters/postgres-store/consultations";
@@ -40,6 +41,48 @@ function fakeTransaction(results: unknown[]) {
   };
   return { calls, transaction };
 }
+
+describe("PostgresStore stale reservation claims", () => {
+  it("leaves translation-worker reservations to the drainer while claiming other stale workers", async () => {
+    const nonTranslationReservation = {
+      consultation_id: RESERVATION.consultationId,
+      generation: RESERVATION.generation,
+      worker_id: "00000000-0000-4000-8000-000000000023",
+      epoch: BigInt(RESERVATION.epoch),
+      heartbeat_at: RESERVATION.heartbeatAt,
+      lease_expires_at: RESERVATION.leaseExpiresAt,
+      accepting_load: true,
+    };
+    const fake = fakeTransaction([[nonTranslationReservation]]);
+
+    const claimed = await claimStaleReservations(fake.transaction as never, {
+      owner: "00000000-0000-4000-8000-000000000024",
+      now: new Date("2026-01-01T00:01:00Z"),
+      leaseMs: 30_000,
+      limit: 10,
+    });
+
+    expect(claimed).toEqual([
+      {
+        consultationId: nonTranslationReservation.consultation_id,
+        generation: nonTranslationReservation.generation,
+        workerId: nonTranslationReservation.worker_id,
+        epoch: RESERVATION.epoch,
+        heartbeatAt: RESERVATION.heartbeatAt,
+        leaseExpiresAt: RESERVATION.leaseExpiresAt,
+        acceptingLoad: true,
+      },
+    ]);
+    expect(fake.calls).toHaveLength(1);
+    expect(fake.calls[0]?.text).toContain(
+      "JOIN consultations consultation ON consultation.id=reservation.consultation_id",
+    );
+    expect(fake.calls[0]?.text).toContain(
+      "reservation.worker_id IS DISTINCT FROM consultation.worker_identity",
+    );
+    expect(fake.calls[0]?.text).toContain("UPDATE worker_reservations r SET supervisor_owner");
+  });
+});
 
 describe("PostgresStore supervisor checkpoint settlement", () => {
   it("persists and verifies one terminal for each frozen direction", async () => {
@@ -281,6 +324,13 @@ describe("PostgresStore batched persistence contracts", () => {
     expect(fake.calls[0]?.text).toContain("FOR UPDATE SKIP LOCKED");
     expect(fake.calls[0]?.text).not.toContain("state='reconciling'");
     expect(fake.calls.filter((call) => call.text.includes("FROM archives"))).toHaveLength(1);
+    expect(fake.calls[1]?.text).toContain(
+      "JOIN worker_checkpoints checkpoint ON checkpoint.id=epoch.terminal_checkpoint_id",
+    );
+    expect(fake.calls[4]?.text).toContain(
+      "JOIN worker_checkpoints checkpoint ON checkpoint.id=epoch.terminal_checkpoint_id",
+    );
+    expect(fake.calls[4]?.text).not.toContain("ORDER BY created_at");
   });
 
   it("returns terminal archives from the primary locked lookup without a fallback query", async () => {

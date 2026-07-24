@@ -41,44 +41,35 @@ async function executeInternal(
         command.epoch,
       );
     case "internal.checkpoint":
-      authorizeInternal(principal, "checkpoint:write", ["translation-worker"]);
+      authorizeInternal(principal, "checkpoint:write", ["spool-drainer"]);
       return config.operations.checkpoint(command);
     case "internal.providerAttempt":
-      authorizeInternal(principal, "checkpoint:write", ["translation-worker"]);
+      authorizeInternal(principal, "provider-attempt:write", ["translation-worker"]);
       return config.operations.providerAttempt(command);
-    case "internal.failure":
-      authorizeInternal(principal, "failure:write", ["translation-worker"]);
-      return config.operations.workerFailure(command);
     case "internal.archiveObject":
-      authorizeInternal(principal, "checkpoint:write", ["translation-worker", "spool-drainer"]);
-      if (principal.service === "translation-worker") {
-        if (
-          command.generation === undefined ||
-          command.workerId === undefined ||
-          command.workerEpoch === undefined ||
-          command.writerEpoch === undefined
-        ) {
-          throw new DomainError("INVALID_WORKER_ARCHIVE_OBJECT");
-        }
-        return config.archives.recordWorkerObject(
-          command.consultationId,
-          {
-            generation: command.generation,
-            workerId: command.workerId,
-            workerEpoch: command.workerEpoch,
-          },
-          command.writerEpoch,
-          command.causalKey,
-          command.object,
-        );
-      }
-      return config.archives.recordDrainerObject(
+      authorizeInternal(principal, "checkpoint:write", ["spool-drainer"]);
+      return config.archives.recordSpoolObject(
         command.consultationId,
+        {
+          generation: command.generation,
+          workerId: command.workerId,
+          workerEpoch: command.workerEpoch,
+        },
+        command.writerEpoch,
         command.causalKey,
         command.object,
       );
+    case "internal.expiredWorkerEpochs":
+      authorizeInternal(principal, "worker-recovery:read", ["spool-drainer"]);
+      return config.operations.expiredWorkerEpochs();
+    case "internal.completeWorkerEpoch":
+      authorizeInternal(principal, "worker-recovery:write", ["spool-drainer"]);
+      return config.operations.completeWorkerEpoch(command);
+    case "internal.abandonWorkerEpoch":
+      authorizeInternal(principal, "worker-recovery:write", ["spool-drainer"]);
+      return config.operations.abandonWorkerEpoch(command);
     case "internal.finalize":
-      authorizeInternal(principal, "archive:finalize", ["translation-worker", "control-worker"]);
+      authorizeInternal(principal, "archive:finalize", ["control-worker"]);
       return config.archives.finalizeInventory(command.consultationId, command.inventory);
     case "internal.egressLayout":
       authorizeInternal(principal, "egress-layout:read", ["control-worker"]);

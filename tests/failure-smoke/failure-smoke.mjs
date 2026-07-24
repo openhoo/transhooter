@@ -4,7 +4,7 @@ import { emitProof, finalizeHarness } from "./harness/finalize.mjs";
 import { installRuntime } from "./harness/runtime.mjs";
 import { runControlScenarios } from "./harness/scenarios/control.mjs";
 import { runProviderScenarios } from "./harness/scenarios/provider.mjs";
-import { runSpoolScenarios } from "./harness/scenarios/spool.mjs";
+import { runSpoolDrainerScenarios, runSpoolScenarios } from "./harness/scenarios/spool.mjs";
 import { runStorageScenarios } from "./harness/scenarios/storage.mjs";
 import { installSettlement } from "./harness/settlement.mjs";
 import {
@@ -52,6 +52,7 @@ async function main() {
     await runControlScenarios(ctx, proof);
     await runProviderScenarios(ctx, proof);
     await runSpoolScenarios(ctx, proof);
+    await runSpoolDrainerScenarios(ctx, proof);
     await runStorageScenarios(ctx, proof);
 
     if (

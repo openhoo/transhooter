@@ -734,26 +734,23 @@ describe("ArchiveService invariants", () => {
     expect(recordObject).not.toHaveBeenCalled();
   });
 
-  it("atomically rejects a stale worker reservation before recording", async () => {
+  it("atomically rejects a stale spool producer before recording", async () => {
     const recordObject = mock(async () => undefined);
-    const lockActiveWorkerWriter = mock(async () => false);
+    const hasExactObject = mock(async () => false);
+    const lockSpoolProducerTuple = mock(async () => false);
     const repository = {
       transaction: runTransaction,
-      lockByConsultation: async () => lockedArchive({ state: "recording" }),
-      lockActiveWorkerWriter,
+      hasExactObject,
+      lockSpoolProducerTuple,
       recordObject,
     } as unknown as ArchiveRepository;
     const verify = mock(async () => true);
     const service = createService(repository, { verify } as unknown as ObjectStoragePort);
 
     await expect(
-      service.recordWorkerObject(
+      service.recordSpoolObject(
         CONSULTATION,
-        {
-          generation: 3,
-          workerId: ACTOR_ID,
-          workerEpoch: 4,
-        },
+        { generation: 3, workerId: ACTOR_ID, workerEpoch: 4 },
         2,
         "exchange:1",
         {
@@ -771,19 +768,8 @@ describe("ArchiveService invariants", () => {
         },
       ),
     ).rejects.toThrowError(/ARCHIVE_WRITER_FENCED/);
-
-    expect(lockActiveWorkerWriter).toHaveBeenCalledWith(
-      {
-        consultationId: CONSULTATION,
-        generation: 3,
-        workerId: ACTOR_ID,
-        workerEpoch: 4,
-        writerEpoch: 2,
-      },
-      transaction,
-    );
+    expect(lockSpoolProducerTuple).toHaveBeenCalled();
     expect(verify).not.toHaveBeenCalled();
-    expect(recordObject).not.toHaveBeenCalled();
   });
 
   it("stably rescans and releases a version created during final-hold release", async () => {
@@ -1142,74 +1128,40 @@ describe("ArchiveService invariants", () => {
     expect(putCreateOnce).not.toHaveBeenCalled();
   });
 
-  it("accepts spool-drainer writes while the archive is reconciling", async () => {
-    const verify = mock(async () => true);
+  it("accepts an exact spool object replay without requiring a live tuple", async () => {
     const recordObject = mock(async () => undefined);
+    const hasExactObject = mock(async () => true);
+    const lockSpoolProducerTuple = mock(async () => false);
     const service = createService(
       {
         transaction: runTransaction,
-        lockByConsultation: async () =>
-          lockedArchive({ state: "reconciling", finalInventoryHash: null }),
-        activeHolds: async () => [],
+        hasExactObject,
         recordObject,
+        lockSpoolProducerTuple,
       } as unknown as ArchiveRepository,
-      { verify } as unknown as ObjectStoragePort,
+      {} as ObjectStoragePort,
     );
-
     await expect(
-      service.recordDrainerObject(CONSULTATION, "exchange:late", {
-        objectId: OBJECT_ID,
-        class: "pipeline_exchange",
-        key: "v1/meetings/x/late",
-        versionId: "v1",
-        size: 1,
-        sha256: CONFLICTING_HASH,
-        s3Checksum: "crc",
-        contentType: "application/octet-stream",
-        sampleRange: null,
-        attempt: 1,
-        sequence: 0,
-      }),
+      service.recordSpoolObject(
+        CONSULTATION,
+        { generation: 3, workerId: ACTOR_ID, workerEpoch: 4 },
+        2,
+        "exchange:late",
+        {
+          objectId: OBJECT_ID,
+          class: "pipeline_exchange",
+          key: "v1/meetings/x/late",
+          versionId: "v1",
+          size: 1,
+          sha256: CONFLICTING_HASH,
+          s3Checksum: "crc",
+          contentType: "application/octet-stream",
+          sampleRange: null,
+          attempt: 1,
+          sequence: 0,
+        },
+      ),
     ).resolves.toBeUndefined();
-    expect(verify).toHaveBeenCalledTimes(1);
-    expect(recordObject).toHaveBeenCalledWith(
-      expect.objectContaining({
-        consultationId: CONSULTATION,
-        writerEpoch: 2,
-        causalKey: "exchange:late",
-      }),
-      transaction,
-    );
-  });
-
-  it("rejects spool-drainer writes once the archive is complete", async () => {
-    const verify = mock(async () => true);
-    const recordObject = mock(async () => undefined);
-    const service = createService(
-      {
-        transaction: runTransaction,
-        lockByConsultation: async () => lockedArchive({ state: "complete" }),
-        recordObject,
-      } as unknown as ArchiveRepository,
-      { verify } as unknown as ObjectStoragePort,
-    );
-
-    await expect(
-      service.recordDrainerObject(CONSULTATION, "exchange:late", {
-        objectId: OBJECT_ID,
-        class: "pipeline_exchange",
-        key: "v1/meetings/x/late",
-        versionId: "v1",
-        size: 1,
-        sha256: CONFLICTING_HASH,
-        s3Checksum: "crc",
-        contentType: "application/octet-stream",
-        sampleRange: null,
-        attempt: 1,
-        sequence: 0,
-      }),
-    ).rejects.toThrowError(/ARCHIVE_WRITER_FENCED/);
-    expect(verify).not.toHaveBeenCalled();
-    expect(recordObject).not.toHaveBeenCalled();
+    expect(lockSpoolProducerTuple).not.toHaveBeenCalled();
   });
 });

@@ -397,7 +397,7 @@ model WorkerCheckpoint {
   destinationParticipant   ConsultationParticipant  @relation("WorkerCheckpointDestinationParticipant", fields: [consultationId, destinationParticipantId], references: [consultationId, id], map: "worker_checkpoints_destination_participant_fkey")
   terminalForJobEpochs     WorkerJobEpoch[]
 
-  @@unique([consultationId, workerEpoch, sourceParticipantId, destinationParticipantId, acceptedInputSequence, acceptedInput, receivedOutput, emittedOutput], map: "worker_checkpoints_direction_watermarks_key")
+  @@unique([consultationId, workerEpoch, sourceParticipantId, destinationParticipantId, acceptedInputSequence, acceptedInput, receivedOutput, emittedOutput, terminal], map: "worker_checkpoints_direction_watermarks_key")
   @@map("worker_checkpoints")
 }
 

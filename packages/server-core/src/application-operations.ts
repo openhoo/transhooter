@@ -98,17 +98,39 @@ export interface CheckpointInput {
   checkpoint: WorkerCheckpoint;
 }
 
-export interface WorkerFailureInput {
+export interface WorkerEpochTuple {
   consultationId: UUID;
   generation: number;
   workerId: UUID;
   epoch: number;
-  eventId: UUID;
-  kindName: string;
+  writeEpoch: number;
+}
+
+export interface WorkerTerminalFailure {
+  kind: string;
   message: string;
-  phase?: string;
-  snapshotHash?: string;
+  phase?: string | undefined;
+  snapshotHash?: string | undefined;
   lastCheckpointHashes: Readonly<Record<UUID, string>>;
+}
+
+export interface CompleteWorkerEpochInput extends WorkerEpochTuple {
+  completionEventId: UUID;
+  outcome: "clean" | "failed";
+  terminalCheckpoints: readonly [
+    { checkpointId: UUID; checkpointHash: string },
+    { checkpointId: UUID; checkpointHash: string },
+  ];
+  failure: WorkerTerminalFailure | null;
+}
+
+export interface AbandonWorkerEpochInput extends WorkerEpochTuple {
+  abandonmentEventId: UUID;
+  sealId?: UUID | undefined;
+  completionEventId?: UUID | undefined;
+  reason: string;
+  handoffDigest: string;
+  permanentOutcomeDigest: string;
 }
 
 export interface ProviderAttemptInput {
@@ -155,7 +177,9 @@ export interface ApplicationOperations {
   ): Promise<boolean>;
   checkpoint(input: CheckpointInput): Promise<boolean>;
   providerAttempt(input: ProviderAttemptInput): Promise<boolean>;
-  workerFailure(input: WorkerFailureInput): Promise<boolean>;
+  expiredWorkerEpochs(): Promise<readonly WorkerEpochTuple[]>;
+  completeWorkerEpoch(input: CompleteWorkerEpochInput): Promise<boolean>;
+  abandonWorkerEpoch(input: AbandonWorkerEpochInput): Promise<boolean>;
 }
 
 export class PrismaApplicationOperations implements ApplicationOperations {
@@ -254,7 +278,15 @@ export class PrismaApplicationOperations implements ApplicationOperations {
     return this.workers.providerAttempt(input);
   }
 
-  workerFailure(input: WorkerFailureInput): Promise<boolean> {
-    return this.workers.workerFailure(input);
+  expiredWorkerEpochs(): Promise<readonly WorkerEpochTuple[]> {
+    return this.workers.expiredWorkerEpochs();
+  }
+
+  completeWorkerEpoch(input: CompleteWorkerEpochInput): Promise<boolean> {
+    return this.workers.completeWorkerEpoch(input);
+  }
+
+  abandonWorkerEpoch(input: AbandonWorkerEpochInput): Promise<boolean> {
+    return this.workers.abandonWorkerEpoch(input);
   }
 }

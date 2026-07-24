@@ -23,11 +23,14 @@ mock.module("../components/room.module.css", () => ({ default: {} }));
 
 // Import after replacing Next's request guards so the server boundary can run in Bun.
 const {
-  parseRequestPayload,
+  abandonWorkerEpochCommand,
   adminLanguageUpdateCommand,
   archiveDeleteCommand,
+  archiveObjectCommand,
+  completeWorkerEpochCommand,
   consultationCreateCommand,
   normalizeAuthFlowError,
+  parseRequestPayload,
   present,
   presentArchiveObjects,
   presentConsultationEnd,
@@ -35,14 +38,23 @@ const {
   presentLanguages,
   providerAttemptCommand,
   statusFor,
-  workerFailureCommand,
 } = await import("./server-application");
 const { startFinalizationPolling, startShutdownCountdown } = await import(
   "../components/consultation-room"
 );
 const { DomainError } = await import("@transhooter/server-core");
-const { trustedClientIp } = await import("./server/composition");
+const { composeBearerRegistrations, kubernetesServiceAccountSubjects, trustedClientIp } =
+  await import("./server/composition");
 const { POST: heartbeatPOST } = await import("../app/api/internal/heartbeat/route");
+const { GET: expiredWorkerEpochsGET } = await import(
+  "../app/api/internal/worker-epochs/expired/route"
+);
+const { POST: completeWorkerEpochPOST } = await import(
+  "../app/api/internal/worker-epochs/complete/route"
+);
+const { POST: abandonWorkerEpochPOST } = await import(
+  "../app/api/internal/worker-epochs/abandon/route"
+);
 const { createRoute } = await import("../app/api/_route");
 const { WEB_OPERATIONS, boundedWebOperation, isWebOperation } = await import(
   "./server/web-operations"
@@ -113,6 +125,134 @@ test("provider attempt command rejects envelope extras and inconsistent reports"
       report: { ...report, outcome: "failed", error: null },
     }),
   ).toThrow();
+});
+
+const workerEpochTuple = {
+  consultationId: envelope.consultationId,
+  generation: 3,
+  workerId: envelope.workerId,
+  epoch: 2,
+  writeEpoch: 5,
+};
+const terminalCheckpoints = [
+  {
+    checkpointId: "00000000-0000-4000-8000-000000000009",
+    checkpointHash: "c".repeat(64),
+  },
+  {
+    checkpointId: "00000000-0000-4000-8000-00000000000a",
+    checkpointHash: "d".repeat(64),
+  },
+] as const;
+
+test("archive object command requires the complete producer tuple", () => {
+  const object = {
+    objectId: "00000000-0000-4000-8000-00000000000b",
+    class: "checkpoint" as const,
+    key: `v1/meetings/${workerEpochTuple.consultationId}/inventory/checkpoints/object.json`,
+    versionId: "version-1",
+    size: 128,
+    sha256: "e".repeat(64),
+    s3Checksum: "checksum",
+    contentType: "application/json",
+    sampleRange: null,
+    attempt: null,
+    sequence: null,
+  };
+  const payload = {
+    consultationId: workerEpochTuple.consultationId,
+    generation: workerEpochTuple.generation,
+    workerId: workerEpochTuple.workerId,
+    epoch: workerEpochTuple.epoch,
+    writerEpoch: workerEpochTuple.writeEpoch,
+    causalKey: object.objectId,
+    object,
+  };
+  expect(archiveObjectCommand(payload)).toEqual({
+    kind: "internal.archiveObject",
+    consultationId: workerEpochTuple.consultationId,
+    generation: workerEpochTuple.generation,
+    workerId: workerEpochTuple.workerId,
+    workerEpoch: workerEpochTuple.epoch,
+    writerEpoch: workerEpochTuple.writeEpoch,
+    causalKey: object.objectId,
+    object,
+  });
+
+  for (const field of ["generation", "workerId", "epoch", "writerEpoch"] as const) {
+    const incomplete: Record<string, unknown> = { ...payload };
+    delete incomplete[field];
+    expect(() => archiveObjectCommand(incomplete)).toThrow();
+  }
+  expect(() => archiveObjectCommand({ ...payload, unauthenticatedTuple: true })).toThrow();
+});
+
+test("worker epoch completion parser preserves the sealed terminal pair and failure", () => {
+  const completionEventId = "00000000-0000-4000-8000-00000000000c";
+  const failure = {
+    kind: "SpoolUnavailable",
+    message: "terminal evidence delivery failed",
+    phase: "preservation",
+    snapshotHash: "f".repeat(64),
+    lastCheckpointHashes: {
+      [terminalCheckpoints[0].checkpointId]: terminalCheckpoints[0].checkpointHash,
+      [terminalCheckpoints[1].checkpointId]: terminalCheckpoints[1].checkpointHash,
+    },
+  };
+  expect(
+    completeWorkerEpochCommand({
+      ...workerEpochTuple,
+      completionEventId,
+      outcome: "failed",
+      terminalCheckpoints,
+      failure,
+    }),
+  ).toEqual({
+    kind: "internal.completeWorkerEpoch",
+    ...workerEpochTuple,
+    completionEventId,
+    outcome: "failed",
+    terminalCheckpoints,
+    failure,
+  });
+  expect(() =>
+    completeWorkerEpochCommand({
+      ...workerEpochTuple,
+      completionEventId,
+      outcome: "clean",
+      terminalCheckpoints,
+      failure,
+    }),
+  ).toThrow();
+  expect(() =>
+    completeWorkerEpochCommand({
+      ...workerEpochTuple,
+      completionEventId,
+      outcome: "clean",
+      terminalCheckpoints: [terminalCheckpoints[0], terminalCheckpoints[0]],
+      failure: null,
+    }),
+  ).toThrow();
+});
+test("worker epoch abandonment parser preserves deterministic recovery evidence", () => {
+  const request = {
+    ...workerEpochTuple,
+    abandonmentEventId: "00000000-0000-4000-8000-00000000000d",
+    sealId: "00000000-0000-4000-8000-00000000000e",
+    completionEventId: "00000000-0000-4000-8000-00000000000f",
+    reason: "  permanent checkpoint registration conflict  ",
+    handoffDigest: "1".repeat(64),
+    permanentOutcomeDigest: "2".repeat(64),
+  };
+  expect(abandonWorkerEpochCommand(request)).toEqual({
+    kind: "internal.abandonWorkerEpoch",
+    ...request,
+    reason: "permanent checkpoint registration conflict",
+  });
+  expect(() =>
+    abandonWorkerEpochCommand({ ...request, permanentOutcomeDigest: "not-a-digest" }),
+  ).toThrow();
+  expect(() => abandonWorkerEpochCommand({ ...request, extra: "untrusted" })).toThrow();
 });
 
 test("archive deletion command requires and preserves a non-blank reason", () => {
@@ -641,6 +781,20 @@ test("native heartbeat route classifies invalid UTF-8 JSON bodies as HTTP 400", 
   });
 });
 
+test("expired worker epoch response exposes only exact recovery tuples", async () => {
+  const context = {} as Parameters<typeof present>[2];
+  await expect(
+    present("internal.expiredWorkerEpochs", [workerEpochTuple], context),
+  ).resolves.toEqual([workerEpochTuple]);
+  await expect(
+    present(
+      "internal.expiredWorkerEpochs",
+      [{ ...workerEpochTuple, leaseExpiresAt: new Date() }],
+      context,
+    ),
+  ).rejects.toThrow();
+});
+
 test("web operation registry is authoritative and bounds external telemetry labels", () => {
   expect(new Set(WEB_OPERATIONS).size).toBe(WEB_OPERATIONS.length);
   for (const operation of WEB_OPERATIONS) {
@@ -649,6 +803,78 @@ test("web operation registry is authoritative and bounds external telemetry labe
   }
   expect(isWebOperation("external.user-controlled-operation")).toBe(false);
   expect(boundedWebOperation("external.user-controlled-operation")).toBe("unknown");
+});
+
+test("worker recovery routes expose the approved operation mapping and methods", async () => {
+  const invalidJson = new Uint8Array([0xff]);
+  const expiredResponse = await expiredWorkerEpochsGET(
+    new Request("http://localhost/api/internal/worker-epochs/expired"),
+  );
+  const completeResponse = await completeWorkerEpochPOST(
+    new Request("http://localhost/api/internal/worker-epochs/complete", {
+      method: "POST",
+      body: invalidJson,
+    }),
+  );
+  const abandonResponse = await abandonWorkerEpochPOST(
+    new Request("http://localhost/api/internal/worker-epochs/abandon", {
+      method: "POST",
+      body: invalidJson,
+    }),
+  );
+
+  expect(expiredResponse.status).toBe(400);
+  expect(await expiredResponse.json()).toMatchObject({ code: "INVALID_REQUEST" });
+  expect(completeResponse.status).toBe(400);
+  expect(abandonResponse.status).toBe(400);
+});
+
+test("internal service permissions match role ownership", () => {
+  const config = {
+    internalTokens: {
+      controlWorker: "control-token",
+      translationWorker: "translation-token",
+      spoolDrainer: "drainer-token",
+    },
+  } as Parameters<typeof composeBearerRegistrations>[0];
+  const registrations = composeBearerRegistrations(config, {
+    hashing: { sha256: (value) => `hash:${String(value)}` },
+    clock: { now: () => new Date(0) },
+  });
+  expect(
+    Object.fromEntries(registrations.map(({ service, permissions }) => [service, permissions])),
+  ).toEqual({
+    "control-worker": [
+      "egress-layout:read",
+      "archive:recording",
+      "archive:finalize",
+      "delete:drain",
+    ],
+    "translation-worker": ["capability:write", "heartbeat:write", "provider-attempt:write"],
+    "spool-drainer": ["checkpoint:write", "worker-recovery:read", "worker-recovery:write"],
+  });
+});
+
+test("Kubernetes subjects include the configured fullname prefix for every service", () => {
+  expect(
+    Object.keys(
+      kubernetesServiceAccountSubjects({
+        podNamespace: "consultations",
+        internalServiceAccountPrefix: "custom-transhooter",
+      }),
+    ).sort(),
+  ).toEqual(
+    [
+      "web",
+      "control-worker",
+      "translation-worker",
+      "spool-drainer",
+      "language-refresh",
+      "capability-publisher",
+    ]
+      .map((component) => `system:serviceaccount:consultations:custom-transhooter-${component}`)
+      .sort(),
+  );
 });
 
 test("application failure logs identify the operation without exposing error or request data", async () => {
@@ -736,30 +962,11 @@ test("exchange failures expose one invalid, expired, or used response shape", ()
   expect(normalizeAuthFlowError("consultations.list", unrelated)).toBe(unrelated);
 });
 
-test("worker failure parser preserves the authenticated fencing envelope", () => {
-  const failure = {
-    consultationId: envelope.consultationId,
-    generation: 3,
-    workerId: envelope.workerId,
-    epoch: 2,
-    eventId: envelope.eventId,
-    kind: "SpoolUnavailable",
-    message: "fsync failed",
-    lastCheckpointHashes: {
-      "00000000-0000-4000-8000-000000000009": "a".repeat(64),
-    },
-  };
-  expect(workerFailureCommand(failure)).toEqual({
-    kind: "internal.failure",
-    kindName: "SpoolUnavailable",
-    consultationId: failure.consultationId,
-    generation: failure.generation,
-    workerId: failure.workerId,
-    epoch: failure.epoch,
-    eventId: failure.eventId,
-    message: failure.message,
-    lastCheckpointHashes: failure.lastCheckpointHashes,
-  });
+test("removed worker failure surface is absent from the web operation registry", () => {
+  expect(isWebOperation("internal.failure")).toBe(false);
+  expect(WEB_OPERATIONS).toContain("internal.expiredWorkerEpochs");
+  expect(WEB_OPERATIONS).toContain("internal.completeWorkerEpoch");
+  expect(WEB_OPERATIONS).toContain("internal.abandonWorkerEpoch");
 });
 
 test("rate limiter ignores caller forwarding headers in direct-local mode", () => {

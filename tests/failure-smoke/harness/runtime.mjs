@@ -36,24 +36,63 @@ export function installRuntime(ctx) {
     ownerLeaseMs,
     faultFile,
     workerScenarioFile,
+    spoolDrainerScenarioFile,
     consultationRuns,
     trackedConsultations,
   } = ctx;
   const settleConsultations = (...args) => ctx.settleConsultations(...args);
   const isCleanSettlement = (...args) => ctx.isCleanSettlement(...args);
   const consultationEvidence = (...args) => ctx.consultationEvidence(...args);
-  function checkpointDeliveries(meetingId) {
-    const spool = new Database("/var/lib/transhooter/spool/journal.sqlite3", { readonly: true });
+  function spoolDatabase() {
+    return new Database("/var/lib/transhooter/spool/journal.sqlite3", { readonly: true });
+  }
+  function checkpointDeliveries(spool, meetingId) {
+    return spool
+      .query(
+        `SELECT d.checkpoint_id AS checkpointId, d.control_event_id AS controlEventId,
+          d.delivery_state AS deliveryState, d.error_kind AS errorKind,
+          r.ordinal AS recordOrdinal
+        FROM checkpoint_deliveries d
+        JOIN records r ON r.object_id = d.record_id
+        WHERE d.meeting_id = ?
+        ORDER BY r.ordinal, d.checkpoint_id`,
+      )
+      .all(meetingId);
+  }
+  function spoolConsultationState(meetingId) {
+    const spool = spoolDatabase();
     try {
-      return spool
-        .query(
-          `SELECT checkpoint_id AS checkpointId, control_event_id AS controlEventId,
-            acknowledged
-          FROM checkpoint_deliveries
-          WHERE meeting_id = ?
-          ORDER BY checkpoint_id`,
-        )
-        .all(meetingId);
+      return spool.transaction(() => {
+        const handoffs = spool
+          .query(
+            `SELECT meeting_id AS meetingId, generation, worker_id AS workerId,
+              worker_epoch AS workerEpoch, write_epoch AS writeEpoch, state, reason
+            FROM consultation_handoffs WHERE meeting_id = ?`,
+          )
+          .all(meetingId);
+        const seals = spool
+          .query(
+            `SELECT seal_id AS sealId, terminal_outcome AS terminalOutcome,
+              evidence_ordinal AS evidenceOrdinal, completion_event_id AS completionEventId,
+              completion_state AS completionState
+            FROM consultation_seals WHERE meeting_id = ?`,
+          )
+          .all(meetingId);
+        const failedRecords = spool
+          .query(
+            `SELECT stage, state, error_kind AS errorKind, ordinal
+            FROM records
+            WHERE meeting_id = ? AND state IN ('permanent', 'quarantined')
+            ORDER BY ordinal`,
+          )
+          .all(meetingId);
+        return {
+          handoffs,
+          seals,
+          failedRecords,
+          checkpoints: checkpointDeliveries(spool, meetingId),
+        };
+      })();
     } finally {
       spool.close();
     }
@@ -355,7 +394,11 @@ export function installRuntime(ctx) {
       }
       const consultations = { ...(current.consultations ?? {}) };
       if (consultationId) {
-        consultations[consultationId] = value;
+        if (value === null) {
+          delete consultations[consultationId];
+        } else {
+          consultations[consultationId] = value;
+        }
       } else {
         for (const ownedId of trackedConsultations) delete consultations[ownedId];
       }
@@ -415,6 +458,7 @@ export function installRuntime(ctx) {
     if (expiredIds.size > 0) {
       await deleteConsultationsFromMap(faultFile, expiredIds);
       await deleteConsultationsFromMap(workerScenarioFile, expiredIds);
+      await deleteConsultationsFromMap(spoolDrainerScenarioFile, expiredIds);
       await persistOwnerLease();
       await settleConsultations(expiredIds);
       await Promise.all(expiredPaths.map((path) => rm(path, { force: true })));
@@ -434,6 +478,17 @@ export function installRuntime(ctx) {
             holdAfterRemoteSuccess: faults.holdAfterRemoteSuccess ?? [],
           }
         : null,
+    );
+  }
+  async function spoolDrainerScenarioEntry(consultationId) {
+    const document = JSON.parse(await readFile(spoolDrainerScenarioFile, "utf8"));
+    return document.consultations?.[consultationId] ?? null;
+  }
+  async function setSpoolDrainerScenario(consultationId = null, scenario = null) {
+    await updateConsultationMap(
+      spoolDrainerScenarioFile,
+      consultationId,
+      consultationId ? scenario : null,
     );
   }
 
@@ -470,5 +525,8 @@ export function installRuntime(ctx) {
     reapExpiredOwners,
     setFaults,
     setWorkerScenario,
+    setSpoolDrainerScenario,
+    spoolDrainerScenarioEntry,
+    spoolConsultationState,
   });
 }

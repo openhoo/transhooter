@@ -767,6 +767,7 @@ describe("ApplicationOperations typed views", () => {
 
   it("continues an output-only chain from its unique structural head when input watermarks tie", async () => {
     const outputOnly = createSequentialOperations([
+      [],
       [{ id: "00000000-0000-4000-8000-000000000032" }],
     ]);
 
@@ -838,7 +839,7 @@ describe("ApplicationOperations typed views", () => {
     ).rejects.toThrow("CHECKPOINT_CONFLICT");
   });
 
-  it("accepts terminal checkpoints in either direction and settles only after both exist", async () => {
+  it("stores terminal checkpoints without implicitly settling the worker epoch", async () => {
     const terminalCheckpoint = {
       checkpointId: "00000000-0000-4000-8000-000000000031",
       workerEpoch: 2,
@@ -864,29 +865,13 @@ describe("ApplicationOperations typed views", () => {
       objectKey: "v1/checkpoint.json",
       checkpoint: terminalCheckpoint,
     };
-
-    const firstDirection = createSequentialOperations([[{ id: terminalCheckpoint.checkpointId }]]);
-    await expect(firstDirection.operations.checkpoint(input)).resolves.toBe(true);
-    expect(firstDirection.queryRaw).toHaveBeenCalledTimes(3);
-    expect(firstDirection.executeRaw).toHaveBeenCalledTimes(1);
-
-    const reverseDirection = createSequentialOperations([
-      [{ id: "00000000-0000-4000-8000-000000000032" }],
-    ]);
-    await expect(
-      reverseDirection.operations.checkpoint({
-        ...input,
-        checkpoint: {
-          ...terminalCheckpoint,
-          checkpointId: "00000000-0000-4000-8000-000000000032",
-          sourceParticipantId: terminalCheckpoint.destinationParticipantId,
-          destinationParticipantId: terminalCheckpoint.sourceParticipantId,
-          highWatermarkSha256: "e".repeat(64),
-        },
-      }),
-    ).resolves.toBe(true);
-    expect(reverseDirection.queryRaw).toHaveBeenCalledTimes(3);
-    expect(reverseDirection.executeRaw).toHaveBeenCalledTimes(1);
+    const stored = createSequentialOperations([[], [{ id: terminalCheckpoint.checkpointId }]]);
+    await expect(stored.operations.checkpoint(input)).resolves.toBe(true);
+    expect(stored.executeRaw).not.toHaveBeenCalled();
+    const insert = stored.queryRaw.mock.calls.find(([statement]) =>
+      inspectSql(statement).text.includes("INSERT INTO worker_checkpoints"),
+    )?.[0];
+    expect(inspectSql(insert).text).not.toContain("UPDATE worker_job_epochs");
   });
   it("serializes concurrent directional appends and rejects a stale committed head", async () => {
     let tail = Promise.resolve();
@@ -986,8 +971,8 @@ describe("ApplicationOperations typed views", () => {
     expect(String(rejected?.reason)).toContain("CHECKPOINT_CONFLICT");
   });
 
-  it("accepts an exact terminal replay after clean two-direction settlement", async () => {
-    const replayed = createSequentialOperations([[], [{ "?column?": 1 }]]);
+  it("accepts an exact terminal replay after explicit completion", async () => {
+    const replayed = createSequentialOperations([[{ "?column?": 1 }]]);
 
     await expect(
       replayed.operations.checkpoint({
@@ -1015,16 +1000,8 @@ describe("ApplicationOperations typed views", () => {
         },
       }),
     ).resolves.toBe(true);
-    expect(replayed.queryRaw).toHaveBeenCalledTimes(4);
-    expect(replayed.executeRaw).toHaveBeenCalledTimes(1);
-
-    const replayStatement = replayed.queryRaw.mock.calls.find(([statement]) =>
-      inspectSql(statement).text.startsWith("SELECT 1 FROM worker_checkpoints checkpoint"),
-    )?.[0];
-    const replaySql = inspectSql(replayStatement).text;
-    expect(replaySql).toContain("job.terminal_outcome='clean'");
-    expect(replaySql).toContain("consultation.generation=checkpoint.generation");
-    expect(replaySql).toContain("reservation.fenced_at IS NULL");
+    expect(replayed.queryRaw).toHaveBeenCalledTimes(1);
+    expect(replayed.executeRaw).not.toHaveBeenCalled();
   });
   it("rejects an old-generation or inactive-job checkpoint replay", async () => {
     const operations = createSequentialOperations([[], []]);
@@ -1057,14 +1034,14 @@ describe("ApplicationOperations typed views", () => {
     ).rejects.toThrow("CHECKPOINT_CONFLICT");
   });
 
-  it("leaves explicit worker failure eligible for supervisor checkpoint settlement", async () => {
+  it("round-trips canonical completion through audit details and exact replay", async () => {
     const queryRaw = mock(async (statement: Prisma.Sql) => {
       const query = inspectSql(statement).text;
-      if (query.startsWith("SELECT 1 FROM outbox")) {
+      if (query.startsWith("SELECT 1 FROM audit_events")) {
         return [];
       }
       if (query.startsWith("WITH locked AS")) {
-        return [{ generation: 4 }];
+        return [{ terminal_at: new Date("2026-01-01T00:00:00Z"), next_generation: 3 }];
       }
       return [];
     });
@@ -1081,29 +1058,114 @@ describe("ApplicationOperations typed views", () => {
       {} as never,
       { now: () => new Date("2026-01-01T00:00:00Z") },
     );
+    const input = {
+      consultationId: "00000000-0000-4000-8000-000000000021",
+      generation: 3,
+      workerId: "00000000-0000-4000-8000-000000000022",
+      epoch: 2,
+      writeEpoch: 4,
+      completionEventId: "00000000-0000-4000-8000-000000000023",
+      outcome: "clean" as const,
+      terminalCheckpoints: [
+        { checkpointId: "00000000-0000-4000-8000-000000000031", checkpointHash: "a".repeat(64) },
+        { checkpointId: "00000000-0000-4000-8000-000000000032", checkpointHash: "b".repeat(64) },
+      ] as const,
+      failure: null,
+    };
+    await expect(operations.completeWorkerEpoch(input)).resolves.toBe(true);
+    const audit = executeRaw.mock.calls.find(([statement]) =>
+      inspectSql(statement).text.startsWith("INSERT INTO audit_events"),
+    )?.[0];
+    const inspected = inspectSql(audit);
+    expect(inspected.values).toContain(JSON.stringify(input));
+    const completion = queryRaw.mock.calls
+      .map(([statement]) => inspectSql(statement))
+      .find(({ text }) => text.startsWith("WITH locked AS"));
+    expect(completion?.text).toContain(
+      "(direction->>'sourceParticipantId')::uuid=checkpoint.source_participant_id",
+    );
+    expect(completion?.text).toContain(
+      "(direction->>'destinationParticipantId')::uuid=checkpoint.destination_participant_id",
+    );
 
-    await expect(
-      operations.workerFailure({
+    const replayQuery = mock(async (_statement: Prisma.Sql) => [{ "?column?": 1 }]);
+    const replay = new PrismaApplicationOperations(
+      {
+        $transaction: async <T>(callback: (transaction: Prisma.TransactionClient) => Promise<T>) =>
+          callback({ $queryRaw: replayQuery } as unknown as Prisma.TransactionClient),
+      } as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date() },
+    );
+    await expect(replay.completeWorkerEpoch(input)).resolves.toBe(true);
+    expect(replayQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires exact canonical abandonment details for replay", async () => {
+    const queryRaw = mock(async (_statement: Prisma.Sql) => [{ "?column?": 1 }]);
+    const operations = new PrismaApplicationOperations(
+      {
+        $transaction: async <T>(callback: (transaction: Prisma.TransactionClient) => Promise<T>) =>
+          callback({ $queryRaw: queryRaw } as unknown as Prisma.TransactionClient),
+      } as unknown as PrismaClient,
+      {} as never,
+      { now: () => new Date() },
+    );
+    const input = {
+      consultationId: "00000000-0000-4000-8000-000000000021",
+      generation: 3,
+      workerId: "00000000-0000-4000-8000-000000000022",
+      epoch: 2,
+      writeEpoch: 4,
+      abandonmentEventId: "00000000-0000-4000-8000-000000000024",
+      reason: "relinquished after producer exit",
+      handoffDigest: "c".repeat(64),
+      permanentOutcomeDigest: "d".repeat(64),
+    };
+    await expect(operations.abandonWorkerEpoch(input)).resolves.toBe(true);
+    const inspected = inspectSql(queryRaw.mock.calls[0]?.[0]);
+    expect(inspected.text).toContain("kind='worker.epoch_abandoned'");
+    expect(inspected.values).toContain(JSON.stringify(input));
+  });
+
+  it("lists only expired exact producer tuples", async () => {
+    const { operations, queryRaw } = createOperations([
+      {
+        consultation_id: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        worker_id: "00000000-0000-4000-8000-000000000022",
+        epoch: 2n,
+        write_epoch: 4,
+      },
+    ]);
+    await expect(operations.expiredWorkerEpochs()).resolves.toEqual([
+      {
         consultationId: "00000000-0000-4000-8000-000000000021",
         generation: 3,
         workerId: "00000000-0000-4000-8000-000000000022",
         epoch: 2,
-        eventId: "00000000-0000-4000-8000-000000000023",
-        kindName: "spool_unwritable",
-        message: "fsync failed",
-        lastCheckpointHashes: {},
-      }),
-    ).resolves.toBe(true);
+        writeEpoch: 4,
+      },
+    ]);
+    expect(inspectSql(queryRaw.mock.calls[0]?.[0]).text).toContain(
+      "reservation.lease_expires_at < now()",
+    );
+  });
 
-    const admissionStatement = queryRaw.mock.calls.find(([statement]) =>
-      inspectSql(statement).text.startsWith("WITH locked AS"),
-    )?.[0];
-    const admissionSql = inspectSql(admissionStatement).text;
-    expect(admissionSql).toContain("lease_expires_at=?");
-    expect(admissionSql).toContain("accepting_load=false");
-    expect(admissionSql).not.toContain("released_at=");
-    expect(admissionSql).not.toContain("archive_state");
-    expect(admissionSql).not.toContain("terminal_at=");
+  it("rejects expired worker epochs outside the JavaScript safe integer range", async () => {
+    const { operations } = createOperations([
+      {
+        consultation_id: "00000000-0000-4000-8000-000000000021",
+        generation: 3,
+        worker_id: "00000000-0000-4000-8000-000000000022",
+        epoch: BigInt(Number.MAX_SAFE_INTEGER) + 1n,
+        write_epoch: 4,
+      },
+    ]);
+
+    await expect(operations.expiredWorkerEpochs()).rejects.toThrow(
+      "worker_reservations.epoch is outside the JavaScript safe integer range",
+    );
   });
 });
 

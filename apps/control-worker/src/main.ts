@@ -223,6 +223,7 @@ async function runLoop(
           level: "error",
           loop: name,
           "error.kind": errorKind,
+          "error.type": error instanceof Error ? error.name : "unknown",
         }),
       );
       await sleep(Math.max(pollIntervalMs, 1_000), signal);

@@ -385,7 +385,7 @@ test("does not compensate a mismatched deterministic remote", async () => {
 test("fenced generation compensates without a new remote call", async () => {
   const { calls, runner } = harness(5, null);
   await runner.tick();
-  assert.deepEqual(calls, ["compensating", "compensate", "done"]);
+  assert.deepEqual(calls, ["persist:70", "compensating", "compensate", "done"]);
 });
 
 test("resumes a leased compensation without replaying the remote effect", async () => {

@@ -54,13 +54,8 @@ const ProviderAttemptEnvelopeSchema = z
     report: ProviderAttemptReportSchema,
   })
   .strict();
-const WorkerFailureEnvelopeSchema = z
+const WorkerTerminalFailureSchema = z
   .object({
-    consultationId: UuidSchema,
-    generation: z.number().int().nonnegative(),
-    workerId: UuidSchema,
-    epoch: z.number().int().nonnegative(),
-    eventId: UuidSchema,
     kind: z.string().min(1).max(120),
     message: z.string().min(1).max(2_000),
     phase: z.string().min(1).max(120).optional(),
@@ -71,6 +66,55 @@ const WorkerFailureEnvelopeSchema = z
     lastCheckpointHashes: z.record(UuidSchema, z.string().regex(/^[0-9a-f]{64}$/u)),
   })
   .strict();
+const WorkerEpochTupleSchema = z
+  .object({
+    consultationId: UuidSchema,
+    generation: z.number().int().nonnegative(),
+    workerId: UuidSchema,
+    epoch: z.number().int().positive(),
+    writeEpoch: z.number().int().nonnegative(),
+  })
+  .strict();
+const TerminalCheckpointIdentitySchema = z
+  .object({
+    checkpointId: UuidSchema,
+    checkpointHash: z.string().regex(/^[0-9a-f]{64}$/u),
+  })
+  .strict();
+const CompleteWorkerEpochSchema = WorkerEpochTupleSchema.extend({
+  completionEventId: UuidSchema,
+  outcome: z.enum(["clean", "failed"]),
+  terminalCheckpoints: z.tuple([
+    TerminalCheckpointIdentitySchema,
+    TerminalCheckpointIdentitySchema,
+  ]),
+  failure: WorkerTerminalFailureSchema.nullable(),
+})
+  .strict()
+  .superRefine((value, context) => {
+    if ((value.outcome === "clean") !== (value.failure === null)) {
+      context.addIssue({
+        code: "custom",
+        message: "failure must be null exactly when outcome is clean",
+        path: ["failure"],
+      });
+    }
+    if (value.terminalCheckpoints[0]?.checkpointId === value.terminalCheckpoints[1]?.checkpointId) {
+      context.addIssue({
+        code: "custom",
+        message: "terminal checkpoints must be distinct",
+        path: ["terminalCheckpoints"],
+      });
+    }
+  });
+const AbandonWorkerEpochSchema = WorkerEpochTupleSchema.extend({
+  abandonmentEventId: UuidSchema,
+  sealId: UuidSchema.optional(),
+  completionEventId: UuidSchema.optional(),
+  reason: z.string().trim().min(1).max(2_000),
+  handoffDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+  permanentOutcomeDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+}).strict();
 const JSON_BODY_LIMIT_BYTES = 1_048_576;
 const WEBHOOK_BODY_LIMIT_BYTES = 1_048_576;
 const AuthResultSchema = z.object({
@@ -205,16 +249,48 @@ export function providerAttemptCommand(
   };
 }
 
-export function workerFailureCommand(
+export function archiveObjectCommand(
   body: unknown,
-): Extract<WebCommand, { kind: "internal.failure" }> {
-  const { kind, phase, snapshotHash, ...envelope } = WorkerFailureEnvelopeSchema.parse(body);
+): Extract<WebCommand, { kind: "internal.archiveObject" }> {
+  const parsed = z
+    .object({
+      consultationId: UuidSchema,
+      generation: z.number().int().nonnegative(),
+      workerId: UuidSchema,
+      epoch: z.number().int().positive(),
+      writerEpoch: z.number().int().nonnegative(),
+      causalKey: z.string().min(1),
+      object: ArchiveObjectRecordSchema,
+    })
+    .strict()
+    .parse(body);
   return {
-    kind: "internal.failure",
-    kindName: kind,
-    ...envelope,
-    ...(phase === undefined ? {} : { phase }),
-    ...(snapshotHash === undefined ? {} : { snapshotHash }),
+    kind: "internal.archiveObject",
+    consultationId: parsed.consultationId,
+    generation: parsed.generation,
+    workerId: parsed.workerId,
+    workerEpoch: parsed.epoch,
+    writerEpoch: parsed.writerEpoch,
+    causalKey: parsed.causalKey,
+    object: parsed.object,
+  };
+}
+
+export function completeWorkerEpochCommand(
+  body: unknown,
+): Extract<WebCommand, { kind: "internal.completeWorkerEpoch" }> {
+  return {
+    kind: "internal.completeWorkerEpoch",
+    ...CompleteWorkerEpochSchema.parse(body),
+  };
+}
+
+export function abandonWorkerEpochCommand(
+  body: unknown,
+): Extract<WebCommand, { kind: "internal.abandonWorkerEpoch" }> {
+  return {
+    kind: "internal.abandonWorkerEpoch",
+    ...AbandonWorkerEpochSchema.parse(body),
   };
 }
 
@@ -422,24 +498,14 @@ function commandFor(operation: WebOperation, context: RequestContext): WebComman
       };
     case "internal.providerAttempt":
       return providerAttemptCommand(body);
-    case "internal.failure":
-      return workerFailureCommand(body);
-    case "internal.archiveObject": {
-      const generation = z.number().int().nonnegative().optional().parse(body.generation);
-      const workerId = UuidSchema.optional().parse(body.workerId);
-      const workerEpoch = z.number().int().nonnegative().optional().parse(body.epoch);
-      const writerEpoch = z.number().int().nonnegative().optional().parse(body.writerEpoch);
-      return {
-        kind: "internal.archiveObject",
-        consultationId: requiredUuid(z.string().parse(body.consultationId), "consultationId"),
-        ...(generation === undefined ? {} : { generation }),
-        ...(workerId === undefined ? {} : { workerId }),
-        ...(workerEpoch === undefined ? {} : { workerEpoch }),
-        ...(writerEpoch === undefined ? {} : { writerEpoch }),
-        causalKey: z.string().min(1).parse(body.causalKey),
-        object: ArchiveObjectRecordSchema.parse(body.object),
-      };
-    }
+    case "internal.archiveObject":
+      return archiveObjectCommand(body);
+    case "internal.expiredWorkerEpochs":
+      return { kind: "internal.expiredWorkerEpochs" };
+    case "internal.completeWorkerEpoch":
+      return completeWorkerEpochCommand(body);
+    case "internal.abandonWorkerEpoch":
+      return abandonWorkerEpochCommand(body);
     case "internal.archive.finalize":
       return {
         kind: "internal.finalize",
@@ -909,6 +975,9 @@ export async function present(
   }
   if (operation === "archives.list") {
     return { archives: result };
+  }
+  if (operation === "internal.expiredWorkerEpochs") {
+    return z.array(WorkerEpochTupleSchema).parse(result);
   }
   if (operation === "internal.egressLayout.authorize") {
     const row = ObjectSchema.parse(result);

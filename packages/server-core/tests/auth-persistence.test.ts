@@ -429,6 +429,7 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           baselineMigrationBytes,
           performanceIndexesMigrationBytes,
           reorderedClaimsMigrationBytes,
+          terminalCheckpointWatermarksMigrationBytes,
         ] = await Promise.all([
           readFile(join(import.meta.dir, "../prisma/migrations/0000_baseline/migration.sql")),
           readFile(
@@ -441,6 +442,12 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
             join(
               import.meta.dir,
               "../prisma/migrations/20260723120000_reorder_active_effect_claims/migration.sql",
+            ),
+          ),
+          readFile(
+            join(
+              import.meta.dir,
+              "../prisma/migrations/20260724070000_allow_terminal_checkpoint_watermarks/migration.sql",
             ),
           ),
         ]);
@@ -462,6 +469,12 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
           {
             migration_name: "20260723120000_reorder_active_effect_claims",
             checksum: createHash("sha256").update(reorderedClaimsMigrationSql).digest("hex"),
+          },
+          {
+            migration_name: "20260724070000_allow_terminal_checkpoint_watermarks",
+            checksum: createHash("sha256")
+              .update(terminalCheckpointWatermarksMigrationBytes)
+              .digest("hex"),
           },
         ];
         const history = await database.query<{
@@ -514,6 +527,18 @@ async function migratorResult(subprocess: Bun.Subprocess<"ignore", "pipe", "pipe
              AND column_name = 'claim_priority'`,
         );
         expect(claimPriorityColumns.rows).toEqual([]);
+
+        const checkpointWatermarkConstraint = await database.query<{ definition: string }>(
+          `SELECT pg_get_constraintdef(oid) AS definition
+           FROM pg_constraint
+           WHERE conname = 'worker_checkpoints_direction_watermarks_key'`,
+        );
+        expect(checkpointWatermarkConstraint.rows).toEqual([
+          {
+            definition:
+              "UNIQUE (consultation_id, worker_epoch, source_participant_id, destination_participant_id, accepted_input_sequence, accepted_input, received_output, emitted_output, terminal)",
+          },
+        ]);
 
         const performanceStatements = performanceIndexesMigrationSql
           .split(";")

@@ -406,4 +406,98 @@ describe("failure-smoke proof contracts", () => {
     expect(logsIndex).toBeGreaterThan(statusIndex);
     expect(databaseIndex).toBeGreaterThan(logsIndex);
   });
+  it("mounts the spool-drainer scenario file writable for one-shot crash consumption", async () => {
+    const compose = await readFile(
+      new URL("../../deploy/compose/compose.test.yml", import.meta.url),
+      "utf8",
+    );
+    const drainer = compose.slice(
+      compose.indexOf("  spool-drainer:"),
+      compose.indexOf("  migrate:"),
+    );
+    expect(drainer).toContain("- fault-control:/shared");
+    expect(drainer).not.toContain("- fault-control:/shared:ro");
+  });
+
+  it("registers and dispatches every spool-drainer scenario with exact subcase arguments", async () => {
+    const config = await readFile(new URL("./harness/config.mjs", import.meta.url), "utf8");
+    const spool = await readFile(new URL("./harness/scenarios/spool.mjs", import.meta.url), "utf8");
+    const runtime = await readFile(new URL("./harness/runtime.mjs", import.meta.url), "utf8");
+    const expected = [
+      "spool-drainer-ownership",
+      "spool-drainer-crash-replay",
+      "spool-drainer-historical-fencing",
+      "spool-drainer-terminal-ordering",
+      "spool-drainer-preseal-recovery",
+      "spool-drainer-seal-race",
+    ];
+    for (const name of expected) {
+      expect(config).toContain(`"${name}"`);
+      expect(spool).toContain(`shouldRunScenario("${name}")`);
+      expect(spool).toContain(`"${name}"`);
+    }
+    for (const point of [
+      "s3-put",
+      "archive-registration",
+      "checkpoint-acceptance",
+      "completion-acceptance",
+    ]) {
+      expect(config).toContain(`"${point}"`);
+      expect(spool).toContain(`"${point}"`);
+    }
+    for (const point of ["active", "settling", "renamed", "committed", "released"]) {
+      expect(config).toContain(`"${point}"`);
+      expect(spool).toContain(`"${point}"`);
+    }
+    expect(config).toContain('"--spool-crash-point"');
+    expect(config).toContain('"--spool-seal-point"');
+    expect(runtime).toContain("JOIN records r ON r.object_id = d.record_id");
+    expect(runtime).toContain("ORDER BY r.ordinal, d.checkpoint_id");
+  });
+
+  it("keeps spool scenario files isolated and reset during cleanup", async () => {
+    const config = await readFile(new URL("./harness/config.mjs", import.meta.url), "utf8");
+    const runtime = await readFile(new URL("./harness/runtime.mjs", import.meta.url), "utf8");
+    const finalizer = await readFile(new URL("./harness/finalize.mjs", import.meta.url), "utf8");
+    expect(config).toContain("SPOOL_DRAINER_SCENARIO_FILE");
+    expect(runtime).toContain("async function setSpoolDrainerScenario");
+    expect(runtime).toContain("if (value === null)");
+    expect(runtime).toContain("delete consultations[consultationId]");
+    expect(runtime).toContain("setSpoolDrainerScenario(consultationId = null, scenario = null)");
+    expect(finalizer).toContain("await setSpoolDrainerScenario()");
+    expect(finalizer).toContain("ownedDrainerScenarioRemains");
+  });
+
+  it("pins canonical drainer recovery route bodies and authorization ownership", async () => {
+    const drainer = await readFile(
+      new URL(
+        "../../services/spool-drainer/src/transhooter_spool_drainer/control_client.py",
+        import.meta.url,
+      ),
+      "utf8",
+    ).catch(() => "");
+    if (drainer === "") return;
+    for (const route of [
+      "/api/internal/worker-epochs/expired",
+      "/api/internal/worker-epochs/complete",
+      "/api/internal/worker-epochs/abandon",
+    ]) {
+      expect(drainer).toContain(route);
+    }
+    for (const field of [
+      "consultationId",
+      "generation",
+      "workerId",
+      "epoch",
+      "writeEpoch",
+      "completionEventId",
+      "terminalCheckpoints",
+      "abandonmentEventId",
+      "handoffDigest",
+      "permanentOutcomeDigest",
+    ]) {
+      expect(drainer).toContain(field);
+    }
+    expect(drainer).not.toContain("/api/internal/failure");
+  });
 });

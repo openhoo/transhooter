@@ -161,21 +161,27 @@ kompensiert.
 
 ### Übersetzungspipeline
 
-`apps/translation-worker` und `apps/spool-drainer` sind getrennte ausführbare
-Anwendungen. Beide verwenden `packages/translation-runtime`, eine gemeinsame
-Python-Ports-and-Adapters-Bibliothek:
+Die Python-Laufzeit besteht aus drei unabhängig installierbaren Projekten:
 
-- `domain`: reine Domänenmodelle ohne ausgehende Schichtabhängigkeiten,
-- `application`: Sitzungen, geordnete Stages, Retry und Caption-Assembly,
-- `ports`: providerneutrale Schnittstellen,
-- `adapters`: Google, Deepgram, DeepL, Fixture, S3 und verschlüsselter Spool,
-- `runtime`: LiveKit, interne Control-API, Quotas, Health und Prozess-Lifecycle.
+- `packages/spool-store` (`transhooter_spool`) besitzt ausschließlich das
+  verschlüsselte TSW1/AAD-v3-Journal, SQLite-WAL/FULL-Durability,
+  Datei-vor-Index-Reihenfolge, Prozessautoritäten und öffentliche Storage-DTOs.
+- `services/translation-worker` (`transhooter_worker`) besitzt LiveKit Agents,
+  Provider, Captions, Checkpoint-Konstruktion und Worker-Lifecycle.
+- `services/spool-drainer` (`transhooter_spool_drainer`) besitzt S3,
+  Archivregistrierung, PCM-Kompaktierung, Checkpoint-Zustellung und
+  Worker-Epoch-Recovery.
 
-Der Translation-Worker führt LiveKit-Jobs aus. Der Spool Drainer lädt bereits
-persistierte Objekte hoch und registriert sie bei der Control-API. Getrennte
-Entrypoints, Identitäten und Deployments verhindern, dass ein Rollenwechsel nur
-über undurchsichtige Modulargumente erfolgt. Import-Linter-Verträge schützen die
-gemeinsamen Schichtgrenzen.
+Die beiden Dienste importieren einander nicht und verwenden den Spool nur über
+`from transhooter_spool import ...`. Der Translation-Worker schreibt lokale
+Evidenz und versiegelt genau zwei terminale Checkpoint-Intents; ausschließlich
+der Spool Drainer führt daraus S3-, Archiv-, Checkpoint-, Complete- und
+Abandon-Remote-Effekte aus. Fünf explizite Konsolenbefehle ersetzen den früheren
+rollenwählenden Runtime-Prozess: `transhooter-translation-worker`,
+`transhooter-provider`, `transhooter-worker-healthcheck`,
+`transhooter-spool-drainer` und `transhooter-spool-drainer-healthcheck`.
+Eigenständige Images, Umgebungen, Locks und Import-Linter-Verträge erzwingen
+diese Eigentumsgrenzen.
 
 ### Sprachübergreifende Verträge
 
@@ -234,14 +240,15 @@ Diese Grenzen sind vor allem in
 .
 ├── apps/
 │   ├── web/                    # Next.js UI, APIs, Auth und Kompositionswurzel
-│   ├── control-worker/         # Dauerhafte Orchestrierung und Remote-Effekte
-│   ├── translation-worker/     # LiveKit-Übersetzungsprozess
-│   └── spool-drainer/          # Upload und Registrierung persistierter Spoolobjekte
+│   └── control-worker/         # Dauerhafte Orchestrierung und Remote-Effekte
 ├── packages/
 │   ├── contracts/              # Zod-Verträge und generiertes JSON Schema
 │   ├── server-core/            # Domäne, Use-Cases, Ports und Prisma-Persistenz
-│   ├── telemetry/              # Gemeinsame TypeScript-OTel-Instrumentierung
-│   └── translation-runtime/    # Gemeinsame Python-Domäne, Ports und Adapter
+│   ├── spool-store/            # TSW1/AAD-v3-Spool und öffentliche Storage-Fassade
+│   └── telemetry/              # Gemeinsame TypeScript-OTel-Instrumentierung
+├── services/
+│   ├── translation-worker/     # LiveKit Agents, Provider und Checkpoint-Erzeugung
+│   └── spool-drainer/          # S3/Archiv/Checkpoint-Zustellung und Recovery
 ├── deploy/
 │   ├── compose/                # Basisstack und Provider-/Test-Overlays
 │   ├── docker/                 # Reproduzierbare Runtime- und Harness-Images
@@ -294,9 +301,10 @@ Diese Grenzen sind vor allem in
 - Vorhandene Kubernetes-Secrets und ein persistenter Spool-PVC, den
   Translation-Worker und Spool Drainer gleichzeitig mounten können
 
-Versionen sind in `package.json`, `bun.lock`,
-`packages/translation-runtime/pyproject.toml`, den Dockerfiles und im Helm-Chart
-festgelegt. Bei reproduzierbaren Builds die Lockfiles nicht umgehen.
+Versionen sind in `package.json`, `bun.lock`, den drei `pyproject.toml`- und
+`uv.lock`-Paaren unter `packages/spool-store`, `services/translation-worker`
+und `services/spool-drainer`, den Dockerfiles und im Helm-Chart festgelegt. Bei
+reproduzierbaren Builds die Lockfiles nicht umgehen.
 
 ## Installation
 
@@ -571,6 +579,30 @@ bun run build
 | `bun run test` | TypeScript- und Python-Unit-/Integrationstests ohne vollständigen Compose-Harness. |
 | `bun run build` | Contracts, Server-Core, Telemetrie, Control-Worker und Next.js. |
 
+Die Python-Grenzen werden jeweils aus ihrer eigenen eingefrorenen Umgebung
+geprüft; eine gemeinsame PATH-Umgebung darf fehlende direkte Abhängigkeiten
+nicht verdecken:
+
+```bash
+uv run --project packages/spool-store --frozen pytest
+uv run --project services/translation-worker --frozen pytest
+uv run --project services/spool-drainer --frozen pytest
+
+uv run --project packages/spool-store --frozen lint-imports
+uv run --project services/translation-worker --frozen lint-imports
+uv run --project services/spool-drainer --frozen lint-imports
+```
+
+Die installierten Laufzeitbefehle sind rollenfest:
+
+```bash
+transhooter-translation-worker start
+transhooter-provider --help
+transhooter-worker-healthcheck
+transhooter-spool-drainer
+transhooter-spool-drainer-healthcheck
+```
+
 Nach einer beabsichtigten Vertragsänderung:
 
 ```bash
@@ -629,7 +661,19 @@ anderem Crash-Windows, Lease-Fencing, Remote-Adoption, Providerfehler,
 Spool-Wiederanlauf, MinIO-Ausfälle, Egress-Abbruch und saubere Finalisierung.
 Vor dem Cleanup wird die Compose-Ownership jedes betroffenen Objekts geprüft.
 
-## Produktionsbetrieb mit Helm
+Die sechs Spool-Drainer-Szenarien heißen exakt
+`spool-drainer-ownership`, `spool-drainer-crash-replay`,
+`spool-drainer-historical-fencing`, `spool-drainer-terminal-ordering`,
+`spool-drainer-preseal-recovery` und `spool-drainer-seal-race`. Die beiden
+tabellengesteuerten Szenarien lassen sich gezielt ausführen:
+
+```bash
+./scripts/failure-smoke --scenarios spool-drainer-crash-replay \
+  --spool-crash-point checkpoint-acceptance
+./scripts/failure-smoke --scenarios spool-drainer-seal-race \
+  --spool-seal-point renamed
+```
+
 
 Das Chart liegt unter `deploy/helm/transhooter` und installiert nur die
 Transhooter-Workloads. PostgreSQL, Redis, S3 und LiveKit müssen erreichbar sein;
@@ -825,8 +869,8 @@ Providerarbeit fortzusetzen.
 
 Jeder Spool-Eintrag besteht aus einem verschlüsselten `.wal`-Envelope und einem
 SQLite-Indexeintrag. Der Envelope bindet unter anderem Objekt-, Consultation-
-und Attempt-ID, Stage, Richtung, Medientyp, Sample-Range, Schlüssel-ID sowie
-Klartext- und Ciphertext-Hash kryptografisch an den Payload.
+und Attempt-ID, Stage, Richtung, Medientyp, Sample-Range, Worker-Tupel,
+Schlüssel-ID sowie Klartext- und Ciphertext-Hash kryptografisch an den Payload.
 
 - Der Payload wird mit AES-256-GCM und einer zufälligen 12-Byte-Nonce
   verschlüsselt; der kanonische Header ist Additional Authenticated Data.
@@ -851,11 +895,10 @@ Indexeintrag übrig bleiben, aber kein gültiger Index auf eine noch nicht
 veröffentlichte Datei entstehen. Beim Start entfernt die Recovery alte
 Tempdateien, validiert und importiert authentifizierte verwaiste Envelopes und
 prüft, dass alle nicht kompaktierten indexierten Payload-Dateien vorhanden
-sind. Ungültige verwaiste Envelopes werden quarantänisiert. Die Integrität
-indexierter Payloads wird beim Lesen authentifiziert; fehlende Dateien oder
-eine dabei erkannte ungültige Integrität führen zu `SpoolUnavailable`.
+sind. Ungültige verwaiste Envelopes werden quarantänisiert. Ein Spool aus dem
+gelöschten Runtime-Schema wird nicht migriert oder als Startzustand akzeptiert.
 
-### Idempotenz, Backpressure und Quarantäne
+### Idempotenz, Backpressure und permanente Zustände
 
 Eine deterministische `object_id` darf wiederverwendet werden, wenn Identität,
 Metadaten, Sample-Range, Hashes, Header und entschlüsselter Payload exakt
@@ -871,15 +914,17 @@ lassen.
 
 Der Spool Drainer verarbeitet `committed`-Objekte mit deterministischen
 Create-once-S3-Schlüsseln. Erst nach erfolgreichem Upload **und** erfolgreicher
-Registrierung beim Control-Worker wird ein Objekt `uploaded`. Temporäre
-Registrierungsfehler lassen es für einen späteren Versuch `committed`;
-permanent abgelehnte Objekte werden isoliert `quarantined` und nicht
-stillschweigend verworfen.
+tuple-gefenceter Registrierung wird ein Objekt `uploaded`. Temporäre Fehler
+lassen Identität, Objekt-ID, Schlüssel, Hash, Version und Retry-Kausalität
+unverändert. Eine permanente Remote-Ablehnung wird als `permanent` mit
+Fehlerart und Zeitpunkt sichtbar gehalten; `quarantined` ist ausschließlich
+lokaler Envelope-/Index-Integritätsbruch.
 
 ```text
 committed → uploaded → lokal kompaktierbar
-    ├─────→ committed     # temporärer Fehler, später erneut versuchen
-    └─────→ quarantined   # permanente, objektspezifische Ablehnung
+    ├─────→ committed     # temporärer Fehler, identischer Retry
+    └─────→ permanent     # dauerhafte Remote-Ablehnung, nicht quittiert
+             quarantined # lokaler Authentizitäts-/Integritätsbruch
 ```
 
 Nur explizit replay-unabhängige, bereits hochgeladene Envelopes sind für die
@@ -891,16 +936,26 @@ strengere Aufbewahrungs- beziehungsweise Kompaktierungsregeln.
 Checkpoints verketten akzeptierte Eingabe-, Provider-Ausgabe- und
 veröffentlichte Ausgabewasserstände kryptografisch. Wasserstände müssen pro
 Richtung monoton sein; jeder Checkpoint referenziert den Hash seines
-Vorgängers. Die Checkpoint-Evidenz und ihre Delivery-Zeile werden vor der
-Übermittlung an den Control-Worker gemeinsam im Spool registriert und können
-bis zur Bestätigung erneut zugestellt werden.
+Vorgängers. Der Worker konstruiert und persistiert nur lokale Intents. Beim
+Shutdown schreibt er einen authentifizierten Terminal-Seal mit exakt zwei
+terminalen Checkpoints und gibt erst danach seine Producer-Autorität frei.
 
-Dadurch kann derselbe Worker-Epoch nach einem Prozessabsturz seine bestätigten
-beziehungsweise noch ausstehenden Checkpoints wiederherstellen und erkennen,
-welche Samples sicher akzeptiert oder emittiert wurden. Ein neuer Worker-Epoch
-beginnt eine eigene Checkpoint-Kette. Die Felder für erwartete und beobachtete
-Objekt-IDs in Checkpoints sind derzeit leer; Inventar und PCM-Abgleich
-verwenden deshalb die übrigen Identitäts-, Sample- und Hashbelege.
+Der Drainer liest Ketten ausschließlich in `records.ordinal`-Reihenfolge,
+liefert immer zuerst Evidenz beziehungsweise PCM/Sidecars, dann beide
+terminalen Checkpoints und erst danach `completeWorkerEpoch`. Permanente oder
+quarantänisierte Evidenz vor der Seal-Grenze blockiert die terminale Zustellung
+und führt nach exklusiver Recovery-Autorität zu `abandonWorkerEpoch`. Ein Crash
+vor dem Seal darf keine konkurrierende Terminalkette synthetisieren.
+
+Die Recovery-API ist drainer-exklusiv: `GET
+/api/internal/worker-epochs/expired` liefert das vollständige Tupel
+`consultationId`, `generation`, `workerId`, `epoch`, `writeEpoch`. `POST
+/api/internal/worker-epochs/complete` übermittelt dieses Tupel, eine stabile
+`completionEventId`, Outcome, exakt zwei Terminal-Checkpoint-Identitäten und
+eine optionale Failure-Struktur. `POST /api/internal/worker-epochs/abandon`
+übermittelt zusätzlich eine stabile `abandonmentEventId`, Grund,
+`handoffDigest` und bei blockiertem Seal `permanentOutcomeDigest`. Die frühere
+allgemeine Worker-Failure-Route existiert nicht mehr.
 
 ### Zusammenspiel mit der Control-Orchestrierung
 
@@ -915,10 +970,11 @@ Effektclaims besitzen Owner und Ablaufzeit. Generations-Fencing wird vor
 Remote-Arbeit, bei der lokalen Anwendung und bei Kompensation geprüft;
 abgelaufene Leases und veraltete Generationen dürfen keinen neueren Besitzer
 überschreiben.
-
-Compose verwendet für den Drainer eine eigene, begrenzte S3-Identität. Im
-Helm-Chart mounten Translation-Worker und Spool Drainer denselben persistenten
-Spool-PVC; beide verwenden derzeit den Runtime-Key `s3-credentials`.
+Compose verwendet getrennte, begrenzte S3-Identitäten für den dauerhaft
+laufenden Spool Drainer und für explizite Providerdiagnosen. Der Translation-
+Worker erhält keine Produktions-S3-Credentials. Im Helm-Chart mounten
+Translation-Worker und Spool Drainer denselben persistenten Spool-PVC; nur der
+Drainer erhält die Archiv-Credentials.
 
 ## Observability
 

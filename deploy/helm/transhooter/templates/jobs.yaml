@@ -192,8 +192,36 @@ spec:
               }
               trap cleanup EXIT
               transhooter-provider sync
-          envFrom: [{configMapRef: {name: {{ include "transhooter.fullname" . }}}}]
           env:
+            - {name: APP_ENV, value: {{ .Values.config.appEnv | quote }}}
+            - {name: PROVIDER_PROFILE, value: {{ .Values.config.providerProfile | quote }}}
+            {{- if eq .Values.config.providerProfile "google-eu" }}
+            - {name: GOOGLE_APPLICATION_CREDENTIALS, value: /run/secrets/google-adc.json}
+            - {name: GOOGLE_CLOUD_PROJECT, value: {{ .Values.config.providers.googleEu.cloudProject | quote }}}
+            - {name: GOOGLE_QUOTA_PROJECT, value: {{ .Values.config.providers.googleEu.quotaProject | quote }}}
+            - {name: GOOGLE_TTS_VOICE, value: {{ .Values.config.providers.googleEu.ttsVoice | quote }}}
+            {{- else if eq .Values.config.providerProfile "google-speech-eu" }}
+            - {name: GOOGLE_APPLICATION_CREDENTIALS, value: /run/secrets/google-adc.json}
+            - {name: GOOGLE_CLOUD_PROJECT, value: {{ .Values.config.providers.googleSpeechEu.cloudProject | quote }}}
+            - {name: GOOGLE_QUOTA_PROJECT, value: {{ .Values.config.providers.googleSpeechEu.quotaProject | quote }}}
+            - {name: GOOGLE_SPEECH_LOCATION, value: {{ .Values.config.providers.googleSpeechEu.speechLocation | quote }}}
+            - {name: GOOGLE_SPEECH_MODEL, value: {{ .Values.config.providers.googleSpeechEu.speechModel | quote }}}
+            - {name: GOOGLE_TRANSLATION_LOCATION, value: {{ .Values.config.providers.googleSpeechEu.translationLocation | quote }}}
+            - {name: GOOGLE_TRANSLATION_MODEL, value: {{ .Values.config.providers.googleSpeechEu.translationModel | quote }}}
+            - {name: GOOGLE_TTS_LOCATION, value: {{ .Values.config.providers.googleSpeechEu.ttsLocation | quote }}}
+            - {name: GOOGLE_TTS_VOICE, value: {{ .Values.config.providers.googleSpeechEu.ttsVoice | quote }}}
+            - {name: GOOGLE_TTS_VOICE_LOCALE, value: {{ .Values.config.providers.googleSpeechEu.ttsVoiceLocale | quote }}}
+            {{- else if eq .Values.config.providerProfile "deepgram-deepl-eu" }}
+            - {name: DEEPGRAM_API_KEY_FILE, value: /run/secrets/deepgram-api-key}
+            - {name: DEEPL_API_KEY_FILE, value: /run/secrets/deepl-api-key}
+            - {name: DEEPGRAM_VOICE, value: {{ .Values.config.providers.deepgramDeeplEu.deepgramVoice | quote }}}
+            - {name: DEEPGRAM_APPROVED_VOICES, value: {{ join "," .Values.config.providers.deepgramDeeplEu.deepgramApprovedVoices | quote }}}
+            - {name: DEEPGRAM_STREAMS, value: {{ .Values.config.providers.deepgramDeeplEu.deepgramStreams | quote }}}
+            - {name: DEEPGRAM_AUDIO_SECONDS_MINUTE, value: {{ .Values.config.providers.deepgramDeeplEu.deepgramAudioSecondsMinute | quote }}}
+            - {name: DEEPL_REQUESTS_MINUTE, value: {{ .Values.config.providers.deepgramDeeplEu.deeplRequestsMinute | quote }}}
+            - {name: DEEPL_CHARACTERS_MINUTE, value: {{ .Values.config.providers.deepgramDeeplEu.deeplCharactersMinute | quote }}}
+            {{- end }}
+            - {name: SPOOL_KEYRING_FILE, value: /run/secrets/spool-keyring}
             - name: CAPABILITY_PUBLISH_URL
               value: {{ printf "http://%s-capability-publisher:%v/api/internal/capabilities" (include "transhooter.fullname" .) .Values.service.port | quote }}
             - {name: INTERNAL_TOKEN_FILE, value: /var/run/secrets/transhooter/token}
@@ -213,12 +241,12 @@ spec:
             sources:
               - secret:
                   name: {{ .Values.existingSecret }}
-                  items: [{key: database-url, path: database-url}]
+                  items: [{key: spool-keyring, path: spool-keyring}]
               - secret:
                   name: {{ .Values.providerSecretName }}
                   items:
                     {{- range .Values.providerSecretKeys }}
-                    - {key: {{ . | quote }}, path: {{ . | quote }}}
+                    - {key: {{ . | quote }}, path: {{ . | quote }} }
                     {{- end }}
         - name: internal-token
           projected:

@@ -49,14 +49,12 @@ services:
       TEST_FAULT_CONTROL_FILE: null
     volumes: !override
       - spool-data:/var/lib/transhooter/spool
-      - test-translation-secrets:/run/secrets:ro
+      - test-translation-worker-secrets:/run/secrets:ro
       - ../../.secrets/google-adc.json:/run/secrets/google-adc.json:ro
 
   spool-drainer:
     environment:
-      <<: *demo-google-env
-      FIXTURE_SCENARIO_FILE: null
-      TEST_FAULT_CONTROL_FILE: null
+      APP_ENV: development
     volumes: !override
       - spool-data:/var/lib/transhooter/spool
       - test-spool-drainer-secrets:/run/secrets:ro

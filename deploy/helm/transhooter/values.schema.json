@@ -334,7 +334,7 @@
         "web": { "type": "integer", "minimum": 1 },
         "controlWorker": { "type": "integer", "minimum": 1 },
         "translationWorker": { "type": "integer", "minimum": 1 },
-        "spoolDrainer": { "type": "integer", "minimum": 1 }
+        "spoolDrainer": { "const": 1 }
       }
     },
     "service": {

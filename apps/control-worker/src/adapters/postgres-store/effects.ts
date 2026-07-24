@@ -60,25 +60,34 @@ export async function claimEffects(
     SELECT candidate.id FROM external_effects candidate WHERE candidate.state IN ('planned','calling','applied','compensating')
       AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at < ${options.now.toISOString()})
       AND (
-        candidate.result->'plan'->>'dependsOnEffectId' IS NULL
-        OR EXISTS (SELECT 1 FROM external_effects dependency WHERE dependency.id=(candidate.result->'plan'->>'dependsOnEffectId')::uuid AND dependency.state='done')
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM jsonb_array_elements_text(COALESCE(candidate.result->'plan'->'dependsOnEffectIds','[]'::jsonb)) required(id)
-        LEFT JOIN external_effects dependency ON dependency.id=required.id::uuid AND dependency.state='done'
-        WHERE dependency.id IS NULL
-      )
-      AND (
-        candidate.result->'plan'->>'notBeforeMs' IS NULL
-        OR (candidate.result->'plan'->>'notBeforeMs')::bigint <= ${options.now.getTime()}
-      )
-      AND (
-        candidate.result->'plan'->>'waitForWorkerTerminal' IS DISTINCT FROM 'true'
-        OR EXISTS (
-          SELECT 1 FROM worker_job_epochs epoch
-          WHERE epoch.consultation_id=candidate.consultation_id
-            AND epoch.generation=COALESCE((candidate.result->'plan'->>'workerTerminalGeneration')::integer,candidate.generation)
-            AND epoch.terminal_at IS NOT NULL
+        EXISTS (
+          SELECT 1 FROM consultations consultation
+          WHERE consultation.id=candidate.consultation_id
+            AND consultation.generation <> candidate.generation
+        )
+        OR (
+          (
+            candidate.result->'plan'->>'dependsOnEffectId' IS NULL
+            OR EXISTS (SELECT 1 FROM external_effects dependency WHERE dependency.id=(candidate.result->'plan'->>'dependsOnEffectId')::uuid AND dependency.state='done')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM jsonb_array_elements_text(COALESCE(candidate.result->'plan'->'dependsOnEffectIds','[]'::jsonb)) required(id)
+            LEFT JOIN external_effects dependency ON dependency.id=required.id::uuid AND dependency.state='done'
+            WHERE dependency.id IS NULL
+          )
+          AND (
+            candidate.result->'plan'->>'notBeforeMs' IS NULL
+            OR (candidate.result->'plan'->>'notBeforeMs')::bigint <= ${options.now.getTime()}
+          )
+          AND (
+            candidate.result->'plan'->>'waitForWorkerTerminal' IS DISTINCT FROM 'true'
+            OR NOT EXISTS (
+              SELECT 1 FROM worker_job_epochs epoch
+              WHERE epoch.consultation_id=candidate.consultation_id
+                AND epoch.generation=COALESCE((candidate.result->'plan'->>'workerTerminalGeneration')::integer,candidate.generation)
+                AND epoch.terminal_at IS NULL
+            )
+          )
         )
       )
     ORDER BY COALESCE(candidate.lease_expires_at,candidate.created_at),

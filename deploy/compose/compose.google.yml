@@ -53,7 +53,8 @@ services:
 
   spool-drainer:
     environment:
-      <<: *production-env
+      APP_ENV: ${APP_ENV:-production}
+      ARCHIVE_REQUIRE_KMS: "false"
 
   control-worker-1:
     environment:

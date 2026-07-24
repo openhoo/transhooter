@@ -99,12 +99,12 @@ export async function reconciliationSnapshot(
       }
       await transaction.$executeRaw(Prisma.sql`UPDATE worker_reservations reservation SET accepting_load=false,released_at=COALESCE(reservation.released_at,epoch.terminal_at)
       FROM worker_job_epochs epoch
+      JOIN worker_checkpoints checkpoint ON checkpoint.id=epoch.terminal_checkpoint_id
       WHERE reservation.consultation_id=${consultationId} AND reservation.generation=${resourceGeneration}
         AND epoch.consultation_id=reservation.consultation_id AND epoch.generation=reservation.generation
         AND epoch.worker_id=reservation.worker_id AND epoch.epoch=reservation.epoch AND epoch.terminal_at IS NOT NULL
-        AND EXISTS (SELECT 1 FROM worker_checkpoints checkpoint WHERE checkpoint.consultation_id=reservation.consultation_id
-          AND checkpoint.generation=${resourceGeneration} AND checkpoint.worker_id=reservation.worker_id
-          AND checkpoint.worker_epoch=reservation.epoch AND checkpoint.terminal=true)`);
+        AND checkpoint.consultation_id=epoch.consultation_id AND checkpoint.generation=epoch.generation
+        AND checkpoint.worker_id=epoch.worker_id AND checkpoint.worker_epoch=epoch.epoch AND checkpoint.terminal=true`);
       const archiveId = archive.id;
       const expectations = await transaction.$queryRaw<ExpectationRow[]>(
         Prisma.sql`SELECT id,object_class,causal_key,sample_start,sample_end,fulfilled_object_id
@@ -115,8 +115,16 @@ export async function reconciliationSnapshot(
         FROM archive_objects WHERE archive_id=${archiveId} ORDER BY key,version_id`,
       );
       const checkpoints = await transaction.$queryRaw<CheckpointRow[]>(
-        Prisma.sql`SELECT to_jsonb(checkpoint) AS checkpoint FROM worker_checkpoints checkpoint
-        WHERE consultation_id=${consultationId} AND generation=${resourceGeneration} AND terminal=true ORDER BY created_at DESC LIMIT 1`,
+        Prisma.sql`SELECT to_jsonb(checkpoint) AS checkpoint
+        FROM worker_reservations reservation
+        JOIN worker_job_epochs epoch ON epoch.consultation_id=reservation.consultation_id
+          AND epoch.generation=reservation.generation AND epoch.worker_id=reservation.worker_id
+          AND epoch.epoch=reservation.epoch
+        JOIN worker_checkpoints checkpoint ON checkpoint.id=epoch.terminal_checkpoint_id
+          AND checkpoint.consultation_id=epoch.consultation_id AND checkpoint.generation=epoch.generation
+          AND checkpoint.worker_id=epoch.worker_id AND checkpoint.worker_epoch=epoch.epoch
+        WHERE reservation.consultation_id=${consultationId} AND reservation.generation=${resourceGeneration}
+          AND epoch.terminal_at IS NOT NULL AND checkpoint.terminal=true`,
       );
       const egress = await transaction.$queryRaw<EgressResultRow[]>(
         Prisma.sql`SELECT id,egress_id,kind,state,output_prefix,terminal_result FROM egress_jobs

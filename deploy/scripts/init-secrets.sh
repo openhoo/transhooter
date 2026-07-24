@@ -7,8 +7,8 @@ runtime_gid=${RUNTIME_GID:-10001}
 temporary_generation=
 temporary_link=
 
-primitive_secrets='postgres-owner-password postgres-migrator-password postgres-web-password postgres-control-password postgres-translation-password postgres-capability-password redis-password minio-root-access-key minio-root-secret-key minio-web-access-key minio-web-secret-key minio-control-access-key minio-control-secret-key minio-translation-access-key minio-translation-secret-key minio-spool-drainer-access-key minio-spool-drainer-secret-key livekit-api-key livekit-api-secret session-secret csrf-secret egress-layout-signing-key internal-control-token internal-translation-token internal-spool-drainer-token spool-keyring magic-link-seal-keys'
-derived_secrets='database-migrator-url database-integration-migrator-url database-web-url database-control-url database-translation-url database-capability-url redis-url livekit-credentials minio-web-credentials minio-control-credentials minio-translation-credentials minio-spool-drainer-credentials'
+primitive_secrets='postgres-owner-password postgres-migrator-password postgres-web-password postgres-control-password postgres-translation-password postgres-capability-password redis-password minio-root-access-key minio-root-secret-key minio-web-access-key minio-web-secret-key minio-control-access-key minio-control-secret-key minio-provider-diagnostics-access-key minio-provider-diagnostics-secret-key minio-spool-drainer-access-key minio-spool-drainer-secret-key livekit-api-key livekit-api-secret session-secret csrf-secret egress-layout-signing-key internal-control-token internal-translation-token internal-spool-drainer-token spool-keyring magic-link-seal-keys'
+derived_secrets='database-migrator-url database-integration-migrator-url database-web-url database-control-url database-translation-url database-capability-url redis-url livekit-credentials minio-web-credentials minio-control-credentials minio-provider-diagnostics-credentials minio-spool-drainer-credentials s3-bucket'
 managed_secrets="$primitive_secrets $derived_secrets"
 
 mkdir -p "$secrets_directory"
@@ -235,8 +235,8 @@ build_generation() {
   minio_web_secret_key=$(load_or_generate_hex minio-web-secret-key 32)
   minio_control_access_key=$(load_or_generate_hex minio-control-access-key 8 ctl_)
   minio_control_secret_key=$(load_or_generate_hex minio-control-secret-key 32)
-  minio_translation_access_key=$(load_or_generate_hex minio-translation-access-key 8 trn_)
-  minio_translation_secret_key=$(load_or_generate_hex minio-translation-secret-key 32)
+  minio_provider_diagnostics_access_key=$(load_or_generate_hex minio-provider-diagnostics-access-key 8 diag_)
+  minio_provider_diagnostics_secret_key=$(load_or_generate_hex minio-provider-diagnostics-secret-key 32)
   minio_spool_drainer_access_key=$(load_or_generate_hex minio-spool-drainer-access-key 8 drn_)
   minio_spool_drainer_secret_key=$(load_or_generate_hex minio-spool-drainer-secret-key 32)
   livekit_api_key=$(load_or_generate_hex livekit-api-key 12 lk_)
@@ -263,8 +263,8 @@ build_generation() {
   write_generation_secret minio-web-secret-key "$minio_web_secret_key"
   write_generation_secret minio-control-access-key "$minio_control_access_key"
   write_generation_secret minio-control-secret-key "$minio_control_secret_key"
-  write_generation_secret minio-translation-access-key "$minio_translation_access_key"
-  write_generation_secret minio-translation-secret-key "$minio_translation_secret_key"
+  write_generation_secret minio-provider-diagnostics-access-key "$minio_provider_diagnostics_access_key"
+  write_generation_secret minio-provider-diagnostics-secret-key "$minio_provider_diagnostics_secret_key"
   write_generation_secret minio-spool-drainer-access-key "$minio_spool_drainer_access_key"
   write_generation_secret minio-spool-drainer-secret-key "$minio_spool_drainer_secret_key"
   write_generation_secret livekit-api-key "$livekit_api_key"
@@ -290,8 +290,8 @@ build_generation() {
   minio_web_secret_json=$(json_escape "$minio_web_secret_key")
   minio_control_access_json=$(json_escape "$minio_control_access_key")
   minio_control_secret_json=$(json_escape "$minio_control_secret_key")
-  minio_translation_access_json=$(json_escape "$minio_translation_access_key")
-  minio_translation_secret_json=$(json_escape "$minio_translation_secret_key")
+  minio_provider_diagnostics_access_json=$(json_escape "$minio_provider_diagnostics_access_key")
+  minio_provider_diagnostics_secret_json=$(json_escape "$minio_provider_diagnostics_secret_key")
   minio_spool_drainer_access_json=$(json_escape "$minio_spool_drainer_access_key")
   minio_spool_drainer_secret_json=$(json_escape "$minio_spool_drainer_secret_key")
 
@@ -305,8 +305,9 @@ build_generation() {
   write_generation_secret livekit-credentials "{\"apiKey\":\"${livekit_key_json}\",\"apiSecret\":\"${livekit_secret_json}\"}"
   write_generation_secret minio-web-credentials "{\"accessKeyId\":\"${minio_web_access_json}\",\"secretAccessKey\":\"${minio_web_secret_json}\"}"
   write_generation_secret minio-control-credentials "{\"accessKeyId\":\"${minio_control_access_json}\",\"secretAccessKey\":\"${minio_control_secret_json}\"}"
-  write_generation_secret minio-translation-credentials "{\"accessKeyId\":\"${minio_translation_access_json}\",\"secretAccessKey\":\"${minio_translation_secret_json}\"}"
+  write_generation_secret minio-provider-diagnostics-credentials "{\"accessKeyId\":\"${minio_provider_diagnostics_access_json}\",\"secretAccessKey\":\"${minio_provider_diagnostics_secret_json}\"}"
   write_generation_secret minio-spool-drainer-credentials "{\"accessKeyId\":\"${minio_spool_drainer_access_json}\",\"secretAccessKey\":\"${minio_spool_drainer_secret_json}\"}"
+  write_generation_secret s3-bucket "transhooter"
 
   for secret_name in $managed_secrets; do
     [ -f "$temporary_generation/$secret_name" ] && [ -s "$temporary_generation/$secret_name" ] || {
@@ -382,11 +383,13 @@ export_runtime_secret_sets() {
   export_secret_set /exports/control \
     database-control-url redis-url livekit-credentials minio-control-credentials \
     internal-control-token egress-layout-signing-key
-  export_secret_set /exports/translation \
-    database-translation-url redis-url livekit-credentials minio-translation-credentials \
-    spool-keyring internal-translation-token
+  export_secret_set /exports/translation-worker \
+    database-translation-url redis-url livekit-credentials spool-keyring \
+    internal-translation-token
   export_secret_set /exports/spool-drainer \
     minio-spool-drainer-credentials spool-keyring internal-spool-drainer-token
+  export_secret_set /exports/provider-diagnostics \
+    minio-provider-diagnostics-credentials s3-bucket spool-keyring
 }
 
 cleanup() {

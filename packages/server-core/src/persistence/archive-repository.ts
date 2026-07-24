@@ -192,6 +192,44 @@ export class PrismaArchiveRepository implements ArchiveRepository {
     return row.id;
   }
 
+  async hasExactObject(object: ArchiveObject, tx: Transaction): Promise<boolean> {
+    const rows = await unwrap(tx).$queryRaw<ArchiveObjectLockRow[]>(Prisma.sql`
+      SELECT o.id, a.consultation_id, o.object_class, o.causal_key, o.key, o.version_id,
+        o.size, o.sha256, o.s3_checksum, o.content_type, o.sample_start, o.sample_end,
+        o.attempt, o.sequence, o.writer_epoch
+      FROM archive_objects o
+      JOIN archives a ON a.id = o.archive_id
+      WHERE o.id = ${object.id}
+        OR (o.key = ${object.key} AND o.version_id = ${object.versionId})
+      FOR UPDATE
+    `);
+    const row = rows[0];
+    if (!row) {
+      return false;
+    }
+    if (
+      row.id !== object.id ||
+      row.consultation_id !== object.consultationId ||
+      row.object_class !== object.objectClass ||
+      row.causal_key !== object.causalKey ||
+      row.key !== object.key ||
+      row.version_id !== object.versionId ||
+      safeDatabaseInteger(row.size, "archive_objects.size") !== object.size ||
+      row.sha256 !== object.sha256 ||
+      row.s3_checksum !== object.s3Checksum ||
+      row.content_type !== object.contentType ||
+      nullableSafeDatabaseInteger(row.sample_start, "archive_objects.sample_start") !==
+        object.sampleStart ||
+      nullableSafeDatabaseInteger(row.sample_end, "archive_objects.sample_end") !==
+        object.sampleEnd ||
+      row.attempt !== object.attempt ||
+      nullableSafeDatabaseInteger(row.sequence, "archive_objects.sequence") !== object.sequence ||
+      row.writer_epoch !== object.writerEpoch
+    ) {
+      throw new DomainError("ARCHIVE_WRITER_FENCED");
+    }
+    return true;
+  }
   async recordObject(object: ArchiveObject, tx: Transaction): Promise<void> {
     const database = unwrap(tx);
     const inserted = await database.$queryRaw<IdRow[]>(Prisma.sql`
@@ -276,7 +314,7 @@ export class PrismaArchiveRepository implements ArchiveRepository {
     }
   }
 
-  async lockActiveWorkerWriter(
+  async lockSpoolProducerTuple(
     input: {
       consultationId: UUID;
       generation: number;
@@ -303,12 +341,12 @@ export class PrismaArchiveRepository implements ArchiveRepository {
         AND r.worker_id = ${input.workerId}
         AND r.epoch = ${input.workerEpoch}
         AND r.released_at IS NULL
-        AND r.lease_expires_at > now()
         AND r.fenced_at IS NULL
         AND j.fenced_at IS NULL
         AND j.terminal_at IS NULL
         AND j.write_epoch = ${input.writerEpoch}
         AND a.write_epoch = ${input.writerEpoch}
+        AND a.state NOT IN ('deleting', 'deleted')
       FOR UPDATE OF r, j
     `);
     return rows.length === 1;

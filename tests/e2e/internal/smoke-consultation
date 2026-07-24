@@ -124,6 +124,6 @@ if [ "$STACK_CLASS" = reused-developer ]; then
   compose_bounded --profile e2e rm --force --stop e2e >/dev/null
 fi
 announce_phase "Building consultation application and smoke images from the current source tree"
-compose_bounded build minio egress-ready translation-worker web e2e
+compose_bounded build minio egress-ready translation-worker spool-drainer web e2e
 announce_phase "Running consultation smoke for ${profile}"
 compose_bounded --profile e2e run --rm e2e bun run smoke:consultation -- "$@"

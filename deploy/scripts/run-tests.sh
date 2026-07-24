@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 workspace=/workspace
-translation_runtime_directory="$workspace/packages/translation-runtime"
+spool_store_directory="$workspace/packages/spool-store"
+translation_worker_directory="$workspace/services/translation-worker"
+spool_drainer_directory="$workspace/services/spool-drainer"
 phase_deadline_seconds=${TEST_GATE_PHASE_DEADLINE_SECONDS:-600}
 case "$phase_deadline_seconds" in
   "" | *[!0-9]* | 0)
@@ -60,12 +62,21 @@ run_infrastructure_contracts() {
   done
 }
 
+run_python_project_gates() {
+  project_name=$1
+  project_directory=$2
+  cd "$project_directory"
+  run_phase "Syncing the $project_name environment" uv sync --project "$project_directory" --frozen
+  run_phase "Linting the $project_name" uv run --project "$project_directory" --frozen ruff check .
+  run_phase "Type-checking the $project_name" uv run --project "$project_directory" --frozen mypy src
+  run_phase "Checking $project_name import boundaries" uv run --project "$project_directory" --frozen lint-imports
+  run_phase "Running $project_name tests" uv run --project "$project_directory" --frozen pytest
+}
+
 run_python_gates() {
-  cd "$translation_runtime_directory"
-  run_phase "Type-checking the translation runtime" mypy src
-  run_phase "Linting the translation runtime" ruff check
-  run_phase "Checking translation runtime import boundaries" lint-imports
-  run_phase "Running translation runtime tests" pytest
+  run_python_project_gates "spool store" "$spool_store_directory"
+  run_python_project_gates "translation worker" "$translation_worker_directory"
+  run_python_project_gates "spool drainer" "$spool_drainer_directory"
 }
 
 main() {

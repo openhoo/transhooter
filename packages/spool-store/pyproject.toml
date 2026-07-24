@@ -1,0 +1,56 @@
+[project]
+name = "transhooter-spool-store"
+version = "0.1.0"
+description = "Authenticated durable spool storage for Transhooter services"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "cryptography==48.0.1",
+]
+
+[dependency-groups]
+dev = [
+  "import-linter==2.3",
+  "mypy==1.17.1",
+  "pytest==9.0.3",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.12.8",
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/transhooter_spool"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --strict-config"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["transhooter_spool"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["E501", "RUF001"]
+
+[tool.importlinter]
+root_package = "transhooter_spool"
+
+[[tool.importlinter.contracts]]
+name = "Value and codec modules do not depend on storage"
+type = "forbidden"
+source_modules = ["transhooter_spool._models", "transhooter_spool._crypto"]
+forbidden_modules = ["transhooter_spool._store"]

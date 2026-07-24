@@ -94,13 +94,26 @@ export class EffectRunner {
     }
     const generation = await this.store.currentGeneration(claimed.consultationId);
     if (claimed.state === "compensating" || generation !== claimed.generation) {
-      const renewal = this.startLeaseRenewal(claimed);
-      try {
-        if (claimed.state !== "compensating") {
-          await this.requireOwnership(claimed, renewal);
-          await this.store.markCompensating(claimed.id, this.options.owner, "generation fenced");
+      let fenced = claimed;
+      if (claimed.state === "planned") {
+        const canonical = this.canonicalEffectRequest(claimed);
+        const calling = await this.store.persistCalling(
+          claimed.id,
+          this.options.owner,
+          canonical.bytes,
+          canonical.sha256,
+        );
+        if (calling === null) {
+          return "not_owned";
         }
-        await this.compensateOwned(claimed, renewal);
+        fenced = calling;
+      }
+      const renewal = this.startLeaseRenewal(fenced);
+      try {
+        if (fenced.state !== "compensating") {
+          await this.store.markCompensating(fenced.id, this.options.owner, "generation fenced");
+        }
+        await this.compensateOwned(fenced, renewal);
         return "compensated";
       } catch (error) {
         if (error instanceof LeaseLostError) {

@@ -28,14 +28,39 @@ const baseEnvironment: NodeJS.ProcessEnv = {
   INTERNAL_JWT_ISSUER: "https://kubernetes.default.svc",
   INTERNAL_JWT_AUDIENCE: "transhooter-internal",
   POD_NAMESPACE: "transhooter",
+  INTERNAL_SERVICE_ACCOUNT_PREFIX: "transhooter",
 };
 
-test("remote JWKS authentication does not require a web caller token", () => {
+test("Kubernetes JWT authentication requires the service-account prefix", () => {
   const parsed = parseWebEnvironment(baseEnvironment);
 
   expect(parsed.INTERNAL_JWT_ISSUER).toBe("https://kubernetes.default.svc");
   expect(parsed.INTERNAL_JWT_AUDIENCE).toBe("transhooter-internal");
   expect(parsed.POD_NAMESPACE).toBe("transhooter");
+  expect(parsed.INTERNAL_SERVICE_ACCOUNT_PREFIX).toBe("transhooter");
+
+  const { INTERNAL_SERVICE_ACCOUNT_PREFIX: _prefix, ...withoutPrefix } = baseEnvironment;
+  expect(() => parseWebEnvironment(withoutPrefix)).toThrow(
+    "Per-caller internal Bearers or JWT issuer/audience/namespace/service-account-prefix configuration is required",
+  );
+});
+
+test("bearer authentication omits and ignores the Kubernetes service-account prefix", () => {
+  const bearerEnvironment: NodeJS.ProcessEnv = {
+    ...baseEnvironment,
+    INTERNAL_CONTROL_TOKEN_FILE: "/run/secrets/internal-control-token",
+    INTERNAL_TRANSLATION_TOKEN_FILE: "/run/secrets/internal-translation-token",
+    INTERNAL_SPOOL_DRAINER_TOKEN_FILE: "/run/secrets/internal-spool-drainer-token",
+  };
+  const { INTERNAL_SERVICE_ACCOUNT_PREFIX: _prefix, ...withoutPrefix } = bearerEnvironment;
+
+  expect(parseWebEnvironment(withoutPrefix).INTERNAL_SERVICE_ACCOUNT_PREFIX).toBeUndefined();
+  expect(
+    parseWebEnvironment({
+      ...bearerEnvironment,
+      INTERNAL_SERVICE_ACCOUNT_PREFIX: "ignored-prefix",
+    }).INTERNAL_SERVICE_ACCOUNT_PREFIX,
+  ).toBeUndefined();
 });
 
 test("production supports direct-local admission when no trusted ingress boundary is configured", () => {

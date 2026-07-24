@@ -186,6 +186,6 @@ trap 'exit 130' HUP INT TERM
 
 compose_with_deadline "Removing stale hermetic containers and volumes" "$CLEANUP_DEADLINE_SECONDS" down --volumes --remove-orphans
 compose_with_deadline "Initializing isolated hermetic runtime secrets" "$START_DEADLINE_SECONDS" run --rm --no-deps secrets-init
-compose_with_deadline "Building application and harness images from the current source tree" "$BUILD_DEADLINE_SECONDS" build minio egress-ready translation-worker web e2e failure-smoke test
+compose_with_deadline "Building application and harness images from the current source tree" "$BUILD_DEADLINE_SECONDS" build minio egress-ready translation-worker spool-drainer web e2e failure-smoke test
 compose_with_deadline "Starting hermetic test dependencies" "$START_DEADLINE_SECONDS" up --wait --no-build test-dependencies-ready
 compose_with_deadline "Running hermetic type, boundary, and test gates" "$TEST_DEADLINE_SECONDS" run --rm --no-deps test

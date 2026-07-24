@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
 import { RoomProviderSelectionSchema, type WorkerCheckpoint } from "@transhooter/contracts";
 import type {
+  AbandonWorkerEpochInput,
   CheckpointInput,
+  CompleteWorkerEpochInput,
   ProviderAttemptInput,
-  WorkerFailureInput,
+  WorkerEpochTuple,
 } from "./application-operations";
 import { type Clock, DomainError, type UUID } from "./domain/model";
 import { Prisma, type PrismaClient } from "./persistence/database";
@@ -40,6 +43,13 @@ export function checkpointPersistenceValues(checkpoint: WorkerCheckpoint): {
   };
 }
 
+function safeDatabaseInteger(value: bigint | number, column: string): number {
+  const converted = typeof value === "bigint" ? Number(value) : value;
+  if (!Number.isSafeInteger(converted)) {
+    throw new Error(`${column} is outside the JavaScript safe integer range`);
+  }
+  return converted;
+}
 export class ApplicationOperationsWorkers {
   constructor(
     private readonly database: PrismaClient,
@@ -97,6 +107,33 @@ export class ApplicationOperationsWorkers {
     const persisted = checkpointPersistenceValues(checkpoint);
     return retryPostgresContention(() =>
       this.database.$transaction(async (transaction) => {
+        const replay = await transaction.$queryRaw<Record<string, unknown>[]>(
+          Prisma.sql`SELECT 1 FROM worker_checkpoints checkpoint
+            WHERE checkpoint.id=${checkpoint.checkpointId}
+              AND checkpoint.consultation_id=${input.consultationId}
+              AND checkpoint.generation=${input.generation}
+              AND checkpoint.worker_id=${input.workerId}
+              AND checkpoint.worker_epoch=${checkpoint.workerEpoch}
+              AND checkpoint.write_epoch=${input.writeEpoch}
+              AND checkpoint.source_participant_id=${persisted.sourceParticipantId}
+              AND checkpoint.destination_participant_id=${persisted.destinationParticipantId}
+              AND checkpoint.accepted_input=${persisted.acceptedInput}
+              AND checkpoint.accepted_input_sequence=${persisted.acceptedInputSequence}
+              AND checkpoint.received_output=${persisted.receivedOutput}
+              AND checkpoint.emitted_output=${persisted.emittedOutput}
+              AND checkpoint.previous_hash IS NOT DISTINCT FROM ${checkpoint.previousCheckpointSha256}
+              AND checkpoint.checkpoint_hash=${checkpoint.highWatermarkSha256}
+              AND checkpoint.expected_ids=${expected}::jsonb
+              AND checkpoint.observed_ids=${observed}::jsonb
+              AND checkpoint.gaps=${gaps}::jsonb
+              AND checkpoint.terminal=${checkpoint.terminal}
+              AND checkpoint.object_key=${input.objectKey}
+              AND checkpoint.created_at=${persisted.createdAt}`,
+        );
+        if (replay.length === 1) {
+          return true;
+        }
+
         const consultation = await transaction.$queryRaw<Record<string, unknown>[]>(
           Prisma.sql`SELECT id FROM consultations WHERE id=${input.consultationId} AND generation=${input.generation} FOR UPDATE`,
         );
@@ -121,8 +158,7 @@ export class ApplicationOperationsWorkers {
               AND head.source_participant_id=${persisted.sourceParticipantId}
               AND head.destination_participant_id=${persisted.destinationParticipantId}
               AND NOT EXISTS (
-                SELECT 1
-                FROM worker_checkpoints child
+                SELECT 1 FROM worker_checkpoints child
                 WHERE child.consultation_id=head.consultation_id
                   AND child.generation=head.generation
                   AND child.worker_id=head.worker_id
@@ -145,7 +181,8 @@ export class ApplicationOperationsWorkers {
             AND reservation.worker_id=${input.workerId} AND reservation.epoch=${checkpoint.workerEpoch}
             AND reservation.fenced_at IS NULL AND reservation.released_at IS NULL
             AND job.fenced_at IS NULL AND job.terminal_at IS NULL
-            AND archive.write_epoch=${input.writeEpoch}
+            AND job.write_epoch=${input.writeEpoch} AND archive.write_epoch=${input.writeEpoch}
+            AND archive.state NOT IN ('deleting','deleted')
             AND (SELECT count(*) FROM chain_heads) <= 1
             AND ${checkpoint.previousCheckpointSha256} IS NOT DISTINCT FROM (
               SELECT max(chain_heads.checkpoint_hash) FROM chain_heads
@@ -162,92 +199,8 @@ export class ApplicationOperationsWorkers {
             )
           ON CONFLICT DO NOTHING RETURNING id`,
         );
-
         if (result.length !== 1) {
-          const replay = await transaction.$queryRaw<Record<string, unknown>[]>(
-            Prisma.sql`SELECT 1 FROM worker_checkpoints checkpoint
-              JOIN consultations consultation ON consultation.id=checkpoint.consultation_id
-                AND consultation.generation=checkpoint.generation
-              JOIN worker_reservations reservation ON reservation.consultation_id=checkpoint.consultation_id
-                AND reservation.generation=checkpoint.generation
-                AND reservation.worker_id=checkpoint.worker_id AND reservation.epoch=checkpoint.worker_epoch
-              JOIN worker_job_epochs job ON job.consultation_id=checkpoint.consultation_id
-                AND job.generation=checkpoint.generation AND job.worker_id=checkpoint.worker_id
-                AND job.epoch=checkpoint.worker_epoch
-              WHERE checkpoint.id=${checkpoint.checkpointId}
-                AND checkpoint.consultation_id=${input.consultationId}
-                AND checkpoint.generation=${input.generation}
-                AND checkpoint.worker_id=${input.workerId}
-                AND checkpoint.worker_epoch=${checkpoint.workerEpoch}
-                AND checkpoint.write_epoch=${input.writeEpoch}
-                AND checkpoint.source_participant_id=${persisted.sourceParticipantId}
-                AND checkpoint.destination_participant_id=${persisted.destinationParticipantId}
-                AND checkpoint.accepted_input=${persisted.acceptedInput}
-                AND checkpoint.accepted_input_sequence=${persisted.acceptedInputSequence}
-                AND checkpoint.received_output=${persisted.receivedOutput}
-                AND checkpoint.emitted_output=${persisted.emittedOutput}
-                AND checkpoint.previous_hash IS NOT DISTINCT FROM ${checkpoint.previousCheckpointSha256}
-                AND checkpoint.checkpoint_hash=${checkpoint.highWatermarkSha256}
-                AND checkpoint.expected_ids=${expected}::jsonb AND checkpoint.observed_ids=${observed}::jsonb
-                AND checkpoint.gaps=${gaps}::jsonb AND checkpoint.terminal=${checkpoint.terminal}
-                AND checkpoint.object_key=${input.objectKey} AND checkpoint.created_at=${persisted.createdAt}
-                AND reservation.fenced_at IS NULL AND job.fenced_at IS NULL
-                AND (
-                  (reservation.released_at IS NULL AND job.terminal_at IS NULL)
-                  OR (
-                    checkpoint.terminal
-                    AND reservation.released_at IS NOT NULL
-                    AND job.terminal_at IS NOT NULL
-                    AND job.terminal_outcome='clean'
-                  )
-                )`,
-          );
-          if (replay.length !== 1) {
-            throw new DomainError("CHECKPOINT_CONFLICT");
-          }
-        }
-
-        if (checkpoint.terminal) {
-          await transaction.$executeRaw(
-            Prisma.sql`WITH frozen_directions AS (
-              SELECT direction->>'sourceParticipantId' AS source_participant_id,
-                direction->>'destinationParticipantId' AS destination_participant_id
-              FROM room_provider_selections selection
-              CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
-              WHERE selection.consultation_id=${input.consultationId}
-            ), complete AS (
-              SELECT count(*)=2 AND bool_and(EXISTS (
-                SELECT 1 FROM worker_checkpoints terminal
-                WHERE terminal.consultation_id=${input.consultationId}
-                  AND terminal.generation=${input.generation}
-                  AND terminal.worker_id=${input.workerId}
-                  AND terminal.worker_epoch=${checkpoint.workerEpoch}
-                  AND terminal.source_participant_id=frozen_directions.source_participant_id::uuid
-                  AND terminal.destination_participant_id=frozen_directions.destination_participant_id::uuid
-                  AND terminal.terminal
-              )) AS settled
-              FROM frozen_directions
-            ), terminal_epoch AS (
-              UPDATE worker_job_epochs job
-              SET terminal_checkpoint_id=${checkpoint.checkpointId},
-                terminal_outcome=COALESCE(job.terminal_outcome,'clean'),
-                terminal_at=COALESCE(job.terminal_at,to_timestamp(${checkpoint.occurredAtMs}/1000.0))
-              FROM complete,consultations consultation
-              WHERE complete.settled AND consultation.id=${input.consultationId}
-                AND consultation.generation=${input.generation}
-                AND job.consultation_id=consultation.id AND job.generation=consultation.generation
-                AND job.worker_id=${input.workerId} AND job.epoch=${checkpoint.workerEpoch}
-                AND job.fenced_at IS NULL AND job.terminal_at IS NULL
-              RETURNING job.consultation_id,job.generation,job.worker_id,job.epoch,job.terminal_at
-            )
-            UPDATE worker_reservations reservation
-            SET accepting_load=false,released_at=COALESCE(reservation.released_at,terminal_epoch.terminal_at)
-            FROM terminal_epoch
-            WHERE reservation.consultation_id=terminal_epoch.consultation_id
-              AND reservation.generation=terminal_epoch.generation
-              AND reservation.worker_id=terminal_epoch.worker_id
-              AND reservation.epoch=terminal_epoch.epoch`,
-          );
+          throw new DomainError("CHECKPOINT_CONFLICT");
         }
         return true;
       }),
@@ -414,83 +367,298 @@ export class ApplicationOperationsWorkers {
     throw new DomainError("PROVIDER_ATTEMPT_CONFLICT");
   }
 
-  async workerFailure(input: WorkerFailureInput): Promise<boolean> {
+  async expiredWorkerEpochs(): Promise<readonly WorkerEpochTuple[]> {
+    const rows = await this.database.$queryRaw<
+      {
+        consultation_id: UUID;
+        generation: number;
+        worker_id: UUID;
+        epoch: bigint;
+        write_epoch: number;
+      }[]
+    >(Prisma.sql`SELECT reservation.consultation_id,reservation.generation,
+        reservation.worker_id,reservation.epoch,job.write_epoch
+      FROM worker_reservations reservation
+      JOIN consultations consultation ON consultation.id=reservation.consultation_id
+        AND consultation.generation=reservation.generation
+      JOIN worker_job_epochs job ON job.consultation_id=reservation.consultation_id
+        AND job.generation=reservation.generation AND job.worker_id=reservation.worker_id
+        AND job.epoch=reservation.epoch
+      JOIN archives archive ON archive.consultation_id=reservation.consultation_id
+      WHERE reservation.lease_expires_at < now()
+        AND reservation.released_at IS NULL AND reservation.fenced_at IS NULL
+        AND job.fenced_at IS NULL AND job.terminal_at IS NULL
+        AND job.write_epoch=archive.write_epoch
+      ORDER BY reservation.lease_expires_at,reservation.consultation_id`);
+    return rows.map((row) => ({
+      consultationId: row.consultation_id,
+      generation: row.generation,
+      workerId: row.worker_id,
+      epoch: safeDatabaseInteger(row.epoch, "worker_reservations.epoch"),
+      writeEpoch: row.write_epoch,
+    }));
+  }
+
+  async completeWorkerEpoch(input: CompleteWorkerEpochInput): Promise<boolean> {
+    const request = JSON.stringify(input);
+    const [first, second] = input.terminalCheckpoints;
+    if (
+      first.checkpointId === second.checkpointId ||
+      (input.outcome === "clean") !== (input.failure === null)
+    ) {
+      throw new DomainError("WORKER_COMPLETION_CONFLICT");
+    }
     return retryPostgresContention(() =>
       this.database.$transaction(async (transaction) => {
         const replay = await transaction.$queryRaw<Record<string, unknown>[]>(
-          Prisma.sql`SELECT 1 FROM outbox WHERE id=${input.eventId} AND topic='archive.failed' AND aggregate_id=${input.consultationId}`,
+          Prisma.sql`SELECT 1 FROM audit_events WHERE id=${input.completionEventId}
+            AND aggregate_id=${input.consultationId} AND kind='worker.epoch_completed'
+            AND details=${request}::jsonb`,
         );
         if (replay.length === 1) {
           return true;
         }
-        const now = this.clock.now();
-        const reason = {
-          kind: input.kindName,
-          message: input.message,
-          phase: input.phase ?? null,
-          snapshotHash: input.snapshotHash ?? null,
-          lastCheckpointHashes: input.lastCheckpointHashes,
-        };
-        const fenced = await transaction.$queryRaw<{ generation: number }[]>(
-          Prisma.sql`WITH locked AS (
-            SELECT consultation.generation
-            FROM consultations consultation
-            JOIN worker_reservations reservation
-              ON reservation.consultation_id=consultation.id
-              AND reservation.generation=${input.generation}
-              AND reservation.worker_id=${input.workerId}
-              AND reservation.epoch=${input.epoch}
-            JOIN worker_job_epochs job
-              ON job.consultation_id=reservation.consultation_id
-              AND job.generation=reservation.generation
-              AND job.worker_id=reservation.worker_id
+        const completed = await transaction.$queryRaw<
+          { terminal_at: Date; next_generation: number }[]
+        >(Prisma.sql`WITH locked AS (
+            SELECT reservation.consultation_id,reservation.generation,reservation.worker_id,
+              reservation.epoch,job.write_epoch
+            FROM worker_reservations reservation
+            JOIN consultations consultation ON consultation.id=reservation.consultation_id
+              AND consultation.generation=reservation.generation
+            JOIN worker_job_epochs job ON job.consultation_id=reservation.consultation_id
+              AND job.generation=reservation.generation AND job.worker_id=reservation.worker_id
               AND job.epoch=reservation.epoch
-            WHERE consultation.id=${input.consultationId}
-              AND consultation.generation=${input.generation}
-              AND consultation.state IN ('ready','active')
-              AND reservation.fenced_at IS NULL
-              AND reservation.released_at IS NULL
-              AND job.fenced_at IS NULL
-              AND job.terminal_at IS NULL
-            FOR UPDATE OF consultation,reservation,job
-          ), stopped_reservation AS (
-            UPDATE worker_reservations reservation
-            SET accepting_load=false,lease_expires_at=${now},
-              fence_reason=COALESCE(reservation.fence_reason,${input.message})
-            FROM locked
+            JOIN archives archive ON archive.consultation_id=reservation.consultation_id
             WHERE reservation.consultation_id=${input.consultationId}
               AND reservation.generation=${input.generation}
-              AND reservation.worker_id=${input.workerId}
-              AND reservation.epoch=${input.epoch}
-            RETURNING reservation.consultation_id
-          )
-          UPDATE consultations consultation
-          SET state='finalizing',generation=consultation.generation+1,
-            finalize_deadline_at=${new Date(now.getTime() + 900_000)},updated_at=${now}
-          FROM locked,stopped_reservation
-          WHERE consultation.id=${input.consultationId}
-          RETURNING consultation.generation`,
-        );
-        const nextGeneration = fenced[0]?.generation;
-        if (nextGeneration === undefined) {
-          throw new DomainError("WORKER_FAILURE_FENCED");
+              AND reservation.worker_id=${input.workerId} AND reservation.epoch=${input.epoch}
+              AND reservation.released_at IS NULL AND reservation.fenced_at IS NULL
+              AND job.fenced_at IS NULL AND job.terminal_at IS NULL
+              AND job.write_epoch=${input.writeEpoch} AND archive.write_epoch=${input.writeEpoch}
+              AND archive.state NOT IN ('deleting','deleted')
+            FOR UPDATE OF consultation,reservation,job
+          ), accepted_pair AS (
+            SELECT min(checkpoint.id::text)::uuid AS designated_id,
+              min(checkpoint.created_at) FILTER (
+                WHERE checkpoint.id::text=(SELECT min(candidate.id::text)
+                  FROM worker_checkpoints candidate
+                  WHERE candidate.id IN (${first.checkpointId},${second.checkpointId}))
+              ) AS terminal_at
+            FROM worker_checkpoints checkpoint,locked
+            WHERE checkpoint.id IN (${first.checkpointId},${second.checkpointId})
+              AND checkpoint.consultation_id=locked.consultation_id
+              AND checkpoint.generation=locked.generation AND checkpoint.worker_id=locked.worker_id
+              AND checkpoint.worker_epoch=locked.epoch AND checkpoint.write_epoch=locked.write_epoch
+              AND checkpoint.terminal
+              AND ((checkpoint.id=${first.checkpointId} AND checkpoint.checkpoint_hash=${first.checkpointHash})
+                OR (checkpoint.id=${second.checkpointId} AND checkpoint.checkpoint_hash=${second.checkpointHash}))
+              AND EXISTS (
+                SELECT 1 FROM room_provider_selections selection
+                CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
+                WHERE selection.consultation_id=locked.consultation_id
+                  AND (direction->>'sourceParticipantId')::uuid=checkpoint.source_participant_id
+                  AND (direction->>'destinationParticipantId')::uuid=checkpoint.destination_participant_id
+              )
+            HAVING count(*)=2 AND count(DISTINCT checkpoint.source_participant_id)=2
+              AND count(DISTINCT checkpoint.destination_participant_id)=2
+          ), terminalized AS (
+            UPDATE worker_job_epochs job SET terminal_checkpoint_id=accepted_pair.designated_id,
+              terminal_outcome=${input.outcome},terminal_at=accepted_pair.terminal_at
+            FROM locked,accepted_pair
+            WHERE job.consultation_id=locked.consultation_id AND job.generation=locked.generation
+              AND job.worker_id=locked.worker_id AND job.epoch=locked.epoch
+              AND accepted_pair.terminal_at IS NOT NULL
+            RETURNING job.consultation_id,job.generation,job.worker_id,job.epoch,job.terminal_at
+          ), released AS (
+            UPDATE worker_reservations reservation SET accepting_load=false,
+              released_at=terminalized.terminal_at
+            FROM terminalized WHERE reservation.consultation_id=terminalized.consultation_id
+              AND reservation.generation=terminalized.generation
+              AND reservation.worker_id=terminalized.worker_id AND reservation.epoch=terminalized.epoch
+            RETURNING terminalized.*
+          ), advanced AS (
+            UPDATE consultations consultation SET state='finalizing',generation=consultation.generation+1,
+              finalize_deadline_at=COALESCE(consultation.finalize_deadline_at,now()+interval '15 minutes'),
+              updated_at=now()
+            FROM released WHERE ${input.outcome}='failed'
+              AND consultation.id=released.consultation_id AND consultation.generation=released.generation
+            RETURNING consultation.generation
+          ) SELECT released.terminal_at,
+            COALESCE((SELECT generation FROM advanced),released.generation) AS next_generation
+          FROM released`);
+        const terminal = completed[0];
+        if (!terminal) {
+          throw new DomainError("WORKER_COMPLETION_FENCED");
+        }
+        if (input.outcome === "failed") {
+          await transaction.$executeRaw(
+            Prisma.sql`UPDATE archives SET state='reconciling',
+              reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,now()+interval '30 minutes'),
+              updated_at=now() WHERE consultation_id=${input.consultationId}
+              AND state IN ('pending','recording','reconciling')`,
+          );
+          await transaction.$executeRaw(
+            Prisma.sql`INSERT INTO outbox(id,topic,aggregate_id,generation,payload,available_at,attempts)
+              VALUES (${input.completionEventId},'archive.failed',${input.consultationId},
+                ${terminal.next_generation},${JSON.stringify({
+                  reasonCode: "ARCHIVE_FAILED",
+                  egressId: input.workerId,
+                  resourceGeneration: input.generation,
+                })}::jsonb,now(),0)`,
+          );
         }
         await transaction.$executeRaw(
-          Prisma.sql`UPDATE archives SET state='reconciling',reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,${new Date(now.getTime() + 1_800_000)}),updated_at=${now} WHERE consultation_id=${input.consultationId} AND state IN ('pending','recording','reconciling')`,
+          Prisma.sql`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
+            VALUES (${input.completionEventId},${input.consultationId},NULL,
+              'worker.epoch_completed',${terminal.terminal_at},${request}::jsonb)`,
+        );
+        return true;
+      }),
+    );
+  }
+
+  async abandonWorkerEpoch(input: AbandonWorkerEpochInput): Promise<boolean> {
+    if ((input.sealId === undefined) !== (input.completionEventId === undefined)) {
+      throw new DomainError("WORKER_ABANDONMENT_CONFLICT");
+    }
+    const request = JSON.stringify(input);
+    return retryPostgresContention(() =>
+      this.database.$transaction(async (transaction) => {
+        const replay = await transaction.$queryRaw<Record<string, unknown>[]>(
+          Prisma.sql`SELECT 1 FROM audit_events WHERE id=${input.abandonmentEventId}
+            AND aggregate_id=${input.consultationId} AND kind='worker.epoch_abandoned'
+            AND details=${request}::jsonb`,
+        );
+        if (replay.length === 1) {
+          return true;
+        }
+        const locked = await transaction.$queryRaw<Record<string, unknown>[]>(
+          Prisma.sql`SELECT reservation.consultation_id FROM worker_reservations reservation
+            JOIN consultations consultation ON consultation.id=reservation.consultation_id
+              AND consultation.generation=reservation.generation
+            JOIN worker_job_epochs job ON job.consultation_id=reservation.consultation_id
+              AND job.generation=reservation.generation AND job.worker_id=reservation.worker_id
+              AND job.epoch=reservation.epoch
+            JOIN archives archive ON archive.consultation_id=reservation.consultation_id
+            WHERE reservation.consultation_id=${input.consultationId}
+              AND reservation.generation=${input.generation}
+              AND reservation.worker_id=${input.workerId} AND reservation.epoch=${input.epoch}
+              AND reservation.lease_expires_at < now() AND reservation.released_at IS NULL
+              AND reservation.fenced_at IS NULL AND job.fenced_at IS NULL AND job.terminal_at IS NULL
+              AND job.write_epoch=${input.writeEpoch} AND archive.write_epoch=${input.writeEpoch}
+              AND (SELECT count(*) FROM worker_checkpoints checkpoint
+                WHERE checkpoint.consultation_id=reservation.consultation_id
+                  AND checkpoint.generation=reservation.generation
+                  AND checkpoint.worker_id=reservation.worker_id
+                  AND checkpoint.worker_epoch=reservation.epoch AND checkpoint.terminal) < 2
+            FOR UPDATE OF consultation,reservation,job`,
+        );
+        if (locked.length !== 1) {
+          throw new DomainError("WORKER_ABANDONMENT_FENCED");
+        }
+        const directions = await transaction.$queryRaw<
+          { source_participant_id: UUID; destination_participant_id: UUID }[]
+        >(Prisma.sql`SELECT (direction->>'sourceParticipantId')::uuid AS source_participant_id,
+            (direction->>'destinationParticipantId')::uuid AS destination_participant_id
+          FROM room_provider_selections selection
+          CROSS JOIN LATERAL jsonb_array_elements(selection.selection->'directions') direction
+          WHERE selection.consultation_id=${input.consultationId}
+          ORDER BY source_participant_id`);
+        if (directions.length !== 2) {
+          throw new DomainError("WORKER_ABANDONMENT_CONFLICT");
+        }
+        const checkpoints = directions.map((direction) => {
+          const seed = `${input.abandonmentEventId}:${direction.source_participant_id}:${direction.destination_participant_id}`;
+          const bytes = createHash("sha256").update(seed).digest().subarray(0, 16);
+          bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x50;
+          bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+          const hex = bytes.toString("hex");
+          const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+          return {
+            ...direction,
+            id,
+            hash: createHash("sha256")
+              .update(`${seed}:${input.handoffDigest}:${input.permanentOutcomeDigest}`)
+              .digest("hex"),
+          };
+        });
+        for (const checkpoint of checkpoints) {
+          await transaction.$executeRaw(
+            Prisma.sql`WITH previous AS (
+                SELECT accepted_input_sequence,accepted_input,received_output,emitted_output,
+                  checkpoint_hash,expected_ids,observed_ids,gaps
+                FROM worker_checkpoints
+                WHERE consultation_id=${input.consultationId} AND generation=${input.generation}
+                  AND worker_id=${input.workerId} AND worker_epoch=${input.epoch}
+                  AND source_participant_id=${checkpoint.source_participant_id}
+                  AND destination_participant_id=${checkpoint.destination_participant_id}
+                ORDER BY accepted_input_sequence DESC,accepted_input DESC LIMIT 1
+                FOR UPDATE
+              ) INSERT INTO worker_checkpoints(id,consultation_id,generation,worker_id,
+                worker_epoch,write_epoch,source_participant_id,destination_participant_id,
+                accepted_input_sequence,accepted_input,received_output,emitted_output,
+                previous_hash,checkpoint_hash,expected_ids,observed_ids,gaps,terminal,
+                object_key,object_version_id,created_at)
+              SELECT ${checkpoint.id},${input.consultationId},${input.generation},${input.workerId},
+                ${input.epoch},${input.writeEpoch},${checkpoint.source_participant_id},
+                ${checkpoint.destination_participant_id},COALESCE(previous.accepted_input_sequence+1,0),
+                COALESCE(previous.accepted_input+1,0),COALESCE(previous.received_output,0),
+                COALESCE(previous.emitted_output,0),previous.checkpoint_hash,${checkpoint.hash},
+                COALESCE(previous.expected_ids,'[]'::jsonb),COALESCE(previous.observed_ids,'[]'::jsonb),
+                COALESCE(previous.gaps,'[]'::jsonb) || ${JSON.stringify([{ reason: input.reason, sampleStart: null, sampleEnd: null }])}::jsonb,
+                true,${`v1/meetings/${input.consultationId}/inventory/checkpoints/supervisor-${checkpoint.id}.json`},
+                NULL,now() FROM (SELECT 1) seed LEFT JOIN previous ON true`,
+          );
+        }
+        const designated = [...checkpoints].sort((left, right) =>
+          left.id.localeCompare(right.id),
+        )[0];
+        if (!designated) {
+          throw new DomainError("WORKER_ABANDONMENT_CONFLICT");
+        }
+        const terminalized = await transaction.$queryRaw<{ next_generation: number }[]>(
+          Prisma.sql`WITH terminalized AS (
+              UPDATE worker_job_epochs SET fenced_at=now(),terminal_checkpoint_id=${designated.id},
+                terminal_outcome='failed',terminal_at=(SELECT created_at FROM worker_checkpoints WHERE id=${designated.id})
+              WHERE consultation_id=${input.consultationId} AND generation=${input.generation}
+                AND worker_id=${input.workerId} AND epoch=${input.epoch} AND terminal_at IS NULL
+              RETURNING consultation_id,generation,worker_id,epoch,terminal_at
+            ), released AS (
+              UPDATE worker_reservations reservation SET accepting_load=false,fenced_at=now(),
+                fence_reason=${input.reason},released_at=terminalized.terminal_at
+              FROM terminalized WHERE reservation.consultation_id=terminalized.consultation_id
+                AND reservation.generation=terminalized.generation
+                AND reservation.worker_id=terminalized.worker_id AND reservation.epoch=terminalized.epoch
+              RETURNING terminalized.*
+            ) UPDATE consultations consultation SET state='finalizing',generation=consultation.generation+1,
+              finalize_deadline_at=COALESCE(consultation.finalize_deadline_at,now()+interval '15 minutes'),updated_at=now()
+            FROM released WHERE consultation.id=released.consultation_id
+              AND consultation.generation=released.generation RETURNING consultation.generation AS next_generation`,
+        );
+        const terminal = terminalized[0];
+        if (!terminal) {
+          throw new DomainError("WORKER_ABANDONMENT_FENCED");
+        }
+        await transaction.$executeRaw(
+          Prisma.sql`UPDATE archives SET state='reconciling',
+            reconciliation_deadline_at=COALESCE(reconciliation_deadline_at,now()+interval '30 minutes'),
+            updated_at=now() WHERE consultation_id=${input.consultationId}
+            AND state IN ('pending','recording','reconciling')`,
         );
         await transaction.$executeRaw(
           Prisma.sql`INSERT INTO audit_events(id,aggregate_id,actor_id,kind,occurred_at,details)
-            VALUES (${input.eventId},${input.consultationId},NULL,'worker.failure_reported',${now},${JSON.stringify(reason)}::jsonb)`,
+            VALUES (${input.abandonmentEventId},${input.consultationId},NULL,
+              'worker.epoch_abandoned',now(),${request}::jsonb)`,
         );
         await transaction.$executeRaw(
           Prisma.sql`INSERT INTO outbox(id,topic,aggregate_id,generation,payload,available_at,attempts)
-            VALUES (${input.eventId},'archive.failed',${input.consultationId},${nextGeneration},${JSON.stringify(
-              {
+            VALUES (${input.abandonmentEventId},'archive.failed',${input.consultationId},
+              ${terminal.next_generation},${JSON.stringify({
                 reasonCode: "ARCHIVE_FAILED",
                 egressId: input.workerId,
                 resourceGeneration: input.generation,
-              },
-            )}::jsonb,${now},0)`,
+              })}::jsonb,now(),0)`,
         );
         return true;
       }),

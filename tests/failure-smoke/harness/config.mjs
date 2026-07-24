@@ -22,6 +22,8 @@ export async function createHarnessContext() {
   if (!adminEmail) throw new Error("E2E_EMPLOYEE_EMAIL is required");
   const faultFile = process.env.FAULT_CONTROL_FILE ?? "/shared/faults.json";
   const workerScenarioFile = process.env.WORKER_SCENARIO_FILE ?? "/shared/worker-scenarios.json";
+  const spoolDrainerScenarioFile =
+    process.env.SPOOL_DRAINER_SCENARIO_FILE ?? "/shared/spool-drainer-scenarios.json";
   const expectedProfile = process.env.EXPECTED_PROFILE ?? "fixture";
   const databaseUrlFile = process.env.DATABASE_URL_FILE ?? "/run/secrets/database-web-url";
   const releaseDirectory = process.env.FAILURE_RELEASE_DIR ?? "/shared/releases";
@@ -35,6 +37,13 @@ export async function createHarnessContext() {
   const checkpointFile =
     process.env.FAILURE_SMOKE_CHECKPOINT_FILE ?? "/shared/failure-smoke-checkpoint.json";
   const capabilityMinimumRemainingMs = 10 * 60_000;
+  const spoolCrashPoints = Object.freeze([
+    "s3-put",
+    "archive-registration",
+    "checkpoint-acceptance",
+    "completion-acceptance",
+  ]);
+  const spoolSealPoints = Object.freeze(["active", "settling", "renamed", "committed", "released"]);
   const scenarioRegistry = Object.freeze([
     "recovery-hold",
     "participant-egress-denied",
@@ -46,8 +55,14 @@ export async function createHarnessContext() {
     "translation-transport",
     "tts-partial-finalization",
     "preservation-fence",
-    "minio-inflight-recovery",
     "spool-durable-recovery",
+    "spool-drainer-ownership",
+    "spool-drainer-crash-replay",
+    "spool-drainer-historical-fencing",
+    "spool-drainer-terminal-ordering",
+    "spool-drainer-preseal-recovery",
+    "spool-drainer-seal-race",
+    "minio-inflight-recovery",
     "unwritable-spool",
   ]);
   const scenarioShards = Object.freeze({
@@ -64,7 +79,16 @@ export async function createHarnessContext() {
       "translation-transport",
       "tts-partial-finalization",
     ]),
-    spool: Object.freeze(["preservation-fence", "spool-durable-recovery"]),
+    spool: Object.freeze([
+      "preservation-fence",
+      "spool-durable-recovery",
+      "spool-drainer-ownership",
+      "spool-drainer-crash-replay",
+      "spool-drainer-historical-fencing",
+      "spool-drainer-terminal-ordering",
+      "spool-drainer-preseal-recovery",
+      "spool-drainer-seal-race",
+    ]),
     storage: Object.freeze(["minio-inflight-recovery", "unwritable-spool"]),
   });
   const translationFailureCases = Object.freeze([
@@ -98,6 +122,8 @@ export async function createHarnessContext() {
     shard: undefined,
     resume: false,
     deadlineEpochMs: undefined,
+    spoolCrashPoint: undefined,
+    spoolSealPoint: undefined,
   };
   for (let index = 2; index < process.argv.length; index += 1) {
     const argument = process.argv[index];
@@ -105,7 +131,15 @@ export async function createHarnessContext() {
       cliOptions.resume = true;
       continue;
     }
-    if (!["--scenarios", "--shard", "--deadline-epoch-ms"].includes(argument)) {
+    if (
+      ![
+        "--scenarios",
+        "--shard",
+        "--deadline-epoch-ms",
+        "--spool-crash-point",
+        "--spool-seal-point",
+      ].includes(argument)
+    ) {
       throw new Error(`unknown failure-smoke argument: ${argument}`);
     }
     const value = process.argv[index + 1];
@@ -121,10 +155,18 @@ export async function createHarnessContext() {
     if (argument === "--deadline-epoch-ms" && cliOptions.deadlineEpochMs !== undefined) {
       throw new Error("--deadline-epoch-ms may only be specified once");
     }
+    if (argument === "--spool-crash-point" && cliOptions.spoolCrashPoint !== undefined) {
+      throw new Error("--spool-crash-point may only be specified once");
+    }
+    if (argument === "--spool-seal-point" && cliOptions.spoolSealPoint !== undefined) {
+      throw new Error("--spool-seal-point may only be specified once");
+    }
     index += 1;
     if (argument === "--scenarios") cliOptions.scenarios = value;
     else if (argument === "--shard") cliOptions.shard = value;
-    else cliOptions.deadlineEpochMs = value;
+    else if (argument === "--deadline-epoch-ms") cliOptions.deadlineEpochMs = value;
+    else if (argument === "--spool-crash-point") cliOptions.spoolCrashPoint = value;
+    else cliOptions.spoolSealPoint = value;
   }
   const requestedScenarioText = cliOptions.scenarios ?? process.env.FAILURE_SMOKE_SCENARIOS;
   if (cliOptions.shard !== undefined && requestedScenarioText !== undefined) {
@@ -165,6 +207,34 @@ export async function createHarnessContext() {
   if (unknownScenarios.length > 0) {
     throw new Error(`unknown failure-smoke scenarios: ${unknownScenarios.join(", ")}`);
   }
+  if (
+    cliOptions.spoolCrashPoint !== undefined &&
+    !spoolCrashPoints.includes(cliOptions.spoolCrashPoint)
+  ) {
+    throw new Error(
+      `unknown --spool-crash-point: ${cliOptions.spoolCrashPoint}; expected one of ${spoolCrashPoints.join(", ")}`,
+    );
+  }
+  if (
+    cliOptions.spoolSealPoint !== undefined &&
+    !spoolSealPoints.includes(cliOptions.spoolSealPoint)
+  ) {
+    throw new Error(
+      `unknown --spool-seal-point: ${cliOptions.spoolSealPoint}; expected one of ${spoolSealPoints.join(", ")}`,
+    );
+  }
+  if (
+    cliOptions.spoolCrashPoint !== undefined &&
+    !selectedScenarios.has("spool-drainer-crash-replay")
+  ) {
+    throw new Error("--spool-crash-point requires spool-drainer-crash-replay");
+  }
+  if (
+    cliOptions.spoolSealPoint !== undefined &&
+    !selectedScenarios.has("spool-drainer-seal-race")
+  ) {
+    throw new Error("--spool-seal-point requires spool-drainer-seal-race");
+  }
   const resumeRequested = cliOptions.resume || process.env.FAILURE_SMOKE_RESUME === "true";
   const checkpointBinding = Object.freeze({
     harnessVersion,
@@ -194,6 +264,7 @@ export async function createHarnessContext() {
     adminEmail,
     faultFile,
     workerScenarioFile,
+    spoolDrainerScenarioFile,
     expectedProfile,
     databaseUrlFile,
     releaseDirectory,
@@ -208,6 +279,8 @@ export async function createHarnessContext() {
     capabilityMinimumRemainingMs,
     scenarioRegistry,
     scenarioShards,
+    spoolCrashPoints,
+    spoolSealPoints,
     translationFailureCases,
     cliOptions,
     harnessDeadlineMs,

@@ -203,9 +203,9 @@ export class ArchiveService {
       ),
     );
   }
-  async recordWorkerObject(
+  async recordSpoolObject(
     consultationId: UUID,
-    worker: {
+    producer: {
       generation: number;
       workerId: UUID;
       workerEpoch: number;
@@ -216,13 +216,15 @@ export class ArchiveService {
   ): Promise<void> {
     await this.archives.transaction(async (tx) => {
       const archiveObject = this.toArchiveObject(consultationId, writerEpoch, causalKey, object);
-      const archive = await this.required(consultationId, tx);
-      const active = await this.archives.lockActiveWorkerWriter(
+      if (await this.archives.hasExactObject(archiveObject, tx)) {
+        return;
+      }
+      const active = await this.archives.lockSpoolProducerTuple(
         {
           consultationId,
-          generation: worker.generation,
-          workerId: worker.workerId,
-          workerEpoch: worker.workerEpoch,
+          generation: producer.generation,
+          workerId: producer.workerId,
+          workerEpoch: producer.workerEpoch,
           writerEpoch,
         },
         tx,
@@ -230,29 +232,7 @@ export class ArchiveService {
       if (!active) {
         throw new DomainError("ARCHIVE_WRITER_FENCED");
       }
-      await this.recordProtectedObject(archiveObject, tx, archive);
-    });
-  }
-
-  async recordDrainerObject(
-    consultationId: UUID,
-    causalKey: string,
-    object: RecordObjectInput,
-  ): Promise<void> {
-    await this.archives.transaction(async (tx) => {
-      const archive = await this.required(consultationId, tx);
-      if (
-        archive.state !== "pending" &&
-        archive.state !== "recording" &&
-        archive.state !== "reconciling"
-      ) {
-        throw new DomainError("ARCHIVE_WRITER_FENCED");
-      }
-      await this.recordProtectedObject(
-        this.toArchiveObject(consultationId, archive.writeEpoch, causalKey, object),
-        tx,
-        archive,
-      );
+      await this.recordProtectedObject(archiveObject, tx);
     });
   }
 

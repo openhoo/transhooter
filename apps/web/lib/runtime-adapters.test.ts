@@ -99,6 +99,7 @@ const config = {
   internalJwtIssuer: null,
   internalJwtAudience: null,
   podNamespace: null,
+  internalServiceAccountPrefix: null,
   trustedClientIpHeader: null,
 } satisfies WebConfig;
 

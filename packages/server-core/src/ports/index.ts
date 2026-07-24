@@ -424,7 +424,8 @@ export interface ArchiveRepository extends TransactionManager {
     tx: Transaction,
   ): Promise<UUID>;
   recordObject(object: ArchiveObject, tx: Transaction): Promise<void>;
-  lockActiveWorkerWriter(
+  hasExactObject(object: ArchiveObject, tx: Transaction): Promise<boolean>;
+  lockSpoolProducerTuple(
     input: {
       consultationId: UUID;
       generation: number;
@@ -640,7 +641,13 @@ export interface ObjectStoragePort {
 }
 
 export interface InternalPrincipal {
-  service: "web" | "control-worker" | "translation-worker" | "language-refresh" | "spool-drainer";
+  service:
+    | "web"
+    | "control-worker"
+    | "translation-worker"
+    | "language-refresh"
+    | "capability-publisher"
+    | "spool-drainer";
   subject: string;
   permissions: readonly string[];
 }

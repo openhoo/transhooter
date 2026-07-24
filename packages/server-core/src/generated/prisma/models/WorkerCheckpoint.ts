@@ -395,7 +395,7 @@ export type WorkerCheckpointOrderByWithRelationInput = {
 export type WorkerCheckpointWhereUniqueInput = Prisma.AtLeast<{
   id?: string
   checkpointHash?: string
-  consultationId_workerEpoch_sourceParticipantId_destinationParticipantId_acceptedInputSequence_acceptedInput_receivedOutput_emittedOutput?: Prisma.WorkerCheckpointConsultationIdWorkerEpochSourceParticipantIdDestinationParticipantIdAcceptedInputSequenceAcceptedInputReceivedOutputEmittedOutputCompoundUniqueInput
+  consultationId_workerEpoch_sourceParticipantId_destinationParticipantId_acceptedInputSequence_acceptedInput_receivedOutput_emittedOutput_terminal?: Prisma.WorkerCheckpointConsultationIdWorkerEpochSourceParticipantIdDestinationParticipantIdAcceptedInputSequenceAcceptedInputReceivedOutputEmittedOutputTerminalCompoundUniqueInput
   AND?: Prisma.WorkerCheckpointWhereInput | Prisma.WorkerCheckpointWhereInput[]
   OR?: Prisma.WorkerCheckpointWhereInput[]
   NOT?: Prisma.WorkerCheckpointWhereInput | Prisma.WorkerCheckpointWhereInput[]
@@ -423,7 +423,7 @@ export type WorkerCheckpointWhereUniqueInput = Prisma.AtLeast<{
   sourceParticipant?: Prisma.XOR<Prisma.ConsultationParticipantScalarRelationFilter, Prisma.ConsultationParticipantWhereInput>
   destinationParticipant?: Prisma.XOR<Prisma.ConsultationParticipantScalarRelationFilter, Prisma.ConsultationParticipantWhereInput>
   terminalForJobEpochs?: Prisma.WorkerJobEpochListRelationFilter
-}, "id" | "checkpointHash" | "consultationId_workerEpoch_sourceParticipantId_destinationParticipantId_acceptedInputSequence_acceptedInput_receivedOutput_emittedOutput">
+}, "id" | "checkpointHash" | "consultationId_workerEpoch_sourceParticipantId_destinationParticipantId_acceptedInputSequence_acceptedInput_receivedOutput_emittedOutput_terminal">
 
 export type WorkerCheckpointOrderByWithAggregationInput = {
   id?: Prisma.SortOrder
@@ -653,7 +653,7 @@ export type WorkerCheckpointOrderByRelationAggregateInput = {
   _count?: Prisma.SortOrder
 }
 
-export type WorkerCheckpointConsultationIdWorkerEpochSourceParticipantIdDestinationParticipantIdAcceptedInputSequenceAcceptedInputReceivedOutputEmittedOutputCompoundUniqueInput = {
+export type WorkerCheckpointConsultationIdWorkerEpochSourceParticipantIdDestinationParticipantIdAcceptedInputSequenceAcceptedInputReceivedOutputEmittedOutputTerminalCompoundUniqueInput = {
   consultationId: string
   workerEpoch: bigint | number
   sourceParticipantId: string
@@ -662,6 +662,7 @@ export type WorkerCheckpointConsultationIdWorkerEpochSourceParticipantIdDestinat
   acceptedInput: bigint | number
   receivedOutput: bigint | number
   emittedOutput: bigint | number
+  terminal: boolean
 }
 
 export type WorkerCheckpointCountOrderByAggregateInput = {

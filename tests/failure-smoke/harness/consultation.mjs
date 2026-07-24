@@ -26,6 +26,7 @@ export function installConsultation(ctx) {
     setFaults,
     setWorkerScenario,
     onlyContainer,
+    setSpoolDrainerScenario,
     inspect,
     withAbsoluteDeadline,
     sql,
@@ -164,6 +165,7 @@ export function installConsultation(ctx) {
   async function runConsultation({
     faults = {},
     workerScenario = {},
+    spoolDrainerScenario = null,
     captureBarrierTimeoutMs = null,
     skipMediaOutputProof = true,
   } = {}) {
@@ -288,6 +290,7 @@ export function installConsultation(ctx) {
       await assertFixtureCapabilityLease();
       await setFaults(created.consultationId, faults);
       await setWorkerScenario(created.consultationId, workerScenario);
+      await setSpoolDrainerScenario(created.consultationId, spoolDrainerScenario);
       await writeFile(releaseFile, `${created.runId}\n`, { mode: 0o600 });
     } catch (error) {
       await terminateProcessTree(run).catch(() => undefined);

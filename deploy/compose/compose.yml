@@ -10,7 +10,8 @@ x-app-base: &app-base
 
 x-runtime-images:
   typescript: &typescript-runtime-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-typescript-runtime:${APP_IMAGE_TAG:-local}"
-  translation: &translation-runtime-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-translation-runtime:${APP_IMAGE_TAG:-local}"
+  translation-worker: &translation-worker-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-translation-worker:${APP_IMAGE_TAG:-local}"
+  spool-drainer: &spool-drainer-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-spool-drainer:${APP_IMAGE_TAG:-local}"
   bootstrap: &bootstrap-runtime-image "${APP_IMAGE_NAMESPACE:-${COMPOSE_PROJECT_NAME:-transhooter}}-bootstrap-runtime:${APP_IMAGE_TAG:-local}"
 
 x-worker-health: &worker-health
@@ -250,8 +251,8 @@ services:
       - ../../.secrets/minio-web-secret-key:/run/secrets/minio-web-secret-key:ro
       - ../../.secrets/minio-control-access-key:/run/secrets/minio-control-access-key:ro
       - ../../.secrets/minio-control-secret-key:/run/secrets/minio-control-secret-key:ro
-      - ../../.secrets/minio-translation-access-key:/run/secrets/minio-translation-access-key:ro
-      - ../../.secrets/minio-translation-secret-key:/run/secrets/minio-translation-secret-key:ro
+      - ../../.secrets/minio-provider-diagnostics-access-key:/run/secrets/minio-provider-diagnostics-access-key:ro
+      - ../../.secrets/minio-provider-diagnostics-secret-key:/run/secrets/minio-provider-diagnostics-secret-key:ro
       - ../../.secrets/minio-spool-drainer-access-key:/run/secrets/minio-spool-drainer-access-key:ro
       - ../../.secrets/minio-spool-drainer-secret-key:/run/secrets/minio-spool-drainer-secret-key:ro
       - ../scripts/minio_identities.sh:/usr/local/bin/minio-identities:ro
@@ -323,7 +324,7 @@ services:
       - ./egress.yaml:/templates/egress.yaml:ro
       - ../scripts/render-config.sh:/usr/local/bin/render-config:ro
     tmpfs:
-      - /runtime:size=1048576,mode=0770,uid=0,gid=0
+      - /runtime:size=1048576,mode=0770
     entrypoint: [/bin/bash, -ec]
     command:
       - |
@@ -459,10 +460,10 @@ services:
 
   profile-preflight:
     <<: *app-base
-    image: *translation-runtime-image
+    image: *translation-worker-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-runtime.Dockerfile
+      dockerfile: deploy/docker/translation-worker.Dockerfile
     restart: "no"
     environment:
       APP_ENV: ${APP_ENV:-development}
@@ -500,10 +501,10 @@ services:
 
   language-refresh:
     <<: *app-base
-    image: *translation-runtime-image
+    image: *translation-worker-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-runtime.Dockerfile
+      dockerfile: deploy/docker/translation-worker.Dockerfile
     restart: "no"
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -525,17 +526,16 @@ services:
 
   translation-worker:
     <<: *app-base
-    image: *translation-runtime-image
+    image: *translation-worker-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-runtime.Dockerfile
+      dockerfile: deploy/docker/translation-worker.Dockerfile
     depends_on:
       migrate: {condition: service_completed_successfully}
       language-refresh: {condition: service_completed_successfully}
       spool-init: {condition: service_completed_successfully}
       livekit: {condition: service_healthy}
       redis: {condition: service_healthy}
-      minio-identity-bootstrap: {condition: service_completed_successfully}
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: transhooter-translation-worker
@@ -545,25 +545,22 @@ services:
       REDIS_URL_FILE: /run/secrets/redis-url
       LIVEKIT_URL: ws://livekit:7880
       LIVEKIT_CREDENTIALS_FILE: /run/secrets/livekit-credentials
-      S3_ENDPOINT: http://minio:9000
-      S3_REGION: eu-central-1
-      S3_BUCKET: transhooter
-      S3_CREDENTIALS_FILE: /run/secrets/minio-translation-credentials
       SPOOL_KEYRING_FILE: /run/secrets/spool-keyring
       INTERNAL_TOKEN_FILE: /run/secrets/internal-token
       CONTROL_INTERNAL_URL: http://web:3000
       SPOOL_WORKER_HEALTH_RATIO: ${SPOOL_WORKER_HEALTH_RATIO:-0.7}
-      SPOOL_DRAINER_HEALTH_RATIO: ${SPOOL_DRAINER_HEALTH_RATIO:-0.8}
       SPOOL_PATH: /var/lib/transhooter/spool
+    read_only: true
+    tmpfs:
+      - /tmp:size=536870912,mode=1777
     volumes:
       - spool-data:/var/lib/transhooter/spool
       - ../../.secrets/database-translation-url:/run/secrets/database-url:ro
       - ../../.secrets/redis-url:/run/secrets/redis-url:ro
       - ../../.secrets/livekit-credentials:/run/secrets/livekit-credentials:ro
-      - ../../.secrets/minio-translation-credentials:/run/secrets/minio-translation-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-translation-token:/run/secrets/internal-token:ro
-    command: [python, apps/translation-worker/main.py, start]
+    command: [transhooter-translation-worker, start]
     healthcheck:
       test: [CMD, transhooter-worker-healthcheck]
       interval: 10s
@@ -573,17 +570,20 @@ services:
 
   spool-drainer:
     <<: *app-base
-    image: *translation-runtime-image
+    image: *spool-drainer-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-runtime.Dockerfile
+      dockerfile: deploy/docker/spool-drainer.Dockerfile
+    restart: unless-stopped
     depends_on:
       spool-init: {condition: service_completed_successfully}
       minio-identity-bootstrap: {condition: service_completed_successfully}
+      web: {condition: service_healthy}
     environment:
       <<: *otel-env
       OTEL_SERVICE_NAME: transhooter-spool-drainer
       APP_ENV: ${APP_ENV:-development}
+      ARCHIVE_REQUIRE_KMS: "false"
       S3_ENDPOINT: http://minio:9000
       S3_REGION: eu-central-1
       S3_BUCKET: transhooter
@@ -593,12 +593,16 @@ services:
       CONTROL_INTERNAL_URL: http://web:3000
       SPOOL_DRAINER_HEALTH_RATIO: ${SPOOL_DRAINER_HEALTH_RATIO:-0.8}
       SPOOL_PATH: /var/lib/transhooter/spool
+    read_only: true
+    stop_grace_period: 2m
+    tmpfs:
+      - /tmp:size=536870912,mode=1777
     volumes:
       - spool-data:/var/lib/transhooter/spool
       - ../../.secrets/minio-spool-drainer-credentials:/run/secrets/minio-spool-drainer-credentials:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
       - ../../.secrets/internal-spool-drainer-token:/run/secrets/internal-token:ro
-    command: [python, apps/spool-drainer/main.py]
+    command: [transhooter-spool-drainer]
     healthcheck:
       test: [CMD, transhooter-spool-drainer-healthcheck]
       interval: 10s
@@ -653,7 +657,6 @@ services:
       language-refresh: {condition: service_completed_successfully}
       egress-ready: {condition: service_completed_successfully}
       translation-worker: {condition: service_healthy}
-      spool-drainer: {condition: service_started}
       control-worker-1: {condition: service_healthy}
       control-worker-2: {condition: service_healthy}
     environment:
@@ -674,24 +677,25 @@ services:
   provider-benchmark:
     profiles: [benchmark]
     <<: *app-base
-    image: *translation-runtime-image
+    image: *translation-worker-image
     build:
       context: ../..
-      dockerfile: deploy/docker/translation-runtime.Dockerfile
+      dockerfile: deploy/docker/translation-worker.Dockerfile
     restart: "no"
     depends_on:
       minio-identity-bootstrap: {condition: service_completed_successfully}
     environment:
       APP_ENV: benchmark
       S3_ENDPOINT: http://minio:9000
-      S3_BUCKET: transhooter
+      S3_BUCKET_FILE: /run/secrets/s3-bucket
       S3_REGION: eu-central-1
-      S3_CREDENTIALS_FILE: /run/secrets/minio-translation-credentials
+      S3_CREDENTIALS_FILE: /run/secrets/minio-provider-diagnostics-credentials
       SPOOL_KEYRING_FILE: /run/secrets/spool-keyring
       SPOOL_PATH: /tmp/transhooter-spool
     volumes:
       - ../../tests/fixtures:/workspace/tests/fixtures:ro
-      - ../../.secrets/minio-translation-credentials:/run/secrets/minio-translation-credentials:ro
+      - ../../.secrets/minio-provider-diagnostics-credentials:/run/secrets/minio-provider-diagnostics-credentials:ro
+      - ../../.secrets/s3-bucket:/run/secrets/s3-bucket:ro
       - ../../.secrets/spool-keyring:/run/secrets/spool-keyring:ro
     command: [transhooter-provider, benchmark]
 
@@ -704,6 +708,7 @@ services:
     restart: "no"
     depends_on:
       web: {condition: service_healthy}
+      spool-drainer: {condition: service_started}
     environment:
       BASE_URL: http://app.localhost:3000
       LIVEKIT_URL: ws://livekit:7880

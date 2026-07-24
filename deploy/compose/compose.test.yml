@@ -35,8 +35,9 @@ services:
       - test-integration-migrator-secrets:/exports/integration-migrator
       - test-web-secrets:/exports/web
       - test-control-secrets:/exports/control
-      - test-translation-secrets:/exports/translation
+      - test-translation-worker-secrets:/exports/translation-worker
       - test-spool-drainer-secrets:/exports/spool-drainer
+      - test-provider-diagnostics-secrets:/exports/provider-diagnostics
       - test-capability-secrets:/exports/capability
 
   postgres:
@@ -111,6 +112,9 @@ services:
   egress:
     environment:
       RTC_ADVERTISED_IP: ${RTC_NODE_IP:-10.254.232.250}
+    security_opt: !override
+      - no-new-privileges:true
+      - seccomp=unconfined
     volumes: !override
       - test-secrets:/secrets:ro
       - ./livekit.yaml:/templates/livekit.yaml:ro
@@ -158,20 +162,29 @@ services:
       INTERNAL_TOKEN_FILE: /run/secrets/internal-translation-token
     volumes: !override
       - spool-data:/var/lib/transhooter/spool
-      - test-translation-secrets:/run/secrets:ro
+      - test-translation-worker-secrets:/run/secrets:ro
       - fault-control:/shared:ro
 
   spool-drainer:
     depends_on:
       otel-collector: {condition: service_healthy}
+      web: {condition: service_healthy}
     environment:
-      <<: [*provider-disabled-env, *fixture-runtime-env]
-      FIXTURE_SCENARIO_FILE: /shared/worker-scenarios.json
+      APP_ENV: test
+      OTEL_SDK_DISABLED: "false"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_METRIC_EXPORT_INTERVAL: "5000"
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: "1"
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=transhooter,deployment.environment.name=test
+      ARCHIVE_REQUIRE_KMS: "false"
+      SPOOL_DRAINER_SCENARIO_FILE: /shared/spool-drainer-scenarios.json
       INTERNAL_TOKEN_FILE: /run/secrets/internal-spool-drainer-token
     volumes: !override
       - spool-data:/var/lib/transhooter/spool
       - test-spool-drainer-secrets:/run/secrets:ro
-      - fault-control:/shared:ro
+      - fault-control:/shared
 
   migrate:
     environment:
@@ -216,6 +229,11 @@ services:
           chmod 0666 /shared/worker-scenarios.json.tmp
           mv /shared/worker-scenarios.json.tmp /shared/worker-scenarios.json
         fi
+        if [ ! -e /shared/spool-drainer-scenarios.json ] || ! grep -q '"consultations"' /shared/spool-drainer-scenarios.json || grep -q '"\*"' /shared/spool-drainer-scenarios.json; then
+          printf '{"consultations":{}}\n' > /shared/spool-drainer-scenarios.json.tmp
+          chmod 0666 /shared/spool-drainer-scenarios.json.tmp
+          mv /shared/spool-drainer-scenarios.json.tmp /shared/spool-drainer-scenarios.json
+        fi
 
   control-worker-1:
     depends_on:
@@ -254,7 +272,6 @@ services:
       language-refresh: {condition: service_completed_successfully}
       egress-ready: {condition: service_completed_successfully}
       translation-worker: {condition: service_healthy}
-      spool-drainer: {condition: service_started}
       control-worker-1: {condition: service_healthy}
       control-worker-2: {condition: service_healthy}
       otel-collector: {condition: service_healthy}
@@ -304,14 +321,14 @@ services:
       - test-web-secrets:/run/secrets:ro
       - test-integration-migrator-secrets:/run/integration-secrets:ro
     tmpfs:
-      - /tmp:size=536870912,mode=1777,uid=10001,gid=10001
+      - /tmp:size=536870912,mode=1777
 
   provider-benchmark:
     environment:
       <<: [*provider-disabled-env, *fixture-runtime-env]
     volumes: !override
       - ../../tests/fixtures:/workspace/tests/fixtures:ro
-      - test-translation-secrets:/run/secrets:ro
+      - test-provider-diagnostics-secrets:/run/secrets:ro
 
   e2e:
     environment:
@@ -321,11 +338,12 @@ services:
 
   failure-smoke:
     user: "0:0"
-    cap_add: [FOWNER]
+    cap_add: [DAC_OVERRIDE, FOWNER]
     depends_on:
       bootstrap-admin: {condition: service_completed_successfully}
       language-refresh: {condition: service_completed_successfully}
       web: {condition: service_healthy}
+      spool-drainer: {condition: service_started}
     environment:
       <<: *fixture-runtime-env
       TARGET_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-transhooter}
@@ -342,7 +360,7 @@ services:
       - test-web-secrets:/run/secrets:ro
       - fault-control:/shared
       - spool-data:/var/lib/transhooter/spool
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ${CONTAINER_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
 
 networks:
   backend:
@@ -354,7 +372,8 @@ volumes:
   test-integration-migrator-secrets:
   test-web-secrets:
   test-control-secrets:
-  test-translation-secrets:
+  test-translation-worker-secrets:
   test-capability-secrets:
   test-spool-drainer-secrets:
+  test-provider-diagnostics-secrets:
   fault-control:

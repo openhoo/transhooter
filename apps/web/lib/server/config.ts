@@ -16,6 +16,18 @@ function hasRequiredKmsKey(value: {
   return value.ARCHIVE_REQUIRE_KMS !== "true" || value.S3_KMS_KEY_ID !== undefined;
 }
 
+function hasBearerAuthentication(value: {
+  INTERNAL_CONTROL_TOKEN_FILE?: string | undefined;
+  INTERNAL_TRANSLATION_TOKEN_FILE?: string | undefined;
+  INTERNAL_SPOOL_DRAINER_TOKEN_FILE?: string | undefined;
+}): boolean {
+  return (
+    value.INTERNAL_CONTROL_TOKEN_FILE !== undefined &&
+    value.INTERNAL_TRANSLATION_TOKEN_FILE !== undefined &&
+    value.INTERNAL_SPOOL_DRAINER_TOKEN_FILE !== undefined
+  );
+}
+
 function hasInternalAuthentication(value: {
   INTERNAL_CONTROL_TOKEN_FILE?: string | undefined;
   INTERNAL_TRANSLATION_TOKEN_FILE?: string | undefined;
@@ -23,16 +35,20 @@ function hasInternalAuthentication(value: {
   INTERNAL_JWT_ISSUER?: string | undefined;
   INTERNAL_JWT_AUDIENCE?: string | undefined;
   POD_NAMESPACE?: string | undefined;
+  INTERNAL_SERVICE_ACCOUNT_PREFIX?: string | undefined;
 }): boolean {
-  const hasBearerFiles =
-    value.INTERNAL_CONTROL_TOKEN_FILE !== undefined &&
-    value.INTERNAL_TRANSLATION_TOKEN_FILE !== undefined &&
-    value.INTERNAL_SPOOL_DRAINER_TOKEN_FILE !== undefined;
-  const hasJwtConfiguration =
+  if (hasBearerAuthentication(value)) {
+    return true;
+  }
+  return (
+    value.INTERNAL_CONTROL_TOKEN_FILE === undefined &&
+    value.INTERNAL_TRANSLATION_TOKEN_FILE === undefined &&
+    value.INTERNAL_SPOOL_DRAINER_TOKEN_FILE === undefined &&
     value.INTERNAL_JWT_ISSUER !== undefined &&
     value.INTERNAL_JWT_AUDIENCE !== undefined &&
-    value.POD_NAMESPACE !== undefined;
-  return hasBearerFiles || hasJwtConfiguration;
+    value.POD_NAMESPACE !== undefined &&
+    value.INTERNAL_SERVICE_ACCOUNT_PREFIX !== undefined
+  );
 }
 
 const MagicLinkSealKeyringSchema = z
@@ -80,6 +96,7 @@ const EnvironmentSchema = z
     INTERNAL_JWT_ISSUER: z.string().min(1).optional(),
     INTERNAL_JWT_AUDIENCE: z.string().min(1).optional(),
     POD_NAMESPACE: z.string().min(1).optional(),
+    INTERNAL_SERVICE_ACCOUNT_PREFIX: z.string().min(1).optional(),
     TRUSTED_CLIENT_IP_HEADER: z
       .string()
       .regex(/^x-[a-z0-9-]+$/iu)
@@ -97,8 +114,13 @@ const EnvironmentSchema = z
   })
   .refine(hasInternalAuthentication, {
     message:
-      "Per-caller internal Bearers or JWT issuer/audience/namespace configuration is required",
-  });
+      "Per-caller internal Bearers or JWT issuer/audience/namespace/service-account-prefix configuration is required",
+  })
+  .transform((value) =>
+    hasBearerAuthentication(value)
+      ? { ...value, INTERNAL_SERVICE_ACCOUNT_PREFIX: undefined }
+      : value,
+  );
 
 export type WebConfig = {
   appEnv: "development" | "test" | "production";
@@ -129,6 +151,7 @@ export type WebConfig = {
   internalJwtIssuer: string | null;
   internalJwtAudience: string | null;
   podNamespace: string | null;
+  internalServiceAccountPrefix: string | null;
   trustedClientIpHeader: string | null;
 };
 
@@ -225,6 +248,7 @@ export function webConfig(): WebConfig {
     internalJwtIssuer: environment.INTERNAL_JWT_ISSUER ?? null,
     internalJwtAudience: environment.INTERNAL_JWT_AUDIENCE ?? null,
     podNamespace: environment.POD_NAMESPACE ?? null,
+    internalServiceAccountPrefix: environment.INTERNAL_SERVICE_ACCOUNT_PREFIX ?? null,
     trustedClientIpHeader: environment.TRUSTED_CLIENT_IP_HEADER ?? null,
   };
   return cached;

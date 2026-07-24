@@ -76,7 +76,9 @@ function fixture(principal: InternalPrincipal = CONTROL_PRINCIPAL) {
   const beginDelete = mock(async () => undefined);
   const requestMagicLink = mock(async () => undefined);
   const providerAttempt = mock(async () => true);
-  const workerFailure = mock(async () => true);
+  const expiredWorkerEpochs = mock(async () => []);
+  const completeWorkerEpoch = mock(async () => true);
+  const abandonWorkerEpoch = mock(async () => true);
   const verify = mock(async () => principal);
   const authenticate = mock(async () => ({ session: SESSION, user: USER }));
   const consultations = {
@@ -94,7 +96,9 @@ function fixture(principal: InternalPrincipal = CONTROL_PRINCIPAL) {
     consultationOptions: mock(async () => []),
     providerProfileMetadata: mock(async () => []),
     providerAttempt,
-    workerFailure,
+    expiredWorkerEpochs,
+    completeWorkerEpoch,
+    abandonWorkerEpoch,
   };
   const app = createWebApplication({
     auth: {
@@ -122,9 +126,11 @@ function fixture(principal: InternalPrincipal = CONTROL_PRINCIPAL) {
     consultations,
     operations,
     providerAttempt,
+    expiredWorkerEpochs,
+    completeWorkerEpoch,
+    abandonWorkerEpoch,
     requestMagicLink,
     verify,
-    workerFailure,
   };
 }
 
@@ -213,7 +219,7 @@ describe("WebApplication authentication boundary", () => {
     const translationWorker: InternalPrincipal = {
       service: "translation-worker",
       subject: "translation",
-      permissions: ["checkpoint:write"],
+      permissions: ["provider-attempt:write"],
     };
     const allowed = fixture(translationWorker);
     await expect(
@@ -226,7 +232,7 @@ describe("WebApplication authentication boundary", () => {
     const wrongService = fixture({
       service: "control-worker",
       subject: "control",
-      permissions: ["checkpoint:write"],
+      permissions: ["provider-attempt:write"],
     });
     await expect(
       wrongService.app.execute(PROVIDER_COMMAND, {
@@ -246,31 +252,46 @@ describe("WebApplication authentication boundary", () => {
     ).rejects.toThrow("FORBIDDEN_INTERNAL");
   });
 
-  it("dispatches authenticated worker failure reports to durable fencing", async () => {
-    const translationWorker: InternalPrincipal = {
-      service: "translation-worker",
-      subject: "translation",
-      permissions: ["failure:write"],
-    };
-    const configured = fixture(translationWorker);
+  it("authorizes worker recovery commands only for the spool drainer", async () => {
+    const configured = fixture({
+      service: "spool-drainer",
+      subject: "drainer",
+      permissions: ["worker-recovery:read", "worker-recovery:write"],
+    });
+    const headers = { authorization: "Bearer drainer" };
+
+    await expect(
+      configured.app.execute(
+        { kind: "internal.expiredWorkerEpochs" },
+        { internalHeaders: headers },
+      ),
+    ).resolves.toEqual([]);
     const command = {
-      kind: "internal.failure" as const,
+      kind: "internal.completeWorkerEpoch" as const,
       consultationId: CONSULTATION,
       generation: 3,
       workerId: PROVIDER_COMMAND.workerId,
       epoch: 2,
-      eventId: PROVIDER_COMMAND.eventId,
-      kindName: "SpoolUnavailable",
-      message: "fsync failed",
-      lastCheckpointHashes: {},
+      writeEpoch: 4,
+      completionEventId: PROVIDER_COMMAND.eventId,
+      outcome: "clean" as const,
+      terminalCheckpoints: [
+        { checkpointId: "00000000-0000-4000-8000-000000000016", checkpointHash: "a".repeat(64) },
+        { checkpointId: "00000000-0000-4000-8000-000000000017", checkpointHash: "b".repeat(64) },
+      ] as const,
+      failure: null,
     };
+    await expect(configured.app.execute(command, { internalHeaders: headers })).resolves.toBe(true);
+    expect(configured.completeWorkerEpoch).toHaveBeenCalledWith(command);
 
-    await expect(
-      configured.app.execute(command, {
-        internalHeaders: { authorization: "Bearer translation" },
-      }),
-    ).resolves.toBe(true);
-    expect(configured.workerFailure).toHaveBeenCalledWith(command);
+    const translation = fixture({
+      service: "translation-worker",
+      subject: "translation",
+      permissions: ["worker-recovery:write"],
+    });
+    await expect(translation.app.execute(command, { internalHeaders: headers })).rejects.toThrow(
+      "FORBIDDEN_INTERNAL",
+    );
   });
 
   it("derives public magic-link purpose, origin and client IP from trusted request context", async () => {

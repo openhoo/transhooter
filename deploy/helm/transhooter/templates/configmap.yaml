@@ -53,6 +53,7 @@ data:
   {{- end }}
   INTERNAL_JWT_ISSUER: {{ .Values.config.internalIssuer | quote }}
   INTERNAL_JWT_AUDIENCE: {{ .Values.config.internalAudience | quote }}
+  INTERNAL_SERVICE_ACCOUNT_PREFIX: {{ include "transhooter.fullname" . | quote }}
   SPOOL_KEYRING_FILE: "/run/secrets/spool-keyring"
   MAGIC_LINK_SEAL_KEYS_FILE: {{ required "magicLinkSealKeys.mountPath must identify the mounted keyring file" .Values.magicLinkSealKeys.mountPath | quote }}
   CONTROL_INTERNAL_URL: {{ printf "http://%s-web:%v" (include "transhooter.fullname" .) .Values.service.port | quote }}

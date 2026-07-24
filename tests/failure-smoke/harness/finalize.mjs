@@ -22,6 +22,7 @@ export async function finalizeHarness(ctx, primaryError, cleanupFailures) {
     trackedConsultations,
     faultFile,
     workerScenarioFile,
+    spoolDrainerScenarioFile,
     database,
     ownerFile,
   } = ctx;
@@ -30,6 +31,7 @@ export async function finalizeHarness(ctx, primaryError, cleanupFailures) {
     terminateProcessTree,
     setFaults,
     setWorkerScenario,
+    setSpoolDrainerScenario,
     onlyContainer,
     inspect,
     start,
@@ -60,9 +62,11 @@ export async function finalizeHarness(ctx, primaryError, cleanupFailures) {
     (await cleanup("reset fault controls", async () => {
       await setFaults();
       await setWorkerScenario();
-      const [faults, scenarios] = await Promise.all([
+      await setSpoolDrainerScenario();
+      const [faults, scenarios, drainerScenarios] = await Promise.all([
         readFile(faultFile, "utf8").then(JSON.parse),
         readFile(workerScenarioFile, "utf8").then(JSON.parse),
+        readFile(spoolDrainerScenarioFile, "utf8").then(JSON.parse),
       ]);
       const ownedFaultRemains = [...trackedConsultations].some(
         (consultationId) => consultationId in (faults.consultations ?? {}),
@@ -70,18 +74,25 @@ export async function finalizeHarness(ctx, primaryError, cleanupFailures) {
       const ownedScenarioRemains = [...trackedConsultations].some(
         (consultationId) => consultationId in (scenarios.consultations ?? {}),
       );
+      const ownedDrainerScenarioRemains = [...trackedConsultations].some(
+        (consultationId) => consultationId in (drainerScenarios.consultations ?? {}),
+      );
       if (
         Object.keys(faults).length !== 1 ||
         !faults.consultations ||
         Object.keys(scenarios).length !== 1 ||
         !scenarios.consultations ||
+        Object.keys(drainerScenarios).length !== 1 ||
+        !drainerScenarios.consultations ||
         ownedFaultRemains ||
-        ownedScenarioRemains
+        ownedScenarioRemains ||
+        ownedDrainerScenarioRemains
       ) {
         throw new Error(
           `fault reset retained harness consultations or invalid shape: ${JSON.stringify({
             faults,
             scenarios,
+            drainerScenarios,
           })}`,
         );
       }

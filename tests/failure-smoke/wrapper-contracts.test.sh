@@ -140,12 +140,12 @@ case " $* " in
       ambiguous) exit 7 ;;
     esac
     ;;
-  *" build minio egress-ready translation-worker web failure-smoke "*)
+  *" build minio egress-ready translation-worker spool-drainer web failure-smoke "*)
     if [ "${MOCK_MODE:-}" = deadline ]; then
       sleep 2
     fi
     ;;
-  *" build minio egress-ready translation-worker web e2e "*)
+  *" build minio egress-ready translation-worker spool-drainer web e2e "*)
     if [ "${MOCK_MODE:-}" = consultation-deadline ]; then
       sleep 2
     fi
@@ -353,8 +353,8 @@ if ! run_wrapper normal "$TEST_DIRECTORY/build-only-output" \
   --build-only --metrics-file "$build_metrics"; then
   fail 'build-only wrapper run failed'
 fi
-grep -F ' build minio egress-ready translation-worker web failure-smoke' "$CALLS" >/dev/null ||
-  fail 'build-only did not build the shared smoke images'
+grep -F ' build minio egress-ready translation-worker spool-drainer web failure-smoke' "$CALLS" >/dev/null ||
+  fail 'build-only did not build the two role-specific Python images and shared smoke images'
 if grep -F 'failure-smoke.mjs' "$CALLS" >/dev/null; then
   fail 'build-only unexpectedly ran failure scenarios'
 fi
@@ -372,7 +372,7 @@ if ! run_wrapper normal "$TEST_DIRECTORY/no-build-output" \
   --shard provider; then
   fail 'no-build shard wrapper run failed'
 fi
-if grep -F ' build minio egress-ready translation-worker web failure-smoke' "$CALLS" >/dev/null; then
+if grep -F ' build minio egress-ready translation-worker spool-drainer web failure-smoke' "$CALLS" >/dev/null; then
   fail 'no-build unexpectedly rebuilt smoke images'
 fi
 grep -F -- '--shard provider' "$CALLS" >/dev/null ||
@@ -384,6 +384,22 @@ grep -F '"name":"Running failure injection scenarios"' "$no_build_metrics" >/dev
 if [ -e "$TEST_DIRECTORY/no-build.scenario.log" ]; then
   fail 'successful scenario run unexpectedly created a failure scenario log'
 fi
+
+: > "$CALLS"
+if ! run_wrapper normal "$TEST_DIRECTORY/crash-point-output" \
+  --no-build --scenarios spool-drainer-crash-replay --spool-crash-point archive-registration; then
+  fail 'spool crash-point wrapper run failed'
+fi
+grep -F -- '--scenarios spool-drainer-crash-replay --spool-crash-point archive-registration' \
+  "$CALLS" >/dev/null || fail 'wrapper did not forward the exact spool crash subcase'
+
+: > "$CALLS"
+if ! run_wrapper normal "$TEST_DIRECTORY/seal-point-output" \
+  --no-build --scenarios spool-drainer-seal-race --spool-seal-point committed; then
+  fail 'spool seal-point wrapper run failed'
+fi
+grep -F -- '--scenarios spool-drainer-seal-race --spool-seal-point committed' \
+  "$CALLS" >/dev/null || fail 'wrapper did not forward the exact spool seal subcase'
 
 : > "$CALLS"
 failed_scenario_log="$TEST_DIRECTORY/failed-scenario.log"
@@ -761,10 +777,16 @@ for role in migrator web control translation; do
   grep -F "database-$role-url" "$TEST_DIRECTORY/production-config" >/dev/null ||
     fail "distinct PostgreSQL $role URL was absent from production config"
 done
-for service in web control translation spool-drainer; do
+for service in web control spool-drainer; do
   grep -F "minio-$service-credentials" "$TEST_DIRECTORY/production-config" >/dev/null ||
     fail "scoped MinIO $service credentials were absent from production config"
 done
+COMPOSE_PROFILES=benchmark render_google_config > "$TEST_DIRECTORY/benchmark-config"
+grep -F 'minio-provider-diagnostics-credentials' "$TEST_DIRECTORY/benchmark-config" >/dev/null ||
+  fail 'provider-diagnostics credentials were absent from benchmark profile config'
+if grep -F 'minio-translation-credentials' "$TEST_DIRECTORY/production-config" >/dev/null; then
+  fail 'long-running translation worker retained production S3 credentials'
+fi
 grep -F 'stop_grace_period: 1h0m0s' "$TEST_DIRECTORY/production-config" >/dev/null ||
   fail 'Egress graceful stop window was not one hour'
 
@@ -781,4 +803,20 @@ grep -F 'APP_ENV: development' "$TEST_DIRECTORY/development-config" >/dev/null |
 ) > "$TEST_DIRECTORY/base-config"
 grep -F 'S3_PUBLIC_ENDPOINT: http://localhost:9000' "$TEST_DIRECTORY/base-config" >/dev/null ||
   fail 'base Compose did not retain its explicit local S3 endpoint default'
+grep -F -- '- transhooter-translation-worker' "$TEST_DIRECTORY/base-config" >/dev/null ||
+  fail 'translation worker did not use its installed console command'
+grep -F -- '- transhooter-spool-drainer' "$TEST_DIRECTORY/base-config" >/dev/null ||
+  fail 'spool drainer did not use its installed console command'
+grep -A80 '^  spool-drainer:$' "$TEST_DIRECTORY/base-config" | grep -m1 -F 'restart: unless-stopped' >/dev/null ||
+  fail 'spool drainer did not retain crash-recovery restart policy'
+COMPOSE_PROFILES=e2e config_compose --env-file "$EMPTY_ENV" -f "$ROOT/deploy/compose/compose.yml" config > "$TEST_DIRECTORY/e2e-config"
+grep -A80 '^  e2e:$' "$TEST_DIRECTORY/e2e-config" | grep -m1 -F 'spool-drainer:' >/dev/null ||
+  fail 'consultation smoke did not start the spool drainer'
+grep -F 'internal-translation-token' "$TEST_DIRECTORY/base-config" >/dev/null ||
+  fail 'translation worker secret projection omitted its role token'
+grep -F 'internal-spool-drainer-token' "$TEST_DIRECTORY/base-config" >/dev/null ||
+  fail 'spool drainer secret projection omitted its role token'
+if grep -F 'translation-runtime.Dockerfile' "$TEST_DIRECTORY/base-config" >/dev/null; then
+  fail 'Compose retained the deleted combined Python image'
+fi
 printf 'failure-smoke wrapper contracts passed\n'
